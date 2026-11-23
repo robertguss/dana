@@ -1,0 +1,17 @@
+# Positive test: schemas with tags, constraints, joins, bucket, and pivot_wider.
+tag counseling
+
+schema Visit [counseling]
+  patient_id: Int [pii]
+  age: Int [health] where . >= 0 and . <= 125
+  note: Text? [counseling]
+end
+
+fn run_query(a: Table(Visit), b: Table(id: Int [pii], dept: Text))
+  a
+    |> join_many_to_one(b, on: left.patient_id == right.id)
+    |> derive(band: bucket(.age, cuts: [18, 65], labels: ["0-17", "18-64", "65+"]))
+    |> group_by(.dept, .band)
+    |> summarize(n: count_distinct(.patient_id))
+    |> suppress_small_groups(min: 5, distinct_by: .patient_id)
+end

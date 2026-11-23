@@ -9,19 +9,26 @@ this repository. `CLAUDE.md` imports this file.
 fast, private, database-native data work—the data sibling to
 [Mo](https://github.com/robertguss/mo).
 
-Dana is currently in **Phase 0 (Design)**. Do not jump ahead to compiler implementation until
-the active Phase 0 design deliverables in `docs/ROADMAP.md` are approved.
+Phase 0 (Design & Executable Grammar) is complete. Phase 1 (Lean Core & Naive Rust Oracle)
+is next. Run `make grammar` after any change to `grammar/`, `examples/`, or
+`docs/reference/README.md`.
 
 ## Documents in Order of Authority
 
 1. `docs/CHARTER.md` — locked-in v1 pillars, non-goals, and constraints.
-2. `docs/reference/README.md` *(Phase 0 deliverable)* — the Dana Language Reference
-   (embedded into `dana guide` once built). Wins over design docs on user-observable rules.
-3. `docs/design/privacy.md` *(Phase 0 deliverable)* — PII/FERPA taint, implicit-flow, and
-   declassification semantics.
-4. `docs/design/architecture.md` — compiler pipeline, Core IR contracts, vectorized VM, and
-   module boundaries.
-5. `docs/ROADMAP.md` — phase gates, active work, and status.
+2. `docs/reference/README.md` — the Dana Language Reference v0.1 (embedded into `dana guide`
+   once built). Wins over design docs on user-observable rules.
+3. `docs/design/privacy.md` — PII/FERPA taint, implicit-flow, and declassification semantics.
+4. `docs/design/core-ir.md` — Dana Core IR, canonical text wire protocol, and Lean theorems.
+5. `docs/design/architecture.md` — compiler pipeline, vectorized VM, and module boundaries.
+6. `docs/ROADMAP.md` — phase gates, active work, and status.
+
+## Checks
+
+```sh
+make grammar               # build 0-conflict Bison IELR(1) grammar and verify examples/ & Reference
+make grammar CC=clang      # verify clean build under clang too
+```
 
 ## Non-Negotiable Engineering Rules
 

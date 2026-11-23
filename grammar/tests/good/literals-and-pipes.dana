@@ -1,0 +1,16 @@
+# Positive test: date, timestamp, coalesce, pipe, inline if, and Markdown table literal.
+x = 2026-10-01
+t = 2026-10-01T12:30:00Z
+v = maybe_gpa ?? 0.00
+msg = if v >= 3.50: "honors" else if v >= 2.00: "good" else: "probation"
+
+sample = table
+  | id | label    | when       |
+  | 1  | "alpha"  | 2026-01-15 |
+  | 2  | "beta"   | 2026-02-20 |
+end
+
+res = sample
+  |> where(.id > 0)
+  |> derive(tag: :active)
+  |> sort_desc(.when)

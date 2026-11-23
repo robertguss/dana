@@ -1,0 +1,2 @@
+# Negative test: invisible zero-width space (U+200B) is rejected by lexer.
+x = "hello​world"

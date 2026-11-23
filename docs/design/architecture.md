@@ -153,14 +153,16 @@ dana/
 └── ci/                        # Local & nightly verification scripts
 ```
 
-## 5. Active Phase 0 Design Work
+## 5. Phase 0 Completion & Transition to Phase 1
 
-Before writing Phase 1/2 code, the remaining Phase 0 design deliverable must be completed and
-approved:
+All four Phase 0 design deliverables are complete and verified:
 
-1. ~~**Privacy & Declassification Semantics**~~ — completed in [`docs/design/privacy.md`](privacy.md).
-2. ~~**Sample Programs**~~ — completed in [`examples/`](../../examples/README.md) (10 programs + `dana.policy`).
-3. ~~**Dana Core IR Specification**~~ — completed in [`docs/design/core-ir.md`](core-ir.md).
-4. **Dana Language Reference v0.1 & Executable Grammar (`docs/reference/README.md`, `grammar/`):**
-   Complete readable reference (destined for `dana guide`) backed by an executable grammar
-   that parses all 10 `examples/*.dana` files and every reference snippet cleanly.
+1. ~~**Privacy & Declassification Semantics**~~ — [`docs/design/privacy.md`](privacy.md).
+2. ~~**Sample Programs**~~ — [`examples/`](../../examples/README.md) (10 programs + `dana.policy`).
+3. ~~**Dana Core IR Specification**~~ — [`docs/design/core-ir.md`](core-ir.md).
+4. ~~**Dana Language Reference v0.1 & Executable Grammar**~~ — [`docs/reference/README.md`](../reference/README.md) & [`grammar/`](../../grammar/README.md) (0-conflict Bison IELR(1), validated via `make grammar`).
+
+Next up is **Phase 1**: formalizing Dana Core IR in Lean 4 (`formal/`), proving Theorem 1
+(schema/type soundness) and Theorem 2 (non-interference up to audited declassifiers), and
+building the Zero-Crate Rust Core IR codec and naive differential oracle (`src/core/`,
+`src/oracle/`).

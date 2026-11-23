@@ -7,8 +7,10 @@ long-running systems and living services, Dana is built for databases, ETL pipel
 operational and financial analytics, practical statistics, and clean reporting—fast by
 default, batteries included, and safe around sensitive data like PII and FERPA records.
 
-> **Status: Phase 0 (Design).** Dana is in its initial design phase before implementation
-> begins. Design documents live under `docs/`. Contributions are not yet open.
+> **Status: Phase 0 Complete (Ready for Phase 1: Lean Core & Oracle).** Dana's design
+> charter, privacy model, Core IR specification, Language Reference v0.1, 10 sample
+> programs, and 0-conflict Bison IELR(1) executable grammar (`make grammar`) are in place.
+> Implementation begins in Phase 1. Contributions are not yet open.
 
 ## Why Dana
 
@@ -44,7 +46,8 @@ Dana addresses all four at the language, compiler, and runtime level:
 
 ## A taste of Dana
 
-```ruby
+<!-- dana-example: file -->
+```dana
 ## Summarizes scholarship applicants by program without exposing student PII/FERPA.
 module ScholarshipReport
 
@@ -83,6 +86,9 @@ end
 
 ## What's here
 
+- [Dana Language Reference v0.1](docs/reference/README.md): readable language reference
+  (destined for `dana guide`), with every code example parsed by the
+  [executable grammar](grammar/README.md) (`make grammar`, 0 Bison IELR(1) conflicts).
 - [Design Charter v1](docs/CHARTER.md): the locked-in v1 pillars, non-goals, and design
   principles.
 - [Privacy & Declassification Model](docs/design/privacy.md): sensitivity tag algebra,

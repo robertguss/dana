@@ -1,0 +1,2 @@
+# Negative test: chained comparison without `and` is disallowed (non-associative).
+x = 1 < 2 < 3

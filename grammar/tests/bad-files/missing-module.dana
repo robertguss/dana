@@ -1,0 +1,4 @@
+# Negative test: a full `.dana` module file must begin with `module Name`.
+fn orphan() : Int
+  42
+end

@@ -1,0 +1,17 @@
+# Positive test: block if / else if / else AND multiline inline if.
+fn classify(n: Int) : Text
+  var out = "zero"
+  if n > 0
+    out = "positive"
+  else if n < 0
+    out = "negative"
+  else
+    out = "zero"
+  end
+
+  inline = if n > 0: "pos"
+    else if n < 0: "neg"
+    else: "zero"
+
+  out
+end
