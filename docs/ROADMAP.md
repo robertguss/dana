@@ -21,7 +21,7 @@ Phase 0 establishes the exact language specification before compiler implementat
 - [x] **Privacy & Declassification Model** (`docs/design/privacy.md`): sensitivity tag algebra, direct and implicit flows (filters/group-bys/counts), audited declassifiers (`redact`, `pseudonymize`, `suppress_small_groups`), capability sink rules, optional `dana.policy`, and runtime redaction rules.
 - [x] **Real-World Sample Programs** (`examples/`): 10 realistic `.dana` scripts (plus `examples/dana.policy`) covering general CSV, higher-ed/FERPA, SaaS, fintech/e-commerce, DevOps streaming logs, healthcare/HIPAA, and exploratory statistics.
 - [ ] **Dana Language Reference v0.1** (`docs/reference/README.md`) & **Executable Grammar** (`grammar/`): complete readable reference (later embedded via `dana guide`) with every example parsed cleanly by the grammar.
-- [ ] **Dana Core IR Specification** (`docs/design/core-ir.md`): exact syntax, typing, sensitivity rules, and text serialization shared between Rust and Lean.
+- [x] **Dana Core IR Specification** (`docs/design/core-ir.md`): exact typed Core IR, pure relational `Plan` sub-calculus, sensitivity algebra, canonical S-expression text protocol `(dana-core 0.1 ...)`, and Lean theorem statements.
 
 ## Upcoming Phases
 

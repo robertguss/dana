@@ -92,6 +92,9 @@ end
   (Learnability & Hardening).
 - [Architecture Overview](docs/design/architecture.md): compiler pipeline, Dana Core IR,
   vectorized columnar VM, Lean verification boundary, and Zero-Crate Rust policy.
+- [Dana Core IR Specification](docs/design/core-ir.md): monomorphic Core IR, pure
+  relational `Plan` calculus, canonical S-expression wire protocol, and Lean soundness and
+  non-interference theorems.
 - [Ten Sample Programs](examples/README.md): realistic `.dana` scripts across higher ed,
   SaaS, fintech, DevOps logs, healthcare, and exploratory statistics.
 

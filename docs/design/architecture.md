@@ -155,12 +155,12 @@ dana/
 
 ## 5. Active Phase 0 Design Work
 
-Before writing Phase 1/2 code, the remaining Phase 0 design artifacts must be completed and
+Before writing Phase 1/2 code, the remaining Phase 0 design deliverable must be completed and
 approved:
 
 1. ~~**Privacy & Declassification Semantics**~~ — completed in [`docs/design/privacy.md`](privacy.md).
-2. **Sample Programs & Surface Grammar (`examples/`, `docs/reference/`):**
-   Pressure-test the syntax against 5–8 real-world data scripts before freezing Dana Core IR
-   and the v0.1 Language Reference.
-3. **Dana Core IR Specification (`docs/design/core-ir.md`):**
-   Define the exact typed IR and canonical text format shared by Rust and Lean.
+2. ~~**Sample Programs**~~ — completed in [`examples/`](../../examples/README.md) (10 programs + `dana.policy`).
+3. ~~**Dana Core IR Specification**~~ — completed in [`docs/design/core-ir.md`](core-ir.md).
+4. **Dana Language Reference v0.1 & Executable Grammar (`docs/reference/README.md`, `grammar/`):**
+   Complete readable reference (destined for `dana guide`) backed by an executable grammar
+   that parses all 10 `examples/*.dana` files and every reference snippet cleanly.
