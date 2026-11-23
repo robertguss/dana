@@ -1,0 +1,7 @@
+/target/
+/build/
+/tmp/
+formal/.lake/
+*.swp
+*.swo
+.DS_Store
