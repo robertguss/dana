@@ -100,7 +100,8 @@ The effective sensitivity of emitting a column `c` from table `T` is always
 | `group_by(keys...)` | Grouping key columns retain their tags | `row_tags ∪ tags(keys)` | Records grouping keys for `summarize` and `suppress_small_groups`. |
 | `summarize(a: agg(e), ...)` | `col_tags(a) = tags(e) ∪ row_tags`; each output col records whether it is a **blending aggregate** (`count`, `sum`, `mean`, `median`, `stddev`, `variance`, `percentile`) or **non-blending** (`min`, `max`, `first`, `last`, `collect`) | Preserves `row_tags`; tracks exact hidden group size (and distinct entity count if specified) | Re-sorting/grouping clears prior `order_tags`. |
 | `window(x: wfn(e), over: part, order: ord)` | `col_tags(x) = tags(e) ∪ tags(part) ∪ tags(ord)` | Unchanged | |
-| `pivot_wider(names: n, values: v)` | Value columns inherit `tags(n) ∪ tags(v)` | `row_tags ∪ tags(n)` | Dynamic/pivoted column names cannot silently leak tagged values. |
+| `pivot_wider(names_from: n, values_from: v, columns: [...])` | Static output columns each inherit `tags(n) ∪ tags(v)` | `row_tags ∪ tags(n)` | Output column names are compile-time constants, so headers cannot leak tagged data. |
+| `crosstab(rows: r, cols: c, values: v)` | Returns `DynamicTable` tagged `row_tags ∪ tags(r) ∪ tags(c) ∪ tags(v)` | Folded into `DynamicTable` tags | Display-only matrix; cannot be statically dot-indexed and cannot leak sensitive headers to public sinks. |
 
 ### Concrete Example: Zero False Alarms vs. Caught Implicit Leak
 
@@ -142,7 +143,15 @@ through two auditable mechanisms:
      preserving equality/joinability across tables without exposing raw identity.
    - Fails to compile if given a hardcoded string literal instead of a `Secret` capability.
 
-3. **`suppress_small_groups(min: k)`** (and **`suppress_small_groups(min: k, distinct_by: .id)`**)
+3. **`bucket(.col, cuts: [...], labels: [...])`**
+   - Maps a sensitive numeric or date column into a **compile-time-constant finite set of
+     public labels** (e.g. `cuts: [18, 45, 65], labels: ["0-17", "18-44", "45-64", "65+"]`).
+   - On individual rows, the bucketed column **retains its original sensitivity tags** (so
+     row-level bands cannot leak publicly), *but* carries a static `bucketed` flag.
+   - Because labels are compile-time constants, no raw sensitive string (such as an email or
+     free-text note) can ever escape through a bucket label.
+
+4. **`suppress_small_groups(min: k)`** (and **`suppress_small_groups(min: k, distinct_by: .id)`**)
    - Valid only immediately on a `summarize`d table (where the engine tracks exact source row
      counts—and when `distinct_by` is supplied, exact distinct entity counts, preventing one
      student with 5 course rows from masquerading as 5 students).
@@ -151,11 +160,16 @@ through two auditable mechanisms:
      while enforcing complementary suppression so suppressed counts cannot be recovered by
      subtraction from a grand total).
    - **What it clears:**
-     - Clears `row_tags` to `[]` (except tags present on any remaining group-by key column).
+     - Clears `row_tags` to `[]` (except tags present on any remaining non-bucketed group-by
+       key column).
      - Clears sensitivity tags on **blending aggregates** (`count`, `sum`, `mean`, `median`,
        `stddev`, `variance`, `percentile`).
+     - Clears sensitivity tags on **`bucketed` group-by key columns** created via
+       `bucket(...)` (since each surviving bucket represents `>= k` distinct entities and its
+       label is a compile-time constant).
    - **What it NEVER clears:**
-     - **Group-by key columns** keep their tags (`group_by(.email)` keeps `.email` as `[pii]`).
+     - **Non-bucketed group-by key columns** keep their tags (`group_by(.email)` keeps
+       `.email` as `[pii]`; `group_by(.clinical_notes)` keeps `[health]`).
      - **Single-record extremes** (`min`, `max`, `first`, `last`, `collect`) keep their tags
        because a single individual's exact value can surface even in a large group.
 

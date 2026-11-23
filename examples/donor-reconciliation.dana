@@ -39,7 +39,7 @@ fn reconcile(sheet: Table(FinanceSheetGift), db_gifts: Table(DbGift)) : Reconcil
   s = sheet |> select(.receipt_no, .fund_code, .amount)
   d = db_gifts |> select(.receipt_no, .fund_code, .amount)
 
-  joined = s |> join_one(d, on: .receipt_no == .receipt_no, suffixes: ("_sheet", "_db"))
+  joined = s |> join_one(d, on: .receipt_no, suffixes: ("_sheet", "_db"))
 
   matched = joined |> where(.amount_sheet == .amount_db)
 
@@ -54,8 +54,8 @@ fn reconcile(sheet: Table(FinanceSheetGift), db_gifts: Table(DbGift)) : Reconcil
          .delta
        )
 
-  only_sheet = s |> anti_join(d, on: .receipt_no == .receipt_no)
-  only_db = d |> anti_join(s, on: .receipt_no == .receipt_no)
+  only_sheet = s |> anti_join(d, on: .receipt_no)
+  only_db = d |> anti_join(s, on: .receipt_no)
 
   # Exact Decimal conservation check: every cent in the spreadsheet is accounted for.
   assert (matched.sum(.amount_sheet) + mismatches.sum(.sheet_amount) + only_sheet.sum(.amount))
@@ -86,25 +86,31 @@ fn main(
 
   res = reconcile(sheet, db.table(DbGift))
 
+  summary_sheet = table
+    | metric            | count                         |
+    | "matched"         | res.matched_count             |
+    | "amount_mismatch" | res.amount_mismatches.count() |
+    | "only_in_sheet"   | res.only_in_sheet.count()     |
+    | "only_in_db"      | res.only_in_db.count()        |
+  end
+
+  # Note: `matched_count` and `amount_mismatches.count()` carry [donor, financial] via
+  # implicit flow (`where(.amount_sheet == .amount_db)`), so they write cleanly into the
+  # authorized `finance-audit/` workbook rather than leaking to plain public `Console`.
   try out.write_xlsx(
     "reconciliation-report.xlsx",
     sheets: {
+      "Summary": summary_sheet,
       "AmountMismatches": res.amount_mismatches,
       "OnlyInSpreadsheet": res.only_in_sheet,
       "OnlyInDatabase": res.only_in_db
     }
   )
 
-  # Public counts print safely without exposing sensitive donor amounts.
-  console.print("Matched: #{res.matched_count}")
-  console.print("Amount mismatches: #{res.amount_mismatches.count()}")
-  console.print("Only in sheet: #{res.only_in_sheet.count()}, only in DB: #{res.only_in_db.count()}")
-
-  has_issues? = not res.amount_mismatches.empty?
-    or not res.only_in_sheet.empty?
-    or not res.only_in_db.empty?
-    or not bad_rows.empty?
-  if has_issues?: 1 else: 0
+  # `sheet.count()` and `bad_rows.count()` did not filter on [donor, financial] -> public!
+  console.print("Reconciled #{sheet.count()} spreadsheet rows (#{bad_rows.count()} malformed).")
+  console.print("Wrote finance-audit/reconciliation-report.xlsx")
+  if bad_rows.empty?: 0 else: 1
 end
 
 test "reconciliation catches amount drift and missing receipts with exact Decimal math"

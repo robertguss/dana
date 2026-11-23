@@ -57,7 +57,7 @@ fn prepare_sync(incoming: Table(ApiStudent), existing: Table(DbStudent))
 
   missing_from_api = existing
     |> where(.active?)
-    |> anti_join(normalized, on: .student_id == .student_id)
+    |> anti_join(normalized, on: .student_id)
     |> derive(active?: false)
 
   normalized |> union(missing_from_api)

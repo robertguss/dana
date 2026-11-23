@@ -44,7 +44,7 @@ fn detect_spikes(buckets: Table(endpoint: Text, bucket: Timestamp, p95_ms: Float
 
   buckets
     |> where(.p95_ms.some?)
-    |> join_many_to_one(baselines, on: .endpoint == .endpoint)
+    |> join_many_to_one(baselines, on: .endpoint)
     |> derive(z_p95: ((.p95_ms ?? 0.0) - .base_mean) / (if .base_sd == 0.0: 1.0 else: .base_sd))
     |> where(.z_p95 >= 3.0)
     |> sort_desc(.z_p95)

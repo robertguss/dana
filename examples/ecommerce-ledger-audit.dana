@@ -48,8 +48,8 @@ fn audit_ledger(
 
   # `left_join_one` guarantees each order joins at most one payment summary row.
   orders
-    |> left_join_one(paid_by_order, on: .order_id == .order_id)
-    |> left_join_one(refunded_by_order, on: .order_id == .order_id)
+    |> left_join_one(paid_by_order, on: .order_id)
+    |> left_join_one(refunded_by_order, on: .order_id)
     |> derive(
          net_collected: (.paid_total ?? 0.00) - (.refund_total ?? 0.00),
          variance: ((.paid_total ?? 0.00) - (.refund_total ?? 0.00)) - .order_total
@@ -63,7 +63,7 @@ fn audit_ledger(
 end
 
 fn orphan_payments(orders: Table(Order), payments: Table(Payment))
-  payments |> anti_join(orders, on: .order_id == .order_id)
+  payments |> anti_join(orders, on: .order_id)
 end
 
 fn main(

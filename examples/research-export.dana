@@ -43,7 +43,7 @@ fn build_research_dataset(
   # Because both keys were pseudonymized with the same Secret, joins still match 100%,
   # ZERO [pii] remains, and `row_tags` accurately preserves [counseling].
   anon_visits
-    |> join_many_to_one(anon_students, on: .student_token == .student_token)
+    |> join_many_to_one(anon_students, on: .student_token)
     |> sort_by(.visit_month, .student_token)
 end
 

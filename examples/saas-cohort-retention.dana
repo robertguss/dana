@@ -28,7 +28,7 @@ fn cohort_retention(subs: Table(Subscription), invoices: Table(MonthlyInvoice))
 
   monthly_activity = invoices
     |> where(.paid? and .mrr > 0)
-    |> join_many_to_one(cohorts, on: .account_id == .account_id)
+    |> join_many_to_one(cohorts, on: .account_id)
     |> derive(months_since_signup: months_between(.cohort_month, .bill_month))
     |> where(.months_since_signup >= 0 and .months_since_signup <= 12)
     |> group_by(.cohort_month, .months_since_signup)
@@ -36,18 +36,26 @@ fn cohort_retention(subs: Table(Subscription), invoices: Table(MonthlyInvoice))
          active_accounts: count_distinct(.account_id),
          retained_mrr: sum(.mrr)
        )
-    |> join_many_to_one(cohort_sizes, on: .cohort_month == .cohort_month)
+    |> join_many_to_one(cohort_sizes, on: .cohort_month)
     |> derive(
          retention_pct: ((.active_accounts.to_decimal / .cohort_accounts.to_decimal) * 100).round(1)
        )
     |> sort_by(.cohort_month, .months_since_signup)
 end
 
+## Static `pivot_wider` with compile-time `columns:` returns a fully typed Table,
+## so downstream code can reference `.M0`, `.M3`, `.M12` safely at compile time.
 fn retention_matrix(retention: Table(cohort_month: Date, months_since_signup: Int, retention_pct: Decimal))
   retention
     |> derive(col_label: "M#{.months_since_signup}")
     |> select(.cohort_month, .col_label, .retention_pct)
-    |> pivot_wider(names_from: .col_label, values_from: .retention_pct, fill: 0.0)
+    |> pivot_wider(
+         names_from: .col_label,
+         values_from: .retention_pct,
+         columns: ["M0", "M1", "M2", "M3", "M6", "M12"],
+         fill: 0.0
+       )
+    |> derive(m0_to_m3_drop: .M0 - .M3)
     |> sort_by(.cohort_month)
 end
 

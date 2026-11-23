@@ -38,7 +38,7 @@ fn program_term_metrics(
   students
     |> where(.active?)
     |> select(.student_id, .program)
-    |> join_many(enrollments, on: .student_id == .student_id)
+    |> join_many(enrollments, on: .student_id)
     |> group_by(.program, .term, .term_start)
     |> summarize(
          students: count_distinct(.student_id),

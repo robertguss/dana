@@ -69,7 +69,7 @@ fn by_program(students: Table(Student), apps: Table(Application))
   students
     |> where(.enrolled_year == 2026 and .active?)
     |> select(.id, .program, .gpa)               # pushes down to Postgres SQL
-    |> join_one(apps, on: .id == .student_id)    # fails loudly on duplicate keys
+    |> join_one(apps, on: left.id == right.student_id) # fails loudly on duplicate keys
     |> group_by(.program)
     |> summarize(
          applicants: count(),
