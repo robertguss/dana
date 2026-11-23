@@ -153,14 +153,14 @@ dana/
 └── ci/                        # Local & nightly verification scripts
 ```
 
-## 5. Open Phase 0 Design Work
+## 5. Active Phase 0 Design Work
 
-Before writing Phase 1/2 code, two design artifacts must be completed and approved:
+Before writing Phase 1/2 code, the remaining Phase 0 design artifacts must be completed and
+approved:
 
-1. **Privacy & Declassification Semantics (`docs/design/privacy.md`):**
-   Formalize the tag lattice, direct vs. implicit information flows (e.g., filtering or
-   grouping on a `[ferpa]` column), exact rules for declassifiers (`suppress_small_groups`,
-   `pseudonymize`, `redact`, `mask`), capability overrides, and runtime redaction guarantees.
+1. ~~**Privacy & Declassification Semantics**~~ — completed in [`docs/design/privacy.md`](privacy.md).
 2. **Sample Programs & Surface Grammar (`examples/`, `docs/reference/`):**
    Pressure-test the syntax against 5–8 real-world data scripts before freezing Dana Core IR
    and the v0.1 Language Reference.
+3. **Dana Core IR Specification (`docs/design/core-ir.md`):**
+   Define the exact typed IR and canonical text format shared by Rust and Lean.

@@ -85,6 +85,9 @@ end
 
 - [Design Charter v1](docs/CHARTER.md): the locked-in v1 pillars, non-goals, and design
   principles.
+- [Privacy & Declassification Model](docs/design/privacy.md): sensitivity tag algebra,
+  implicit flows, audited declassifiers, optional `dana.policy`, runtime redaction, and Lean
+  non-interference contract.
 - [Roadmap](docs/ROADMAP.md): phase-gated build plan from Phase 0 (Design) through Phase 5
   (Learnability & Hardening).
 - [Architecture Overview](docs/design/architecture.md): compiler pipeline, Dana Core IR,
