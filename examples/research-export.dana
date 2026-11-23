@@ -1,0 +1,87 @@
+## Builds a pseudonymized research dataset joining student cohorts with counseling
+## utilization, stripping all direct [pii] while keeping [counseling] tracked to
+## an explicitly authorized Institutional Research export folder.
+module ResearchExport
+
+tag counseling
+
+schema Student
+  student_id: Int [pii]
+  full_name: Text [pii]
+  email: Text [pii]
+  program: Text
+  cohort_year: Int
+end
+
+## Row existence itself indicates a counseling visit, so the schema carries [counseling].
+schema CounselingVisit [counseling]
+  student_id: Int [pii]
+  visit_date: Date
+  duration_min: Int where . > 0
+  modality: Text
+end
+
+fn build_research_dataset(
+  students: Table(Student),
+  visits: Table(CounselingVisit),
+  pseudo_key: Secret("ir_pseudonym_key")
+)
+  promise all(.duration_min > 0)
+
+  # Select only needed non-name columns; pseudonymize clears [pii] with a Secret key.
+  anon_students = students
+    |> select(.student_id, .program, .cohort_year)
+    |> pseudonymize(.student_id, key: pseudo_key)
+    |> rename(student_token: .student_id)
+
+  anon_visits = visits
+    |> pseudonymize(.student_id, key: pseudo_key)
+    |> rename(student_token: .student_id)
+    |> derive(visit_month: date_trunc(.visit_date, :month))
+    |> drop(.visit_date)
+
+  # Because both keys were pseudonymized with the same Secret, joins still match 100%,
+  # ZERO [pii] remains, and `row_tags` accurately preserves [counseling].
+  anon_visits
+    |> join_many_to_one(anon_students, on: .student_token == .student_token)
+    |> sort_by(.visit_month, .student_token)
+end
+
+fn main(
+  db: ReadDB(Seminary),
+  pseudo_key: Secret("ir_pseudonym_key"),
+  out: WriteFiles("ir-exports/", allows: [counseling]),
+  console: Console
+) : Int
+  dataset = build_research_dataset(
+    db.table(Student),
+    db.table(CounselingVisit),
+    pseudo_key
+  )
+
+  # Fails to compile if ANY [pii] column survived; succeeds for [counseling] only because
+  # `out` and `dana.policy` explicitly authorize "ir-exports/" for [counseling].
+  try out.write_parquet("counseling-utilization.parquet", dataset)
+  try out.write_xlsx("counseling-utilization.xlsx", sheets: {"Utilization": dataset})
+
+  console.print("Exported #{dataset.count()} pseudonymized records (zero PII).")
+  0
+end
+
+test "pseudonymize keeps joins intact while clearing student_id PII"
+  students = table
+    | student_id | full_name   | email           | program | cohort_year |
+    | 42         | "Jane Doe"  | "j@example.edu" | "MDiv"  | 2025        |
+  end
+  visits = table
+    | student_id | visit_date | duration_min | modality    |
+    | 42         | 2026-02-14 | 50           | "in-person" |
+  end
+
+  out = build_research_dataset(students, visits, Secret.fake("test-key"))
+
+  assert out.count() == 1
+  assert out.first!.program == "MDiv"
+  assert out.first!.visit_month == 2026-02-01
+  assert out.first!.student_token != "42"
+end

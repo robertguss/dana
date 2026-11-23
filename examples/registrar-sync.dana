@@ -1,0 +1,111 @@
+## Syncs student records from an allowlisted SIS REST API into Postgres.
+##
+## Run `dana dry-run examples/registrar-sync.dana` to preview redacted insert/update
+## counts before committing with `dana run`. Governed by `examples/dana.policy`.
+module RegistrarSync
+
+schema ApiStudent
+  external_id: Int [pii]
+  email: Text [pii] where .contains?("@")
+  program: Text where not .empty?
+  gpa: Decimal? [ferpa] where . >= 0.00 and . <= 4.00
+  active?: Bool
+end
+
+schema DbStudent
+  student_id: Int [pii]
+  email: Text [pii]
+  program: Text
+  gpa: Decimal? [ferpa]
+  active?: Bool
+end
+
+## Imperative pagination glue lives cleanly outside pure table pipelines.
+fn fetch_all_students(
+  api: HttpsAllow("api.populiweb.com", allows: [pii]),
+  token: Secret("populi_api_token")
+) : Result((Table(ApiStudent), Table(BadRow(ApiStudent))), Text)
+  var pages = []
+  var all_bad = []
+  var page = 1
+
+  while true
+    response = try api.get_json(
+      "https://api.populiweb.com/v2/students?page=#{page}&per_page=200",
+      headers: {"Authorization": "Bearer #{token}"}
+    )
+    (rows, bad_rows) = response.parse_table("items", as: ApiStudent)
+    pages = pages.append(rows)
+    all_bad = all_bad.append(bad_rows)
+    break if not response.bool_at("has_more")
+    page = page + 1
+  end
+
+  Ok((Table.concat(pages), Table.concat(all_bad)))
+end
+
+## Pure relational transform prepares normalized rows and finds newly deactivated records.
+fn prepare_sync(incoming: Table(ApiStudent), existing: Table(DbStudent))
+  promise unique(.student_id)
+
+  normalized = incoming
+    |> rename(student_id: .external_id)
+    |> derive(
+         email: .email.trim.ascii_lowercase,
+         program: .program.trim
+       )
+
+  missing_from_api = existing
+    |> where(.active?)
+    |> anti_join(normalized, on: .student_id == .student_id)
+    |> derive(active?: false)
+
+  normalized |> union(missing_from_api)
+end
+
+fn main(
+  api: HttpsAllow("api.populiweb.com", allows: [pii]),
+  token: Secret("populi_api_token"),
+  db_read: ReadDB(Seminary),
+  db_write: WriteTable(Seminary, "students", allows: [pii, ferpa]),
+  console: Console
+) : Int
+  (incoming, bad_rows) = case fetch_all_students(api, token)
+    Ok(result): result
+    Error(err):
+      console.error("sync failed: #{err}")
+      return 2
+  end
+
+  # Safe on tagged schemas: `line`, `column`, `error_kind` are public; raw PII is never printed.
+  for bad in bad_rows
+    console.error("record #{bad.line}, col #{bad.column}: #{bad.error_kind}")
+  end
+
+  # Column-by-column tag match guarantees [pii]/[ferpa] only land in matching Postgres columns.
+  to_upsert = prepare_sync(incoming, db_read.table(DbStudent))
+  stats = try db_write.upsert(to_upsert, key: .student_id)
+
+  console.print("Sync complete: #{stats.inserted} inserted, #{stats.updated} updated.")
+  if bad_rows.empty?: 0 else: 1
+end
+
+test "sync normalizes emails and marks absent active students inactive"
+  incoming = table
+    | external_id | email                | program  | gpa  | active? |
+    | 101         | "  Alice@Sem.EDU "   | " MDiv " | 3.85 | true    |
+  end
+  existing = table
+    | student_id | email           | program | gpa  | active? |
+    | 101        | "alice@sem.edu" | "MDiv"  | 3.80 | true    |
+    | 102        | "bob@sem.edu"   | "MAR"   | 3.40 | true    |
+  end
+
+  out = prepare_sync(incoming, existing) |> sort_by(.student_id)
+
+  assert out == table
+    | student_id | email           | program | gpa  | active? |
+    | 101        | "alice@sem.edu" | "MDiv"  | 3.85 | true    |
+    | 102        | "bob@sem.edu"   | "MAR"   | 3.40 | false   |
+  end
+end

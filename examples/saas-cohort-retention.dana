@@ -1,0 +1,106 @@
+## SaaS monthly cohort retention matrix, MRR summary, and SVG heatmap report.
+##
+## Replaces 100+ lines of nested SQL CTEs or Pandas multi-index pivot gymnastics
+## with one typed, readable pipeline that pushes down to Postgres.
+module SaasCohortRetention
+
+schema Subscription
+  account_id: Int
+  plan: Text
+  signup_date: Date
+end
+
+schema MonthlyInvoice
+  account_id: Int
+  bill_month: Date
+  mrr: Decimal where . >= 0
+  paid?: Bool
+end
+
+fn cohort_retention(subs: Table(Subscription), invoices: Table(MonthlyInvoice))
+  cohorts = subs
+    |> derive(cohort_month: date_trunc(.signup_date, :month))
+    |> select(.account_id, .cohort_month)
+
+  cohort_sizes = cohorts
+    |> group_by(.cohort_month)
+    |> summarize(cohort_accounts: count())
+
+  monthly_activity = invoices
+    |> where(.paid? and .mrr > 0)
+    |> join_many_to_one(cohorts, on: .account_id == .account_id)
+    |> derive(months_since_signup: months_between(.cohort_month, .bill_month))
+    |> where(.months_since_signup >= 0 and .months_since_signup <= 12)
+    |> group_by(.cohort_month, .months_since_signup)
+    |> summarize(
+         active_accounts: count_distinct(.account_id),
+         retained_mrr: sum(.mrr)
+       )
+    |> join_many_to_one(cohort_sizes, on: .cohort_month == .cohort_month)
+    |> derive(
+         retention_pct: ((.active_accounts.to_decimal / .cohort_accounts.to_decimal) * 100).round(1)
+       )
+    |> sort_by(.cohort_month, .months_since_signup)
+end
+
+fn retention_matrix(retention: Table(cohort_month: Date, months_since_signup: Int, retention_pct: Decimal))
+  retention
+    |> derive(col_label: "M#{.months_since_signup}")
+    |> select(.cohort_month, .col_label, .retention_pct)
+    |> pivot_wider(names_from: .col_label, values_from: .retention_pct, fill: 0.0)
+    |> sort_by(.cohort_month)
+end
+
+fn main(db: ReadDB(Billing), out: WriteFiles("reports/"), console: Console) : Int
+  long_form = cohort_retention(db.table(Subscription), db.table(MonthlyInvoice))
+  matrix = retention_matrix(long_form)
+
+  heatmap = long_form
+    |> chart_heatmap(
+         x: .months_since_signup,
+         y: .cohort_month,
+         value: .retention_pct,
+         title: "Monthly Account Retention (%)"
+       )
+
+  mrr_trend = long_form
+    |> group_by(.cohort_month)
+    |> summarize(total_ltv_mrr: sum(.retained_mrr))
+    |> window(
+         rolling_3m_avg: rolling_mean(.total_ltv_mrr, rows: 3),
+         over: [],
+         order: .cohort_month
+       )
+    |> chart_line(x: .cohort_month, y: .rolling_3m_avg, title: "3-Month Rolling Cohort LTV")
+
+  report = Report.new("SaaS Cohort Retention & MRR")
+    |> add_chart(heatmap)
+    |> add_chart(mrr_trend)
+    |> add_table(matrix)
+
+  try out.write_html("saas-retention.html", report)
+  console.print_table(matrix)
+  0
+end
+
+test "cohort retention calculates exact percentages across signup months"
+  subs = table
+    | account_id | plan  | signup_date |
+    | 1          | "pro" | 2026-01-05  |
+    | 2          | "pro" | 2026-01-19  |
+  end
+  invoices = table
+    | account_id | bill_month | mrr    | paid? |
+    | 1          | 2026-01-01 | 100.00 | true  |
+    | 2          | 2026-01-01 | 100.00 | true  |
+    | 1          | 2026-02-01 | 100.00 | true  |
+    | 2          | 2026-02-01 | 100.00 | false |
+  end
+
+  long = cohort_retention(subs, invoices)
+  assert long.select(.cohort_month, .months_since_signup, .retention_pct) == table
+    | cohort_month | months_since_signup | retention_pct |
+    | 2026-01-01   | 0                   | 100.0         |
+    | 2026-01-01   | 1                   |  50.0         |
+  end
+end

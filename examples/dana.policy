@@ -1,0 +1,20 @@
+# Optional institutional privacy policy (example upper bound for examples/).
+# When present in a repository, Dana enforces this file as a hard ceiling on
+# every script during both `dana check` and `dana run`.
+version 1
+
+min_group_size 5
+forbid manual_declassify
+forbid repl_show_sensitive
+
+# Authorized external exports
+allow export "ir-exports/"        tags [counseling]
+allow export "finance-audit/"     tags [donor, financial]
+allow export "reports/"           tags []
+
+# Authorized HTTPS endpoints
+allow https  "api.populiweb.com"  tags [pii]
+
+# Authorized database table writes
+allow write  Seminary.students    tags [pii, ferpa]
+allow write  AuditDB.ledger_runs  tags []

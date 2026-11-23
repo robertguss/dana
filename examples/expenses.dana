@@ -1,0 +1,89 @@
+## Totals a CSV file of expenses by category, largest first.
+##
+##   dana run examples/expenses.dana -- FILE.csv
+##
+## Direct sibling to Mo's `examples/expenses.mo`. Because `Expense` has no
+## sensitivity tags, the entire privacy layer stays invisible (zero friction).
+module Expenses
+
+schema Expense
+  date: Date
+  category: Text where not .empty?
+  amount: Decimal
+end
+
+fn summarize_by_category(expenses: Table(Expense)) : Table(category: Text, total: Decimal)
+  examples
+    input = table
+      | date       | category | amount |
+      | 2026-10-01 | "food"   |  12.50 |
+      | 2026-10-02 | "food"   |   3.00 |
+      | 2026-10-03 | "rent"   | 900.00 |
+    end
+    summarize_by_category(input) == table
+      | category | total  |
+      | "rent"   | 900.00 |
+      | "food"   |  15.50 |
+    end
+  end
+
+  promise unique(.category)
+  promise sum(.total) == expenses.sum(.amount)
+
+  expenses
+    |> group_by(.category)
+    |> summarize(total: sum(.amount))
+    |> sort_desc(.total)
+end
+
+fn main(args: Args, files: ReadFiles, console: Console) : Int
+  path = case args.list
+    [p]: p
+    _:
+      console.error("usage: expenses FILE.csv")
+      return 2
+  end
+
+  (expenses, bad_rows) = case files.read_csv(path, as: Expense)
+    Ok(parsed): parsed
+    Error(failure):
+      console.error("expenses: #{failure}")
+      return 2
+  end
+
+  for bad in bad_rows
+    console.error("line #{bad.line}, col #{bad.column}: #{bad.error_kind} (#{bad.raw_value})")
+  end
+
+  console.print_table(summarize_by_category(expenses))
+  if bad_rows.empty?: 0 else: 1
+end
+
+test "a malformed line is quarantined and reported while valid rows still total"
+  csv = """
+    date,category,amount
+    2026-10-01,food,12.50
+    2026-10-02,food,x
+    2026-10-03,rent,900
+  """
+  files = Files.in_memory({"october.csv": csv}).read_only
+  console = Console.fake()
+
+  assert main(Args.of(["october.csv"]), files, console) == 1
+  assert console.printed_errors.size == 1
+  assert console.printed_errors.first!.contains?("line 3")
+  assert console.printed_tables.first! == table
+    | category | total  |
+    | "rent"   | 900.00 |
+    | "food"   |  12.50 |
+  end
+end
+
+test "a clean file exits 0 and a missing file exits 2"
+  files = Files.in_memory({"ok.csv": "date,category,amount\n2026-10-01,food,3\n"}).read_only
+  console = Console.fake()
+
+  assert main(Args.of(["ok.csv"]), files, console) == 0
+  assert main(Args.of(["missing.csv"]), files, console) == 2
+  assert main(Args.of([]), files, console) == 2
+end

@@ -1,0 +1,128 @@
+## Generates a FERPA-safe enrollment and GPA trend report by program and term.
+##
+## Demonstrates Postgres SQL pushdown, [pii]/[ferpa] taint tracking,
+## distinct-student small-cell suppression, rolling windows, and SVG HTML reports.
+module EnrollmentReport
+
+schema Student
+  student_id: Int [pii]
+  email: Text [pii]
+  program: Text
+  cohort_year: Int
+  active?: Bool
+end
+
+schema CourseEnrollment
+  student_id: Int [pii]
+  term: Text
+  term_start: Date
+  credits: Decimal where . > 0
+  grade_points: Decimal? [ferpa]
+end
+
+fn program_term_metrics(
+  students: Table(Student),
+  enrollments: Table(CourseEnrollment)
+) : Table(
+  program: Text,
+  term: Text,
+  term_start: Date,
+  students: Int,
+  avg_gpa: Decimal?,
+  headcount_change: Int?
+)
+  promise unique(.program, .term)
+  promise all(.students >= 5)
+
+  # Filter, projection, join, and group-by push down into parameterized Postgres SQL.
+  students
+    |> where(.active?)
+    |> select(.student_id, .program)
+    |> join_many(enrollments, on: .student_id == .student_id)
+    |> group_by(.program, .term, .term_start)
+    |> summarize(
+         students: count_distinct(.student_id),
+         avg_gpa: mean(.grade_points)
+       )
+    |> suppress_small_groups(min: 5, distinct_by: .student_id)
+    |> sort_by(.program, .term_start)
+    |> window(
+         headcount_change: .students - lag(.students, 1),
+         over: [.program],
+         order: .term_start
+       )
+end
+
+fn main(
+  db: ReadDB(Seminary),
+  out: WriteFiles("reports/"),
+  console: Console
+) : Int
+  metrics = program_term_metrics(
+    db.table(Student),
+    db.table(CourseEnrollment)
+  )
+
+  # Compiles ONLY because [pii] and [ferpa] were cleared by `suppress_small_groups`.
+  trend_chart = metrics
+    |> chart_line(
+         x: .term,
+         y: .students,
+         color: .program,
+         title: "Active Enrollment by Program"
+       )
+
+  gpa_chart = metrics
+    |> where(.avg_gpa.some?)
+    |> chart_bar(
+         x: .program,
+         y: .avg_gpa,
+         title: "Mean GPA by Program (Groups >= 5 Students)"
+       )
+
+  report = Report.new("Seminary Enrollment & Academic Summary")
+    |> add_summary("All groups with fewer than 5 distinct students are suppressed per FERPA.")
+    |> add_chart(trend_chart)
+    |> add_chart(gpa_chart)
+    |> add_table(metrics)
+
+  try out.write_html("enrollment-summary.html", report)
+  console.print("Wrote reports/enrollment-summary.html (#{metrics.count()} published cells)")
+  0
+end
+
+test "small programs with fewer than 5 distinct students are suppressed"
+  students = table
+    | student_id | email           | program | cohort_year | active? |
+    | 1          | "a@example.edu" | "MDiv"  | 2025        | true    |
+    | 2          | "b@example.edu" | "MDiv"  | 2025        | true    |
+    | 3          | "c@example.edu" | "MDiv"  | 2025        | true    |
+    | 4          | "d@example.edu" | "MDiv"  | 2025        | true    |
+    | 5          | "e@example.edu" | "MDiv"  | 2025        | true    |
+    | 6          | "f@example.edu" | "ThM"   | 2025        | true    |
+  end
+
+  # Student 6 takes 5 courses, but is still only 1 distinct student -> must suppress ThM!
+  enrollments = table
+    | student_id | term        | term_start | credits | grade_points |
+    | 1          | "2026-Fall" | 2026-09-01 | 3.0     | 3.80         |
+    | 2          | "2026-Fall" | 2026-09-01 | 3.0     | 3.60         |
+    | 3          | "2026-Fall" | 2026-09-01 | 3.0     | 3.40         |
+    | 4          | "2026-Fall" | 2026-09-01 | 3.0     | 4.00         |
+    | 5          | "2026-Fall" | 2026-09-01 | 3.0     | 3.20         |
+    | 6          | "2026-Fall" | 2026-09-01 | 3.0     | 3.90         |
+    | 6          | "2026-Fall" | 2026-09-01 | 3.0     | 3.90         |
+    | 6          | "2026-Fall" | 2026-09-01 | 3.0     | 3.90         |
+    | 6          | "2026-Fall" | 2026-09-01 | 3.0     | 3.90         |
+    | 6          | "2026-Fall" | 2026-09-01 | 3.0     | 3.90         |
+  end
+
+  db = DB.in_memory(Seminary, {Student: students, CourseEnrollment: enrollments})
+  result = program_term_metrics(db.table(Student), db.table(CourseEnrollment))
+
+  assert result.count() == 1
+  assert result == table
+    | program | term        | term_start | students | avg_gpa | headcount_change |
+    | "MDiv"  | "2026-Fall" | 2026-09-01 | 5        | 3.60    | none             |
+  end
+end

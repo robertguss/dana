@@ -1,0 +1,118 @@
+## E-commerce payment ledger audit across Parquet + CSV -> embedded SQLite snapshot.
+##
+## Showcases Parquet streaming, exact Decimal double-entry promises, explicit
+## `join_many_to_one` duplicate-key protection, and zero-setup embedded SQLite.
+module EcommerceLedgerAudit
+
+schema Order
+  order_id: Text
+  created_at: Timestamp
+  currency: Text
+  order_total: Decimal where . >= 0
+end
+
+schema Payment
+  payment_id: Text
+  order_id: Text
+  settled_amount: Decimal where . >= 0
+end
+
+schema Refund
+  refund_id: Text
+  order_id: Text
+  refund_amount: Decimal where . > 0
+end
+
+schema AuditSummaryRow
+  order_id: Text
+  order_total: Decimal
+  net_collected: Decimal
+  variance: Decimal
+  status: Text
+end
+
+fn audit_ledger(
+  orders: Table(Order),
+  payments: Table(Payment),
+  refunds: Table(Refund)
+) : Table(AuditSummaryRow)
+  promise unique(.order_id)
+
+  paid_by_order = payments
+    |> group_by(.order_id)
+    |> summarize(paid_total: sum(.settled_amount))
+
+  refunded_by_order = refunds
+    |> group_by(.order_id)
+    |> summarize(refund_total: sum(.refund_amount))
+
+  # `left_join_one` guarantees each order joins at most one payment summary row.
+  orders
+    |> left_join_one(paid_by_order, on: .order_id == .order_id)
+    |> left_join_one(refunded_by_order, on: .order_id == .order_id)
+    |> derive(
+         net_collected: (.paid_total ?? 0.00) - (.refund_total ?? 0.00),
+         variance: ((.paid_total ?? 0.00) - (.refund_total ?? 0.00)) - .order_total
+       )
+    |> derive(
+         status: if .variance == 0.00: "balanced"
+                 else if .variance < 0.00: "underpaid"
+                 else: "overpaid"
+       )
+    |> select(.order_id, .order_total, .net_collected, .variance, .status)
+end
+
+fn orphan_payments(orders: Table(Order), payments: Table(Payment))
+  payments |> anti_join(orders, on: .order_id == .order_id)
+end
+
+fn main(
+  files: ReadFiles,
+  audit_db: WriteTable(AuditDB, "ledger_runs"),
+  out: WriteFiles("reports/"),
+  console: Console
+) : Int
+  orders = try files.read_parquet("data/orders.parquet", as: Order)
+  payments = try files.read_parquet("data/payments.parquet", as: Payment)
+  (refunds, bad_refunds) = try files.read_csv("data/refunds.csv", as: Refund)
+
+  audit = audit_ledger(orders, payments, refunds)
+  orphans = orphan_payments(orders, payments)
+  exceptions = audit |> where(.status != "balanced")
+
+  # Persist full audit snapshot into embedded SQLite and Parquet for downstream queries.
+  try audit_db.upsert(audit, key: .order_id)
+  try out.write_parquet("ledger-exceptions.parquet", exceptions)
+
+  console.print("Audited #{audit.count()} orders: #{exceptions.count()} exceptions, #{orphans.count()} orphan payments.")
+  if exceptions.empty? and orphans.empty? and bad_refunds.empty?: 0 else: 1
+end
+
+test "audit catches underpaid, overpaid, and orphan payments with exact Decimal math"
+  orders = table
+    | order_id | created_at           | currency | order_total |
+    | "O-1"    | 2026-10-01T10:00:00Z | "USD"    | 100.00      |
+    | "O-2"    | 2026-10-01T11:00:00Z | "USD"    |  50.00      |
+  end
+  payments = table
+    | payment_id | order_id | settled_amount |
+    | "P-1"      | "O-1"    | 100.00         |
+    | "P-2"      | "O-2"    |  60.00         |
+    | "P-3"      | "O-999"  |  25.00         |
+  end
+  refunds = table
+    | refund_id | order_id | refund_amount |
+    | "RF-1"    | "O-1"    | 10.00         |
+  end
+
+  audit = audit_ledger(orders, payments, refunds) |> sort_by(.order_id)
+  orphans = orphan_payments(orders, payments)
+
+  assert audit == table
+    | order_id | order_total | net_collected | variance | status      |
+    | "O-1"    | 100.00      | 90.00         | -10.00   | "underpaid" |
+    | "O-2"    |  50.00      | 60.00         |  10.00   | "overpaid"  |
+  end
+  assert orphans.count() == 1
+  assert orphans.first!.payment_id == "P-3"
+end

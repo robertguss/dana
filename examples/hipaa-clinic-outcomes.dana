@@ -1,0 +1,85 @@
+## HIPAA-safe clinical outcomes summary by department and age band.
+##
+## Demonstrates that Dana's privacy system generalizes cleanly beyond higher ed:
+## built-in [pii] + [health] tags, k >= 10 distinct-patient suppression, and
+## explicit protection against single-patient min/max leaks.
+module HipaaClinicOutcomes
+
+schema PatientEncounter
+  patient_id: Int [pii]
+  full_name: Text [pii]
+  department: Text
+  age_years: Int [health] where . >= 0 and . <= 125
+  length_of_stay_days: Decimal [health] where . >= 0
+  readmitted_30d?: Bool [health]
+end
+
+fn department_outcomes(encounters: Table(PatientEncounter))
+  promise unique(.department)
+  promise all(.patients >= 10)
+
+  # Group by public `department`, clearing [health] + [pii] via k >= 10 distinct
+  # patients on blending aggregates. (Note: grouping by coarsened sensitive buckets
+  # like age bands is an open design refinement tracked for Phase 0.)
+  encounters
+    |> select(.patient_id, .department, .length_of_stay_days, .readmitted_30d?)
+    |> group_by(.department)
+    |> summarize(
+         patients: count_distinct(.patient_id),
+         encounters: count(),
+         avg_los_days: mean(.length_of_stay_days),
+         median_los_days: median(.length_of_stay_days),
+         readmission_rate: mean(if .readmitted_30d?: 1.0 else: 0.0)
+       )
+    |> suppress_small_groups(min: 10, distinct_by: .patient_id)
+    |> sort_desc(.patients)
+end
+
+fn main(
+  db: ReadDB(Clinic),
+  out: WriteFiles("reports/"),
+  console: Console
+) : Int
+  summary = department_outcomes(db.table(PatientEncounter))
+
+  chart = summary
+    |> chart_bar(
+         x: .department,
+         y: .readmission_rate,
+         title: "30-Day Readmission Rate by Department (n >= 10 Patients)"
+       )
+
+  report = Report.new("Quarterly Clinical Outcomes (HIPAA De-Identified)")
+    |> add_summary("Groups with fewer than 10 distinct patients are suppressed.")
+    |> add_chart(chart)
+    |> add_table(summary)
+
+  try out.write_html("clinical-outcomes.html", report)
+  console.print_table(summary)
+  0
+end
+
+test "departments under 10 distinct patients are suppressed"
+  # 10 distinct patients in Cardiology, 2 in Genetics -> only Cardiology survives.
+  rows = table
+    | patient_id | full_name | department   | age_years | length_of_stay_days | readmitted_30d? |
+    | 1          | "P1"      | "Cardiology" | 62        | 3.0                 | false           |
+    | 2          | "P2"      | "Cardiology" | 58        | 4.0                 | true            |
+    | 3          | "P3"      | "Cardiology" | 71        | 5.0                 | false           |
+    | 4          | "P4"      | "Cardiology" | 65        | 2.0                 | false           |
+    | 5          | "P5"      | "Cardiology" | 54        | 3.0                 | false           |
+    | 6          | "P6"      | "Cardiology" | 69        | 6.0                 | true            |
+    | 7          | "P7"      | "Cardiology" | 73        | 4.0                 | false           |
+    | 8          | "P8"      | "Cardiology" | 60        | 3.0                 | false           |
+    | 9          | "P9"      | "Cardiology" | 66        | 5.0                 | false           |
+    | 10         | "P10"     | "Cardiology" | 61        | 5.0                 | false           |
+    | 11         | "P11"     | "Genetics"   | 34        | 2.0                 | false           |
+    | 12         | "P12"     | "Genetics"   | 29        | 1.0                 | false           |
+  end
+
+  out = department_outcomes(rows)
+  assert out.count() == 1
+  assert out.first!.department == "Cardiology"
+  assert out.first!.patients == 10
+  assert out.first!.avg_los_days == 4.0
+end

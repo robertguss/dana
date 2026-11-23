@@ -1,0 +1,107 @@
+## Streaming HTTP access-log anomaly triage over compressed `.jsonl.gz` files.
+##
+## Demonstrates out-of-core streaming, `date_trunc` + `fill_gaps`, p50/p95/p99
+## latency, z-score spike detection, zero-false-alarm [pii] column isolation,
+## `redact`, and terminal + SVG charts.
+module LogAnomalyTriage
+
+schema AccessLog
+  ts: Timestamp
+  client_ip: Text [pii]
+  endpoint: Text
+  status: Int
+  latency_ms: Float where . >= 0.0
+end
+
+fn latency_buckets(logs: Table(AccessLog))
+  # Never touches `client_ip` [pii] -> output has row_tags = [] and col_tags = [] (zero friction!).
+  logs
+    |> select(.ts, .endpoint, .status, .latency_ms)
+    |> derive(
+         bucket: date_trunc(.ts, 5.minutes),
+         server_error?: .status >= 500
+       )
+    |> group_by(.endpoint, .bucket)
+    |> summarize(
+         requests: count(),
+         error_rate: mean(if .server_error?: 1.0 else: 0.0),
+         p50_ms: percentile(.latency_ms, 0.50),
+         p95_ms: percentile(.latency_ms, 0.95),
+         p99_ms: percentile(.latency_ms, 0.99)
+       )
+    |> fill_gaps(.bucket, every: 5.minutes, over: [.endpoint], fill: {requests: 0, error_rate: 0.0})
+    |> sort_by(.endpoint, .bucket)
+end
+
+fn detect_spikes(buckets: Table(endpoint: Text, bucket: Timestamp, p95_ms: Float?))
+  baselines = buckets
+    |> where(.p95_ms.some?)
+    |> group_by(.endpoint)
+    |> summarize(
+         base_mean: mean(.p95_ms) ?? 0.0,
+         base_sd: stddev(.p95_ms) ?? 1.0
+       )
+
+  buckets
+    |> where(.p95_ms.some?)
+    |> join_many_to_one(baselines, on: .endpoint == .endpoint)
+    |> derive(z_p95: ((.p95_ms ?? 0.0) - .base_mean) / (if .base_sd == 0.0: 1.0 else: .base_sd))
+    |> where(.z_p95 >= 3.0)
+    |> sort_desc(.z_p95)
+end
+
+## Redacts [pii] client_ip so sample 5xx error rows can print safely to an incident log.
+fn safe_error_samples(logs: Table(AccessLog))
+  logs
+    |> where(.status >= 500)
+    |> redact(.client_ip)
+    |> sort_desc(.latency_ms)
+    |> limit(20)
+end
+
+fn main(args: Args, files: ReadFiles, out: WriteFiles("reports/"), console: Console) : Int
+  path = args.first.or_return(2)
+
+  # Transparently streams `.jsonl` or `.jsonl.gz` / `.jsonl.zst` in 2,048-row batches.
+  (logs, bad_rows) = try files.read_jsonl(path, as: AccessLog)
+  buckets = latency_buckets(logs)
+  spikes = detect_spikes(buckets)
+  samples = safe_error_samples(logs)
+
+  chart = buckets
+    |> where(.p95_ms.some?)
+    |> chart_line(x: .bucket, y: .p95_ms, color: .endpoint, title: "p95 Latency (5m Buckets)")
+
+  console.print_chart(chart)
+  console.print_table(spikes)
+
+  if not samples.empty?
+    report = Report.new("HTTP Latency & 5xx Triage")
+      |> add_chart(chart)
+      |> add_table(spikes)
+      |> add_table(samples)
+    try out.write_html("incident-triage.html", report)
+  end
+
+  if not bad_rows.empty?
+    console.error("Skipped #{bad_rows.count()} malformed JSON log lines.")
+  end
+
+  if spikes.empty?: 0 else: 1
+end
+
+test "aggregating non-PII log columns stays public and redacts IP on error samples"
+  logs = table
+    | ts                   | client_ip   | endpoint   | status | latency_ms |
+    | 2026-10-01T12:00:10Z | "10.0.0.1"  | "/api/pay" | 200    | 25.0       |
+    | 2026-10-01T12:02:15Z | "10.0.0.2"  | "/api/pay" | 502    | 980.0      |
+  end
+
+  buckets = latency_buckets(logs)
+  samples = safe_error_samples(logs)
+
+  assert buckets.count() == 1
+  assert buckets.first!.requests == 2
+  assert samples.count() == 1
+  assert samples.first!.client_ip == "[REDACTED]"
+end
