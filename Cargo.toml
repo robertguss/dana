@@ -1,0 +1,26 @@
+[package]
+name = "dana"
+version = "0.1.0"
+edition = "2024"
+description = "Dana Core IR v0.1 verifier, canonical wire codec, and naive differential reference oracle"
+license = "MIT OR Apache-2.0"
+
+# Non-Negotiable Engineering Rule 1: Zero external Rust crates.
+[dependencies]
+
+[dev-dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+or_fun_call = "deny"

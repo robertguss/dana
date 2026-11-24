@@ -7,10 +7,12 @@ long-running systems and living services, Dana is built for databases, ETL pipel
 operational and financial analytics, practical statistics, and clean reporting—fast by
 default, batteries included, and safe around sensitive data like PII and FERPA records.
 
-> **Status: Phase 0 Complete (Ready for Phase 1: Lean Core & Oracle).** Dana's design
-> charter, privacy model, Core IR specification, Language Reference v0.1, 10 sample
-> programs, and 0-conflict Bison IELR(1) executable grammar (`make grammar`) are in place.
-> Implementation begins in Phase 1. Contributions are not yet open.
+> **Status: Phase 1 Complete (Ready for Phase 2: Core Toolchain & Vectorized VM).**
+> Dana's design charter, privacy model, Core IR specification, Language Reference v0.1,
+> 10 sample programs, 0-conflict Bison IELR(1) executable grammar (`make grammar`),
+> Lean 4 formal core with soundness & non-interference proofs (`make formal`), and
+> Zero-Crate Rust Core IR + differential reference oracle (`make oracle`) are in place.
+> Contributions are not yet open.
 
 ## Why Dana
 

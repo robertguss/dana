@@ -2,7 +2,7 @@ CC ?= gcc
 BISON ?= bison
 CFLAGS ?= -std=c17 -Wall -Wextra -Werror -O2
 
-.PHONY: grammar formal clean
+.PHONY: grammar formal oracle check-all clean
 
 build/dana.tab.c build/dana.tab.h: grammar/dana.y
 	mkdir -p build
@@ -36,6 +36,14 @@ formal:
 	! ./formal/.lake/build/bin/danacore run "$$tmp" --allow-export -pii >/dev/null 2>&1 && \
 	rm -f "$$tmp" && \
 	echo "danacore CLI smoke checks passed."
+
+oracle:
+	cargo fmt --all -- --check
+	cargo clippy --all-targets -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+	cargo test --all-targets
+
+check-all: grammar formal oracle
 
 clean:
 	rm -rf build

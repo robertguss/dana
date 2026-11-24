@@ -13,9 +13,9 @@ when its declared checks pass.
 | 4. Formats, Analytics, Charts & REPL | Native Parquet & `.xlsx`, HTTPS allowlist, windows/pivots/stats, SVG/HTML reports, `dana repl` | **v0.2** |
 | 5. Hardening & Learnability Gate | Full parser fuzzing, differential soak tests, real-world pipelines, multi-model AI learnability gate | **v1.0** |
 
-## Now: Phase 1A Complete — Moving to Phase 1B (Zero-Crate Rust Core IR & Naive Oracle)
+## Now: Phase 1 Complete — Ready for Phase 2 (Core Toolchain & Vectorized Columnar VM)
 
-Phase 0 and Phase 1A established and formally verified the language specification and Core IR:
+Phase 0 and Phase 1 established, formally proved, and differentially verified the language specification, Core IR, Lean 4 proofs, and Zero-Crate Rust reference oracle:
 
 - [x] **Design Charter & Architecture Overview** (`docs/CHARTER.md`, `docs/design/architecture.md`, `docs/ROADMAP.md`)
 - [x] **Privacy & Declassification Model** (`docs/design/privacy.md`): sensitivity tag algebra, direct and implicit flows (filters/group-bys/counts), audited declassifiers (`redact`, `pseudonymize`, `bucket`, `suppress_small_groups`), capability sink rules, optional `dana.policy`, and runtime redaction rules.
@@ -23,14 +23,11 @@ Phase 0 and Phase 1A established and formally verified the language specificatio
 - [x] **Dana Core IR Specification** (`docs/design/core-ir.md`): exact typed Core IR, pure relational `Plan` sub-calculus, sensitivity algebra, canonical S-expression text protocol `(dana-core 0.1 ...)`, and Lean theorem statements.
 - [x] **Dana Language Reference v0.1** (`docs/reference/README.md`) & **Executable Grammar** (`grammar/`): 0-conflict Bison IELR(1) grammar (`%expect 0`, no precedence declarations) passing all 10 `examples/*.dana`, every fenced snippet in `docs/reference/README.md` and `README.md`, and positive/negative syntax tests (`make grammar`).
 - [x] **Phase 1A — Lean 4 Formal Core & Non-Interference Proofs** (`formal/`): zero-dependency Lean 4 (`v4.36.0`) formalization of Dana Core IR, decidable static checker, deterministic evaluator, canonical `(dana-core 0.1 ...)` wire codec, `danacore` CLI oracle, and machine-checked proofs of Schema & Type Soundness (Theorems 1A–1D) and Termination-/Error-Insensitive Non-Interference + Redacted Explicit-Stop Diagnostics (Theorems 2A–2E), zero `sorry`/custom axioms (`make formal`).
+- [x] **Phase 1B — Zero-Crate Rust Core IR & Naive Differential Oracle** (`Cargo.toml`, `src/core/`, `src/oracle/`, `src/bin/dana-oracle.rs`, `tests/`): zero-dependency Rust (`std` only, `#![forbid(unsafe_code)]`, strict clippy denies) Core IR AST, arbitrary-precision `BigInt`, iterative $O(1)$-stack canonical `(dana-core 0.1 ...)` parser/printer, static verifier, persistent `Arc`-environment reference evaluator, and `dana-oracle` CLI (`make oracle`), differentially verified byte-for-byte against the Lean `danacore` CLI across curated corpora, privacy/policy rejections, unbounded `Nat >= 2^64` wire payloads, deep AST/type/value shapes, closure chains, fuel boundaries, and 300 PRNG-generated programs.
 
 ## Upcoming Phases
 
-### Phase 1B — Zero-Crate Rust Core IR & Naive Differential Oracle (Next)
-- Implement `Cargo.toml` (zero external Rust crates, `#![forbid(unsafe_code)]`), `src/core/` (Core IR AST, canonical `(dana-core 0.1 ...)` parser/printer, static verifier), and `src/oracle/` (compact naive row-by-row reference evaluator + `(dana-report 0.1 ...)` serializer).
-- Build automated differential verification asserting byte-for-byte agreement between the Rust oracle and the Lean `danacore` CLI oracle across programs, edge cases, privacy rejections, and runtime reports.
-
-### Phase 2 — Core Toolchain & Vectorized Columnar VM
+### Phase 2 — Core Toolchain & Vectorized Columnar VM (Next)
 - Implement the Zero-Crate Rust CLI (`dana check`, `dana run`, `dana test`, `dana format`, `dana fake`, `dana infer-schema`, `dana guide`).
 - Front end: lexer, parser, name/module resolver, boundary schema + inferred structural table type checker, sensitivity/capability checker, `examples` and `promise` lowering.
 - Back end: relational plan builder + 2,048-row contiguous columnar batch VM (streaming, multi-threaded partitions, compiled vectorized expressions with zero UDF cliff).

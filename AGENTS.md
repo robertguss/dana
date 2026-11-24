@@ -28,6 +28,9 @@ is next. Run `make grammar` after any change to `grammar/`, `examples/`, or
 ```sh
 make grammar               # build 0-conflict Bison IELR(1) grammar and verify examples/ & Reference
 make grammar CC=clang      # verify clean build under clang too
+make formal                # build & verify Lean 4 formal core, proofs, and danacore CLI
+make oracle                # fmt, clippy (-D warnings), unit & Rust-vs-Lean differential tests
+make check-all             # run grammar, formal, and oracle checks end-to-end
 ```
 
 ## Non-Negotiable Engineering Rules
