@@ -300,307 +300,432 @@ impl<'a> Evaluator<'a> {
     }
 
     fn eval_expr(&mut self, expr: &ExecExpr, env: &RTEnv) -> EvalOut {
-        if let Some(stop) = self.tick() {
-            return stop;
-        }
-        match expr {
-            ExecExpr::Lit(l) => EvalOut::Ok(eval_literal(l)),
-            ExecExpr::Var(name) => env.get(name).cloned().map_or_else(
-                || EvalOut::Failed(format!("unbound runtime variable `{name}`")),
-                EvalOut::Ok,
-            ),
-            ExecExpr::ConstRef(name) => self
-                .prog
-                .find_const(name)
-                .map(|c| eval_literal(&c.value))
-                .map_or_else(
-                    || EvalOut::Failed(format!("unbound constant `{name}`")),
-                    EvalOut::Ok,
-                ),
-            ExecExpr::LetE {
-                name, bound, body, ..
-            } => {
-                let val = match self.eval_expr(bound, env) {
-                    EvalOut::Ok(v) => v,
-                    other => return other,
-                };
-                let mut next_env = env.clone();
-                next_env.insert(name.clone(), val);
-                self.eval_expr(body, &next_env)
+        // Tail-iterate `LetE` chains so long sequential blocks run in O(1) call stack.
+        let mut cur_expr = expr;
+        let mut owned_env: Option<RTEnv> = None;
+        loop {
+            if let Some(stop) = self.tick() {
+                return stop;
             }
-            ExecExpr::IfE {
-                cond,
-                then_br,
-                else_br,
-            } => {
-                let cv = match self.eval_expr(cond, env) {
-                    EvalOut::Ok(v) => v,
-                    other => return other,
-                };
-                match cv {
-                    Val::Bool(true) => self.eval_expr(then_br, env),
-                    Val::Bool(false) => self.eval_expr(else_br, env),
-                    _ => EvalOut::Failed("non-Bool condition in `if`".to_string()),
-                }
-            }
-            ExecExpr::CaseE { scrut, arms } => {
-                let sv = match self.eval_expr(scrut, env) {
-                    EvalOut::Ok(v) => v,
-                    other => return other,
-                };
-                for arm in arms {
-                    if let Some(bindings) = match_pattern(&arm.pattern, &sv) {
-                        let mut arm_env = env.clone();
-                        for (k, v) in bindings {
-                            arm_env.insert(k, v);
-                        }
-                        return self.eval_expr(&arm.body, &arm_env);
-                    }
-                }
-                EvalOut::Stopped(Bug {
-                    kind: BugKind::UserStop,
-                    message: "non-exhaustive `case` match at runtime".to_string(),
-                })
-            }
-            ExecExpr::Lam { .. } => EvalOut::Stopped(Bug {
-                kind: BugKind::OutsideBoundary,
-                message: "lambda execution not yet lowered in Slice 2A".to_string(),
-            }),
-            ExecExpr::App { .. } => EvalOut::Stopped(Bug {
-                kind: BugKind::OutsideBoundary,
-                message: "higher-order function application not yet supported in Slice 2A"
-                    .to_string(),
-            }),
-            ExecExpr::Call { fn_name, args } => {
-                let mut vals = Vec::with_capacity(args.len());
-                for a in args {
-                    match self.eval_expr(a, env) {
-                        EvalOut::Ok(v) => vals.push(v),
+            let cur_env = owned_env.as_ref().unwrap_or(env);
+            match cur_expr {
+                ExecExpr::LetE {
+                    name, bound, body, ..
+                } => {
+                    let val = match self.eval_expr(bound, cur_env) {
+                        EvalOut::Ok(v) => v,
                         other => return other,
-                    }
+                    };
+                    let map = owned_env.get_or_insert_with(|| env.clone());
+                    map.insert(name.clone(), val);
+                    cur_expr = body;
+                    continue;
                 }
-                self.eval_call(fn_name, vals)
-            }
-            ExecExpr::Join {
-                label,
-                params,
-                rhs,
-                body,
-            } => {
-                let mut cur = self.eval_expr(body, env);
-                loop {
-                    match cur {
-                        EvalOut::Jumped(ref lbl, ref jargs) if lbl == label => {
-                            let mut jenv = env.clone();
-                            for ((p, _), v) in params.iter().zip(jargs.iter()) {
-                                jenv.insert(p.clone(), v.clone());
-                            }
-                            cur = self.eval_expr(rhs, &jenv);
-                        }
+                ExecExpr::Lit(l) => return EvalOut::Ok(eval_literal(l)),
+                ExecExpr::Var(name) => {
+                    return cur_env.get(name).cloned().map_or_else(
+                        || EvalOut::Failed(format!("unbound runtime variable `{name}`")),
+                        EvalOut::Ok,
+                    );
+                }
+                ExecExpr::ConstRef(name) => {
+                    return self
+                        .prog
+                        .find_const(name)
+                        .map(|c| eval_literal(&c.value))
+                        .map_or_else(
+                            || EvalOut::Failed(format!("unbound constant `{name}`")),
+                            EvalOut::Ok,
+                        );
+                }
+                ExecExpr::IfE {
+                    cond,
+                    then_br,
+                    else_br,
+                } => {
+                    let cv = match self.eval_expr(cond, cur_env) {
+                        EvalOut::Ok(v) => v,
                         other => return other,
+                    };
+                    match cv {
+                        Val::Bool(true) => {
+                            cur_expr = then_br;
+                            continue;
+                        }
+                        Val::Bool(false) => {
+                            cur_expr = else_br;
+                            continue;
+                        }
+                        _ => return EvalOut::Failed("non-Bool condition in `if`".to_string()),
                     }
                 }
-            }
-            ExecExpr::Jump { label, args } => {
-                let mut vals = Vec::with_capacity(args.len());
-                for a in args {
-                    match self.eval_expr(a, env) {
-                        EvalOut::Ok(v) => vals.push(v),
+                ExecExpr::CaseE { scrut, arms } => {
+                    let sv = match self.eval_expr(scrut, cur_env) {
+                        EvalOut::Ok(v) => v,
                         other => return other,
-                    }
-                }
-                EvalOut::Jumped(label.clone(), vals)
-            }
-            ExecExpr::ForLoop {
-                item_var,
-                iter_expr,
-                state_vars,
-                body,
-                after,
-            } => {
-                let iter_val = match self.eval_expr(iter_expr, env) {
-                    EvalOut::Ok(v) => v,
-                    other => return other,
-                };
-                let Val::List(ref items) = iter_val else {
-                    return EvalOut::Failed("`for` loop iterable must be a list".to_string());
-                };
-                let items = items.clone();
-                let mut loop_env = env.clone();
-                for item in items {
-                    if let Some(stop) = self.tick() {
-                        return stop;
-                    }
-                    loop_env.insert(item_var.clone(), item);
-                    match self.eval_expr(body, &loop_env) {
-                        EvalOut::Ok(Val::Tuple(ref updated)) => {
-                            for ((k, _), v) in state_vars.iter().zip(updated.iter()) {
-                                loop_env.insert(k.clone(), v.clone());
+                    };
+                    let mut matched_body = None;
+                    for arm in arms {
+                        if let Some(bindings) = match_pattern(&arm.pattern, &sv) {
+                            let map = owned_env.get_or_insert_with(|| env.clone());
+                            for (k, v) in bindings {
+                                map.insert(k, v);
                             }
-                        }
-                        EvalOut::Ok(_) => {}
-                        EvalOut::Jumped(lbl, vals) if lbl == "__continue" => {
-                            for ((k, _), v) in state_vars.iter().zip(vals) {
-                                loop_env.insert(k.clone(), v);
-                            }
-                        }
-                        EvalOut::Jumped(lbl, vals) if lbl == "__break" => {
-                            for ((k, _), v) in state_vars.iter().zip(vals) {
-                                loop_env.insert(k.clone(), v);
-                            }
+                            matched_body = Some(&arm.body);
                             break;
                         }
-                        other => return other,
+                    }
+                    if let Some(next_body) = matched_body {
+                        cur_expr = next_body;
+                        continue;
+                    }
+                    return EvalOut::Stopped(Bug {
+                        kind: BugKind::UserStop,
+                        message: "non-exhaustive `case` match at runtime".to_string(),
+                    });
+                }
+                ExecExpr::Lam { .. } => {
+                    return EvalOut::Stopped(Bug {
+                        kind: BugKind::OutsideBoundary,
+                        message: "lambda execution not yet lowered in Slice 2A".to_string(),
+                    });
+                }
+                ExecExpr::App { .. } => {
+                    return EvalOut::Stopped(Bug {
+                        kind: BugKind::OutsideBoundary,
+                        message: "higher-order function application not yet supported in Slice 2A"
+                            .to_string(),
+                    });
+                }
+                ExecExpr::Call { fn_name, args } => {
+                    // Iteratively flatten deep left-leaning call chains (`x |> f() |> f() |> ...`)
+                    // so 200,000-stage generic pipe chains run in O(1) call stack.
+                    if let Some(ExecExpr::Call { .. }) = args.first() {
+                        let mut chain: Vec<(&str, &[ExecExpr])> = Vec::new();
+                        chain.push((fn_name.as_str(), &args[1..]));
+                        let mut base = &args[0];
+                        while let ExecExpr::Call {
+                            fn_name: inner_fn,
+                            args: inner_args,
+                        } = base
+                        {
+                            if let Some(first) = inner_args.first() {
+                                chain.push((inner_fn.as_str(), &inner_args[1..]));
+                                base = first;
+                            } else {
+                                break;
+                            }
+                        }
+                        let mut acc = match self.eval_expr(base, cur_env) {
+                            EvalOut::Ok(v) => v,
+                            other => return other,
+                        };
+                        while let Some((cname, rest_args)) = chain.pop() {
+                            if let Some(stop) = self.tick() {
+                                return stop;
+                            }
+                            let mut vals = Vec::with_capacity(1 + rest_args.len());
+                            vals.push(acc);
+                            for a in rest_args {
+                                match self.eval_expr(a, cur_env) {
+                                    EvalOut::Ok(v) => vals.push(v),
+                                    other => return other,
+                                }
+                            }
+                            acc = match self.eval_call(cname, vals) {
+                                EvalOut::Ok(v) => v,
+                                other => return other,
+                            };
+                        }
+                        return EvalOut::Ok(acc);
+                    }
+                    let mut vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        match self.eval_expr(a, cur_env) {
+                            EvalOut::Ok(v) => vals.push(v),
+                            other => return other,
+                        }
+                    }
+                    return self.eval_call(fn_name, vals);
+                }
+                ExecExpr::Join {
+                    label,
+                    params,
+                    rhs,
+                    body,
+                } => {
+                    let mut cur = self.eval_expr(body, cur_env);
+                    loop {
+                        match cur {
+                            EvalOut::Jumped(ref lbl, ref jargs) if lbl == label => {
+                                let mut jenv = cur_env.clone();
+                                for ((p, _), v) in params.iter().zip(jargs.iter()) {
+                                    jenv.insert(p.clone(), v.clone());
+                                }
+                                cur = self.eval_expr(rhs, &jenv);
+                            }
+                            other => return other,
+                        }
                     }
                 }
-                self.eval_expr(after, &loop_env)
-            }
-            ExecExpr::WhileLoop {
-                cond,
-                state_vars,
-                body,
-                after,
-            } => {
-                let mut loop_env = env.clone();
-                loop {
-                    if let Some(stop) = self.tick() {
-                        return stop;
+                ExecExpr::Jump { label, args } => {
+                    let mut vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        match self.eval_expr(a, cur_env) {
+                            EvalOut::Ok(v) => vals.push(v),
+                            other => return other,
+                        }
                     }
-                    match self.eval_expr(cond, &loop_env) {
-                        EvalOut::Ok(Val::Bool(true)) => {}
-                        EvalOut::Ok(Val::Bool(false)) => break,
+                    return EvalOut::Jumped(label.clone(), vals);
+                }
+                ExecExpr::ForLoop {
+                    item_var,
+                    iter_expr,
+                    state_vars,
+                    body,
+                    after,
+                } => {
+                    let iter_val = match self.eval_expr(iter_expr, cur_env) {
+                        EvalOut::Ok(v) => v,
+                        other => return other,
+                    };
+                    let Val::List(ref items) = iter_val else {
+                        return EvalOut::Failed("`for` loop iterable must be a list".to_string());
+                    };
+                    let items = items.clone();
+                    let mut loop_env = cur_env.clone();
+                    for item in items {
+                        if let Some(stop) = self.tick() {
+                            return stop;
+                        }
+                        loop_env.insert(item_var.clone(), item);
+                        match self.eval_expr(body, &loop_env) {
+                            EvalOut::Ok(Val::Tuple(ref updated)) => {
+                                for ((k, _), v) in state_vars.iter().zip(updated.iter()) {
+                                    loop_env.insert(k.clone(), v.clone());
+                                }
+                            }
+                            EvalOut::Ok(_) => {}
+                            EvalOut::Jumped(lbl, vals) if lbl == "__continue" => {
+                                for ((k, _), v) in state_vars.iter().zip(vals) {
+                                    loop_env.insert(k.clone(), v);
+                                }
+                            }
+                            EvalOut::Jumped(lbl, vals) if lbl == "__break" => {
+                                for ((k, _), v) in state_vars.iter().zip(vals) {
+                                    loop_env.insert(k.clone(), v);
+                                }
+                                break;
+                            }
+                            other => return other,
+                        }
+                    }
+                    owned_env = Some(loop_env);
+                    cur_expr = after;
+                    continue;
+                }
+                ExecExpr::WhileLoop {
+                    cond,
+                    state_vars,
+                    body,
+                    after,
+                } => {
+                    let mut loop_env = cur_env.clone();
+                    loop {
+                        if let Some(stop) = self.tick() {
+                            return stop;
+                        }
+                        match self.eval_expr(cond, &loop_env) {
+                            EvalOut::Ok(Val::Bool(true)) => {}
+                            EvalOut::Ok(Val::Bool(false)) => break,
+                            EvalOut::Ok(_) => {
+                                return EvalOut::Failed(
+                                    "non-Bool condition in `while`".to_string(),
+                                );
+                            }
+                            other => return other,
+                        }
+                        match self.eval_expr(body, &loop_env) {
+                            EvalOut::Ok(Val::Tuple(ref updated)) => {
+                                for ((k, _), v) in state_vars.iter().zip(updated.iter()) {
+                                    loop_env.insert(k.clone(), v.clone());
+                                }
+                            }
+                            EvalOut::Ok(_) => {}
+                            EvalOut::Jumped(lbl, vals) if lbl == "__continue" => {
+                                for ((k, _), v) in state_vars.iter().zip(vals) {
+                                    loop_env.insert(k.clone(), v);
+                                }
+                            }
+                            EvalOut::Jumped(lbl, vals) if lbl == "__break" => {
+                                for ((k, _), v) in state_vars.iter().zip(vals) {
+                                    loop_env.insert(k.clone(), v);
+                                }
+                                break;
+                            }
+                            other => return other,
+                        }
+                    }
+                    owned_env = Some(loop_env);
+                    cur_expr = after;
+                    continue;
+                }
+                ExecExpr::Tuple(elems) => {
+                    let mut vals = Vec::with_capacity(elems.len());
+                    for e in elems {
+                        match self.eval_expr(e, cur_env) {
+                            EvalOut::Ok(v) => vals.push(v),
+                            other => return other,
+                        }
+                    }
+                    return EvalOut::Ok(Val::Tuple(vals));
+                }
+                ExecExpr::Proj { tup, idx } => {
+                    let mut tv = match self.eval_expr(tup, cur_env) {
+                        EvalOut::Ok(v) => v,
+                        other => return other,
+                    };
+                    let i = idx.to_u64().unwrap_or(usize::MAX as u64) as usize;
+                    return match &mut tv {
+                        Val::Tuple(xs) if i < xs.len() => EvalOut::Ok(xs.swap_remove(i)),
+                        _ => EvalOut::Failed("tuple projection out of bounds".to_string()),
+                    };
+                }
+                ExecExpr::Ctor {
+                    type_name,
+                    ctor_name,
+                    args,
+                } => {
+                    let mut fields = Vec::with_capacity(args.len());
+                    for a in args {
+                        match self.eval_expr(a, cur_env) {
+                            EvalOut::Ok(v) => fields.push(v),
+                            other => return other,
+                        }
+                    }
+                    return EvalOut::Ok(Val::Ctor {
+                        type_name: type_name.clone(),
+                        ctor_name: ctor_name.clone(),
+                        fields,
+                    });
+                }
+                ExecExpr::TableLit { schema, rows } => {
+                    let trows = rows
+                        .iter()
+                        .map(|r| TableRow {
+                            cells: r.cells.iter().map(eval_literal).collect(),
+                            group_meta: None,
+                        })
+                        .collect();
+                    return EvalOut::Ok(Val::Table(TableVal {
+                        cols: schema.cols.clone(),
+                        rows: trows,
+                    }));
+                }
+                ExecExpr::Prim { op, args } => {
+                    // Iteratively flatten deep left-leaning primitive chains (`1 + 1 + ...`)
+                    // so 200,000-term arithmetic/field chains run in O(1) call stack.
+                    if let Some(ExecExpr::Prim { .. }) = args.first() {
+                        let mut chain: Vec<(&ExecPrimOp, &[ExecExpr])> = Vec::new();
+                        chain.push((op, &args[1..]));
+                        let mut base = &args[0];
+                        while let ExecExpr::Prim {
+                            op: inner_op,
+                            args: inner_args,
+                        } = base
+                        {
+                            if let Some(first) = inner_args.first() {
+                                chain.push((inner_op, &inner_args[1..]));
+                                base = first;
+                            } else {
+                                break;
+                            }
+                        }
+                        let mut acc = match self.eval_expr(base, cur_env) {
+                            EvalOut::Ok(v) => v,
+                            other => return other,
+                        };
+                        while let Some((pop, rest_args)) = chain.pop() {
+                            if let Some(stop) = self.tick() {
+                                return stop;
+                            }
+                            let mut vals = Vec::with_capacity(1 + rest_args.len());
+                            vals.push(acc);
+                            for a in rest_args {
+                                match self.eval_expr(a, cur_env) {
+                                    EvalOut::Ok(v) => vals.push(v),
+                                    other => return other,
+                                }
+                            }
+                            acc = match self.eval_exec_prim(pop, &vals) {
+                                EvalOut::Ok(v) => v,
+                                other => return other,
+                            };
+                        }
+                        return EvalOut::Ok(acc);
+                    }
+                    let mut vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        match self.eval_expr(a, cur_env) {
+                            EvalOut::Ok(v) => vals.push(v),
+                            other => return other,
+                        }
+                    }
+                    return self.eval_exec_prim(op, &vals);
+                }
+                ExecExpr::Rel(plan) => return self.eval_plan(plan, cur_env),
+                ExecExpr::Host { op, args } => {
+                    let mut vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        match self.eval_expr(a, cur_env) {
+                            EvalOut::Ok(v) => vals.push(v),
+                            other => return other,
+                        }
+                    }
+                    return self.eval_exec_host(op, &vals);
+                }
+                ExecExpr::Assert { cond, message } => {
+                    return match self.eval_expr(cond, cur_env) {
+                        EvalOut::Ok(Val::Bool(true)) => EvalOut::Ok(Val::Unit),
+                        EvalOut::Ok(Val::Bool(false)) => EvalOut::Stopped(Bug {
+                            kind: BugKind::PromiseViolation,
+                            message: message.clone(),
+                        }),
                         EvalOut::Ok(_) => {
-                            return EvalOut::Failed("non-Bool condition in `while`".to_string());
+                            EvalOut::Failed("`assert` evaluated to non-Bool".to_string())
                         }
-                        other => return other,
-                    }
-                    match self.eval_expr(body, &loop_env) {
-                        EvalOut::Ok(Val::Tuple(ref updated)) => {
-                            for ((k, _), v) in state_vars.iter().zip(updated.iter()) {
-                                loop_env.insert(k.clone(), v.clone());
+                        other => other,
+                    };
+                }
+                ExecExpr::CheckPromise { ret_var, promise } => {
+                    return self.eval_promise(ret_var, promise, cur_env);
+                }
+                ExecExpr::Stop {
+                    kind,
+                    detail,
+                    detail_tags,
+                } => {
+                    let msg = match detail {
+                        Some(d) => match self.eval_expr(d, cur_env) {
+                            EvalOut::Ok(v) => {
+                                crate::oracle::value::format_diag_detail(detail_tags, &v)
                             }
-                        }
-                        EvalOut::Ok(_) => {}
-                        EvalOut::Jumped(lbl, vals) if lbl == "__continue" => {
-                            for ((k, _), v) in state_vars.iter().zip(vals) {
-                                loop_env.insert(k.clone(), v);
-                            }
-                        }
-                        EvalOut::Jumped(lbl, vals) if lbl == "__break" => {
-                            for ((k, _), v) in state_vars.iter().zip(vals) {
-                                loop_env.insert(k.clone(), v);
-                            }
-                            break;
-                        }
-                        other => return other,
-                    }
+                            other => return other,
+                        },
+                        None => format!("{kind:?}"),
+                    };
+                    return EvalOut::Stopped(Bug {
+                        kind: *kind,
+                        message: msg,
+                    });
                 }
-                self.eval_expr(after, &loop_env)
-            }
-            ExecExpr::Tuple(elems) => {
-                let mut vals = Vec::with_capacity(elems.len());
-                for e in elems {
-                    match self.eval_expr(e, env) {
-                        EvalOut::Ok(v) => vals.push(v),
-                        other => return other,
-                    }
-                }
-                EvalOut::Ok(Val::Tuple(vals))
-            }
-            ExecExpr::Proj { tup, idx } => {
-                let mut tv = match self.eval_expr(tup, env) {
-                    EvalOut::Ok(v) => v,
-                    other => return other,
-                };
-                let i = idx.to_u64().unwrap_or(usize::MAX as u64) as usize;
-                match &mut tv {
-                    Val::Tuple(xs) if i < xs.len() => EvalOut::Ok(xs.swap_remove(i)),
-                    _ => EvalOut::Failed("tuple projection out of bounds".to_string()),
+                ExecExpr::Fail(e) => {
+                    return match self.eval_expr(e, cur_env) {
+                        EvalOut::Ok(v) => EvalOut::Failed(render_public_val(&v)),
+                        other => other,
+                    };
                 }
             }
-            ExecExpr::Ctor {
-                type_name,
-                ctor_name,
-                args,
-            } => {
-                let mut fields = Vec::with_capacity(args.len());
-                for a in args {
-                    match self.eval_expr(a, env) {
-                        EvalOut::Ok(v) => fields.push(v),
-                        other => return other,
-                    }
-                }
-                EvalOut::Ok(Val::Ctor {
-                    type_name: type_name.clone(),
-                    ctor_name: ctor_name.clone(),
-                    fields,
-                })
-            }
-            ExecExpr::TableLit { schema, rows } => {
-                let trows = rows
-                    .iter()
-                    .map(|r| TableRow {
-                        cells: r.cells.iter().map(eval_literal).collect(),
-                        group_meta: None,
-                    })
-                    .collect();
-                EvalOut::Ok(Val::Table(TableVal {
-                    cols: schema.cols.clone(),
-                    rows: trows,
-                }))
-            }
-            ExecExpr::Prim { op, args } => {
-                let mut vals = Vec::with_capacity(args.len());
-                for a in args {
-                    match self.eval_expr(a, env) {
-                        EvalOut::Ok(v) => vals.push(v),
-                        other => return other,
-                    }
-                }
-                self.eval_exec_prim(op, &vals)
-            }
-            ExecExpr::Rel(plan) => self.eval_plan(plan, env),
-            ExecExpr::Host { op, args } => {
-                let mut vals = Vec::with_capacity(args.len());
-                for a in args {
-                    match self.eval_expr(a, env) {
-                        EvalOut::Ok(v) => vals.push(v),
-                        other => return other,
-                    }
-                }
-                self.eval_exec_host(op, &vals)
-            }
-            ExecExpr::Assert { cond, message } => match self.eval_expr(cond, env) {
-                EvalOut::Ok(Val::Bool(true)) => EvalOut::Ok(Val::Unit),
-                EvalOut::Ok(Val::Bool(false)) => EvalOut::Stopped(Bug {
-                    kind: BugKind::PromiseViolation,
-                    message: message.clone(),
-                }),
-                EvalOut::Ok(_) => EvalOut::Failed("`assert` evaluated to non-Bool".to_string()),
-                other => other,
-            },
-            ExecExpr::CheckPromise { ret_var, promise } => self.eval_promise(ret_var, promise, env),
-            ExecExpr::Stop {
-                kind,
-                detail,
-                detail_tags,
-            } => {
-                let msg = match detail {
-                    Some(d) => match self.eval_expr(d, env) {
-                        EvalOut::Ok(v) => crate::oracle::value::format_diag_detail(detail_tags, &v),
-                        other => return other,
-                    },
-                    None => format!("{kind:?}"),
-                };
-                EvalOut::Stopped(Bug {
-                    kind: *kind,
-                    message: msg,
-                })
-            }
-            ExecExpr::Fail(e) => match self.eval_expr(e, env) {
-                EvalOut::Ok(v) => EvalOut::Failed(render_public_val(&v)),
-                other => other,
-            },
         }
     }
 
@@ -1541,6 +1666,56 @@ impl<'a> Evaluator<'a> {
                 other => other,
             },
             ExecRowExpr::Prim { op, args } => {
+                // Iteratively flatten left-leaning non-short-circuit row primitive chains
+                // (`a + b + c + ...`) so long row expressions run in O(1) call stack.
+                let is_short_circuit = |o: &ExecPrimOp| {
+                    matches!(
+                        o,
+                        ExecPrimOp::Core(PrimOp::AndBool) | ExecPrimOp::Core(PrimOp::OrBool)
+                    )
+                };
+                if !is_short_circuit(op)
+                    && let Some(ExecRowExpr::Prim { op: inner_op, .. }) = args.first()
+                    && !is_short_circuit(inner_op)
+                {
+                    let mut chain: Vec<(&ExecPrimOp, &[ExecRowExpr])> = Vec::new();
+                    chain.push((op, &args[1..]));
+                    let mut base = &args[0];
+                    while let ExecRowExpr::Prim {
+                        op: iop,
+                        args: iargs,
+                    } = base
+                    {
+                        if is_short_circuit(iop) {
+                            break;
+                        }
+                        if let Some(first) = iargs.first() {
+                            chain.push((iop, &iargs[1..]));
+                            base = first;
+                        } else {
+                            break;
+                        }
+                    }
+                    let mut acc = match self.eval_row_expr(base, cols, cells, outer_env) {
+                        EvalOut::Ok(v) => v,
+                        other => return other,
+                    };
+                    while let Some((pop, rest_args)) = chain.pop() {
+                        let mut vals = Vec::with_capacity(1 + rest_args.len());
+                        vals.push(acc);
+                        for a in rest_args {
+                            match self.eval_row_expr(a, cols, cells, outer_env) {
+                                EvalOut::Ok(v) => vals.push(v),
+                                other => return other,
+                            }
+                        }
+                        acc = match self.eval_exec_prim(pop, &vals) {
+                            EvalOut::Ok(v) => v,
+                            other => return other,
+                        };
+                    }
+                    return EvalOut::Ok(acc);
+                }
                 // Short-circuit `AndBool` and `OrBool`.
                 if matches!(op, ExecPrimOp::Core(PrimOp::AndBool)) && args.len() == 2 {
                     return match self.eval_row_expr(&args[0], cols, cells, outer_env) {
@@ -1585,6 +1760,34 @@ impl<'a> Evaluator<'a> {
     }
 
     fn eval_plan(&mut self, plan: &ExecPlan, env: &RTEnv) -> EvalOut {
+        // Iteratively peel arbitrarily deep unary plan chains so 200,000-stage
+        // relational pipelines evaluate in O(1) call stack.
+        let mut unary_stack: Vec<&ExecPlan> = Vec::new();
+        let mut leaf = plan;
+        while let Some(child) = unary_plan_input(leaf) {
+            unary_stack.push(leaf);
+            leaf = child;
+        }
+        let mut cur_val = match self.eval_plan_leaf(leaf, env) {
+            EvalOut::Ok(v) => v,
+            other => return other,
+        };
+        while let Some(stage) = unary_stack.pop() {
+            if let Some(stop) = self.tick() {
+                return stop;
+            }
+            let Some(tv) = cur_val.into_table() else {
+                return EvalOut::Failed("plan did not evaluate to Table".to_string());
+            };
+            cur_val = match self.eval_plan_unary_stage(stage, tv, env) {
+                EvalOut::Ok(v) => v,
+                other => return other,
+            };
+        }
+        EvalOut::Ok(cur_val)
+    }
+
+    fn eval_plan_leaf(&mut self, plan: &ExecPlan, env: &RTEnv) -> EvalOut {
         if let Some(stop) = self.tick() {
             return stop;
         }
@@ -1635,11 +1838,42 @@ impl<'a> Evaluator<'a> {
                     }),
                 }
             }
-            ExecPlan::Select { input, cols } => {
-                let tv = match self.eval_plan_table(input, env) {
+            ExecPlan::Union { left, right } => {
+                let mut ltv = match self.eval_plan_table(left, env) {
                     Ok(t) => t,
                     Err(out) => return *out,
                 };
+                let rtv = match self.eval_plan_table(right, env) {
+                    Ok(t) => t,
+                    Err(out) => return *out,
+                };
+                ltv.rows.extend(rtv.rows);
+                EvalOut::Ok(Val::Table(ltv))
+            }
+            ExecPlan::Join {
+                kind,
+                left,
+                right,
+                on,
+                suffixes,
+            } => {
+                let ltv = match self.eval_plan_table(left, env) {
+                    Ok(t) => t,
+                    Err(out) => return *out,
+                };
+                let rtv = match self.eval_plan_table(right, env) {
+                    Ok(t) => t,
+                    Err(out) => return *out,
+                };
+                eval_join(*kind, ltv, rtv, on, suffixes.as_ref())
+            }
+            _ => EvalOut::Failed("unexpected unary stage in eval_plan_leaf".to_string()),
+        }
+    }
+
+    fn eval_plan_unary_stage(&mut self, stage: &ExecPlan, tv: TableVal, env: &RTEnv) -> EvalOut {
+        match stage {
+            ExecPlan::Select { cols, .. } => {
                 let mut idxs = Vec::with_capacity(cols.len());
                 let mut out_cols = Vec::with_capacity(cols.len());
                 for c in cols {
@@ -1662,11 +1896,7 @@ impl<'a> Evaluator<'a> {
                     rows,
                 }))
             }
-            ExecPlan::Drop { input, cols } => {
-                let tv = match self.eval_plan_table(input, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
+            ExecPlan::Drop { cols, .. } => {
                 let keep: Vec<usize> = tv
                     .cols
                     .iter()
@@ -1688,11 +1918,8 @@ impl<'a> Evaluator<'a> {
                     rows,
                 }))
             }
-            ExecPlan::Rename { input, pairs } => {
-                let mut tv = match self.eval_plan_table(input, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
+            ExecPlan::Rename { pairs, .. } => {
+                let mut tv = tv;
                 for (old, new) in pairs {
                     if let Some(c) = tv.cols.iter_mut().find(|c| c.name == *old) {
                         c.name = new.clone();
@@ -1700,11 +1927,7 @@ impl<'a> Evaluator<'a> {
                 }
                 EvalOut::Ok(Val::Table(tv))
             }
-            ExecPlan::Filter { input, pred } => {
-                let tv = match self.eval_plan_table(input, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
+            ExecPlan::Filter { pred, .. } => {
                 let mut kept = Vec::new();
                 for row in tv.rows {
                     match self.eval_row_expr(pred, &tv.cols, &row.cells, env) {
@@ -1723,11 +1946,8 @@ impl<'a> Evaluator<'a> {
                     rows: kept,
                 }))
             }
-            ExecPlan::Derive { input, items } => {
-                let mut tv = match self.eval_plan_table(input, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
+            ExecPlan::Derive { items, .. } => {
+                let mut tv = tv;
                 for item in items {
                     match item {
                         ExecDeriveItem::ColExpr { name, expr } => {
@@ -1804,11 +2024,7 @@ impl<'a> Evaluator<'a> {
                 }
                 EvalOut::Ok(Val::Table(tv))
             }
-            ExecPlan::Distinct { input, cols } => {
-                let tv = match self.eval_plan_table(input, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
+            ExecPlan::Distinct { cols, .. } => {
                 let idxs: Vec<usize> = if cols.is_empty() {
                     (0..tv.cols.len()).collect()
                 } else {
@@ -1830,11 +2046,8 @@ impl<'a> Evaluator<'a> {
                     rows: out_rows,
                 }))
             }
-            ExecPlan::Sort { input, keys } => {
-                let mut tv = match self.eval_plan_table(input, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
+            ExecPlan::Sort { keys, .. } => {
+                let mut tv = tv;
                 let key_specs: Vec<(usize, SortDir)> = keys
                     .iter()
                     .filter_map(|(c, d)| {
@@ -1856,67 +2069,27 @@ impl<'a> Evaluator<'a> {
                 });
                 EvalOut::Ok(Val::Table(tv))
             }
-            ExecPlan::Limit { input, n } => {
-                let mut tv = match self.eval_plan_table(input, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
+            ExecPlan::Limit { n, .. } => {
+                let mut tv = tv;
                 let lim = n.to_u64().unwrap_or(0) as usize;
                 tv.rows.truncate(lim);
                 EvalOut::Ok(Val::Table(tv))
             }
-            ExecPlan::Union { left, right } => {
-                let mut ltv = match self.eval_plan_table(left, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
-                let rtv = match self.eval_plan_table(right, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
-                ltv.rows.extend(rtv.rows);
-                EvalOut::Ok(Val::Table(ltv))
-            }
-            ExecPlan::Join {
-                kind,
-                left,
-                right,
-                on,
-                suffixes,
-            } => {
-                let ltv = match self.eval_plan_table(left, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
-                let rtv = match self.eval_plan_table(right, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
-                eval_join(*kind, ltv, rtv, on, suffixes.as_ref())
-            }
-            ExecPlan::GroupBy { input, .. } => self.eval_plan(input, env),
+            ExecPlan::GroupBy { .. } => EvalOut::Ok(Val::Table(tv)),
             ExecPlan::Summarize {
                 input,
                 aggs,
                 distinct_key,
             } => {
                 let gkeys = extract_group_keys(input);
-                let tv = match self.eval_plan_table(input, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
                 self.eval_summarize(&tv, &gkeys, aggs, distinct_key.as_deref(), env)
             }
             ExecPlan::SuppressSmallGroups {
-                input,
                 min_k,
                 distinct_by,
                 mode,
+                ..
             } => {
-                let tv = match self.eval_plan_table(input, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
                 let floor = self
                     .prog
                     .min_group_floor()
@@ -2041,61 +2214,32 @@ impl<'a> Evaluator<'a> {
                     }
                 }
             }
-            ExecPlan::Window { input, items } => {
-                let tv = match self.eval_plan_table(input, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
-                eval_window(tv, items)
-            }
+            ExecPlan::Window { items, .. } => eval_window(tv, items),
             ExecPlan::FillGaps {
-                input,
                 col,
                 step_micros,
                 over,
                 fill,
-            } => {
-                let tv = match self.eval_plan_table(input, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
-                eval_fill_gaps(tv, col, step_micros.to_i64().unwrap_or(1), over, fill)
-            }
+                ..
+            } => eval_fill_gaps(tv, col, step_micros.to_i64().unwrap_or(1), over, fill),
             ExecPlan::PivotWider {
-                input,
                 names_from,
                 values_from,
                 static_cols,
                 fill,
-            } => {
-                let tv = match self.eval_plan_table(input, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
-                eval_pivot_wider(tv, names_from, values_from, static_cols, eval_literal(fill))
-            }
+                ..
+            } => eval_pivot_wider(tv, names_from, values_from, static_cols, eval_literal(fill)),
             ExecPlan::Crosstab {
-                input,
                 rows_col,
                 cols_col,
                 values_col,
                 fill,
-            } => {
-                let tv = match self.eval_plan_table(input, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
-                eval_crosstab(tv, rows_col, cols_col, values_col, eval_literal(fill))
-            }
+                ..
+            } => eval_crosstab(tv, rows_col, cols_col, values_col, eval_literal(fill)),
             ExecPlan::Redact {
-                input,
-                col,
-                replacement,
+                col, replacement, ..
             } => {
-                let mut tv = match self.eval_plan_table(input, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
+                let mut tv = tv;
                 if let Some(idx) = tv.cols.iter().position(|c| c.name == *col) {
                     tv.cols[idx].ty = ScalarTy::Text;
                     tv.cols[idx].tags = TagSet::empty();
@@ -2105,11 +2249,8 @@ impl<'a> Evaluator<'a> {
                 }
                 EvalOut::Ok(Val::Table(tv))
             }
-            ExecPlan::Pseudonymize { input, col, secret } => {
-                let mut tv = match self.eval_plan_table(input, env) {
-                    Ok(t) => t,
-                    Err(out) => return *out,
-                };
+            ExecPlan::Pseudonymize { col, secret, .. } => {
+                let mut tv = tv;
                 let sec_val = match self.eval_expr(secret, env) {
                     EvalOut::Ok(v) => v,
                     other => return other,
@@ -2150,6 +2291,7 @@ impl<'a> Evaluator<'a> {
                 let _ = self.ew.pseudonymize_mode;
                 EvalOut::Ok(Val::Table(tv))
             }
+            _ => EvalOut::Failed("unexpected leaf in eval_plan_unary_stage".to_string()),
         }
     }
 
@@ -2441,6 +2583,32 @@ fn eval_table_col_agg(tv: &TableVal, col: &str, op: AggOp) -> EvalOut {
         };
     }
     eval_agg_values(op, &vals, tv.rows.len())
+}
+
+fn unary_plan_input(plan: &ExecPlan) -> Option<&ExecPlan> {
+    match plan {
+        ExecPlan::Select { input, .. }
+        | ExecPlan::Drop { input, .. }
+        | ExecPlan::Rename { input, .. }
+        | ExecPlan::Derive { input, .. }
+        | ExecPlan::Filter { input, .. }
+        | ExecPlan::Distinct { input, .. }
+        | ExecPlan::Sort { input, .. }
+        | ExecPlan::Limit { input, .. }
+        | ExecPlan::GroupBy { input, .. }
+        | ExecPlan::Summarize { input, .. }
+        | ExecPlan::SuppressSmallGroups { input, .. }
+        | ExecPlan::Window { input, .. }
+        | ExecPlan::FillGaps { input, .. }
+        | ExecPlan::PivotWider { input, .. }
+        | ExecPlan::Crosstab { input, .. }
+        | ExecPlan::Redact { input, .. }
+        | ExecPlan::Pseudonymize { input, .. } => Some(input),
+        ExecPlan::SourceExpr(_)
+        | ExecPlan::SourceDB { .. }
+        | ExecPlan::Join { .. }
+        | ExecPlan::Union { .. } => None,
+    }
 }
 
 fn eval_join(

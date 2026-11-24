@@ -31,6 +31,8 @@ pub struct Module {
     pub header: ModuleHeader,
     pub items: Vec<TopItem>,
     pub comments: Vec<Comment>,
+    /// Sorted byte offsets of blank lines preserved by the canonical formatter.
+    pub blank_lines: Vec<u32>,
     pub span: Span,
 }
 
@@ -439,8 +441,8 @@ pub enum ExprKind {
     IfBlock {
         cond: Box<Expr>,
         then_body: Vec<Stmt>,
-        else_ifs: Vec<(Expr, Vec<Stmt>)>,
-        else_body: Option<Vec<Stmt>>,
+        else_ifs: Vec<ElseIfBranch>,
+        else_body: Option<ElseBranch>,
     },
     Case {
         scrut: Box<Expr>,
@@ -454,6 +456,19 @@ pub enum ExprKind {
         headers: Vec<SpannedName>,
         rows: Vec<Vec<Expr>>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElseIfBranch {
+    pub else_kw: Span,
+    pub cond: Expr,
+    pub body: Vec<Stmt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElseBranch {
+    pub else_kw: Span,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -627,14 +642,14 @@ fn push_expr_children(e: &mut Expr, stack: &mut Vec<AstDropNode>) {
             for s in std::mem::take(then_body) {
                 stack.push(AstDropNode::Stmt(s));
             }
-            for (c, body) in std::mem::take(else_ifs) {
-                stack.push(AstDropNode::Expr(c));
-                for s in body {
+            for branch in std::mem::take(else_ifs) {
+                stack.push(AstDropNode::Expr(branch.cond));
+                for s in branch.body {
                     stack.push(AstDropNode::Stmt(s));
                 }
             }
-            if let Some(body) = else_body.take() {
-                for s in body {
+            if let Some(branch) = else_body.take() {
+                for s in branch.body {
                     stack.push(AstDropNode::Stmt(s));
                 }
             }

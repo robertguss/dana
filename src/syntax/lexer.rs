@@ -12,6 +12,8 @@ use crate::syntax::token::{Comment, Token, TokenKind};
 pub struct LexOutput {
     pub tokens: Vec<Token>,
     pub comments: Vec<Comment>,
+    /// Sorted byte offsets of blank (whitespace-only) lines in the source text.
+    pub blank_lines: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -72,7 +74,31 @@ pub fn lex(file: FileId, src: &str) -> Result<LexOutput, Diagnostic> {
     Ok(LexOutput {
         tokens: lx.tokens,
         comments: lx.comments,
+        blank_lines: collect_blank_lines(src),
     })
+}
+
+fn collect_blank_lines(src: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let line_start = i;
+        let mut only_ws = true;
+        while i < bytes.len() && bytes[i] != b'\n' {
+            if !matches!(bytes[i], b' ' | b'\t' | b'\r') {
+                only_ws = false;
+            }
+            i += 1;
+        }
+        if only_ws && i < bytes.len() && bytes[i] == b'\n' {
+            out.push(u32::try_from(line_start).unwrap_or(u32::MAX));
+        }
+        if i < bytes.len() {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Reject ASCII controls except `\t`, `\n`, `\r`, plus `0x7F` and bidi/zero-width characters

@@ -62,6 +62,7 @@ fn parse_module_tokens(file: FileId, lexed: LexOutput) -> Result<Module, Diagnos
         header,
         items,
         comments: lexed.comments,
+        blank_lines: lexed.blank_lines,
         span,
     })
 }
@@ -1465,17 +1466,21 @@ impl Parser {
         let mut else_body = None;
 
         while matches!(self.peek_kind(), TokenKind::KwElse) {
-            self.advance();
+            let else_kw = self.advance().span;
             if matches!(self.peek_kind(), TokenKind::KwIf) {
                 self.advance();
                 let c = self.parse_expr()?;
                 self.expect_nl()?;
                 let body = self.parse_stmts_until(&[TokenKind::KwElse, TokenKind::KwEnd])?;
-                else_ifs.push((c, body));
+                else_ifs.push(ElseIfBranch {
+                    else_kw,
+                    cond: c,
+                    body,
+                });
             } else {
                 self.expect_nl()?;
                 let body = self.parse_stmts_until(&[TokenKind::KwEnd])?;
-                else_body = Some(body);
+                else_body = Some(ElseBranch { else_kw, body });
                 break;
             }
         }

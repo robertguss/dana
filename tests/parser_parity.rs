@@ -187,3 +187,62 @@ fn deep_nesting_returns_diagnostic_instead_of_stack_overflow() {
     let res = parse_fragment(FileId(0), &src);
     assert!(res.is_err(), "deep nesting should hit MAX_NESTING_DEPTH");
 }
+
+#[test]
+fn formatter_preserves_else_comments_inline_comments_and_blank_lines() -> Result<(), String> {
+    let src = "\
+module FmtPreservation
+
+schema Section
+  a: Text
+  b: Text  # stays on b
+  c: Int
+  d: Float?  # stays on d
+end
+
+fn f(c: Bool) : Int
+  x = 1
+
+  if c
+    # comment in then
+    x + 1
+  else if not c
+    # comment in else if
+    x + 2
+  else
+    # comment in else
+    x + 3
+  end
+end
+";
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("fmt_preserve.dana", src);
+    let m = parse_module(fid, src).map_err(|d| dana::base::render_diagnostic(&d, &sm))?;
+    let out = format_module(&m);
+    assert_eq!(
+        out, src,
+        "formatter must preserve else/inline comments and single blank lines exactly"
+    );
+    Ok(())
+}
+
+#[test]
+fn diagnostic_snippet_truncates_huge_lines() {
+    let huge_line = format!(
+        "module Huge\n\nfn main() : Int\n  {}@\nend\n",
+        "1 + ".repeat(50_000)
+    );
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("huge.dana", huge_line.clone());
+    let err = parse_module(fid, &huge_line).expect_err("expected lex error on `@`");
+    let rendered = dana::base::render_diagnostic(&err, &sm);
+    assert!(
+        rendered.len() < 1000,
+        "rendered diagnostic should truncate huge lines, got {} bytes",
+        rendered.len()
+    );
+    assert!(
+        rendered.contains("..."),
+        "expected truncation ellipsis in rendered diagnostic:\n{rendered}"
+    );
+}

@@ -14,7 +14,7 @@ const LINE_WIDTH: usize = 96;
 /// Format a parsed [`Module`] into canonical 2-space Dana source text.
 #[must_use]
 pub fn format_module(module: &Module) -> String {
-    let mut f = Formatter::new(&module.comments);
+    let mut f = Formatter::new(&module.comments, &module.blank_lines);
     f.emit_comments_before(module.header.span.start, 0, false);
     f.format_header(&module.header);
     for item in &module.items {
@@ -31,17 +31,34 @@ pub fn format_module(module: &Module) -> String {
 
 struct Formatter<'a> {
     comments: &'a [Comment],
+    blank_lines: &'a [u32],
     c_idx: usize,
     out: String,
 }
 
 impl<'a> Formatter<'a> {
-    const fn new(comments: &'a [Comment]) -> Self {
+    const fn new(comments: &'a [Comment], blank_lines: &'a [u32]) -> Self {
         Self {
             comments,
+            blank_lines,
             c_idx: 0,
             out: String::new(),
         }
+    }
+
+    fn has_blank_line_between(&self, start: u32, end: u32) -> bool {
+        if start >= end {
+            return false;
+        }
+        let idx = self.blank_lines.partition_point(|&off| off < start);
+        self.blank_lines.get(idx).is_some_and(|&off| off < end)
+    }
+
+    fn next_comment_or(&self, limit: u32) -> u32 {
+        self.comments
+            .get(self.c_idx)
+            .filter(|c| c.span.start < limit)
+            .map_or(limit, |c| c.span.start)
     }
 
     fn indent(&mut self, level: usize) {
@@ -83,19 +100,16 @@ impl<'a> Formatter<'a> {
     }
 
     fn emit_inline_comment_after(&mut self, span: Span) {
+        // Declaration/field spans include their terminating newline, so any inline comment on
+        // the same line strictly lies within `[span.start, span.end]`.
         if let Some(c) = self.comments.get(self.c_idx)
             && c.is_inline
             && c.span.start >= span.start
-            && c.span.start <= span.end.saturating_add(4096)
+            && c.span.end <= span.end
         {
-            // Only attach if the comment appears before the next newline (i.e. inline on same line
-            // as this node, already tagged `is_inline` by the lexer).
-            // Check that no non-inline comment precedes it; safe since comments are sorted.
-            if c.span.start >= span.end || c.span.end <= span.end {
-                self.out.push_str("  ");
-                self.out.push_str(&c.text);
-                self.c_idx += 1;
-            }
+            self.out.push_str("  ");
+            self.out.push_str(&c.text);
+            self.c_idx += 1;
         }
     }
 
@@ -312,15 +326,19 @@ impl<'a> Formatter<'a> {
         }
 
         let mut prev_was_examples_or_promise = false;
+        let mut prev_end: Option<u32> = None;
         for (idx, fs) in f.body.iter().enumerate() {
             let is_spec = matches!(fs, FnStmt::Examples { .. } | FnStmt::Promise { .. });
-            if idx > 0
+            let fs_start = fs.span().start;
+            let force_blank = idx > 0
                 && (matches!(fs, FnStmt::Examples { .. })
-                    || (prev_was_examples_or_promise && !is_spec))
-            {
+                    || (prev_was_examples_or_promise && !is_spec));
+            let source_blank = prev_end
+                .is_some_and(|pe| self.has_blank_line_between(pe, self.next_comment_or(fs_start)));
+            if force_blank || source_blank {
                 self.ensure_blank_line();
             }
-            self.emit_comments_before(fs.span().start, 1, idx > 0);
+            self.emit_comments_before(fs_start, 1, idx > 0);
             match fs {
                 FnStmt::Examples { stmts, span } => {
                     self.indent(1);
@@ -341,6 +359,7 @@ impl<'a> Formatter<'a> {
                     prev_was_examples_or_promise = false;
                 }
             }
+            prev_end = Some(fs.span().end);
         }
         self.emit_comments_before(f.span.end, 1, false);
         self.out.push_str("end\n");
@@ -353,9 +372,16 @@ impl<'a> Formatter<'a> {
     }
 
     fn format_stmts(&mut self, stmts: &[Stmt], level: usize, block_end: u32) {
+        let mut prev_end: Option<u32> = None;
         for (idx, st) in stmts.iter().enumerate() {
+            if let Some(pe) = prev_end
+                && self.has_blank_line_between(pe, self.next_comment_or(st.span.start))
+            {
+                self.ensure_blank_line();
+            }
             self.emit_comments_before(st.span.start, level, idx > 0);
             self.format_stmt(st, level);
+            prev_end = Some(st.span.end);
         }
         self.emit_comments_before(block_end, level, false);
     }
@@ -566,12 +592,51 @@ impl<'a> Formatter<'a> {
                 out
             }
             ExprKind::Binary { op, lhs, rhs } => {
-                let l = self.render_expr(lhs, level);
-                let r = self.render_expr(rhs, level);
-                format!("{l} {} {r}", op.as_str())
+                // Flatten arbitrarily long left-associative binary chains iteratively so
+                // 200,000+ term expressions never overflow the call stack.
+                let mut chain: Vec<(BinOp, &Expr)> = Vec::new();
+                chain.push((*op, rhs.as_ref()));
+                let mut cur = lhs.as_ref();
+                while let ExprKind::Binary {
+                    op: lop,
+                    lhs: llhs,
+                    rhs: lrhs,
+                } = &cur.kind
+                {
+                    if *lop == BinOp::Pipe {
+                        break;
+                    }
+                    chain.push((*lop, lrhs.as_ref()));
+                    cur = llhs.as_ref();
+                }
+                let mut out = self.render_expr(cur, level);
+                while let Some((bop, r)) = chain.pop() {
+                    let rs = self.render_expr(r, level);
+                    out.push(' ');
+                    out.push_str(bop.as_str());
+                    out.push(' ');
+                    out.push_str(&rs);
+                }
+                out
             }
             ExprKind::Field { receiver, member } => {
-                format!("{}.{}", self.render_expr(receiver, level), member.name)
+                let mut members: Vec<&str> = Vec::new();
+                members.push(member.name.as_str());
+                let mut cur = receiver.as_ref();
+                while let ExprKind::Field {
+                    receiver: inner,
+                    member: m,
+                } = &cur.kind
+                {
+                    members.push(m.name.as_str());
+                    cur = inner.as_ref();
+                }
+                let mut out = self.render_expr(cur, level);
+                while let Some(m) = members.pop() {
+                    out.push('.');
+                    out.push_str(m);
+                }
+                out
             }
             ExprKind::Call { callee, args } => {
                 let head = self.render_expr(callee, level);
@@ -608,11 +673,23 @@ impl<'a> Formatter<'a> {
                 }
             }
             ExprKind::Index { target, index } => {
-                format!(
-                    "{}[{}]",
-                    self.render_expr(target, level),
-                    self.render_expr(index, level)
-                )
+                let mut indices: Vec<&Expr> = Vec::new();
+                indices.push(index.as_ref());
+                let mut cur = target.as_ref();
+                while let ExprKind::Index {
+                    target: inner,
+                    index: idx,
+                } = &cur.kind
+                {
+                    indices.push(idx.as_ref());
+                    cur = inner.as_ref();
+                }
+                let mut out = self.render_expr(cur, level);
+                while let Some(idx) = indices.pop() {
+                    let rendered = self.render_expr(idx, level);
+                    let _ = write!(out, "[{rendered}]");
+                }
+                out
             }
             ExprKind::IfInline {
                 cond,
@@ -659,6 +736,7 @@ impl<'a> Formatter<'a> {
                 let pad = " ".repeat(level * 2);
                 let mut sub = Formatter {
                     comments: self.comments,
+                    blank_lines: self.blank_lines,
                     c_idx: self.c_idx,
                     out: String::new(),
                 };
@@ -666,34 +744,24 @@ impl<'a> Formatter<'a> {
                 let _ = writeln!(sub.out, "if {c_str}");
                 let then_end = else_ifs
                     .first()
-                    .map(|(ec, _)| ec.span.start)
-                    .or_else(|| {
-                        else_body
-                            .as_ref()
-                            .and_then(|b| b.first())
-                            .map(|s| s.span.start)
-                    })
+                    .map(|b| b.else_kw.start)
+                    .or_else(|| else_body.as_ref().map(|b| b.else_kw.start))
                     .unwrap_or(expr.span.end);
                 sub.format_stmts(then_body, level + 1, then_end);
-                for (i, (ec, body)) in else_ifs.iter().enumerate() {
+                for (i, branch) in else_ifs.iter().enumerate() {
                     let _ = write!(sub.out, "{pad}else if ");
-                    let ecs = sub.render_expr(ec, level);
+                    let ecs = sub.render_expr(&branch.cond, level);
                     let _ = writeln!(sub.out, "{ecs}");
                     let next_end = else_ifs
                         .get(i + 1)
-                        .map(|(nc, _)| nc.span.start)
-                        .or_else(|| {
-                            else_body
-                                .as_ref()
-                                .and_then(|b| b.first())
-                                .map(|s| s.span.start)
-                        })
+                        .map(|nb| nb.else_kw.start)
+                        .or_else(|| else_body.as_ref().map(|b| b.else_kw.start))
                         .unwrap_or(expr.span.end);
-                    sub.format_stmts(body, level + 1, next_end);
+                    sub.format_stmts(&branch.body, level + 1, next_end);
                 }
                 if let Some(eb) = else_body {
                     let _ = writeln!(sub.out, "{pad}else");
-                    sub.format_stmts(eb, level + 1, expr.span.end);
+                    sub.format_stmts(&eb.body, level + 1, expr.span.end);
                 }
                 let _ = write!(sub.out, "{pad}end");
                 self.c_idx = sub.c_idx;
@@ -703,6 +771,7 @@ impl<'a> Formatter<'a> {
                 let pad = " ".repeat(level * 2);
                 let mut sub = Formatter {
                     comments: self.comments,
+                    blank_lines: self.blank_lines,
                     c_idx: self.c_idx,
                     out: String::new(),
                 };
@@ -755,6 +824,7 @@ impl<'a> Formatter<'a> {
                         let pad = " ".repeat(level * 2);
                         let mut sub = Formatter {
                             comments: self.comments,
+                            blank_lines: self.blank_lines,
                             c_idx: self.c_idx,
                             out: String::new(),
                         };

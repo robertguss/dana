@@ -219,6 +219,237 @@ end
 "#,
             DiagCode::PrivacyError,
         ),
+        (
+            "guarded_return_laundering_rejected",
+            r#"
+module GuardedReturnLeak
+
+schema S
+  id: Int [pii]
+end
+
+fn leak(t: Table(S)) : Int
+  return 1 if t.first!.id > 5
+  0
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "guarded_return_inferred_signature_tainted",
+            r##"
+module GuardedReturnInferred
+
+schema S
+  id: Int [pii]
+end
+
+fn f(t: Table(S))
+  return 1 if t.first!.id > 5
+  0
+end
+
+fn main(t: Table(S), console: Console) : Int
+  console.print("#{f(t)}")
+  0
+end
+"##,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "guarded_return_post_statement_pc_leak_rejected",
+            r#"
+module GuardedReturnPostPc
+
+schema S
+  id: Int [pii]
+end
+
+fn leak(t: Table(S), console: Console) : Int [pii]
+  return 1 if t.first!.id > 5
+  console.print("small")
+  0
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "if_early_return_post_statement_pc_leak_rejected",
+            r#"
+module IfEarlyReturnPostPc
+
+schema S
+  id: Int [pii]
+end
+
+fn leak(t: Table(S), console: Console) : Int [pii]
+  if t.first!.id > 5
+    return 1
+  end
+  console.print("small")
+  0
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "guarded_break_full_value_leak_rejected",
+            r#"
+module GuardedBreakLeak
+
+schema S
+  id: Int [pii]
+end
+
+fn leak(t: Table(S)) : Int
+  var n = 0
+  for i in [40, 41, 42, 43]
+    n = i
+    break if i == t.first!.id
+  end
+  n
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "guarded_continue_leak_rejected",
+            r#"
+module GuardedContinueLeak
+
+schema S
+  id: Int [pii]
+end
+
+fn leak(t: Table(S)) : Int
+  var n = 0
+  for i in [1, 2, 3]
+    continue if i == t.first!.id
+    n = n + i
+  end
+  n
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "or_return_post_statement_pc_leak_rejected",
+            r#"
+module OrReturnLeak
+
+fn leak(x: Int? [pii], console: Console) : Int [pii]
+  _ = x.or_return(0)
+  console.print("was some")
+  1
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "if_block_var_assign_implicit_leak_rejected",
+            r##"
+module IfAssignLeak
+
+schema S
+  id: Int [pii]
+end
+
+fn leak(t: Table(S), console: Console) : Int
+  var leaked = 0
+  if t.first!.id > 5
+    leaked = 1
+  end
+  console.print("#{leaked}")
+  0
+end
+"##,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "if_else_block_var_assign_implicit_leak_rejected",
+            r##"
+module IfElseAssignLeak
+
+schema S
+  id: Int [pii]
+end
+
+fn leak(t: Table(S), console: Console) : Int
+  var leaked = 0
+  if t.first!.id > 5
+    _ = 0
+  else
+    leaked = 1
+  end
+  console.print("#{leaked}")
+  0
+end
+"##,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "case_block_var_assign_implicit_leak_rejected",
+            r##"
+module CaseAssignLeak
+
+schema S
+  id: Int [pii]
+end
+
+fn leak(t: Table(S), console: Console) : Int
+  var leaked = 0
+  case t.first!.id
+    1:
+      leaked = 1
+    _:
+      leaked = 2
+  end
+  console.print("#{leaked}")
+  0
+end
+"##,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "loop_cross_iteration_fixpoint_leak_rejected",
+            r##"
+module LoopFixpointLeak
+
+schema S
+  id: Int [pii]
+end
+
+fn leak(t: Table(S), console: Console) : Int
+  var a = 0
+  var b = 0
+  var c = 0
+  for _ in [1, 2, 3]
+    c = b
+    b = a
+    a = t.first!.id
+  end
+  console.print("#{c}")
+  0
+end
+"##,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "while_indirect_condition_taint_fixpoint_rejected",
+            r#"
+module WhileIndirectLeak
+
+fn leak(secret: Bool [pii], console: Console) : Int
+  var flag = true
+  while flag
+    console.print("tick")
+    flag = secret
+  end
+  0
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
     ];
 
     for (name, src, expected_code) in cases {
@@ -506,4 +737,237 @@ fn cli_guide_check_json_and_format_commands() {
         ]),
         0
     );
+}
+
+#[test]
+fn mutable_var_semantics_across_loops_ifs_and_cases() -> Result<(), String> {
+    let src = r#"
+module VarSemantics
+
+fn sum_for() : Int
+  var s = 0
+  for i in [1, 2, 3]
+    s = s + i
+  end
+  s
+end
+
+fn count_while() : Int
+  var n = 0
+  while n < 10
+    n = n + 1
+  end
+  n
+end
+
+fn if_mut(c: Bool) : Int
+  var x = 0
+  if c
+    x = 1
+  end
+  x
+end
+
+fn if_else_mut(c: Bool) : Int
+  var x = 0
+  if c
+    x = 1
+  else
+    x = 2
+  end
+  x
+end
+
+fn if_elif_mut(k: Int) : Int
+  var x = 0
+  if k == 1
+    x = 10
+  else if k == 2
+    x = 20
+  else
+    x = 30
+  end
+  x
+end
+
+fn nested_if_mut(a: Bool, b: Bool) : Int
+  var x = 0
+  if a
+    if b
+      x = 42
+    end
+  end
+  x
+end
+
+fn cont_for() : Int
+  var s = 0
+  for i in [1, 2, 3, 4]
+    continue if i == 2
+    s = s + i
+  end
+  s
+end
+
+fn brk_while() : Int
+  var n = 0
+  while true
+    break if n == 4
+    n = n + 1
+  end
+  n
+end
+
+fn local_var_with_break() : Int
+  var z = 0
+  for i in [1, 2, 3, 4]
+    var a = 999
+    z = z + i
+    break if i == 3
+  end
+  z
+end
+
+fn paginate_sim() : Int
+  var pages = []
+  var page = 1
+  while true
+    pages = pages.append(page * 10)
+    break if page >= 3
+    page = page + 1
+  end
+  var total = 0
+  for p in pages
+    total = total + p
+  end
+  total + page
+end
+
+fn case_mut(k: Int) : Int
+  var x = 0
+  case k
+    1:
+      x = 11
+    2:
+      x = 22
+    _:
+      x = 33
+  end
+  x
+end
+
+test "all var mutation paths execute accurately"
+  assert sum_for() == 6
+  assert count_while() == 10
+  assert if_mut(true) == 1
+  assert if_mut(false) == 0
+  assert if_else_mut(true) == 1
+  assert if_else_mut(false) == 2
+  assert if_elif_mut(1) == 10
+  assert if_elif_mut(2) == 20
+  assert if_elif_mut(9) == 30
+  assert nested_if_mut(true, true) == 42
+  assert nested_if_mut(true, false) == 0
+  assert cont_for() == 8
+  assert brk_while() == 4
+  assert local_var_with_break() == 6
+  assert paginate_sim() == 63
+  assert case_mut(1) == 11
+  assert case_mut(2) == 22
+  assert case_mut(9) == 33
+
+  # Also exercise loops & if-mutations directly inside `test` blocks.
+  var local_s = 0
+  for i in [10, 20, 30]
+    local_s = local_s + i
+  end
+  assert local_s == 60
+  if true
+    local_s = local_s + 5
+  end
+  assert local_s == 65
+end
+"#;
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("var_sem.dana", src);
+    let m = parse_module(fid, src)
+        .map_err(|d| format!("parse failed:\n{}", render_diagnostic(&d, &sm)))?;
+    let checked = check_module(fid, m, None, &sm).map_err(|ds| {
+        ds.iter()
+            .map(|d| render_diagnostic(d, &sm))
+            .collect::<String>()
+    })?;
+    let lowered = lower_program(checked)
+        .map_err(|d| format!("lower failed:\n{}", render_diagnostic(&d, &sm)))?;
+    let outcomes = run_program_tests(&lowered.exec, None, &RunConfig::default());
+    assert_eq!(outcomes.len(), 1);
+    assert!(
+        outcomes[0].passed,
+        "var mutation semantics test failed: {:?}",
+        outcomes[0].message
+    );
+    Ok(())
+}
+
+#[test]
+fn long_left_associative_chains_never_overflow_stack() -> Result<(), String> {
+    // 1. 2,500-term arithmetic chain: parse, format, check, lower, verify Core IR, and execute!
+    let terms: String = std::iter::repeat_n("1", 2_500)
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let src = format!(
+        "module LongAdd\n\nfn main() : Int\n  {terms}\nend\n\ntest \"add2500\"\n  assert main() == 2500\nend\n"
+    );
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("long_add.dana", src.clone());
+    let m = parse_module(fid, &src).map_err(|d| render_diagnostic(&d, &sm))?;
+    let formatted = dana::syntax::format_module(&m);
+    assert_eq!(formatted, src);
+    let checked = check_module(fid, m, None, &sm).map_err(|ds| {
+        ds.iter()
+            .map(|d| render_diagnostic(d, &sm))
+            .collect::<String>()
+    })?;
+    let lowered = lower_program(checked).map_err(|d| render_diagnostic(&d, &sm))?;
+    let outcomes = run_program_tests(&lowered.exec, None, &RunConfig::default());
+    assert_eq!(outcomes.len(), 1);
+    assert!(outcomes[0].passed, "{:?}", outcomes[0].message);
+
+    // 2. 5,000-stage generic pipe chain: parse, format, check, lower, and execute!
+    let stages = " |> inc()".repeat(5_000);
+    let pipe_src = format!(
+        "module LongPipe\n\nfn inc(x: Int) : Int\n  x + 1\nend\n\nfn main() : Int\n  0{stages}\nend\n\ntest \"pipe5000\"\n  assert main() == 5000\nend\n"
+    );
+    let fid2 = sm.add_file("long_pipe.dana", pipe_src.clone());
+    let m2 = parse_module(fid2, &pipe_src).map_err(|d| render_diagnostic(&d, &sm))?;
+    let _ = dana::syntax::format_module(&m2);
+    let checked2 = check_module(fid2, m2, None, &sm).map_err(|ds| {
+        ds.iter()
+            .map(|d| render_diagnostic(d, &sm))
+            .collect::<String>()
+    })?;
+    let lowered2 = lower_program(checked2).map_err(|d| render_diagnostic(&d, &sm))?;
+    let outcomes2 = run_program_tests(&lowered2.exec, None, &RunConfig::default());
+    assert_eq!(outcomes2.len(), 1);
+    assert!(outcomes2[0].passed, "{:?}", outcomes2[0].message);
+
+    // 3. 2,500-term row expression inside `derive` + 2,500-stage table pipeline!
+    let row_terms: String = std::iter::repeat_n("1", 2_500)
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let table_src = format!(
+        "module LongRow\n\nfn calc()\n  t = table\n    | x |\n    | 0 |\n  end\n  t |> derive(y: .x + {row_terms})\nend\n\ntest \"row2500\"\n  out = calc()\n  assert out.first!.y == 2500\nend\n"
+    );
+    let fid3 = sm.add_file("long_row.dana", table_src.clone());
+    let m3 = parse_module(fid3, &table_src).map_err(|d| render_diagnostic(&d, &sm))?;
+    let checked3 = check_module(fid3, m3, None, &sm).map_err(|ds| {
+        ds.iter()
+            .map(|d| render_diagnostic(d, &sm))
+            .collect::<String>()
+    })?;
+    let lowered3 = lower_program(checked3).map_err(|d| render_diagnostic(&d, &sm))?;
+    let outcomes3 = run_program_tests(&lowered3.exec, None, &RunConfig::default());
+    assert_eq!(outcomes3.len(), 1);
+    assert!(outcomes3[0].passed, "{:?}", outcomes3[0].message);
+    Ok(())
 }

@@ -217,6 +217,8 @@ pub fn render_diagnostic(diag: &Diagnostic, sm: &SourceMap) -> String {
     out
 }
 
+const MAX_SNIPPET_CHARS: usize = 160;
+
 fn render_label(out: &mut String, label: &Label, sm: &SourceMap, marker: char) {
     let Some(file) = sm.file(label.span.file) else {
         return;
@@ -227,22 +229,56 @@ fn render_label(out: &mut String, label: &Label, sm: &SourceMap, marker: char) {
     if let Some(line_str) = file.line_text(start.line) {
         let line_num = start.line.to_string();
         let pad = " ".repeat(line_num.len());
-        let _ = writeln!(out, "  {pad} |");
-        let _ = writeln!(out, "  {line_num} | {line_str}");
         let col0 = start.col.saturating_sub(1) as usize;
-        let width = if end.line == start.line && end.col > start.col {
+        let raw_width = if end.line == start.line && end.col > start.col {
             (end.col - start.col) as usize
         } else {
             1
         };
-        let spaces = " ".repeat(col0);
-        let carets: String = std::iter::repeat_n(marker, width.max(1)).collect();
+
+        // Window very long lines around the error column so diagnostics never flood stderr.
+        let (display_line, caret_col, caret_width) = truncate_snippet(line_str, col0, raw_width);
+        let _ = writeln!(out, "  {pad} |");
+        let _ = writeln!(out, "  {line_num} | {display_line}");
+        let spaces = " ".repeat(caret_col);
+        let carets: String = std::iter::repeat_n(marker, caret_width.max(1)).collect();
         if label.message.is_empty() {
             let _ = writeln!(out, "  {pad} | {spaces}{carets}");
         } else {
             let _ = writeln!(out, "  {pad} | {spaces}{carets} {}", label.message);
         }
     }
+}
+
+fn truncate_snippet(line: &str, col0: usize, width: usize) -> (String, usize, usize) {
+    let char_count = line.chars().count();
+    if char_count <= MAX_SNIPPET_CHARS {
+        let clamped_col = col0.min(char_count);
+        let max_w = char_count.saturating_sub(clamped_col).max(1);
+        return (line.to_string(), clamped_col, width.min(max_w).max(1));
+    }
+
+    let focus = col0.min(char_count);
+    let half = MAX_SNIPPET_CHARS / 2;
+    let mut win_start = focus.saturating_sub(half);
+    let mut win_end = (win_start + MAX_SNIPPET_CHARS).min(char_count);
+    if win_end - win_start < MAX_SNIPPET_CHARS {
+        win_start = win_end.saturating_sub(MAX_SNIPPET_CHARS);
+    }
+    win_end = (win_start + MAX_SNIPPET_CHARS).min(char_count);
+
+    let slice: String = line
+        .chars()
+        .skip(win_start)
+        .take(win_end - win_start)
+        .collect();
+    let prefix = if win_start > 0 { "..." } else { "" };
+    let suffix = if win_end < char_count { "..." } else { "" };
+    let display = format!("{prefix}{slice}{suffix}");
+    let caret_col = prefix.len() + focus.saturating_sub(win_start);
+    let visible_rem = (win_end.saturating_sub(focus)).max(1);
+    let caret_width = width.min(visible_rem).max(1);
+    (display, caret_col, caret_width)
 }
 
 fn json_escape(s: &str) -> String {
