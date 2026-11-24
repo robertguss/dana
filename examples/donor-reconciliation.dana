@@ -21,7 +21,7 @@ schema DbGift
 end
 
 struct ReconciliationResult
-  matched_count: Int
+  matched_count: Int [financial, donor]
   matched_total: Decimal [financial, donor]
   amount_mismatches: Table(
     receipt_no: Text,

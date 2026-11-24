@@ -64,7 +64,9 @@ fn main(
   try out.write_parquet("counseling-utilization.parquet", dataset)
   try out.write_xlsx("counseling-utilization.xlsx", sheets: {"Utilization": dataset})
 
-  console.print("Exported #{dataset.count()} pseudonymized records (zero PII).")
+  # `dataset.count()` carries [counseling] via `row_tags`, so public `Console` prints
+  # only a static confirmation message (zero [pii] and zero [counseling] leak).
+  console.print("Exported pseudonymized counseling records to ir-exports/ (zero PII).")
   0
 end
 

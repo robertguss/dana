@@ -1,0 +1,8218 @@
+//! Structural `Table(...)` type inference, boundary schema & constraint validation,
+//! flow-sensitive sensitivity tag tracking, capability/policy verification, and
+//! elaborated IR construction.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use crate::base::{DiagCode, Diagnostic, SourceMap, Span};
+use crate::check::resolve::{ModuleOrigin, ResolvedProgram, check_tag_declared};
+use crate::core::bigint::BigInt;
+use crate::core::check::{
+    ensure_option_scalar, numeric_core_of_scalar, quarantine_bad_row_table_ty,
+};
+use crate::core::syntax::*;
+use crate::formats::time::{
+    MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MINUTE, MICROS_PER_SECOND, parse_decimal_bigint,
+    parse_iso_date, parse_iso_timestamp,
+};
+use crate::runtime::ir::*;
+use crate::syntax::ast::{self, BinOp, CallArg, Expr, ExprKind, Stmt, StmtKind, TopItem, UnaryOp};
+
+/// Checked and elaborated Dana program ready for final Core IR lowering & sanity verification.
+#[derive(Clone, Debug)]
+pub struct CheckedProgram {
+    pub root_name: String,
+    pub exec: ExecProgram,
+    /// Metadata source spans for functions, schemas, and tests.
+    pub spans: Vec<(Ident, String, Span)>,
+}
+
+/// Check an already-resolved multi-module program.
+///
+/// # Errors
+/// Returns one or more privacy-safe [`Diagnostic`]s on type, schema, privacy, policy, or
+/// capability violations.
+pub fn check_resolved(
+    resolved: &ResolvedProgram,
+    sm: &SourceMap,
+) -> Result<CheckedProgram, Vec<Diagnostic>> {
+    let mut checker = Checker::new(resolved, sm);
+    checker.check_all()?;
+    Ok(checker.finish())
+}
+
+/// Convenience helper: resolve and check a single in-memory parsed module.
+///
+/// # Errors
+/// Returns diagnostics on resolution, type, privacy, or policy errors.
+pub fn check_module(
+    file_id: crate::base::FileId,
+    module: ast::Module,
+    policy: Option<Policy>,
+    sm: &SourceMap,
+) -> Result<CheckedProgram, Vec<Diagnostic>> {
+    let resolved = crate::check::resolve::resolve_module(file_id, module, policy)?;
+    check_resolved(&resolved, sm)
+}
+
+#[derive(Clone, Debug)]
+struct FnSig {
+    name: Ident,
+    params: Vec<(Ident, LTy)>,
+    ret: Option<LTy>,
+    is_pure: bool,
+    module_idx: usize,
+    ast_decl: ast::FnDecl,
+}
+
+#[derive(Clone, Debug)]
+struct VarBinding {
+    lty: LTy,
+    mutable: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LocalScopeKind {
+    Normal,
+    Spec,
+}
+
+/// Internal sentinel type names for built-in record-like values represented via `Ty::Data(...)`.
+const TY_UPSERT_STATS: &str = "__UpsertStats";
+const TY_JSON_RESPONSE: &str = "__JsonResponse";
+const TY_IN_MEMORY_FILES: &str = "__InMemoryFiles";
+const TY_TABLE_ROW_PREFIX: &str = "__TableRow$";
+const TY_UNRESOLVED_LIST_ELEM: &str = "__UnresolvedElem";
+
+struct Checker<'a> {
+    resolved: &'a ResolvedProgram,
+    sm: &'a SourceMap,
+    diags: Vec<Diagnostic>,
+    schemas: HashMap<Ident, CompiledSchema>,
+    schema_order: Vec<Ident>,
+    structs: HashMap<Ident, StructLayout>,
+    enums: HashMap<Ident, DataDecl>,
+    ctor_to_enum: HashMap<Ident, (Ident, usize)>,
+    consts: HashMap<Ident, ConstDecl>,
+    const_order: Vec<Ident>,
+    fn_sigs: HashMap<Ident, FnSig>,
+    fn_order: Vec<Ident>,
+    checked_funs: HashMap<Ident, ExecFun>,
+    in_progress_fns: HashSet<Ident>,
+    table_row_schemas: HashMap<Ident, TableTy>,
+    temp_counter: usize,
+    spans: Vec<(Ident, String, Span)>,
+}
+
+impl<'a> Checker<'a> {
+    fn new(resolved: &'a ResolvedProgram, sm: &'a SourceMap) -> Self {
+        let mut structs = HashMap::new();
+        structs.insert(
+            TY_UPSERT_STATS.to_string(),
+            StructLayout {
+                name: TY_UPSERT_STATS.to_string(),
+                field_names: vec!["inserted".to_string(), "updated".to_string()],
+                field_ltys: vec![LTy::public(Ty::Int), LTy::public(Ty::Int)],
+            },
+        );
+        Self {
+            resolved,
+            sm,
+            diags: Vec::new(),
+            schemas: HashMap::new(),
+            schema_order: Vec::new(),
+            structs,
+            enums: HashMap::new(),
+            ctor_to_enum: HashMap::new(),
+            consts: HashMap::new(),
+            const_order: Vec::new(),
+            fn_sigs: HashMap::new(),
+            fn_order: Vec::new(),
+            checked_funs: HashMap::new(),
+            in_progress_fns: HashSet::new(),
+            table_row_schemas: HashMap::new(),
+            temp_counter: 0,
+            spans: Vec::new(),
+        }
+    }
+
+    fn fresh(&mut self, prefix: &str) -> String {
+        self.temp_counter += 1;
+        format!("__{prefix}_{}", self.temp_counter)
+    }
+
+    fn check_all(&mut self) -> Result<(), Vec<Diagnostic>> {
+        // 1. Collect enums, structs, schemas across all resolved modules.
+        for rm in &self.resolved.modules {
+            for item in &rm.module.items {
+                if let TopItem::Enum(e) = item {
+                    self.register_enum(e);
+                }
+            }
+        }
+        for rm in &self.resolved.modules {
+            for item in &rm.module.items {
+                if let TopItem::Schema(s) = item {
+                    self.register_schema_header(s);
+                }
+            }
+        }
+        for rm in &self.resolved.modules {
+            for item in &rm.module.items {
+                if let TopItem::Struct(s) = item {
+                    self.register_struct(s);
+                }
+            }
+        }
+        // Compile schema `where` constraints now that all schemas/types are known.
+        for rm in &self.resolved.modules {
+            for item in &rm.module.items {
+                if let TopItem::Schema(s) = item {
+                    self.compile_schema_constraints(s);
+                }
+            }
+        }
+        // 2. Register constants.
+        for rm in &self.resolved.modules {
+            for item in &rm.module.items {
+                if let TopItem::Const(c) = item {
+                    self.register_const(c);
+                }
+            }
+        }
+        // 3. Register function signatures (checking parameter policy ceilings).
+        for (mod_idx, rm) in self.resolved.modules.iter().enumerate() {
+            for item in &rm.module.items {
+                if let TopItem::Fn(f) = item {
+                    self.register_fn_sig(mod_idx, rm.origin, f);
+                }
+            }
+        }
+        if !self.diags.is_empty() {
+            return Err(std::mem::take(&mut self.diags));
+        }
+
+        // 4. Type-check & elaborate all functions (inferring omitted return types on demand).
+        let fn_names = self.fn_order.clone();
+        for fname in fn_names {
+            self.ensure_fn_checked(&fname);
+        }
+
+        // 5. Type-check & elaborate top-level `test` blocks from the root module.
+        let root_items = self.resolved.root().module.items.clone();
+        let mut test_idx = 0usize;
+        for item in &root_items {
+            if let TopItem::Test(t) = item {
+                test_idx += 1;
+                let t_name = format!("__test_{test_idx}_{}", sanitize_ident(&t.name));
+                self.spans.push((t_name.clone(), t.name.clone(), t.span));
+                self.check_test_decl(&t_name, t);
+            }
+        }
+
+        if !self.diags.is_empty() {
+            return Err(std::mem::take(&mut self.diags));
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> CheckedProgram {
+        let mut datas: Vec<DataDecl> = self.enums.into_values().collect();
+        for (name, layout) in &self.structs {
+            if !name.starts_with("__") {
+                datas.push(DataDecl {
+                    name: name.clone(),
+                    ctors: vec![CtorDecl {
+                        name: name.clone(),
+                        fields: layout.field_ltys.clone(),
+                    }],
+                });
+            }
+        }
+        datas.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let schemas: Vec<CompiledSchema> = self
+            .schema_order
+            .iter()
+            .filter_map(|n| self.schemas.get(n).cloned())
+            .collect();
+        let consts: Vec<ConstDecl> = self
+            .const_order
+            .iter()
+            .filter_map(|n| self.consts.get(n).cloned())
+            .collect();
+
+        let mut funs = Vec::new();
+        for name in &self.fn_order {
+            if let Some(f) = self.checked_funs.get(name) {
+                funs.push(f.clone());
+            }
+        }
+        // Append spec functions (`examples`, `test`) in deterministic order.
+        let mut extra_funs: Vec<ExecFun> = self
+            .checked_funs
+            .into_iter()
+            .filter(|(k, _)| !self.fn_order.contains(k))
+            .map(|(_, v)| v)
+            .collect();
+        extra_funs.sort_by(|a, b| a.name.cmp(&b.name));
+        funs.extend(extra_funs);
+
+        let mut tags: Vec<String> = self.resolved.declared_tags.iter().cloned().collect();
+        tags.sort();
+
+        let entry = if funs.iter().any(|f| f.name == "main") {
+            Some("main".to_string())
+        } else {
+            None
+        };
+
+        let mut metadata = CompilerMetadata::default();
+        for (node_id, orig_name, sp) in &self.spans {
+            metadata.entries.push(MetaEntry {
+                node_id: node_id.clone(),
+                orig_name: Some(orig_name.clone()),
+                span: Some(self.sm.to_core_span(*sp)),
+            });
+        }
+
+        CheckedProgram {
+            root_name: self.resolved.root_name.clone(),
+            exec: ExecProgram {
+                version: CoreVersion::default(),
+                tags,
+                policy: self.resolved.policy.clone(),
+                datas,
+                struct_layouts: self.structs,
+                schemas,
+                consts,
+                funs,
+                entry,
+                metadata,
+            },
+            spans: self.spans,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tag & Policy Validation
+    // -----------------------------------------------------------------------
+
+    fn resolve_tags(&mut self, tags: &[ast::SpannedName]) -> TagSet {
+        let mut out = Vec::with_capacity(tags.len());
+        for t in tags {
+            if let Some(d) = check_tag_declared(self.resolved, &t.name, t.span) {
+                self.diags.push(d);
+            } else {
+                out.push(t.name.clone());
+            }
+        }
+        TagSet::of_list(out)
+    }
+
+    fn check_capability_policy(&mut self, ty: &Ty, span: Span) {
+        if let Err(err) =
+            crate::core::check::check_cap_against_policy(self.resolved.policy.as_ref(), ty)
+        {
+            self.diags.push(
+                Diagnostic::error(DiagCode::PrivacyError, err.message)
+                    .with_primary(span, "capability exceeds `dana.policy` ceiling"),
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Type Expression Resolution
+    // -----------------------------------------------------------------------
+
+    fn resolve_type(&mut self, te: &ast::TypeExpr) -> Ty {
+        let base = match &te.kind {
+            ast::TypeKind::Tuple(elems) => {
+                let ltys = elems
+                    .iter()
+                    .map(|e| LTy::public(self.resolve_type(e)))
+                    .collect();
+                Ty::Tuple(ltys)
+            }
+            ast::TypeKind::Named { name, args } => self.resolve_named_type(name, args, te.span),
+        };
+        if te.optional {
+            Ty::Option(Box::new(base))
+        } else {
+            base
+        }
+    }
+
+    fn resolve_named_type(
+        &mut self,
+        name: &ast::SpannedName,
+        args: &[ast::TypeArg],
+        span: Span,
+    ) -> Ty {
+        match name.name.as_str() {
+            "Unit" => Ty::Unit,
+            "Bool" => Ty::Bool,
+            "Int" => Ty::Int,
+            "Decimal" => Ty::Decimal,
+            "Float" => Ty::Float,
+            "Text" => Ty::Text,
+            "Bytes" => Ty::Bytes,
+            "Date" => Ty::Date,
+            "Timestamp" => Ty::Timestamp,
+            "Duration" => Ty::Duration,
+            "LinearModel" => Ty::LinearModel,
+            "StatTest" => Ty::StatTest,
+            "Args" => Ty::Args,
+            "Clock" => Ty::Clock,
+            "ReadFiles" => Ty::ReadFiles,
+            "Option" => {
+                if let [ast::TypeArg::Type(inner)] = args {
+                    Ty::Option(Box::new(self.resolve_type(inner)))
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(DiagCode::TypeError, "`Option` expects 1 type argument")
+                            .with_span(span),
+                    );
+                    Ty::Unit
+                }
+            }
+            "Result" => {
+                if let [ast::TypeArg::Type(ok), ast::TypeArg::Type(err)] = args {
+                    Ty::Result {
+                        ok_ty: Box::new(self.resolve_type(ok)),
+                        err_ty: Box::new(self.resolve_type(err)),
+                    }
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(DiagCode::TypeError, "`Result` expects 2 type arguments")
+                            .with_span(span),
+                    );
+                    Ty::Unit
+                }
+            }
+            "List" => {
+                if let [ast::TypeArg::Type(elem)] = args {
+                    Ty::List(Box::new(LTy::public(self.resolve_type(elem))))
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(DiagCode::TypeError, "`List` expects 1 type argument")
+                            .with_span(span),
+                    );
+                    Ty::Unit
+                }
+            }
+            "Map" => {
+                if let [ast::TypeArg::Type(k), ast::TypeArg::Type(v)] = args {
+                    Ty::Map {
+                        key: Box::new(LTy::public(self.resolve_type(k))),
+                        val: Box::new(LTy::public(self.resolve_type(v))),
+                    }
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(DiagCode::TypeError, "`Map` expects 2 type arguments")
+                            .with_span(span),
+                    );
+                    Ty::Unit
+                }
+            }
+            "Table" => self.resolve_table_type(args, span),
+            "BadRow" => {
+                if let [
+                    ast::TypeArg::Type(ast::TypeExpr {
+                        kind: ast::TypeKind::Named { name: sname, .. },
+                        optional: false,
+                        ..
+                    }),
+                ] = args
+                    && let Some(cs) = self.schemas.get(&sname.name)
+                {
+                    Ty::Table(quarantine_bad_row_table_ty(&cs.decl.schema))
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::SchemaError,
+                            "`BadRow(Schema)` requires a declared schema name",
+                        )
+                        .with_span(span),
+                    );
+                    Ty::Unit
+                }
+            }
+            "DynamicTable" => Ty::DynamicTable(TagSet::empty()),
+            "Chart" => Ty::Chart(TagSet::empty()),
+            "Report" => Ty::Report(TagSet::empty()),
+            "Profile" => Ty::Profile(TagSet::empty()),
+            "Console" => {
+                let allows = self.extract_allows_arg(args, span);
+                Ty::Console(allows)
+            }
+            "WriteFiles" => {
+                let root = match args.first() {
+                    Some(ast::TypeArg::Text { value, .. }) => value.clone(),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::CapabilityError,
+                                "`WriteFiles` requires a directory prefix string literal",
+                            )
+                            .with_span(span),
+                        );
+                        String::new()
+                    }
+                };
+                let allows = self.extract_allows_arg(&args[1.min(args.len())..], span);
+                Ty::WriteFiles { root, allows }
+            }
+            "ReadDB" => {
+                let db = self.extract_cap_ident_arg(args.first(), "ReadDB", span);
+                Ty::ReadDB(db)
+            }
+            "RawReadDB" => {
+                let db = self.extract_cap_ident_arg(args.first(), "RawReadDB", span);
+                Ty::RawReadDB(db)
+            }
+            "WriteTable" => {
+                let db = self.extract_cap_ident_arg(args.first(), "WriteTable", span);
+                let table_name = match args.get(1) {
+                    Some(ast::TypeArg::Text { value, .. }) => value.clone(),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::CapabilityError,
+                                "`WriteTable` requires `(DbName, \"table_name\", ...)`",
+                            )
+                            .with_span(span),
+                        );
+                        String::new()
+                    }
+                };
+                let allows = self.extract_allows_arg(&args[2.min(args.len())..], span);
+                Ty::WriteTable {
+                    db,
+                    table_name,
+                    dest_cols: Vec::new(),
+                    dest_row_tags: TagSet::empty(),
+                    allows,
+                }
+            }
+            "HttpsAllow" => {
+                let host = match args.first() {
+                    Some(ast::TypeArg::Text { value, .. }) => value.clone(),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::CapabilityError,
+                                "`HttpsAllow` requires a hostname string literal",
+                            )
+                            .with_span(span),
+                        );
+                        String::new()
+                    }
+                };
+                let allows = self.extract_allows_arg(&args[1.min(args.len())..], span);
+                Ty::HttpsAllow { host, allows }
+            }
+            "Secret" => {
+                let sname = match args.first() {
+                    Some(ast::TypeArg::Text { value, .. }) => value.clone(),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::CapabilityError,
+                                "`Secret` requires a secret name string literal",
+                            )
+                            .with_span(span),
+                        );
+                        String::new()
+                    }
+                };
+                Ty::Secret(sname)
+            }
+            "Declassify" => {
+                let allows = self.extract_allows_arg(args, span);
+                Ty::Declassify(allows)
+            }
+            other => {
+                if self.structs.contains_key(other) || self.enums.contains_key(other) {
+                    Ty::Data(other.to_string())
+                } else if self.schemas.contains_key(other) {
+                    // Schema name used directly inside `Table(Schema)` is handled by `resolve_table_type`.
+                    Ty::Data(other.to_string())
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(DiagCode::TypeError, format!("unknown type `{other}`"))
+                            .with_span(span),
+                    );
+                    Ty::Unit
+                }
+            }
+        }
+    }
+
+    fn resolve_table_type(&mut self, args: &[ast::TypeArg], span: Span) -> Ty {
+        // Case 1: `Table(SchemaName)` or `Table(BadRow(SchemaName))`
+        if let [ast::TypeArg::Type(inner)] = args
+            && !inner.optional
+            && let ast::TypeKind::Named { name, args: iargs } = &inner.kind
+        {
+            if name.name == "BadRow" {
+                return self.resolve_named_type(name, iargs, inner.span);
+            }
+            if let Some(cs) = self.schemas.get(&name.name) {
+                return Ty::Table(cs.decl.schema.clone());
+            }
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::SchemaError,
+                    format!("unknown schema `{}` in `Table(...)`", name.name),
+                )
+                .with_span(name.span),
+            );
+            return Ty::Table(TableTy::default());
+        }
+
+        // Case 2: Structural `Table(col: Ty [tags], ...)`
+        let mut cols = Vec::with_capacity(args.len());
+        let mut seen = HashSet::new();
+        for arg in args {
+            match arg {
+                ast::TypeArg::NamedType {
+                    name,
+                    ty,
+                    tags,
+                    span: aspan,
+                } => {
+                    if !seen.insert(name.name.clone()) {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::SchemaError,
+                                format!(
+                                    "duplicate column `{}` in structural `Table(...)`",
+                                    name.name
+                                ),
+                            )
+                            .with_span(name.span),
+                        );
+                    }
+                    let resolved_ty = self.resolve_type(ty);
+                    let Some(scalar_ty) = resolved_ty.to_scalar_ty() else {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("column `{}` must have a scalar type", name.name),
+                            )
+                            .with_span(*aspan),
+                        );
+                        continue;
+                    };
+                    let col_tags = self.resolve_tags(tags);
+                    cols.push(ColSpec {
+                        name: name.name.clone(),
+                        ty: scalar_ty,
+                        tags: col_tags,
+                        bucketed: false,
+                        agg_kind: AggKind::Raw,
+                    });
+                }
+                _ => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "structural `Table(...)` requires `column: Type` entries or a single Schema name",
+                        )
+                        .with_span(span),
+                    );
+                }
+            }
+        }
+        Ty::Table(TableTy {
+            cols,
+            row_tags: TagSet::empty(),
+            order_tags: TagSet::empty(),
+            grouped_by: None,
+            summarized: false,
+            distinct_by: None,
+        })
+    }
+
+    fn extract_allows_arg(&mut self, args: &[ast::TypeArg], span: Span) -> TagSet {
+        for arg in args {
+            match arg {
+                ast::TypeArg::NamedTags { name, tags, .. } if name.name == "allows" => {
+                    return self.resolve_tags(tags);
+                }
+                _ => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::CapabilityError,
+                            "expected `allows: [tag1, ...]` capability argument",
+                        )
+                        .with_span(span),
+                    );
+                }
+            }
+        }
+        TagSet::empty()
+    }
+
+    fn extract_cap_ident_arg(
+        &mut self,
+        arg: Option<&ast::TypeArg>,
+        cap_name: &str,
+        span: Span,
+    ) -> Ident {
+        match arg {
+            Some(ast::TypeArg::Type(ast::TypeExpr {
+                kind: ast::TypeKind::Named { name, args },
+                optional: false,
+                ..
+            })) if args.is_empty() => name.name.clone(),
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::CapabilityError,
+                        format!("`{cap_name}` requires a capitalized database name"),
+                    )
+                    .with_span(span),
+                );
+                String::new()
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Declaration Registration
+    // -----------------------------------------------------------------------
+
+    fn register_enum(&mut self, e: &ast::EnumDecl) {
+        let mut ctors = Vec::with_capacity(e.variants.len());
+        for (idx, v) in e.variants.iter().enumerate() {
+            let mut fields = Vec::with_capacity(v.fields.len());
+            for vf in &v.fields {
+                match vf {
+                    ast::VariantField::Positional { ty, .. } => {
+                        fields.push(LTy::public(self.resolve_type(ty)));
+                    }
+                    ast::VariantField::Named { ty, tags, .. } => {
+                        let rty = self.resolve_type(ty);
+                        let ts = self.resolve_tags(tags);
+                        fields.push(LTy::new(rty, ts));
+                    }
+                }
+            }
+            self.ctor_to_enum
+                .insert(v.name.name.clone(), (e.name.name.clone(), idx));
+            ctors.push(CtorDecl {
+                name: v.name.name.clone(),
+                fields,
+            });
+        }
+        self.enums.insert(
+            e.name.name.clone(),
+            DataDecl {
+                name: e.name.name.clone(),
+                ctors,
+            },
+        );
+    }
+
+    fn register_schema_header(&mut self, s: &ast::SchemaDecl) {
+        let row_tags = self.resolve_tags(&s.tags);
+        let mut cols = Vec::with_capacity(s.fields.len());
+        let mut seen = HashSet::new();
+        for f in &s.fields {
+            if !seen.insert(f.name.name.clone()) {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::SchemaError,
+                        format!(
+                            "duplicate column `{}` in schema `{}`",
+                            f.name.name, s.name.name
+                        ),
+                    )
+                    .with_span(f.name.span),
+                );
+            }
+            let rty = self.resolve_type(&f.ty);
+            let Some(scalar_ty) = rty.to_scalar_ty() else {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::SchemaError,
+                        format!(
+                            "schema column `{}.{}` must have a scalar type",
+                            s.name.name, f.name.name
+                        ),
+                    )
+                    .with_span(f.ty.span),
+                );
+                continue;
+            };
+            let tags = self.resolve_tags(&f.tags);
+            cols.push(ColSpec {
+                name: f.name.name.clone(),
+                ty: scalar_ty,
+                tags,
+                bucketed: false,
+                agg_kind: AggKind::Raw,
+            });
+        }
+        if cols.is_empty() {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::SchemaError,
+                    format!("schema `{}` must declare at least one column", s.name.name),
+                )
+                .with_span(s.span),
+            );
+        }
+        let decl = SchemaDecl {
+            name: s.name.name.clone(),
+            schema: TableTy {
+                cols,
+                row_tags,
+                order_tags: TagSet::empty(),
+                grouped_by: None,
+                summarized: false,
+                distinct_by: None,
+            },
+        };
+        self.spans
+            .push((s.name.name.clone(), s.name.name.clone(), s.span));
+        self.schema_order.push(s.name.name.clone());
+        self.schemas.insert(
+            s.name.name.clone(),
+            CompiledSchema {
+                decl,
+                constraints: vec![None; s.fields.len()],
+            },
+        );
+    }
+
+    fn compile_schema_constraints(&mut self, s: &ast::SchemaDecl) {
+        let Some(existing) = self.schemas.get(&s.name.name).cloned() else {
+            return;
+        };
+        let mut compiled = Vec::with_capacity(s.fields.len());
+        let empty_env = HashMap::new();
+        for (idx, f) in s.fields.iter().enumerate() {
+            if let Some(cond) = &f.constraint {
+                let col_spec = existing.decl.schema.cols.get(idx).cloned();
+                let Some(cs) = col_spec else {
+                    compiled.push(None);
+                    continue;
+                };
+                // Constraints check the non-null inner value when the column is `T?`.
+                let inner_ty = match &cs.ty {
+                    ScalarTy::Option(inner) => inner.as_ref().clone(),
+                    other => other.clone(),
+                };
+                let self_cols = vec![ColSpec {
+                    name: "__self".to_string(),
+                    ty: inner_ty,
+                    tags: TagSet::empty(),
+                    bucketed: false,
+                    agg_kind: AggKind::Raw,
+                }];
+                let (re, re_ty, _) =
+                    self.check_row_expr(cond, &self_cols, &empty_env, Some(&Ty::Bool), true);
+                if re_ty != Ty::Bool {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::SchemaError,
+                            format!(
+                                "`where` constraint on `{}.{}` must evaluate to `Bool`",
+                                s.name.name, f.name.name
+                            ),
+                        )
+                        .with_span(cond.span),
+                    );
+                }
+                compiled.push(Some(re));
+            } else {
+                compiled.push(None);
+            }
+        }
+        if let Some(entry) = self.schemas.get_mut(&s.name.name) {
+            entry.constraints = compiled;
+        }
+    }
+
+    fn register_struct(&mut self, s: &ast::StructDecl) {
+        let mut field_names = Vec::with_capacity(s.fields.len());
+        let mut field_ltys = Vec::with_capacity(s.fields.len());
+        let mut seen = HashSet::new();
+        for f in &s.fields {
+            if !seen.insert(f.name.name.clone()) {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!(
+                            "duplicate field `{}` in struct `{}`",
+                            f.name.name, s.name.name
+                        ),
+                    )
+                    .with_span(f.name.span),
+                );
+            }
+            let rty = self.resolve_type(&f.ty);
+            let tags = self.resolve_tags(&f.tags);
+            field_names.push(f.name.name.clone());
+            field_ltys.push(LTy::new(rty, tags));
+        }
+        self.structs.insert(
+            s.name.name.clone(),
+            StructLayout {
+                name: s.name.name.clone(),
+                field_names,
+                field_ltys,
+            },
+        );
+    }
+
+    fn register_const(&mut self, c: &ast::ConstDecl) {
+        let expected = c.ty.as_ref().map(|t| self.resolve_type(t));
+        let empty_env = HashMap::new();
+        let (expr, lty) = self.check_expr(
+            &c.value,
+            &empty_env,
+            expected.as_ref(),
+            &TagSet::empty(),
+            LocalScopeKind::Normal,
+            None,
+        );
+        let lit = match expr {
+            ExecExpr::Lit(l) => l,
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("`const {}` must be a compile-time literal", c.name.name),
+                    )
+                    .with_span(c.value.span),
+                );
+                Literal::Unit
+            }
+        };
+        self.const_order.push(c.name.name.clone());
+        self.consts.insert(
+            c.name.name.clone(),
+            ConstDecl {
+                name: c.name.name.clone(),
+                lty,
+                value: lit,
+            },
+        );
+    }
+
+    fn register_fn_sig(&mut self, mod_idx: usize, origin: ModuleOrigin, f: &ast::FnDecl) {
+        if origin == ModuleOrigin::Vendor && f.name.name == "main" {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::CapabilityError,
+                    "vendored modules cannot define an entry `main` function",
+                )
+                .with_span(f.name.span),
+            );
+        }
+        let mut params = Vec::with_capacity(f.params.len());
+        let mut is_pure = true;
+        for p in &f.params {
+            let pty = self.resolve_type(&p.ty);
+            self.check_capability_policy(&pty, p.span);
+            if is_capability_ty(&pty) {
+                is_pure = false;
+            }
+            let ptags = self.resolve_tags(&p.tags);
+            params.push((p.name.name.clone(), LTy::new(pty, ptags)));
+        }
+        let ret = f.ret_ty.as_ref().map(|r| {
+            let rty = self.resolve_type(&r.ty);
+            let rtags = self.resolve_tags(&r.tags);
+            LTy::new(rty, rtags)
+        });
+        self.spans
+            .push((f.name.name.clone(), f.name.name.clone(), f.span));
+        self.fn_order.push(f.name.name.clone());
+        self.fn_sigs.insert(
+            f.name.name.clone(),
+            FnSig {
+                name: f.name.name.clone(),
+                params,
+                ret,
+                is_pure,
+                module_idx: mod_idx,
+                ast_decl: f.clone(),
+            },
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Function, Examples, Promise & Test Checking
+    // -----------------------------------------------------------------------
+
+    fn ensure_fn_checked(&mut self, name: &str) -> Option<LTy> {
+        if let Some(done) = self.checked_funs.get(name) {
+            return Some(done.ret.clone());
+        }
+        let sig = self.fn_sigs.get(name)?.clone();
+        if !self.in_progress_fns.insert(name.to_string()) {
+            // Recursive call: return declared return type if present.
+            return sig.ret.clone();
+        }
+
+        let mut env: HashMap<Ident, VarBinding> = HashMap::new();
+        for (pname, plty) in &sig.params {
+            env.insert(
+                pname.clone(),
+                VarBinding {
+                    lty: plty.clone(),
+                    mutable: false,
+                },
+            );
+        }
+
+        let expected_ret = sig.ret.as_ref().map(|r| r.ty.clone());
+        let mut regular_stmts = Vec::new();
+        let mut example_blocks = Vec::new();
+        let mut promise_exprs = Vec::new();
+        for fs in &sig.ast_decl.body {
+            match fs {
+                ast::FnStmt::Examples { stmts, span } => {
+                    example_blocks.push((stmts.clone(), *span));
+                }
+                ast::FnStmt::Promise { expr, span } => {
+                    promise_exprs.push((expr.clone(), *span));
+                }
+                ast::FnStmt::Stmt(st) => regular_stmts.push(st.clone()),
+            }
+        }
+
+        let ret_label = self.fresh("ret");
+        let (mut body_expr, inferred_ret) = self.check_block(
+            &regular_stmts,
+            &mut env,
+            expected_ret.as_ref(),
+            &TagSet::empty(),
+            LocalScopeKind::Normal,
+            Some((&ret_label, expected_ret.as_ref())),
+        );
+
+        let final_ret = if let Some(declared) = &sig.ret {
+            body_expr = self.coerce_expr(
+                body_expr,
+                &inferred_ret,
+                declared,
+                sig.ast_decl.span,
+                "function return value",
+            );
+            // If no runtime `TableCoerce` was needed (columns/types already match), preserve
+            // the body's exact Core IR `TableTy` metadata (`summarized`, `agg_kind`, `bucketed`)
+            // so `core::check_program` validates pure Core IR v0.1 functions directly.
+            if !matches!(
+                body_expr,
+                ExecExpr::Prim {
+                    op: ExecPrimOp::TableCoerce(_),
+                    ..
+                }
+            ) && matches!(
+                (&inferred_ret.ty, &declared.ty),
+                (Ty::Table(_), Ty::Table(_))
+            ) {
+                inferred_ret
+            } else {
+                declared.clone()
+            }
+        } else {
+            inferred_ret
+        };
+
+        // Wrap `return` jumps with an outer `Join` target only when the body actually jumps to it.
+        let mut wrapped_body = if expr_jumps_to(&body_expr, &ret_label) {
+            let ret_param = self.fresh("ret_val");
+            ExecExpr::Join {
+                label: ret_label,
+                params: vec![(ret_param.clone(), final_ret.clone())],
+                rhs: Box::new(ExecExpr::Var(ret_param)),
+                body: Box::new(body_expr),
+            }
+        } else {
+            body_expr
+        };
+
+        // Compile and attach `promise` postconditions around the return value!
+        if !promise_exprs.is_empty() {
+            let res_var = self.fresh("promise_res");
+            let mut checks = ExecExpr::Var(res_var.clone());
+            for (pexpr, pspan) in promise_exprs.iter().rev() {
+                let compiled_promise =
+                    self.check_promise_expr(pexpr, *pspan, &res_var, &final_ret, &env);
+                checks = ExecExpr::LetE {
+                    name: self.fresh("p_ok"),
+                    lty: LTy::public(Ty::Unit),
+                    bound: Box::new(ExecExpr::CheckPromise {
+                        ret_var: res_var.clone(),
+                        promise: compiled_promise,
+                    }),
+                    body: Box::new(checks),
+                };
+            }
+            wrapped_body = ExecExpr::LetE {
+                name: res_var,
+                lty: final_ret.clone(),
+                bound: Box::new(wrapped_body),
+                body: Box::new(checks),
+            };
+        }
+
+        // Update signature return type so subsequent callers and examples see inferred return type.
+        if let Some(s_entry) = self.fn_sigs.get_mut(name) {
+            s_entry.ret = Some(final_ret.clone());
+        }
+
+        let exec_fn = ExecFun {
+            name: sig.name.clone(),
+            kind: FunKind::Function,
+            is_pure: sig.is_pure,
+            params: sig.params.clone(),
+            pc: TagSet::empty(),
+            ret: final_ret.clone(),
+            body: wrapped_body,
+        };
+        self.checked_funs.insert(sig.name.clone(), exec_fn);
+        self.in_progress_fns.remove(name);
+
+        // Now check inline `examples ... end` blocks (in Spec scope, with the function's final sig visible!).
+        for (idx, (ex_stmts, ex_span)) in example_blocks.into_iter().enumerate() {
+            let ex_name = format!("__example_{}_{}", sig.name, idx + 1);
+            self.spans
+                .push((ex_name.clone(), format!("{} (example)", sig.name), ex_span));
+            self.check_spec_block(&ex_name, FunKind::ExampleDecl, &ex_stmts, true);
+        }
+
+        let _ = sig.module_idx;
+        Some(final_ret)
+    }
+
+    fn check_promise_expr(
+        &mut self,
+        expr: &Expr,
+        span: Span,
+        res_var: &str,
+        ret_lty: &LTy,
+        fn_env: &HashMap<Ident, VarBinding>,
+    ) -> ExecPromise {
+        // Case 1: `promise unique(.a, .b)` on a `Table` return type.
+        if let ExprKind::Call { callee, args } = &expr.kind
+            && let ExprKind::Ident(fname) = &callee.kind
+        {
+            if fname == "unique" {
+                let mut cols = Vec::new();
+                if let Ty::Table(tt) = &ret_lty.ty {
+                    for arg in args {
+                        if let CallArg::Positional(ae) = arg
+                            && let ExprKind::DotField(m) = &ae.kind
+                        {
+                            if tt.find_col(&m.name).is_none() {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        format!(
+                                            "unknown column `.{}` in `promise unique(...)`",
+                                            m.name
+                                        ),
+                                    )
+                                    .with_span(m.span),
+                                );
+                            }
+                            cols.push(m.name.clone());
+                        } else {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    "`promise unique(...)` expects `.column` arguments",
+                                )
+                                .with_span(arg.span()),
+                            );
+                        }
+                    }
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`promise unique(...)` is only valid on functions returning a `Table`",
+                        )
+                        .with_span(span),
+                    );
+                }
+                return ExecPromise::UniqueCols(cols);
+            }
+            if fname == "all" {
+                if let [CallArg::Positional(pred)] = args.as_slice()
+                    && let Ty::Table(tt) = &ret_lty.ty
+                {
+                    let (re, re_ty, _) =
+                        self.check_row_expr(pred, &tt.cols, fn_env, Some(&Ty::Bool), false);
+                    if re_ty != Ty::Bool {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`promise all(...)` predicate must return `Bool`",
+                            )
+                            .with_span(pred.span),
+                        );
+                    }
+                    return ExecPromise::AllRows(Box::new(re));
+                }
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`promise all(pred)` requires 1 boolean row predicate on a `Table` return type",
+                    )
+                    .with_span(span),
+                );
+                return ExecPromise::AllRows(Box::new(ExecRowExpr::Lit(Literal::Bool(true))));
+            }
+        }
+
+        // Case 2: General boolean expression where `.` refers to `res_var`, and `sum(.col)` /
+        // `count()` / etc. on a Table return type operate on `res_var`.
+        let mut p_env = fn_env.clone();
+        p_env.insert(
+            "__promise_self".to_string(),
+            VarBinding {
+                lty: ret_lty.clone(),
+                mutable: false,
+            },
+        );
+        let rewritten =
+            rewrite_promise_self(expr, "__promise_self", matches!(ret_lty.ty, Ty::Table(_)));
+        let (ex, lty) = self.check_expr(
+            &rewritten,
+            &p_env,
+            Some(&Ty::Bool),
+            &TagSet::empty(),
+            LocalScopeKind::Spec,
+            None,
+        );
+        if lty.ty != Ty::Bool {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    "`promise` expression must return `Bool`",
+                )
+                .with_span(span),
+            );
+        }
+        // Substitute `__promise_self` variable ref -> `res_var`.
+        let bound = ExecExpr::LetE {
+            name: "__promise_self".to_string(),
+            lty: ret_lty.clone(),
+            bound: Box::new(ExecExpr::Var(res_var.to_string())),
+            body: Box::new(ex),
+        };
+        ExecPromise::BoolExpr(Box::new(bound))
+    }
+
+    fn check_test_decl(&mut self, name: &str, t: &ast::TestDecl) {
+        self.check_spec_block(name, FunKind::Test, &t.body, false);
+    }
+
+    fn check_spec_block(
+        &mut self,
+        name: &str,
+        kind: FunKind,
+        stmts: &[Stmt],
+        assert_bare_bool_exprs: bool,
+    ) {
+        let mut env = HashMap::new();
+        let ret_label = self.fresh("spec_ret");
+        let ret_ctx = Some((ret_label.as_str(), Some(&Ty::Unit)));
+        let pc = TagSet::empty();
+        let mut steps: Vec<BlockStep> = Vec::with_capacity(stmts.len());
+
+        for st in stmts {
+            match &st.kind {
+                StmtKind::Var {
+                    name: vname,
+                    ty,
+                    value,
+                } => {
+                    let ann = ty.as_ref().map(|t| self.resolve_type(t));
+                    let (mut rhs, mut rhs_lty) = self.check_expr(
+                        value,
+                        &env,
+                        ann.as_ref(),
+                        &pc,
+                        LocalScopeKind::Spec,
+                        ret_ctx,
+                    );
+                    if let Some(a_ty) = ann {
+                        let target = LTy::new(a_ty, rhs_lty.tags.clone());
+                        rhs = self.coerce_expr(
+                            rhs,
+                            &rhs_lty,
+                            &target,
+                            value.span,
+                            "`var` initializer",
+                        );
+                        rhs_lty = target;
+                    }
+                    env.insert(
+                        vname.name.clone(),
+                        VarBinding {
+                            lty: rhs_lty.clone(),
+                            mutable: true,
+                        },
+                    );
+                    steps.push(BlockStep::Bind(vname.name.clone(), rhs_lty, rhs));
+                }
+                StmtKind::Assign { lhs, rhs } => {
+                    self.lower_assign_stmt(
+                        lhs,
+                        rhs,
+                        &mut env,
+                        &pc,
+                        LocalScopeKind::Spec,
+                        ret_ctx,
+                        &mut steps,
+                    );
+                }
+                StmtKind::Expr(e) if assert_bare_bool_exprs => {
+                    let (ex, lty) =
+                        self.check_expr(e, &env, None, &pc, LocalScopeKind::Spec, ret_ctx);
+                    if lty.ty == Ty::Bool {
+                        steps.push(BlockStep::Effect(ExecExpr::Assert {
+                            cond: Box::new(ex),
+                            message: format!("example assertion failed in `{name}`"),
+                        }));
+                    } else {
+                        steps.push(BlockStep::Effect(ex));
+                    }
+                }
+                _ => {
+                    let (ex, _) = self.check_block(
+                        std::slice::from_ref(st),
+                        &mut env,
+                        None,
+                        &pc,
+                        LocalScopeKind::Spec,
+                        ret_ctx,
+                    );
+                    steps.push(BlockStep::Effect(ex));
+                }
+            }
+        }
+
+        let body = self.fold_block_steps(steps);
+        let ret_param = self.fresh("spec_done");
+        let wrapped = ExecExpr::Join {
+            label: ret_label,
+            params: vec![(ret_param, LTy::public(Ty::Unit))],
+            rhs: Box::new(ExecExpr::Lit(Literal::Unit)),
+            body: Box::new(body),
+        };
+        self.checked_funs.insert(
+            name.to_string(),
+            ExecFun {
+                name: name.to_string(),
+                kind,
+                is_pure: false,
+                params: Vec::new(),
+                pc: TagSet::empty(),
+                ret: LTy::public(Ty::Unit),
+                body: wrapped,
+            },
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Block & Statement Checking / Lowering
+    // -----------------------------------------------------------------------
+
+    fn check_block(
+        &mut self,
+        stmts: &[Stmt],
+        env: &mut HashMap<Ident, VarBinding>,
+        expected_ret: Option<&Ty>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        if stmts.is_empty() {
+            return (ExecExpr::Lit(Literal::Unit), LTy::new(Ty::Unit, pc.clone()));
+        }
+        let last_idx = stmts.len() - 1;
+        let mut steps: Vec<BlockStep> = Vec::with_capacity(stmts.len());
+        let mut final_lty = LTy::new(Ty::Unit, pc.clone());
+
+        for (idx, st) in stmts.iter().enumerate() {
+            let is_last = idx == last_idx;
+            let exp_ty = if is_last { expected_ret } else { None };
+            match &st.kind {
+                StmtKind::Var { name, ty, value } => {
+                    let ann = ty.as_ref().map(|t| self.resolve_type(t));
+                    let (mut rhs, mut rhs_lty) =
+                        self.check_expr(value, env, ann.as_ref(), pc, scope, ret_ctx);
+                    if let Some(a_ty) = ann {
+                        let target = LTy::new(a_ty, rhs_lty.tags.union(pc));
+                        rhs = self.coerce_expr(
+                            rhs,
+                            &rhs_lty,
+                            &target,
+                            value.span,
+                            "`var` initializer",
+                        );
+                        rhs_lty = target;
+                    }
+                    rhs_lty.tags = rhs_lty.tags.union(pc);
+                    env.insert(
+                        name.name.clone(),
+                        VarBinding {
+                            lty: rhs_lty.clone(),
+                            mutable: true,
+                        },
+                    );
+                    steps.push(BlockStep::Bind(name.name.clone(), rhs_lty, rhs));
+                }
+                StmtKind::Assign { lhs, rhs } => {
+                    self.lower_assign_stmt(lhs, rhs, env, pc, scope, ret_ctx, &mut steps);
+                    if is_last
+                        && !matches!(expected_ret, Some(Ty::Unit))
+                        && let ExprKind::Ident(name) = &lhs.kind
+                        && let Some(b) = env.get(name)
+                    {
+                        final_lty = b.lty.clone();
+                        steps.push(BlockStep::Final(ExecExpr::Var(name.clone())));
+                    }
+                }
+                StmtKind::Assert(cond) => {
+                    let (cex, clty) =
+                        self.check_expr(cond, env, Some(&Ty::Bool), pc, scope, ret_ctx);
+                    if clty.ty != Ty::Bool {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`assert` requires a `Bool` expression",
+                            )
+                            .with_span(cond.span),
+                        );
+                    }
+                    steps.push(BlockStep::Effect(ExecExpr::Assert {
+                        cond: Box::new(cex),
+                        message: "assertion failed".to_string(),
+                    }));
+                }
+                StmtKind::Return { value, guard } => {
+                    let r_exp = ret_ctx.and_then(|(_, t)| t);
+                    let (val_ex, val_lty) = match value {
+                        Some(v) => self.check_expr(v, env, r_exp, pc, scope, ret_ctx),
+                        None => (ExecExpr::Lit(Literal::Unit), LTy::new(Ty::Unit, pc.clone())),
+                    };
+                    let val_ex = if let Some(rt) = r_exp {
+                        self.coerce_expr(
+                            val_ex,
+                            &val_lty,
+                            &LTy::new(rt.clone(), val_lty.tags.union(pc)),
+                            st.span,
+                            "`return` value",
+                        )
+                    } else {
+                        val_ex
+                    };
+                    let jump = if let Some((lbl, _)) = ret_ctx {
+                        ExecExpr::Jump {
+                            label: lbl.to_string(),
+                            args: vec![val_ex],
+                        }
+                    } else {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`return` used outside a function",
+                            )
+                            .with_span(st.span),
+                        );
+                        val_ex
+                    };
+                    let eff = if let Some(g) = guard {
+                        let (gex, glty) =
+                            self.check_expr(g, env, Some(&Ty::Bool), pc, scope, ret_ctx);
+                        if glty.ty != Ty::Bool {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    "`return ... if` guard must be `Bool`",
+                                )
+                                .with_span(g.span),
+                            );
+                        }
+                        ExecExpr::IfE {
+                            cond: Box::new(gex),
+                            then_br: Box::new(jump),
+                            else_br: Box::new(ExecExpr::Lit(Literal::Unit)),
+                        }
+                    } else {
+                        jump
+                    };
+                    if is_last {
+                        final_lty = r_exp.cloned().map_or_else(
+                            || val_lty.clone(),
+                            |rt| LTy::new(rt, val_lty.tags.union(pc)),
+                        );
+                    }
+                    steps.push(BlockStep::Effect(eff));
+                }
+                StmtKind::Break { guard } => {
+                    let jmp = ExecExpr::Jump {
+                        label: "__break".to_string(),
+                        args: self.capture_mut_vars(env),
+                    };
+                    let eff = self.wrap_loop_guard(jmp, guard.as_ref(), env, pc, scope, ret_ctx);
+                    steps.push(BlockStep::Effect(eff));
+                }
+                StmtKind::Continue { guard } => {
+                    let jmp = ExecExpr::Jump {
+                        label: "__continue".to_string(),
+                        args: self.capture_mut_vars(env),
+                    };
+                    let eff = self.wrap_loop_guard(jmp, guard.as_ref(), env, pc, scope, ret_ctx);
+                    steps.push(BlockStep::Effect(eff));
+                }
+                StmtKind::Stop(opt) => {
+                    let (detail, detail_tags) = match opt.as_ref() {
+                        Some(e) => {
+                            let (de, dlty) = self.check_expr(e, env, None, pc, scope, ret_ctx);
+                            (Some(Box::new(de)), dlty.effective_tags().union(pc))
+                        }
+                        None => (None, pc.clone()),
+                    };
+                    steps.push(BlockStep::Effect(ExecExpr::Stop {
+                        kind: BugKind::UserStop,
+                        detail,
+                        detail_tags,
+                    }));
+                }
+                StmtKind::For { target, iter, body } => {
+                    self.lower_for_stmt(target, iter, body, env, pc, scope, ret_ctx, &mut steps);
+                }
+                StmtKind::While { cond, body } => {
+                    self.lower_while_stmt(cond, body, env, pc, scope, ret_ctx, &mut steps);
+                }
+                StmtKind::Expr(e) => {
+                    let (ex, lty) = self.check_expr(e, env, exp_ty, pc, scope, ret_ctx);
+                    if is_last {
+                        final_lty = lty;
+                        steps.push(BlockStep::Final(ex));
+                    } else {
+                        steps.push(BlockStep::Effect(ex));
+                    }
+                }
+            }
+        }
+
+        let folded = self.fold_block_steps(steps);
+        (folded, final_lty)
+    }
+
+    fn capture_mut_vars(&self, env: &HashMap<Ident, VarBinding>) -> Vec<ExecExpr> {
+        let mut names: Vec<&String> = env
+            .iter()
+            .filter(|(_, b)| b.mutable)
+            .map(|(k, _)| k)
+            .collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|n| ExecExpr::Var(n.clone()))
+            .collect()
+    }
+
+    fn wrap_loop_guard(
+        &mut self,
+        jmp: ExecExpr,
+        guard: Option<&Expr>,
+        env: &mut HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> ExecExpr {
+        if let Some(g) = guard {
+            let (gex, glty) = self.check_expr(g, env, Some(&Ty::Bool), pc, scope, ret_ctx);
+            if glty.ty != Ty::Bool {
+                self.diags.push(
+                    Diagnostic::error(DiagCode::TypeError, "loop guard must evaluate to `Bool`")
+                        .with_span(g.span),
+                );
+            }
+            ExecExpr::IfE {
+                cond: Box::new(gex),
+                then_br: Box::new(jmp),
+                else_br: Box::new(ExecExpr::Lit(Literal::Unit)),
+            }
+        } else {
+            jmp
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "assignment lowering carries block state and typing context"
+    )]
+    fn lower_assign_stmt(
+        &mut self,
+        lhs: &Expr,
+        rhs: &Expr,
+        env: &mut HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+        steps: &mut Vec<BlockStep>,
+    ) {
+        let (rhs_ex, mut rhs_lty) = self.check_expr(rhs, env, None, pc, scope, ret_ctx);
+        rhs_lty.tags = rhs_lty.tags.union(pc);
+        match &lhs.kind {
+            ExprKind::Ident(name) => {
+                let was_mut = env.get(name).is_some_and(|b| b.mutable);
+                if let Some(prev) = env.get_mut(name)
+                    && prev.mutable
+                {
+                    // Refine unresolved empty-list element type on first append/reassignment!
+                    if is_unresolved_list(&prev.lty.ty) && matches!(rhs_lty.ty, Ty::List(_)) {
+                        prev.lty = rhs_lty.clone();
+                    } else {
+                        prev.lty.tags = prev.lty.tags.union(&rhs_lty.tags);
+                    }
+                } else {
+                    env.insert(
+                        name.clone(),
+                        VarBinding {
+                            lty: rhs_lty.clone(),
+                            mutable: was_mut,
+                        },
+                    );
+                }
+                steps.push(BlockStep::Bind(name.clone(), rhs_lty, rhs_ex));
+            }
+            ExprKind::Underscore => {
+                steps.push(BlockStep::Effect(rhs_ex));
+            }
+            ExprKind::Tuple(elems) => {
+                let tmp = self.fresh("tup");
+                let elem_ltys = match &rhs_lty.ty {
+                    Ty::Tuple(ts) if ts.len() == elems.len() => ts.clone(),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("cannot destructure non-tuple into {}-tuple", elems.len()),
+                            )
+                            .with_span(lhs.span),
+                        );
+                        vec![LTy::public(Ty::Unit); elems.len()]
+                    }
+                };
+                steps.push(BlockStep::Bind(tmp.clone(), rhs_lty.clone(), rhs_ex));
+                for (i, (el, el_lty)) in elems.iter().zip(elem_ltys).enumerate() {
+                    let proj = ExecExpr::Proj {
+                        tup: Box::new(ExecExpr::Var(tmp.clone())),
+                        idx: BigInt::from(i),
+                    };
+                    let tagged_el = LTy::new(el_lty.ty, el_lty.tags.union(&rhs_lty.tags));
+                    match &el.kind {
+                        ExprKind::Ident(n) => {
+                            env.insert(
+                                n.clone(),
+                                VarBinding {
+                                    lty: tagged_el.clone(),
+                                    mutable: false,
+                                },
+                            );
+                            steps.push(BlockStep::Bind(n.clone(), tagged_el, proj));
+                        }
+                        ExprKind::Underscore => {}
+                        _ => {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    "unsupported tuple destructuring target",
+                                )
+                                .with_span(el.span),
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "assignment target must be a variable or tuple of variables",
+                    )
+                    .with_span(lhs.span),
+                );
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "for-loop lowering carries environment and continuation state"
+    )]
+    fn lower_for_stmt(
+        &mut self,
+        target: &ast::ForTarget,
+        iter: &Expr,
+        body: &[Stmt],
+        env: &mut HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+        steps: &mut Vec<BlockStep>,
+    ) {
+        let (iter_ex, iter_lty) = self.check_expr(iter, env, None, pc, scope, ret_ctx);
+        let loop_pc = pc.union(&iter_lty.tags);
+        let (list_ex, elem_lty, extra_pc) = match &iter_lty.ty {
+            Ty::List(el) => (iter_ex, el.as_ref().clone(), loop_pc),
+            Ty::Table(tt) => {
+                let row_ty_name = self.register_table_row_type(tt);
+                let row_lty = LTy::new(Ty::Data(row_ty_name), tt.row_tags.clone());
+                let extra = loop_pc.union(&tt.row_tags);
+                (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::TableRowsToList,
+                        args: vec![iter_ex],
+                    },
+                    row_lty,
+                    extra,
+                )
+            }
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`for ... in ...` requires a `List` or `Table`",
+                    )
+                    .with_span(iter.span),
+                );
+                (iter_ex, LTy::public(Ty::Unit), loop_pc)
+            }
+        };
+
+        let item_var = match target {
+            ast::ForTarget::Name(n) => n.name.clone(),
+            ast::ForTarget::Wildcard(_) => self.fresh("ignored"),
+            ast::ForTarget::Tuple(_, _) => self.fresh("for_tup"),
+        };
+
+        let mut body_env = env.clone();
+        body_env.insert(
+            item_var.clone(),
+            VarBinding {
+                lty: elem_lty.clone(),
+                mutable: false,
+            },
+        );
+        // If tuple destructuring in `for (a, b) in ...`, bind inner names from tuple elem_lty.
+        let mut prefix_steps = Vec::new();
+        if let ast::ForTarget::Tuple(parts, _) = target
+            && let Ty::Tuple(ts) = &elem_lty.ty
+        {
+            for (i, (pt, tlty)) in parts.iter().zip(ts).enumerate() {
+                if let ast::ForTarget::Name(n) = pt {
+                    body_env.insert(
+                        n.name.clone(),
+                        VarBinding {
+                            lty: tlty.clone(),
+                            mutable: false,
+                        },
+                    );
+                    prefix_steps.push(BlockStep::Bind(
+                        n.name.clone(),
+                        tlty.clone(),
+                        ExecExpr::Proj {
+                            tup: Box::new(ExecExpr::Var(item_var.clone())),
+                            idx: BigInt::from(i),
+                        },
+                    ));
+                }
+            }
+        }
+
+        let (raw_body, _) = self.check_block(body, &mut body_env, None, &extra_pc, scope, ret_ctx);
+        // Propagate any refined mutable var types back out to outer `env`.
+        let state_vars = self.sync_mut_vars_from_loop(env, &body_env);
+        let state_tuple = ExecExpr::Tuple(
+            state_vars
+                .iter()
+                .map(|(n, _)| ExecExpr::Var(n.clone()))
+                .collect(),
+        );
+        prefix_steps.push(BlockStep::Effect(raw_body));
+        prefix_steps.push(BlockStep::Final(state_tuple));
+        let loop_body = self.fold_block_steps(prefix_steps);
+
+        steps.push(BlockStep::Loop(Box::new(LoopStep::For {
+            item_var,
+            iter_expr: list_ex,
+            state_vars,
+            body: loop_body,
+        })));
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "while-loop lowering carries environment and continuation state"
+    )]
+    fn lower_while_stmt(
+        &mut self,
+        cond: &Expr,
+        body: &[Stmt],
+        env: &mut HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+        steps: &mut Vec<BlockStep>,
+    ) {
+        let (cond_ex, cond_lty) = self.check_expr(cond, env, Some(&Ty::Bool), pc, scope, ret_ctx);
+        if cond_lty.ty != Ty::Bool {
+            self.diags.push(
+                Diagnostic::error(DiagCode::TypeError, "`while` condition must be `Bool`")
+                    .with_span(cond.span),
+            );
+        }
+        let loop_pc = pc.union(&cond_lty.tags);
+        let mut body_env = env.clone();
+        let (raw_body, _) = self.check_block(body, &mut body_env, None, &loop_pc, scope, ret_ctx);
+        let state_vars = self.sync_mut_vars_from_loop(env, &body_env);
+        let state_tuple = ExecExpr::Tuple(
+            state_vars
+                .iter()
+                .map(|(n, _)| ExecExpr::Var(n.clone()))
+                .collect(),
+        );
+        let loop_body = self.fold_block_steps(vec![
+            BlockStep::Effect(raw_body),
+            BlockStep::Final(state_tuple),
+        ]);
+        steps.push(BlockStep::Loop(Box::new(LoopStep::While {
+            cond: cond_ex,
+            state_vars,
+            body: loop_body,
+        })));
+    }
+
+    fn sync_mut_vars_from_loop(
+        &self,
+        outer: &mut HashMap<Ident, VarBinding>,
+        inner: &HashMap<Ident, VarBinding>,
+    ) -> Vec<(Ident, LTy)> {
+        let mut state_vars = Vec::new();
+        for (name, ob) in outer.iter_mut() {
+            if ob.mutable {
+                if let Some(ib) = inner.get(name) {
+                    if is_unresolved_list(&ob.lty.ty) && !is_unresolved_list(&ib.lty.ty) {
+                        ob.lty = ib.lty.clone();
+                    } else {
+                        ob.lty.tags = ob.lty.tags.union(&ib.lty.tags);
+                    }
+                }
+                state_vars.push((name.clone(), ob.lty.clone()));
+            }
+        }
+        state_vars.sort_by(|a, b| a.0.cmp(&b.0));
+        state_vars
+    }
+
+    fn fold_block_steps(&mut self, steps: Vec<BlockStep>) -> ExecExpr {
+        let mut acc = ExecExpr::Lit(Literal::Unit);
+        for step in steps.into_iter().rev() {
+            match step {
+                BlockStep::Final(e) => acc = e,
+                BlockStep::Bind(name, lty, bound) => {
+                    acc = ExecExpr::LetE {
+                        name,
+                        lty,
+                        bound: Box::new(bound),
+                        body: Box::new(acc),
+                    };
+                }
+                BlockStep::Effect(e) => {
+                    if matches!(acc, ExecExpr::Lit(Literal::Unit)) {
+                        acc = e;
+                    } else {
+                        let tmp = self.fresh("seq");
+                        acc = ExecExpr::LetE {
+                            name: tmp,
+                            lty: LTy::public(Ty::Unit),
+                            bound: Box::new(e),
+                            body: Box::new(acc),
+                        };
+                    }
+                }
+                BlockStep::Loop(lp) => match *lp {
+                    LoopStep::For {
+                        item_var,
+                        iter_expr,
+                        state_vars,
+                        body,
+                    } => {
+                        acc = ExecExpr::ForLoop {
+                            item_var,
+                            iter_expr: Box::new(iter_expr),
+                            state_vars,
+                            body: Box::new(body),
+                            after: Box::new(acc),
+                        };
+                    }
+                    LoopStep::While {
+                        cond,
+                        state_vars,
+                        body,
+                    } => {
+                        acc = ExecExpr::WhileLoop {
+                            cond: Box::new(cond),
+                            state_vars,
+                            body: Box::new(body),
+                            after: Box::new(acc),
+                        };
+                    }
+                },
+            }
+        }
+        acc
+    }
+
+    fn register_table_row_type(&mut self, tt: &TableTy) -> Ident {
+        let name = format!("{TY_TABLE_ROW_PREFIX}{}", self.table_row_schemas.len() + 1);
+        self.table_row_schemas.insert(name.clone(), tt.clone());
+        name
+    }
+
+    // -----------------------------------------------------------------------
+    // Expression Checking & Lowering
+    // -----------------------------------------------------------------------
+
+    fn check_expr(
+        &mut self,
+        expr: &Expr,
+        env: &HashMap<Ident, VarBinding>,
+        expected: Option<&Ty>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        match &expr.kind {
+            ExprKind::Int(raw) => self.check_int_lit(raw, expected, expr.span),
+            ExprKind::Decimal(raw) => self.check_decimal_lit(raw, expected, expr.span),
+            ExprKind::Date(raw) => match parse_iso_date(raw) {
+                Ok(days) => (ExecExpr::Lit(Literal::date(days)), LTy::public(Ty::Date)),
+                Err(e) => {
+                    self.diags.push(
+                        Diagnostic::error(DiagCode::TypeError, e.message).with_span(expr.span),
+                    );
+                    (ExecExpr::Lit(Literal::date(0i64)), LTy::public(Ty::Date))
+                }
+            },
+            ExprKind::Timestamp(raw) => match parse_iso_timestamp(raw) {
+                Ok(us) => (
+                    ExecExpr::Lit(Literal::timestamp(us)),
+                    LTy::public(Ty::Timestamp),
+                ),
+                Err(e) => {
+                    self.diags.push(
+                        Diagnostic::error(DiagCode::TypeError, e.message).with_span(expr.span),
+                    );
+                    (
+                        ExecExpr::Lit(Literal::timestamp(0i64)),
+                        LTy::public(Ty::Timestamp),
+                    )
+                }
+            },
+            ExprKind::Text { value, .. } => (
+                ExecExpr::Lit(Literal::Text(value.clone())),
+                LTy::public(Ty::Text),
+            ),
+            ExprKind::InterpText { parts, .. } => {
+                self.check_interp_text(parts, env, pc, scope, ret_ctx)
+            }
+            ExprKind::Atom(a) => (
+                ExecExpr::Lit(Literal::Text(format!(":{a}"))),
+                LTy::public(Ty::Text),
+            ),
+            ExprKind::Bool(b) => (ExecExpr::Lit(Literal::Bool(*b)), LTy::public(Ty::Bool)),
+            ExprKind::None => {
+                let inner = match expected {
+                    Some(Ty::Option(t)) => t.as_ref().clone(),
+                    _ => Ty::Unit,
+                };
+                (
+                    ExecExpr::Lit(Literal::NoneLit(inner.clone())),
+                    LTy::public(Ty::Option(Box::new(inner))),
+                )
+            }
+            ExprKind::Ident(name) => {
+                if let Some(b) = env.get(name) {
+                    (ExecExpr::Var(name.clone()), b.lty.clone())
+                } else if let Some(c) = self.consts.get(name) {
+                    (ExecExpr::ConstRef(name.clone()), c.lty.clone())
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::ResolveError,
+                            format!("unknown identifier `{name}`"),
+                        )
+                        .with_span(expr.span),
+                    );
+                    (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit))
+                }
+            }
+            ExprKind::CapName(name) => {
+                if name == "Unit" {
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                }
+                if let Some((enum_name, idx)) = self.ctor_to_enum.get(name).cloned() {
+                    let fields_len = self
+                        .enums
+                        .get(&enum_name)
+                        .and_then(|d| d.ctors.get(idx))
+                        .map_or(0, |c| c.fields.len());
+                    if fields_len == 0 {
+                        return (
+                            ExecExpr::Ctor {
+                                type_name: enum_name.clone(),
+                                ctor_name: name.clone(),
+                                args: Vec::new(),
+                            },
+                            LTy::public(Ty::Data(enum_name)),
+                        );
+                    }
+                }
+                // CapNames can also be passed as schema/db/namespace names in specific calls
+                // (handled at Call/Field sites); as a standalone expression, treat as label.
+                (
+                    ExecExpr::Lit(Literal::Text(name.clone())),
+                    LTy::public(Ty::Text),
+                )
+            }
+            ExprKind::Underscore | ExprKind::DotField(_) | ExprKind::DotSelf => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "column/self shorthand (`.` / `.col`) is only valid inside a table pipeline or `schema`/`promise` clause",
+                    )
+                    .with_span(expr.span),
+                );
+                (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit))
+            }
+            ExprKind::Paren(inner) => self.check_expr(inner, env, expected, pc, scope, ret_ctx),
+            ExprKind::Tuple(elems) => {
+                let exp_elems = match expected {
+                    Some(Ty::Tuple(ts)) if ts.len() == elems.len() => Some(ts),
+                    _ => None,
+                };
+                let mut exs = Vec::with_capacity(elems.len());
+                let mut ltys = Vec::with_capacity(elems.len());
+                for (i, e) in elems.iter().enumerate() {
+                    let e_exp = exp_elems.and_then(|ts| ts.get(i)).map(|l| &l.ty);
+                    let (ex, lty) = self.check_expr(e, env, e_exp, pc, scope, ret_ctx);
+                    exs.push(ex);
+                    ltys.push(lty);
+                }
+                (ExecExpr::Tuple(exs), LTy::public(Ty::Tuple(ltys)))
+            }
+            ExprKind::List(elems) => {
+                let exp_elem = match expected {
+                    Some(Ty::List(el)) => Some(el.as_ref().clone()),
+                    _ => None,
+                };
+                if elems.is_empty() {
+                    let elem_lty = exp_elem.unwrap_or_else(|| {
+                        LTy::public(Ty::Data(TY_UNRESOLVED_LIST_ELEM.to_string()))
+                    });
+                    return (
+                        ExecExpr::Prim {
+                            op: ExecPrimOp::Core(PrimOp::ListLit(elem_lty.clone())),
+                            args: Vec::new(),
+                        },
+                        LTy::public(Ty::List(Box::new(elem_lty))),
+                    );
+                }
+                let mut exs = Vec::with_capacity(elems.len());
+                let mut inferred_elem: Option<LTy> = exp_elem;
+                for e in elems {
+                    let hint = inferred_elem.as_ref().map(|l| &l.ty);
+                    let (ex, lty) = self.check_expr(e, env, hint, pc, scope, ret_ctx);
+                    inferred_elem = Some(match inferred_elem {
+                        None => lty,
+                        Some(prev) => LTy::new(prev.ty, prev.tags.union(&lty.tags)),
+                    });
+                    exs.push(ex);
+                }
+                let el = inferred_elem.unwrap_or_else(|| LTy::public(Ty::Unit));
+                (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::ListLit(el.clone())),
+                        args: exs,
+                    },
+                    LTy::public(Ty::List(Box::new(el))),
+                )
+            }
+            ExprKind::Map(entries) => {
+                let mut k_lty = LTy::public(Ty::Text);
+                let mut v_lty = LTy::public(Ty::Unit);
+                let mut args = Vec::with_capacity(entries.len() * 2);
+                for (idx, (k, v)) in entries.iter().enumerate() {
+                    // Map keys written as bare identifiers (`{requests: 0}`) are Text keys!
+                    let (kex, klty) = match &k.kind {
+                        ExprKind::Ident(s) | ExprKind::CapName(s) => (
+                            ExecExpr::Lit(Literal::Text(s.clone())),
+                            LTy::public(Ty::Text),
+                        ),
+                        _ => self.check_expr(k, env, None, pc, scope, ret_ctx),
+                    };
+                    let (vex, vlty) = self.check_expr(v, env, None, pc, scope, ret_ctx);
+                    if idx == 0 {
+                        k_lty = klty;
+                        v_lty = vlty;
+                    } else {
+                        k_lty.tags = k_lty.tags.union(&klty.tags);
+                        v_lty.tags = v_lty.tags.union(&vlty.tags);
+                    }
+                    args.push(kex);
+                    args.push(vex);
+                }
+                (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::MapLit {
+                            key_lty: k_lty.clone(),
+                            val_lty: v_lty.clone(),
+                        }),
+                        args,
+                    },
+                    LTy::public(Ty::Map {
+                        key: Box::new(k_lty),
+                        val: Box::new(v_lty),
+                    }),
+                )
+            }
+            ExprKind::Unary { op, expr: inner } => {
+                self.check_unary(*op, inner, expr.span, env, expected, pc, scope, ret_ctx)
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                self.check_binary(*op, lhs, rhs, expr.span, env, expected, pc, scope, ret_ctx)
+            }
+            ExprKind::Field { receiver, member } => {
+                self.check_field_access(receiver, member, expr.span, env, pc, scope, ret_ctx)
+            }
+            ExprKind::Call { callee, args } => {
+                self.check_call(callee, args, expr.span, env, expected, pc, scope, ret_ctx)
+            }
+            ExprKind::Index { target, index } => {
+                let (tex, tlty) = self.check_expr(target, env, None, pc, scope, ret_ctx);
+                let (iex, ilty) = self.check_expr(index, env, None, pc, scope, ret_ctx);
+                match &tlty.ty {
+                    Ty::Map { val, .. } => (
+                        ExecExpr::Prim {
+                            op: ExecPrimOp::Core(PrimOp::MapGet),
+                            args: vec![tex, iex],
+                        },
+                        LTy::new(
+                            Ty::Option(Box::new(val.ty.clone())),
+                            tlty.tags.union(&ilty.tags).union(&val.tags),
+                        ),
+                    ),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(DiagCode::TypeError, "indexing requires a `Map`")
+                                .with_span(expr.span),
+                        );
+                        (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit))
+                    }
+                }
+            }
+            ExprKind::IfInline {
+                cond,
+                then_expr,
+                else_ifs,
+                else_expr,
+            } => self.check_if_inline(
+                cond, then_expr, else_ifs, else_expr, env, expected, pc, scope, ret_ctx,
+            ),
+            ExprKind::IfBlock {
+                cond,
+                then_body,
+                else_ifs,
+                else_body,
+            } => self.check_if_block(
+                cond,
+                then_body,
+                else_ifs,
+                else_body.as_deref(),
+                env,
+                expected,
+                pc,
+                scope,
+                ret_ctx,
+            ),
+            ExprKind::Case { scrut, lines } => {
+                self.check_case(scrut, lines, expr.span, env, expected, pc, scope, ret_ctx)
+            }
+            ExprKind::Lambda { params, body } => {
+                let mut l_env = env.clone();
+                let mut l_params = Vec::with_capacity(params.len());
+                for p in params {
+                    let pname = match p {
+                        ast::LambdaParam::Name(n) => n.name.clone(),
+                        ast::LambdaParam::Wildcard(_) => self.fresh("wild"),
+                    };
+                    let plty = LTy::public(Ty::Int);
+                    l_env.insert(
+                        pname.clone(),
+                        VarBinding {
+                            lty: plty.clone(),
+                            mutable: false,
+                        },
+                    );
+                    l_params.push((pname, plty));
+                }
+                let (bex, blty) = match body {
+                    ast::LambdaBody::Expr(ex) => {
+                        self.check_expr(ex, &l_env, None, pc, scope, ret_ctx)
+                    }
+                    ast::LambdaBody::Block(stmts) => {
+                        self.check_block(stmts, &mut l_env, None, pc, scope, ret_ctx)
+                    }
+                };
+                let fn_ty = Ty::Fn {
+                    params: l_params.iter().map(|(_, l)| l.clone()).collect(),
+                    pc: pc.clone(),
+                    ret: Box::new(blty.clone()),
+                };
+                (
+                    ExecExpr::Lam {
+                        params: l_params,
+                        pc: pc.clone(),
+                        ret: blty,
+                        body: Arc::new(bex),
+                    },
+                    LTy::public(fn_ty),
+                )
+            }
+            ExprKind::TableLit { headers, rows } => {
+                self.check_table_lit(headers, rows, expr.span, env, expected, pc, scope, ret_ctx)
+            }
+        }
+    }
+
+    fn check_int_lit(&mut self, raw: &str, expected: Option<&Ty>, span: Span) -> (ExecExpr, LTy) {
+        let cleaned: String = raw.chars().filter(|&c| c != '_').collect();
+        let val: i64 = match cleaned.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("integer literal `{raw}` out of Int64 range"),
+                    )
+                    .with_span(span),
+                );
+                0
+            }
+        };
+        match expected {
+            Some(Ty::Decimal) => {
+                let scaled = parse_decimal_bigint(&cleaned).unwrap_or(BigInt::ZERO);
+                (
+                    ExecExpr::Lit(Literal::Decimal(scaled)),
+                    LTy::public(Ty::Decimal),
+                )
+            }
+            Some(Ty::Float) => (
+                ExecExpr::Lit(Literal::Float(Float64::from_f64(val as f64))),
+                LTy::public(Ty::Float),
+            ),
+            _ => (ExecExpr::Lit(Literal::int(val)), LTy::public(Ty::Int)),
+        }
+    }
+
+    fn check_decimal_lit(
+        &mut self,
+        raw: &str,
+        expected: Option<&Ty>,
+        span: Span,
+    ) -> (ExecExpr, LTy) {
+        let cleaned: String = raw.chars().filter(|&c| c != '_').collect();
+        let has_exp = cleaned.contains('e') || cleaned.contains('E');
+        let want_float = has_exp
+            || matches!(expected, Some(Ty::Float))
+            || matches!(expected, Some(Ty::Option(inner)) if matches!(inner.as_ref(), Ty::Float));
+        if want_float {
+            match cleaned.parse::<f64>() {
+                Ok(f) => (
+                    ExecExpr::Lit(Literal::Float(Float64::from_f64(f))),
+                    LTy::public(Ty::Float),
+                ),
+                Err(_) => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("invalid float literal `{raw}`"),
+                        )
+                        .with_span(span),
+                    );
+                    (
+                        ExecExpr::Lit(Literal::Float(Float64::ZERO)),
+                        LTy::public(Ty::Float),
+                    )
+                }
+            }
+        } else {
+            match parse_decimal_bigint(&cleaned) {
+                Ok(d) => (ExecExpr::Lit(Literal::Decimal(d)), LTy::public(Ty::Decimal)),
+                Err(e) => {
+                    self.diags
+                        .push(Diagnostic::error(DiagCode::TypeError, e.message).with_span(span));
+                    (
+                        ExecExpr::Lit(Literal::Decimal(BigInt::ZERO)),
+                        LTy::public(Ty::Decimal),
+                    )
+                }
+            }
+        }
+    }
+
+    fn check_interp_text(
+        &mut self,
+        parts: &[ast::InterpPart],
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        let mut acc: Option<ExecExpr> = None;
+        let mut tags = TagSet::empty();
+        for part in parts {
+            let piece = match part {
+                ast::InterpPart::Literal { value, .. } => {
+                    if value.is_empty() {
+                        continue;
+                    }
+                    ExecExpr::Lit(Literal::Text(value.clone()))
+                }
+                ast::InterpPart::Expr(ex) => {
+                    let (e, lty) = self.check_expr(ex, env, None, pc, scope, ret_ctx);
+                    tags = tags.union(&lty.effective_tags());
+                    if lty.ty == Ty::Text {
+                        e
+                    } else {
+                        ExecExpr::Prim {
+                            op: ExecPrimOp::ValToText,
+                            args: vec![e],
+                        }
+                    }
+                }
+            };
+            acc = Some(match acc {
+                None => piece,
+                Some(prev) => ExecExpr::Prim {
+                    op: ExecPrimOp::Core(PrimOp::ConcatText),
+                    args: vec![prev, piece],
+                },
+            });
+        }
+        (
+            acc.unwrap_or_else(|| ExecExpr::Lit(Literal::Text(String::new()))),
+            LTy::new(Ty::Text, tags),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "unary expression checker propagates typing context"
+    )]
+    fn check_unary(
+        &mut self,
+        op: UnaryOp,
+        inner: &Expr,
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        expected: Option<&Ty>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        match op {
+            UnaryOp::Not => {
+                let (e, lty) = self.check_expr(inner, env, Some(&Ty::Bool), pc, scope, ret_ctx);
+                if lty.ty != Ty::Bool {
+                    self.diags.push(
+                        Diagnostic::error(DiagCode::TypeError, "`not` requires a `Bool` operand")
+                            .with_span(span),
+                    );
+                }
+                (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::NotBool),
+                        args: vec![e],
+                    },
+                    LTy::new(Ty::Bool, lty.tags),
+                )
+            }
+            UnaryOp::Neg => {
+                let (e, lty) = self.check_expr(inner, env, expected, pc, scope, ret_ctx);
+                let pop = match lty.ty {
+                    Ty::Int => ExecPrimOp::Core(PrimOp::NegInt),
+                    Ty::Decimal => ExecPrimOp::Core(PrimOp::NegDec),
+                    Ty::Float => ExecPrimOp::NegFloat,
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "unary `-` requires a numeric operand",
+                            )
+                            .with_span(span),
+                        );
+                        ExecPrimOp::Core(PrimOp::NegInt)
+                    }
+                };
+                (
+                    ExecExpr::Prim {
+                        op: pop,
+                        args: vec![e],
+                    },
+                    lty,
+                )
+            }
+            UnaryOp::Try => {
+                let (e, lty) = self.check_expr(inner, env, None, pc, scope, ret_ctx);
+                let (ok_ty, err_ty) = match &lty.ty {
+                    Ty::Result { ok_ty, err_ty } => {
+                        (ok_ty.as_ref().clone(), err_ty.as_ref().clone())
+                    }
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`try` requires a `Result(T, E)` expression",
+                            )
+                            .with_span(span),
+                        );
+                        return (e, lty);
+                    }
+                };
+                let ok_var = self.fresh("try_ok");
+                let err_var = self.fresh("try_err");
+                let ret_ty = ret_ctx.and_then(|(_, t)| t);
+                let err_arm_body = match (ret_ctx, ret_ty) {
+                    (Some((lbl, _)), Some(Ty::Result { ok_ty: f_ok, .. })) => ExecExpr::Jump {
+                        label: lbl.to_string(),
+                        args: vec![ExecExpr::Prim {
+                            op: ExecPrimOp::Core(PrimOp::ErrVal(f_ok.as_ref().clone())),
+                            args: vec![ExecExpr::Var(err_var.clone())],
+                        }],
+                    },
+                    // In `fn main(...) : Int`, `try` propagates fatal I/O errors cleanly as Fail!
+                    _ => ExecExpr::Fail(Box::new(ExecExpr::Prim {
+                        op: ExecPrimOp::ValToText,
+                        args: vec![ExecExpr::Var(err_var.clone())],
+                    })),
+                };
+                let _ = err_ty;
+                let case_ex = ExecExpr::CaseE {
+                    scrut: Box::new(e),
+                    arms: vec![
+                        ExecCaseArm {
+                            pattern: ExecPattern::Ctor {
+                                ctor: "Ok".to_string(),
+                                binders: vec![ok_var.clone()],
+                            },
+                            body: ExecExpr::Var(ok_var),
+                        },
+                        ExecCaseArm {
+                            pattern: ExecPattern::Ctor {
+                                ctor: "Error".to_string(),
+                                binders: vec![err_var],
+                            },
+                            body: err_arm_body,
+                        },
+                    ],
+                };
+                (case_ex, LTy::new(ok_ty, lty.tags))
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "binary expression checker handles pipes, coalescing, arithmetic, and comparisons"
+    )]
+    fn check_binary(
+        &mut self,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        expected: Option<&Ty>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        if op == BinOp::Pipe {
+            return self.check_pipe(lhs, rhs, span, env, pc, scope, ret_ctx);
+        }
+
+        if op == BinOp::Coalesce {
+            let (lex, llty) = self.check_expr(lhs, env, None, pc, scope, ret_ctx);
+            let inner_ty = match &llty.ty {
+                Ty::Option(t) => t.as_ref().clone(),
+                _ => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`??` left operand must be `Option(T)` (`T?`)",
+                        )
+                        .with_span(lhs.span),
+                    );
+                    llty.ty.clone()
+                }
+            };
+            let (rex, rlty) = self.check_expr(rhs, env, Some(&inner_ty), pc, scope, ret_ctx);
+            let tags = llty.tags.union(&rlty.tags);
+            // Short-circuit coalesce via CaseE so `rhs` is only evaluated when `lhs` is `none`.
+            let some_v = self.fresh("coal_v");
+            let case_ex = ExecExpr::CaseE {
+                scrut: Box::new(lex),
+                arms: vec![
+                    ExecCaseArm {
+                        pattern: ExecPattern::Ctor {
+                            ctor: "Some".to_string(),
+                            binders: vec![some_v.clone()],
+                        },
+                        body: ExecExpr::Var(some_v),
+                    },
+                    ExecCaseArm {
+                        pattern: ExecPattern::Ctor {
+                            ctor: "None".to_string(),
+                            binders: Vec::new(),
+                        },
+                        body: rex,
+                    },
+                ],
+            };
+            return (case_ex, LTy::new(inner_ty, tags));
+        }
+
+        let (mut lex, mut llty) = self.check_expr(lhs, env, None, pc, scope, ret_ctx);
+        let rhs_hint = match &llty.ty {
+            Ty::Option(inner) if matches!(op, BinOp::Eq | BinOp::Ne) => Some(inner.as_ref()),
+            t => Some(t),
+        };
+        let (mut rex, mut rlty) = self.check_expr(rhs, env, rhs_hint, pc, scope, ret_ctx);
+
+        // Numeric literal cross-coercion when left side was a literal and right side resolved concretely.
+        if llty.ty != rlty.ty {
+            if matches!(llty.ty, Ty::Decimal) && matches!(rlty.ty, Ty::Float) && is_numeric_lit(lhs)
+            {
+                (lex, llty) = self.check_decimal_from_expr(lhs, &Ty::Float);
+            } else if matches!(llty.ty, Ty::Int)
+                && matches!(rlty.ty, Ty::Decimal | Ty::Float)
+                && is_numeric_lit(lhs)
+            {
+                (lex, llty) = self.check_decimal_from_expr(lhs, &rlty.ty);
+            } else if matches!(rlty.ty, Ty::Int | Ty::Decimal)
+                && matches!(llty.ty, Ty::Float)
+                && is_numeric_lit(rhs)
+            {
+                (rex, rlty) = self.check_decimal_from_expr(rhs, &Ty::Float);
+            } else if matches!(rlty.ty, Ty::Int)
+                && matches!(llty.ty, Ty::Decimal)
+                && is_numeric_lit(rhs)
+            {
+                (rex, rlty) = self.check_decimal_from_expr(rhs, &Ty::Decimal);
+            }
+        }
+
+        let tags = llty.tags.union(&rlty.tags);
+        let _ = expected;
+
+        match op {
+            BinOp::And | BinOp::Or => {
+                if llty.ty != Ty::Bool || rlty.ty != Ty::Bool {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`{}` requires `Bool` operands", op.as_str()),
+                        )
+                        .with_span(span),
+                    );
+                }
+                let ex = if op == BinOp::And {
+                    ExecExpr::IfE {
+                        cond: Box::new(lex),
+                        then_br: Box::new(rex),
+                        else_br: Box::new(ExecExpr::Lit(Literal::Bool(false))),
+                    }
+                } else {
+                    ExecExpr::IfE {
+                        cond: Box::new(lex),
+                        then_br: Box::new(ExecExpr::Lit(Literal::Bool(true))),
+                        else_br: Box::new(rex),
+                    }
+                };
+                (ex, LTy::new(Ty::Bool, tags))
+            }
+            BinOp::Eq | BinOp::Ne => {
+                // Coerce `Option(T) == T` or `T == Option(T)` cleanly.
+                if let Ty::Option(inner) = &llty.ty
+                    && **inner == rlty.ty
+                {
+                    rex = ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::SomeVal(rlty.ty.clone())),
+                        args: vec![rex],
+                    };
+                    rlty.ty = llty.ty.clone();
+                } else if let Ty::Option(inner) = &rlty.ty
+                    && **inner == llty.ty
+                {
+                    lex = ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::SomeVal(llty.ty.clone())),
+                        args: vec![lex],
+                    };
+                    llty.ty = rlty.ty.clone();
+                }
+
+                // Table structural equality (ignoring hidden `group_meta`, coercing literal schemas).
+                if let (Ty::Table(ltt), Ty::Table(_)) = (&llty.ty, &rlty.ty) {
+                    if !ltt.cols.is_empty() {
+                        rex = ExecExpr::Prim {
+                            op: ExecPrimOp::TableCoerce(ltt.clone()),
+                            args: vec![rex],
+                        };
+                    }
+                    let eq_ex = ExecExpr::Prim {
+                        op: ExecPrimOp::TableEq,
+                        args: vec![lex, rex],
+                    };
+                    let out = if op == BinOp::Ne {
+                        ExecExpr::Prim {
+                            op: ExecPrimOp::Core(PrimOp::NotBool),
+                            args: vec![eq_ex],
+                        }
+                    } else {
+                        eq_ex
+                    };
+                    return (
+                        out,
+                        LTy::new(
+                            Ty::Bool,
+                            llty.effective_tags().union(&rlty.effective_tags()),
+                        ),
+                    );
+                }
+
+                let pop = if op == BinOp::Eq {
+                    PrimOp::Eq
+                } else {
+                    PrimOp::Ne
+                };
+                (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(pop),
+                        args: vec![lex, rex],
+                    },
+                    LTy::new(Ty::Bool, tags),
+                )
+            }
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let pop = match op {
+                    BinOp::Lt => PrimOp::Lt,
+                    BinOp::Le => PrimOp::Le,
+                    BinOp::Gt => PrimOp::Gt,
+                    _ => PrimOp::Ge,
+                };
+                (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(pop),
+                        args: vec![lex, rex],
+                    },
+                    LTy::new(Ty::Bool, tags),
+                )
+            }
+            BinOp::Add => {
+                let (pop, rty) = match (&llty.ty, &rlty.ty) {
+                    (Ty::Int, Ty::Int) => (ExecPrimOp::Core(PrimOp::AddInt), Ty::Int),
+                    (Ty::Decimal, Ty::Decimal) => (ExecPrimOp::Core(PrimOp::AddDec), Ty::Decimal),
+                    (Ty::Float, Ty::Float) => (ExecPrimOp::AddFloat, Ty::Float),
+                    (Ty::Text, Ty::Text) => (ExecPrimOp::Core(PrimOp::ConcatText), Ty::Text),
+                    (Ty::Timestamp, Ty::Duration) => {
+                        (ExecPrimOp::Core(PrimOp::AddDuration), Ty::Timestamp)
+                    }
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "incompatible operand types for `+`",
+                            )
+                            .with_span(span),
+                        );
+                        (ExecPrimOp::Core(PrimOp::AddInt), llty.ty.clone())
+                    }
+                };
+                (
+                    ExecExpr::Prim {
+                        op: pop,
+                        args: vec![lex, rex],
+                    },
+                    LTy::new(rty, tags),
+                )
+            }
+            BinOp::Sub => {
+                let (pop, rty) = match (&llty.ty, &rlty.ty) {
+                    (Ty::Int, Ty::Int) => (ExecPrimOp::Core(PrimOp::SubInt), Ty::Int),
+                    (Ty::Decimal, Ty::Decimal) => (ExecPrimOp::Core(PrimOp::SubDec), Ty::Decimal),
+                    (Ty::Float, Ty::Float) => (ExecPrimOp::SubFloat, Ty::Float),
+                    (Ty::Timestamp, Ty::Timestamp) => {
+                        (ExecPrimOp::Core(PrimOp::DiffTimestamp), Ty::Duration)
+                    }
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "incompatible operand types for `-`",
+                            )
+                            .with_span(span),
+                        );
+                        (ExecPrimOp::Core(PrimOp::SubInt), llty.ty.clone())
+                    }
+                };
+                (
+                    ExecExpr::Prim {
+                        op: pop,
+                        args: vec![lex, rex],
+                    },
+                    LTy::new(rty, tags),
+                )
+            }
+            BinOp::Mul => {
+                let (pop, rty) = match (&llty.ty, &rlty.ty) {
+                    (Ty::Int, Ty::Int) => (ExecPrimOp::Core(PrimOp::MulInt), Ty::Int),
+                    (Ty::Decimal, Ty::Decimal) => (ExecPrimOp::Core(PrimOp::MulDec), Ty::Decimal),
+                    (Ty::Float, Ty::Float) => (ExecPrimOp::MulFloat, Ty::Float),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "incompatible operand types for `*`",
+                            )
+                            .with_span(span),
+                        );
+                        (ExecPrimOp::Core(PrimOp::MulInt), llty.ty.clone())
+                    }
+                };
+                (
+                    ExecExpr::Prim {
+                        op: pop,
+                        args: vec![lex, rex],
+                    },
+                    LTy::new(rty, tags),
+                )
+            }
+            BinOp::Div => {
+                let (pop, rty) = match (&llty.ty, &rlty.ty) {
+                    (Ty::Int, Ty::Int) => (ExecPrimOp::Core(PrimOp::DivInt), Ty::Int),
+                    (Ty::Decimal, Ty::Decimal) => (ExecPrimOp::Core(PrimOp::DivDec), Ty::Decimal),
+                    (Ty::Float, Ty::Float) => (ExecPrimOp::DivFloat, Ty::Float),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "incompatible operand types for `/`",
+                            )
+                            .with_span(span),
+                        );
+                        (ExecPrimOp::Core(PrimOp::DivInt), llty.ty.clone())
+                    }
+                };
+                (
+                    ExecExpr::Prim {
+                        op: pop,
+                        args: vec![lex, rex],
+                    },
+                    LTy::new(rty, tags),
+                )
+            }
+            BinOp::Mod => (
+                ExecExpr::Prim {
+                    op: ExecPrimOp::Core(PrimOp::ModInt),
+                    args: vec![lex, rex],
+                },
+                LTy::new(Ty::Int, tags),
+            ),
+            BinOp::Is => (
+                ExecExpr::Prim {
+                    op: ExecPrimOp::Core(PrimOp::Eq),
+                    args: vec![lex, rex],
+                },
+                LTy::new(Ty::Bool, tags),
+            ),
+            BinOp::Pipe | BinOp::Coalesce => unreachable!("handled above"),
+        }
+    }
+
+    fn check_decimal_from_expr(&mut self, expr: &Expr, target: &Ty) -> (ExecExpr, LTy) {
+        match &expr.kind {
+            ExprKind::Int(raw) => self.check_int_lit(raw, Some(target), expr.span),
+            ExprKind::Decimal(raw) => self.check_decimal_lit(raw, Some(target), expr.span),
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                expr: inner,
+            } => {
+                let (e, lty) = self.check_decimal_from_expr(inner, target);
+                let pop = match target {
+                    Ty::Float => ExecPrimOp::NegFloat,
+                    Ty::Decimal => ExecPrimOp::Core(PrimOp::NegDec),
+                    _ => ExecPrimOp::Core(PrimOp::NegInt),
+                };
+                (
+                    ExecExpr::Prim {
+                        op: pop,
+                        args: vec![e],
+                    },
+                    lty,
+                )
+            }
+            _ => (ExecExpr::Lit(Literal::Unit), LTy::public(target.clone())),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipelines (`|>`): Relational Table Verbs, Charts & Report Builders
+    // -----------------------------------------------------------------------
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "pipe checking dispatches relational plans, charts, and report builders"
+    )]
+    fn check_pipe(
+        &mut self,
+        lhs: &Expr,
+        rhs: &Expr,
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        let (lex, llty) = self.check_expr(lhs, env, None, pc, scope, ret_ctx);
+
+        let ExprKind::Call { callee, args } = &rhs.kind else {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    "right-hand side of `|>` must be a call",
+                )
+                .with_span(rhs.span),
+            );
+            return (lex, llty);
+        };
+        let ExprKind::Ident(verb) = &callee.kind else {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    "right-hand side of `|>` must be a verb/function call",
+                )
+                .with_span(callee.span),
+            );
+            return (lex, llty);
+        };
+
+        // Report pipeline verbs (`add_summary`, `add_chart`, `add_table`).
+        if let Ty::Report(rtags) = &llty.ty {
+            return self.check_report_pipe(
+                lex,
+                rtags.clone(),
+                llty.tags.clone(),
+                verb,
+                args,
+                span,
+                env,
+                pc,
+                scope,
+                ret_ctx,
+            );
+        }
+
+        // Table pipeline verbs and chart constructors.
+        if let Ty::Table(in_tt) = &llty.ty {
+            let in_tt = in_tt.clone();
+            if verb.starts_with("chart_") {
+                return self.check_chart_verb(
+                    lex, &in_tt, &llty.tags, verb, args, span, env, pc, scope, ret_ctx,
+                );
+            }
+            let in_plan = expr_to_plan(lex);
+            return self.check_table_verb(
+                in_plan, in_tt, llty.tags, verb, args, span, env, pc, scope, ret_ctx,
+            );
+        }
+
+        // Generic pipe: `x |> f(a, b)` -> `f(x, a, b)`.
+        let mut all_args = vec![CallArg::Positional(lhs.clone())];
+        all_args.extend(args.iter().cloned());
+        self.check_call(callee, &all_args, span, env, None, pc, scope, ret_ctx)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "report builder verb checking propagates sensitivity tags"
+    )]
+    fn check_report_pipe(
+        &mut self,
+        rep_ex: ExecExpr,
+        rep_tags: TagSet,
+        outer_tags: TagSet,
+        verb: &str,
+        args: &[CallArg],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        let Some(CallArg::Positional(arg0)) = args.first() else {
+            self.diags.push(
+                Diagnostic::error(DiagCode::TypeError, format!("`{verb}` requires 1 argument"))
+                    .with_span(span),
+            );
+            return (rep_ex, LTy::new(Ty::Report(rep_tags), outer_tags));
+        };
+        let (aex, alty) = self.check_expr(arg0, env, None, pc, scope, ret_ctx);
+        let merged = rep_tags.union(&alty.effective_tags());
+        let op = match verb {
+            "add_summary" => PrimOp::ReportAddSummary,
+            "add_chart" => PrimOp::ReportAddChart,
+            "add_table" => PrimOp::ReportAddTable,
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("unknown `Report` verb `{verb}`"),
+                    )
+                    .with_span(span),
+                );
+                return (rep_ex, LTy::new(Ty::Report(merged), outer_tags));
+            }
+        };
+        (
+            ExecExpr::Prim {
+                op: ExecPrimOp::Core(op),
+                args: vec![rep_ex, aex],
+            },
+            LTy::new(Ty::Report(merged), outer_tags),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "chart builder verb validates column refs and propagates table sensitivity tags"
+    )]
+    fn check_chart_verb(
+        &mut self,
+        tbl_ex: ExecExpr,
+        in_tt: &TableTy,
+        outer_tags: &TagSet,
+        verb: &str,
+        args: &[CallArg],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        let kind = match verb {
+            "chart_bar" => ChartKind::Bar,
+            "chart_line" => ChartKind::Line,
+            "chart_scatter" => ChartKind::Scatter,
+            "chart_histogram" => ChartKind::Histogram,
+            "chart_heatmap" => ChartKind::Heatmap,
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(DiagCode::TypeError, format!("unknown chart verb `{verb}`"))
+                        .with_span(span),
+                );
+                ChartKind::Bar
+            }
+        };
+        let mut cols = Vec::new();
+        let mut title = String::new();
+        let mut extra_tags = TagSet::empty();
+        for arg in args {
+            match arg {
+                CallArg::Named { name, value, .. } => match name.name.as_str() {
+                    "x" | "y" | "color" | "value" => {
+                        if let ExprKind::DotField(m) = &value.kind {
+                            if let Some(c) = in_tt.find_col(&m.name) {
+                                extra_tags = extra_tags.union(&c.tags);
+                                cols.push(m.name.clone());
+                            } else {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        format!("unknown column `.{}` in `{verb}`", m.name),
+                                    )
+                                    .with_span(m.span),
+                                );
+                            }
+                        }
+                    }
+                    "title" => {
+                        let (_, tlty) =
+                            self.check_expr(value, env, Some(&Ty::Text), pc, scope, ret_ctx);
+                        extra_tags = extra_tags.union(&tlty.effective_tags());
+                        if let ExprKind::Text { value: s, .. } = &value.kind {
+                            title = s.clone();
+                        }
+                    }
+                    "trendline" => {
+                        let (_, mlty) = self.check_expr(value, env, None, pc, scope, ret_ctx);
+                        extra_tags = extra_tags.union(&mlty.effective_tags());
+                    }
+                    _ => {}
+                },
+                CallArg::Positional(e) => {
+                    if let ExprKind::DotField(m) = &e.kind {
+                        cols.push(m.name.clone());
+                    }
+                }
+            }
+        }
+        let chart_tags = in_tt
+            .row_tags
+            .union(&in_tt.order_tags)
+            .union(&extra_tags)
+            .union(outer_tags);
+        (
+            ExecExpr::Prim {
+                op: ExecPrimOp::Core(PrimOp::ChartMake { kind, cols, title }),
+                args: vec![tbl_ex],
+            },
+            LTy::new(Ty::Chart(chart_tags), TagSet::empty()),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "relational verb checker updates structural TableTy and privacy metadata"
+    )]
+    fn check_table_verb(
+        &mut self,
+        in_plan: ExecPlan,
+        in_tt: TableTy,
+        outer_tags: TagSet,
+        verb: &str,
+        args: &[CallArg],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        match verb {
+            "where" => {
+                let Some(CallArg::Positional(pred)) = args.first() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`where` expects 1 predicate argument",
+                        )
+                        .with_span(span),
+                    );
+                    return (
+                        ExecExpr::Rel(Box::new(in_plan)),
+                        LTy::new(Ty::Table(in_tt), outer_tags),
+                    );
+                };
+                let (re, re_ty, re_tags) =
+                    self.check_row_expr(pred, &in_tt.cols, env, Some(&Ty::Bool), false);
+                if re_ty != Ty::Bool {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`where` predicate must return `Bool`",
+                        )
+                        .with_span(pred.span),
+                    );
+                }
+                let mut out_tt = in_tt;
+                out_tt.row_tags = out_tt.row_tags.union(&re_tags);
+                (
+                    ExecExpr::Rel(Box::new(ExecPlan::Filter {
+                        input: Box::new(in_plan),
+                        pred: re,
+                    })),
+                    LTy::new(Ty::Table(out_tt), outer_tags),
+                )
+            }
+            "select" => {
+                let mut keep_cols = Vec::new();
+                let mut renames = Vec::new();
+                let mut out_cols = Vec::new();
+                for arg in args {
+                    match arg {
+                        CallArg::Positional(e) => {
+                            if let ExprKind::DotField(m) = &e.kind {
+                                if let Some(cs) = in_tt.find_col(&m.name) {
+                                    keep_cols.push(m.name.clone());
+                                    out_cols.push(cs.clone());
+                                } else {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::TypeError,
+                                            format!("unknown column `.{}` in `select`", m.name),
+                                        )
+                                        .with_span(m.span),
+                                    );
+                                }
+                            } else {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        "`select` expects `.col` or `alias: .col`",
+                                    )
+                                    .with_span(e.span),
+                                );
+                            }
+                        }
+                        CallArg::Named { name, value, .. } => {
+                            if let ExprKind::DotField(m) = &value.kind {
+                                if let Some(cs) = in_tt.find_col(&m.name) {
+                                    keep_cols.push(m.name.clone());
+                                    renames.push((m.name.clone(), name.name.clone()));
+                                    let mut renamed = cs.clone();
+                                    renamed.name = name.name.clone();
+                                    out_cols.push(renamed);
+                                } else {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::TypeError,
+                                            format!("unknown column `.{}` in `select`", m.name),
+                                        )
+                                        .with_span(m.span),
+                                    );
+                                }
+                            } else {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        "`select` alias value must be `.col`",
+                                    )
+                                    .with_span(value.span),
+                                );
+                            }
+                        }
+                    }
+                }
+                if out_cols.is_empty() {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`select` must retain at least one column",
+                        )
+                        .with_span(span),
+                    );
+                }
+                let mut plan = ExecPlan::Select {
+                    input: Box::new(in_plan),
+                    cols: keep_cols,
+                };
+                if !renames.is_empty() {
+                    plan = ExecPlan::Rename {
+                        input: Box::new(plan),
+                        pairs: renames,
+                    };
+                }
+                let mut out_tt = in_tt;
+                out_tt.cols = out_cols;
+                (
+                    ExecExpr::Rel(Box::new(plan)),
+                    LTy::new(Ty::Table(out_tt), outer_tags),
+                )
+            }
+            "drop" => {
+                let mut drop_cols = Vec::new();
+                for arg in args {
+                    if let CallArg::Positional(e) = arg
+                        && let ExprKind::DotField(m) = &e.kind
+                    {
+                        if in_tt.find_col(&m.name).is_none() {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("unknown column `.{}` in `drop`", m.name),
+                                )
+                                .with_span(m.span),
+                            );
+                        }
+                        drop_cols.push(m.name.clone());
+                    }
+                }
+                let mut out_tt = in_tt;
+                out_tt.cols.retain(|c| !drop_cols.contains(&c.name));
+                if out_tt.cols.is_empty() {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`drop` cannot remove all columns from a table",
+                        )
+                        .with_span(span),
+                    );
+                }
+                (
+                    ExecExpr::Rel(Box::new(ExecPlan::Drop {
+                        input: Box::new(in_plan),
+                        cols: drop_cols,
+                    })),
+                    LTy::new(Ty::Table(out_tt), outer_tags),
+                )
+            }
+            "rename" => {
+                let mut pairs = Vec::new();
+                let mut out_tt = in_tt;
+                for arg in args {
+                    if let CallArg::Named { name, value, .. } = arg
+                        && let ExprKind::DotField(m) = &value.kind
+                    {
+                        if let Some(c) = out_tt.cols.iter_mut().find(|c| c.name == m.name) {
+                            c.name = name.name.clone();
+                            pairs.push((m.name.clone(), name.name.clone()));
+                        } else {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("unknown column `.{}` in `rename`", m.name),
+                                )
+                                .with_span(m.span),
+                            );
+                        }
+                    } else {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`rename` expects `new_name: .old_name`",
+                            )
+                            .with_span(arg.span()),
+                        );
+                    }
+                }
+                (
+                    ExecExpr::Rel(Box::new(ExecPlan::Rename {
+                        input: Box::new(in_plan),
+                        pairs,
+                    })),
+                    LTy::new(Ty::Table(out_tt), outer_tags),
+                )
+            }
+            "derive" => {
+                let mut items = Vec::new();
+                let mut out_tt = in_tt;
+                for arg in args {
+                    let CallArg::Named { name, value, .. } = arg else {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`derive` expects `col_name: expr` arguments",
+                            )
+                            .with_span(arg.span()),
+                        );
+                        continue;
+                    };
+                    // Detect `bucket(.col, cuts: [...], labels: [...])` built-in declassifier.
+                    if let ExprKind::Call {
+                        callee,
+                        args: bargs,
+                    } = &value.kind
+                        && let ExprKind::Ident(fn_name) = &callee.kind
+                        && fn_name == "bucket"
+                    {
+                        if let Some((item, spec)) =
+                            self.check_bucket_call(&name.name, bargs, &out_tt, value.span)
+                        {
+                            upsert_col(&mut out_tt.cols, spec);
+                            items.push(item);
+                        }
+                        continue;
+                    }
+                    let (re, re_ty, re_tags) =
+                        self.check_row_expr(value, &out_tt.cols, env, None, false);
+                    let scalar_ty = re_ty.to_scalar_ty().unwrap_or_else(|| {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("derived column `{}` must have a scalar type", name.name),
+                            )
+                            .with_span(value.span),
+                        );
+                        ScalarTy::Unit
+                    });
+                    let spec = ColSpec {
+                        name: name.name.clone(),
+                        ty: scalar_ty,
+                        tags: re_tags,
+                        bucketed: false,
+                        agg_kind: AggKind::Raw,
+                    };
+                    upsert_col(&mut out_tt.cols, spec);
+                    items.push(ExecDeriveItem::ColExpr {
+                        name: name.name.clone(),
+                        expr: Box::new(re),
+                    });
+                }
+                (
+                    ExecExpr::Rel(Box::new(ExecPlan::Derive {
+                        input: Box::new(in_plan),
+                        items,
+                    })),
+                    LTy::new(Ty::Table(out_tt), outer_tags),
+                )
+            }
+            "sort_by" | "sort_desc" => {
+                let dir = if verb == "sort_desc" {
+                    SortDir::Desc
+                } else {
+                    SortDir::Asc
+                };
+                let mut keys = Vec::new();
+                let mut key_tags = TagSet::empty();
+                for arg in args {
+                    if let CallArg::Positional(e) = arg
+                        && let ExprKind::DotField(m) = &e.kind
+                    {
+                        if let Some(c) = in_tt.find_col(&m.name) {
+                            key_tags = key_tags.union(&c.tags);
+                            keys.push((m.name.clone(), dir));
+                        } else {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("unknown sort column `.{}`", m.name),
+                                )
+                                .with_span(m.span),
+                            );
+                        }
+                    }
+                }
+                let mut out_tt = in_tt;
+                for c in &mut out_tt.cols {
+                    c.agg_kind = AggKind::Raw;
+                }
+                out_tt.order_tags = out_tt.order_tags.union(&key_tags);
+                out_tt.grouped_by = None;
+                out_tt.summarized = false;
+                out_tt.distinct_by = None;
+                (
+                    ExecExpr::Rel(Box::new(ExecPlan::Sort {
+                        input: Box::new(in_plan),
+                        keys,
+                    })),
+                    LTy::new(Ty::Table(out_tt), outer_tags),
+                )
+            }
+            "distinct" => {
+                let mut cols = Vec::new();
+                let mut key_tags = TagSet::empty();
+                if args.is_empty() {
+                    for c in &in_tt.cols {
+                        key_tags = key_tags.union(&c.tags);
+                    }
+                } else {
+                    for arg in args {
+                        if let CallArg::Positional(e) = arg
+                            && let ExprKind::DotField(m) = &e.kind
+                        {
+                            if let Some(c) = in_tt.find_col(&m.name) {
+                                key_tags = key_tags.union(&c.tags);
+                                cols.push(m.name.clone());
+                            } else {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        format!("unknown column `.{}` in `distinct`", m.name),
+                                    )
+                                    .with_span(m.span),
+                                );
+                            }
+                        }
+                    }
+                }
+                let mut out_tt = in_tt;
+                out_tt.row_tags = out_tt.row_tags.union(&key_tags);
+                (
+                    ExecExpr::Rel(Box::new(ExecPlan::Distinct {
+                        input: Box::new(in_plan),
+                        cols,
+                    })),
+                    LTy::new(Ty::Table(out_tt), outer_tags),
+                )
+            }
+            "limit" => {
+                let n = match args.first() {
+                    Some(CallArg::Positional(Expr {
+                        kind: ExprKind::Int(raw),
+                        ..
+                    })) => raw.replace('_', "").parse::<u64>().unwrap_or(0),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`limit` expects a non-negative integer literal",
+                            )
+                            .with_span(span),
+                        );
+                        0
+                    }
+                };
+                let mut out_tt = in_tt;
+                for c in &mut out_tt.cols {
+                    c.agg_kind = AggKind::Raw;
+                }
+                out_tt.row_tags = out_tt.row_tags.union(&out_tt.order_tags);
+                out_tt.grouped_by = None;
+                out_tt.summarized = false;
+                out_tt.distinct_by = None;
+                (
+                    ExecExpr::Rel(Box::new(ExecPlan::Limit {
+                        input: Box::new(in_plan),
+                        n: BigInt::from(n),
+                    })),
+                    LTy::new(Ty::Table(out_tt), outer_tags),
+                )
+            }
+            "group_by" => {
+                let mut keys = Vec::new();
+                let mut key_tags = TagSet::empty();
+                for arg in args {
+                    if let CallArg::Positional(e) = arg
+                        && let ExprKind::DotField(m) = &e.kind
+                    {
+                        if let Some(c) = in_tt.find_col(&m.name) {
+                            key_tags = key_tags.union(&c.tags);
+                            keys.push(m.name.clone());
+                        } else {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("unknown grouping column `.{}`", m.name),
+                                )
+                                .with_span(m.span),
+                            );
+                        }
+                    }
+                }
+                let mut out_tt = in_tt;
+                out_tt.row_tags = out_tt.row_tags.union(&key_tags);
+                out_tt.grouped_by = Some(keys.clone());
+                (
+                    ExecExpr::Rel(Box::new(ExecPlan::GroupBy {
+                        input: Box::new(in_plan),
+                        keys,
+                    })),
+                    LTy::new(Ty::Table(out_tt), outer_tags),
+                )
+            }
+            "summarize" => self.check_summarize_verb(in_plan, in_tt, outer_tags, args, span, env),
+            "suppress_small_groups" => {
+                self.check_suppress_verb(in_plan, in_tt, outer_tags, args, span)
+            }
+            "window" => self.check_window_verb(in_plan, in_tt, outer_tags, args, span, env),
+            "fill_gaps" => self.check_fill_gaps_verb(in_plan, in_tt, outer_tags, args, span),
+            "pivot_wider" => self.check_pivot_wider_verb(in_plan, in_tt, outer_tags, args, span),
+            "crosstab" => self.check_crosstab_verb(in_plan, in_tt, outer_tags, args, span),
+            "union" => {
+                let Some(CallArg::Positional(other_e)) = args.first() else {
+                    self.diags.push(
+                        Diagnostic::error(DiagCode::TypeError, "`union` requires 1 table argument")
+                            .with_span(span),
+                    );
+                    return (
+                        ExecExpr::Rel(Box::new(in_plan)),
+                        LTy::new(Ty::Table(in_tt), outer_tags),
+                    );
+                };
+                let (oex, olty) = self.check_expr(other_e, env, None, pc, scope, ret_ctx);
+                let mut out_tt = in_tt;
+                if let Ty::Table(ott) = &olty.ty {
+                    if ott.cols.len() != out_tt.cols.len()
+                        || out_tt
+                            .cols
+                            .iter()
+                            .zip(&ott.cols)
+                            .any(|(a, b)| a.name != b.name || a.ty != b.ty)
+                    {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`union` requires tables with matching column names and types",
+                            )
+                            .with_span(span),
+                        );
+                    } else {
+                        for (a, b) in out_tt.cols.iter_mut().zip(&ott.cols) {
+                            a.tags = a.tags.union(&b.tags);
+                            a.bucketed = a.bucketed && b.bucketed;
+                        }
+                        out_tt.row_tags = out_tt.row_tags.union(&ott.row_tags);
+                        out_tt.order_tags = TagSet::empty();
+                    }
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`union` argument must be a `Table`",
+                        )
+                        .with_span(other_e.span),
+                    );
+                }
+                let rplan = expr_to_plan(oex);
+                (
+                    ExecExpr::Rel(Box::new(ExecPlan::Union {
+                        left: Box::new(in_plan),
+                        right: Box::new(rplan),
+                    })),
+                    LTy::new(Ty::Table(out_tt), outer_tags.union(&olty.tags)),
+                )
+            }
+            "redact" => {
+                let col_name = match args.first() {
+                    Some(CallArg::Positional(Expr {
+                        kind: ExprKind::DotField(m),
+                        ..
+                    })) => m.name.clone(),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`redact` expects a `.column` argument",
+                            )
+                            .with_span(span),
+                        );
+                        String::new()
+                    }
+                };
+                let mut out_tt = in_tt;
+                if let Some(c) = out_tt.cols.iter_mut().find(|c| c.name == col_name) {
+                    c.ty = ScalarTy::Text;
+                    c.tags = TagSet::empty();
+                    c.bucketed = false;
+                } else if !col_name.is_empty() {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("unknown column `.{col_name}` in `redact`"),
+                        )
+                        .with_span(span),
+                    );
+                }
+                (
+                    ExecExpr::Rel(Box::new(ExecPlan::Redact {
+                        input: Box::new(in_plan),
+                        col: col_name,
+                        replacement: "[REDACTED]".to_string(),
+                    })),
+                    LTy::new(Ty::Table(out_tt), outer_tags),
+                )
+            }
+            "pseudonymize" => {
+                let col_name = match args.first() {
+                    Some(CallArg::Positional(Expr {
+                        kind: ExprKind::DotField(m),
+                        ..
+                    })) => m.name.clone(),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`pseudonymize` expects `.column, key: secret`",
+                            )
+                            .with_span(span),
+                        );
+                        String::new()
+                    }
+                };
+                let key_expr = args.iter().find_map(|a| match a {
+                    CallArg::Named { name, value, .. } if name.name == "key" => Some(value),
+                    _ => None,
+                });
+                let secret_ex = if let Some(ke) = key_expr {
+                    let (sex, slty) = self.check_expr(ke, env, None, pc, scope, ret_ctx);
+                    if !matches!(slty.ty, Ty::Secret(_)) {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::CapabilityError,
+                                "`pseudonymize(..., key: ...)` requires a `Secret` capability",
+                            )
+                            .with_span(ke.span),
+                        );
+                    }
+                    sex
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::CapabilityError,
+                            "`pseudonymize` requires a `key: secret` argument",
+                        )
+                        .with_span(span),
+                    );
+                    ExecExpr::Lit(Literal::Unit)
+                };
+                let mut out_tt = in_tt;
+                if let Some(c) = out_tt.cols.iter_mut().find(|c| c.name == col_name) {
+                    c.ty = ScalarTy::Text;
+                    c.tags = c.tags.remove("pii");
+                    c.bucketed = false;
+                } else if !col_name.is_empty() {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("unknown column `.{col_name}` in `pseudonymize`"),
+                        )
+                        .with_span(span),
+                    );
+                }
+                (
+                    ExecExpr::Rel(Box::new(ExecPlan::Pseudonymize {
+                        input: Box::new(in_plan),
+                        col: col_name,
+                        secret: Box::new(secret_ex),
+                    })),
+                    LTy::new(Ty::Table(out_tt), outer_tags),
+                )
+            }
+            "join_one"
+            | "join_many_to_one"
+            | "join_many"
+            | "left_join_one"
+            | "left_join_many_to_one"
+            | "semi_join"
+            | "anti_join" => {
+                let kind = match verb {
+                    "join_one" => JoinKind::InnerOne,
+                    "join_many_to_one" => JoinKind::InnerManyToOne,
+                    "join_many" => JoinKind::InnerMany,
+                    "left_join_one" => JoinKind::LeftOne,
+                    "left_join_many_to_one" => JoinKind::LeftManyToOne,
+                    "semi_join" => JoinKind::Semi,
+                    _ => JoinKind::Anti,
+                };
+                self.check_join_verb(
+                    kind, in_plan, in_tt, outer_tags, args, span, env, pc, scope, ret_ctx,
+                )
+            }
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("unknown table pipeline verb `{verb}`"),
+                    )
+                    .with_span(span),
+                );
+                (
+                    ExecExpr::Rel(Box::new(in_plan)),
+                    LTy::new(Ty::Table(in_tt), outer_tags),
+                )
+            }
+        }
+    }
+
+    fn check_bucket_call(
+        &mut self,
+        out_col: &str,
+        args: &[CallArg],
+        in_tt: &TableTy,
+        span: Span,
+    ) -> Option<(ExecDeriveItem, ColSpec)> {
+        let source = match args.first() {
+            Some(CallArg::Positional(Expr {
+                kind: ExprKind::DotField(m),
+                ..
+            })) => m.name.clone(),
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`bucket` expects `.col, cuts: [...], labels: [...]`",
+                    )
+                    .with_span(span),
+                );
+                return None;
+            }
+        };
+        let Some(src_col) = in_tt.find_col(&source) else {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!("unknown column `.{source}` in `bucket`"),
+                )
+                .with_span(span),
+            );
+            return None;
+        };
+        let cuts_arg = args.iter().find_map(|a| match a {
+            CallArg::Named { name, value, .. } if name.name == "cuts" => Some(value),
+            _ => None,
+        });
+        let labels_arg = args.iter().find_map(|a| match a {
+            CallArg::Named { name, value, .. } if name.name == "labels" => Some(value),
+            _ => None,
+        });
+        let target_ty = src_col.ty.to_ty();
+        let mut cuts = Vec::new();
+        if let Some(Expr {
+            kind: ExprKind::List(items),
+            ..
+        }) = cuts_arg
+        {
+            for it in items {
+                let (e, _) = self.check_expr(
+                    it,
+                    &HashMap::new(),
+                    Some(&target_ty),
+                    &TagSet::empty(),
+                    LocalScopeKind::Normal,
+                    None,
+                );
+                if let ExecExpr::Lit(l) = e {
+                    cuts.push(l);
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::PrivacyError,
+                            "`bucket` cuts must be compile-time constant literals",
+                        )
+                        .with_span(it.span),
+                    );
+                }
+            }
+        } else {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    "`bucket` requires `cuts: [...]` list literal",
+                )
+                .with_span(span),
+            );
+        }
+        let mut labels = Vec::new();
+        if let Some(Expr {
+            kind: ExprKind::List(items),
+            ..
+        }) = labels_arg
+        {
+            for it in items {
+                if let ExprKind::Text { value: s, .. } = &it.kind {
+                    labels.push(s.clone());
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::PrivacyError,
+                            "`bucket` labels must be compile-time string literals",
+                        )
+                        .with_span(it.span),
+                    );
+                }
+            }
+        } else {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    "`bucket` requires `labels: [...]` list literal",
+                )
+                .with_span(span),
+            );
+        }
+        if labels.len() != cuts.len() + 1 {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!(
+                        "`bucket` requires `labels.len() == cuts.len() + 1` (got {} labels for {} cuts)",
+                        labels.len(),
+                        cuts.len()
+                    ),
+                )
+                .with_span(span),
+            );
+        }
+        let spec = ColSpec {
+            name: out_col.to_string(),
+            ty: ScalarTy::Text,
+            // Stays tagged on individual rows; clears under `suppress_small_groups` because `bucketed = true`!
+            tags: src_col.tags.clone(),
+            bucketed: true,
+            agg_kind: AggKind::Raw,
+        };
+        Some((
+            ExecDeriveItem::BucketCol {
+                name: out_col.to_string(),
+                source,
+                cuts,
+                labels,
+            },
+            spec,
+        ))
+    }
+
+    fn check_summarize_verb(
+        &mut self,
+        in_plan: ExecPlan,
+        in_tt: TableTy,
+        outer_tags: TagSet,
+        args: &[CallArg],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+    ) -> (ExecExpr, LTy) {
+        let group_keys = in_tt.grouped_by.clone().unwrap_or_default();
+        let mut out_cols = Vec::new();
+        let mut base_ctx = in_tt.row_tags.clone();
+        for gk in &group_keys {
+            if let Some(c) = in_tt.find_col(gk) {
+                base_ctx = base_ctx.union(&c.tags);
+                out_cols.push(ColSpec {
+                    name: c.name.clone(),
+                    ty: c.ty.clone(),
+                    tags: c.tags.clone(),
+                    bucketed: c.bucketed,
+                    agg_kind: AggKind::GroupKey,
+                });
+            }
+        }
+
+        let mut agg_items = Vec::new();
+        let mut post_derives: Vec<ExecDeriveItem> = Vec::new();
+        let mut post_drops: Vec<Ident> = Vec::new();
+        let mut distinct_key: Option<Ident> = None;
+
+        for arg in args {
+            let CallArg::Named { name, value, .. } = arg else {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`summarize` expects `name: agg(...)` arguments",
+                    )
+                    .with_span(arg.span()),
+                );
+                continue;
+            };
+            // Support post-aggregate coalesce: `base_mean: mean(.p95_ms) ?? 0.0`!
+            if let ExprKind::Binary {
+                op: BinOp::Coalesce,
+                lhs,
+                rhs,
+            } = &value.kind
+            {
+                let tmp_col = self.fresh("agg");
+                if let Some((item, spec, dk)) =
+                    self.check_agg_call(&tmp_col, lhs, &in_tt, &base_ctx, env)
+                {
+                    if distinct_key.is_none() {
+                        distinct_key = dk;
+                    }
+                    let inner_ty = match &spec.ty {
+                        ScalarTy::Option(t) => t.as_ref().clone(),
+                        other => other.clone(),
+                    };
+                    let inner_ty_ty = inner_ty.to_ty();
+                    let (def_re, _, def_tags) =
+                        self.check_row_expr(rhs, &out_cols, env, Some(&inner_ty_ty), false);
+                    let final_spec = ColSpec {
+                        name: name.name.clone(),
+                        ty: inner_ty,
+                        tags: spec.tags.union(&def_tags),
+                        bucketed: false,
+                        agg_kind: spec.agg_kind,
+                    };
+                    agg_items.push(item);
+                    post_derives.push(ExecDeriveItem::ColExpr {
+                        name: name.name.clone(),
+                        expr: Box::new(ExecRowExpr::Coalesce {
+                            opt_expr: Box::new(ExecRowExpr::Col(tmp_col.clone())),
+                            default_expr: Box::new(def_re),
+                        }),
+                    });
+                    post_drops.push(tmp_col);
+                    out_cols.push(final_spec);
+                }
+                continue;
+            }
+
+            if let Some((item, spec, dk)) =
+                self.check_agg_call(&name.name, value, &in_tt, &base_ctx, env)
+            {
+                if distinct_key.is_none() {
+                    distinct_key = dk;
+                }
+                agg_items.push(item);
+                out_cols.push(spec);
+            }
+        }
+
+        if agg_items.is_empty() {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    "`summarize` requires at least one aggregate",
+                )
+                .with_span(span),
+            );
+        }
+
+        let mut plan = ExecPlan::Summarize {
+            input: Box::new(in_plan),
+            aggs: agg_items,
+            distinct_key: distinct_key.clone(),
+        };
+        if !post_derives.is_empty() {
+            plan = ExecPlan::Derive {
+                input: Box::new(plan),
+                items: post_derives,
+            };
+            plan = ExecPlan::Drop {
+                input: Box::new(plan),
+                cols: post_drops,
+            };
+        }
+
+        let dk_tags = distinct_key
+            .as_deref()
+            .and_then(|dk| in_tt.find_col(dk).map(|c| c.tags.clone()))
+            .unwrap_or_default();
+        let out_tt = TableTy {
+            cols: out_cols,
+            row_tags: base_ctx.union(&dk_tags),
+            order_tags: TagSet::empty(),
+            grouped_by: Some(group_keys),
+            summarized: true,
+            distinct_by: distinct_key,
+        };
+        (
+            ExecExpr::Rel(Box::new(plan)),
+            LTy::new(Ty::Table(out_tt), outer_tags),
+        )
+    }
+
+    fn check_agg_call(
+        &mut self,
+        out_name: &str,
+        expr: &Expr,
+        in_tt: &TableTy,
+        base_ctx: &TagSet,
+        env: &HashMap<Ident, VarBinding>,
+    ) -> Option<(ExecAggItem, ColSpec, Option<Ident>)> {
+        let ExprKind::Call { callee, args } = &expr.kind else {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    "`summarize` entries must be aggregate calls (`count`, `sum`, `mean`, ...)",
+                )
+                .with_span(expr.span),
+            );
+            return None;
+        };
+        let ExprKind::Ident(agg_name) = &callee.kind else {
+            self.diags.push(
+                Diagnostic::error(DiagCode::TypeError, "invalid aggregate name")
+                    .with_span(callee.span),
+            );
+            return None;
+        };
+
+        if agg_name == "count" {
+            return Some((
+                ExecAggItem {
+                    name: out_name.to_string(),
+                    op: AggOp::Count,
+                    arg: None,
+                },
+                ColSpec {
+                    name: out_name.to_string(),
+                    ty: ScalarTy::Int,
+                    tags: base_ctx.clone(),
+                    bucketed: false,
+                    agg_kind: AggKind::Blending,
+                },
+                None,
+            ));
+        }
+
+        let Some(CallArg::Positional(arg0)) = args.first() else {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!("`{agg_name}` requires a column/expression argument"),
+                )
+                .with_span(expr.span),
+            );
+            return None;
+        };
+        let (re, re_ty, re_tags) = self.check_row_expr(arg0, &in_tt.cols, env, None, false);
+        let s_ty = re_ty.to_scalar_ty().unwrap_or(ScalarTy::Unit);
+        let distinct_col = if agg_name == "count_distinct" {
+            if let ExecRowExpr::Col(c) = &re {
+                Some(c.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let (op, out_ty) = match agg_name.as_str() {
+            "count_distinct" => (AggOp::CountDistinct, ScalarTy::Int),
+            "sum" => {
+                let num = numeric_core_of_scalar(&s_ty).unwrap_or(ScalarTy::Int);
+                (AggOp::Sum, num)
+            }
+            "mean" | "median" => {
+                let op = if agg_name == "mean" {
+                    AggOp::Mean
+                } else {
+                    AggOp::Median
+                };
+                let out_t = match numeric_core_of_scalar(&s_ty) {
+                    Some(ScalarTy::Int) | None => ScalarTy::Option(Box::new(ScalarTy::Float)),
+                    Some(num) => ScalarTy::Option(Box::new(num)),
+                };
+                (op, out_t)
+            }
+            "stddev" | "variance" => {
+                let op = if agg_name == "stddev" {
+                    AggOp::Stddev
+                } else {
+                    AggOp::Variance
+                };
+                (op, ScalarTy::Option(Box::new(ScalarTy::Float)))
+            }
+            "percentile" => {
+                let q = match args.get(1) {
+                    Some(CallArg::Positional(Expr {
+                        kind: ExprKind::Decimal(raw),
+                        ..
+                    })) => raw.parse::<f64>().unwrap_or(0.5),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`percentile(.col, q)` requires a float quantile `q` in [0.0, 1.0]",
+                            )
+                            .with_span(expr.span),
+                        );
+                        0.5
+                    }
+                };
+                (
+                    AggOp::Percentile(Float64::from_f64(q)),
+                    ScalarTy::Option(Box::new(ScalarTy::Float)),
+                )
+            }
+            "min" => (AggOp::Min, ensure_option_scalar(&s_ty)),
+            "max" => (AggOp::Max, ensure_option_scalar(&s_ty)),
+            "first" => (AggOp::First, ensure_option_scalar(&s_ty)),
+            "last" => (AggOp::Last, ensure_option_scalar(&s_ty)),
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("unknown aggregate `{agg_name}`"),
+                    )
+                    .with_span(callee.span),
+                );
+                return None;
+            }
+        };
+
+        let agg_kind = if op.is_blending() {
+            AggKind::Blending
+        } else {
+            AggKind::NonBlending
+        };
+        let extra_order = if op.is_order_sensitive() {
+            &in_tt.order_tags
+        } else {
+            &TagSet::empty()
+        };
+        let col_tags = re_tags.union(base_ctx).union(extra_order);
+        Some((
+            ExecAggItem {
+                name: out_name.to_string(),
+                op,
+                arg: Some(re),
+            },
+            ColSpec {
+                name: out_name.to_string(),
+                ty: out_ty,
+                tags: col_tags,
+                bucketed: false,
+                agg_kind,
+            },
+            distinct_col,
+        ))
+    }
+
+    fn check_suppress_verb(
+        &mut self,
+        in_plan: ExecPlan,
+        in_tt: TableTy,
+        outer_tags: TagSet,
+        args: &[CallArg],
+        span: Span,
+    ) -> (ExecExpr, LTy) {
+        if !in_tt.summarized {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::PrivacyError,
+                    "`suppress_small_groups` requires a summarized table (after `summarize(...)`)",
+                )
+                .with_span(span),
+            );
+        }
+        let mut min_k: u64 = 5;
+        let mut distinct_by: Option<Ident> = None;
+        let mut mode = SuppressMode::Drop;
+        for arg in args {
+            if let CallArg::Named { name, value, .. } = arg {
+                match name.name.as_str() {
+                    "min" => {
+                        if let ExprKind::Int(raw) = &value.kind {
+                            min_k = raw.replace('_', "").parse().unwrap_or(0);
+                        } else {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::PrivacyError,
+                                    "`min:` must be a constant integer",
+                                )
+                                .with_span(value.span),
+                            );
+                        }
+                    }
+                    "distinct_by" => {
+                        if let ExprKind::DotField(m) = &value.kind {
+                            distinct_by = Some(m.name.clone());
+                        }
+                    }
+                    "mode" => {
+                        if let ExprKind::Atom(a) = &value.kind {
+                            match a.as_str() {
+                                "drop" => mode = SuppressMode::Drop,
+                                "mask" => mode = SuppressMode::MaskComplementary,
+                                other => self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::PrivacyError,
+                                        format!("unknown `suppress_small_groups` mode `:{other}` (expected `:drop` or `:mask`)"),
+                                    )
+                                    .with_span(value.span),
+                                ),
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let policy_floor = self
+            .resolved
+            .policy
+            .as_ref()
+            .and_then(|p| p.min_group_size.to_u64())
+            .unwrap_or(5)
+            .max(5);
+        if min_k < policy_floor {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::PrivacyError,
+                    format!(
+                        "`suppress_small_groups(min: {min_k})` is below the required minimum group floor ({policy_floor})"
+                    ),
+                )
+                .with_span(span),
+            );
+        }
+        if let Some(ref req_dk) = distinct_by
+            && in_tt.distinct_by.as_ref() != Some(req_dk)
+        {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::PrivacyError,
+                    format!(
+                        "`suppress_small_groups(distinct_by: .{req_dk})` requires a matching `count_distinct(.{req_dk})` in `summarize`"
+                    ),
+                )
+                .with_span(span),
+            );
+        }
+
+        // Apply exact declassification semantics matching `src/core/check.rs` and `privacy.md`:
+        // Clears `order_tags`, `Blending` aggregates, and `bucketed` `GroupKey`s.
+        // Keeps non-bucketed `GroupKey` tags (in both column and `row_tags`) and `NonBlending`
+        // (`median`, `percentile`, `min`, `max`, `first`, `last`) tagged, resetting `agg_kind` to `Raw`.
+        let raw_key_tags = TagSet::union_list(
+            in_tt
+                .cols
+                .iter()
+                .filter(|c| c.agg_kind == AggKind::GroupKey && !c.bucketed)
+                .map(|c| &c.tags),
+        );
+        let mut out_cols = Vec::with_capacity(in_tt.cols.len());
+        for c in &in_tt.cols {
+            let new_tags = match c.agg_kind {
+                AggKind::Blending => TagSet::empty(),
+                AggKind::GroupKey if c.bucketed => TagSet::empty(),
+                AggKind::GroupKey | AggKind::NonBlending | AggKind::Raw => c.tags.clone(),
+            };
+            let new_ty = match (mode, c.agg_kind) {
+                (SuppressMode::MaskComplementary, AggKind::Blending | AggKind::NonBlending) => {
+                    ensure_option_scalar(&c.ty)
+                }
+                _ => c.ty.clone(),
+            };
+            out_cols.push(ColSpec {
+                name: c.name.clone(),
+                ty: new_ty,
+                tags: new_tags,
+                bucketed: false,
+                agg_kind: AggKind::Raw,
+            });
+        }
+        let out_tt = TableTy {
+            cols: out_cols,
+            row_tags: raw_key_tags,
+            order_tags: TagSet::empty(),
+            grouped_by: None,
+            summarized: false,
+            distinct_by: None,
+        };
+        (
+            ExecExpr::Rel(Box::new(ExecPlan::SuppressSmallGroups {
+                input: Box::new(in_plan),
+                min_k: BigInt::from(min_k),
+                distinct_by,
+                mode,
+            })),
+            LTy::new(Ty::Table(out_tt), outer_tags),
+        )
+    }
+
+    fn check_window_verb(
+        &mut self,
+        in_plan: ExecPlan,
+        in_tt: TableTy,
+        outer_tags: TagSet,
+        args: &[CallArg],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+    ) -> (ExecExpr, LTy) {
+        let mut over = Vec::new();
+        let mut order = Vec::new();
+        let mut win_named: Vec<(&ast::SpannedName, &Expr)> = Vec::new();
+
+        for arg in args {
+            let CallArg::Named { name, value, .. } = arg else {
+                continue;
+            };
+            match name.name.as_str() {
+                "over" => {
+                    if let ExprKind::List(items) = &value.kind {
+                        for it in items {
+                            if let ExprKind::DotField(m) = &it.kind {
+                                over.push(m.name.clone());
+                            }
+                        }
+                    } else if let ExprKind::DotField(m) = &value.kind {
+                        over.push(m.name.clone());
+                    }
+                }
+                "order" => {
+                    if let ExprKind::DotField(m) = &value.kind {
+                        order.push((m.name.clone(), SortDir::Asc));
+                    } else if let ExprKind::List(items) = &value.kind {
+                        for it in items {
+                            if let ExprKind::DotField(m) = &it.kind {
+                                order.push((m.name.clone(), SortDir::Asc));
+                            }
+                        }
+                    }
+                }
+                _ => win_named.push((name, value)),
+            }
+        }
+
+        let mut ctx_tags = in_tt.row_tags.clone();
+        for c in &over {
+            if let Some(cs) = in_tt.find_col(c) {
+                ctx_tags = ctx_tags.union(&cs.tags);
+            }
+        }
+        for (c, _) in &order {
+            if let Some(cs) = in_tt.find_col(c) {
+                ctx_tags = ctx_tags.union(&cs.tags);
+            }
+        }
+
+        let mut out_tt = in_tt;
+        let mut win_items = Vec::new();
+        let mut post_derives = Vec::new();
+        let mut post_drops = Vec::new();
+
+        for (name, val_expr) in win_named {
+            // Direct window function call (`rolling_mean(...)`, `lag(...)`, `row_number()`, ...)
+            if let Some((wfn, wty, wtags)) =
+                self.try_parse_window_call(val_expr, &out_tt, &ctx_tags)
+            {
+                win_items.push(WindowItem {
+                    name: name.name.clone(),
+                    win_fn: wfn,
+                    over: over.clone(),
+                    order: order.clone(),
+                });
+                upsert_col(
+                    &mut out_tt.cols,
+                    ColSpec {
+                        name: name.name.clone(),
+                        ty: wty,
+                        tags: wtags,
+                        bucketed: false,
+                        agg_kind: AggKind::Raw,
+                    },
+                );
+                continue;
+            }
+            // Compound expression around a window call (e.g. `.students - lag(.students, 1)`)!
+            if let ExprKind::Binary {
+                op: BinOp::Sub,
+                lhs,
+                rhs,
+            } = &val_expr.kind
+                && let Some((wfn, wty, wtags)) = self.try_parse_window_call(rhs, &out_tt, &ctx_tags)
+            {
+                let tmp = self.fresh("win");
+                win_items.push(WindowItem {
+                    name: tmp.clone(),
+                    win_fn: wfn,
+                    over: over.clone(),
+                    order: order.clone(),
+                });
+                let mut aug_cols = out_tt.cols.clone();
+                aug_cols.push(ColSpec {
+                    name: tmp.clone(),
+                    ty: wty.clone(),
+                    tags: wtags.clone(),
+                    bucketed: false,
+                    agg_kind: AggKind::Raw,
+                });
+                let (lre, lty, ltags) = self.check_row_expr(lhs, &aug_cols, env, None, false);
+                let (opt_op, res_ty) = match lty {
+                    Ty::Int => (
+                        ExecPrimOp::OptSubInt,
+                        ScalarTy::Option(Box::new(ScalarTy::Int)),
+                    ),
+                    Ty::Decimal => (
+                        ExecPrimOp::OptSubDec,
+                        ScalarTy::Option(Box::new(ScalarTy::Decimal)),
+                    ),
+                    _ => (
+                        ExecPrimOp::OptSubFloat,
+                        ScalarTy::Option(Box::new(ScalarTy::Float)),
+                    ),
+                };
+                post_derives.push(ExecDeriveItem::ColExpr {
+                    name: name.name.clone(),
+                    expr: Box::new(ExecRowExpr::Prim {
+                        op: opt_op,
+                        args: vec![lre, ExecRowExpr::Col(tmp.clone())],
+                    }),
+                });
+                post_drops.push(tmp);
+                upsert_col(
+                    &mut out_tt.cols,
+                    ColSpec {
+                        name: name.name.clone(),
+                        ty: res_ty,
+                        tags: ltags.union(&wtags),
+                        bucketed: false,
+                        agg_kind: AggKind::Raw,
+                    },
+                );
+                continue;
+            }
+
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!("unsupported window expression for `{}`", name.name),
+                )
+                .with_span(span),
+            );
+        }
+
+        let mut plan = ExecPlan::Window {
+            input: Box::new(in_plan),
+            items: win_items,
+        };
+        if !post_derives.is_empty() {
+            plan = ExecPlan::Derive {
+                input: Box::new(plan),
+                items: post_derives,
+            };
+            plan = ExecPlan::Drop {
+                input: Box::new(plan),
+                cols: post_drops,
+            };
+        }
+        (
+            ExecExpr::Rel(Box::new(plan)),
+            LTy::new(Ty::Table(out_tt), outer_tags),
+        )
+    }
+
+    fn try_parse_window_call(
+        &self,
+        expr: &Expr,
+        in_tt: &TableTy,
+        ctx_tags: &TagSet,
+    ) -> Option<(WindowFn, ScalarTy, TagSet)> {
+        let ExprKind::Call { callee, args } = &expr.kind else {
+            return None;
+        };
+        let ExprKind::Ident(wname) = &callee.kind else {
+            return None;
+        };
+        match wname.as_str() {
+            "row_number" => Some((WindowFn::RowNumber, ScalarTy::Int, ctx_tags.clone())),
+            "lag" | "lead" => {
+                let col = match args.first()? {
+                    CallArg::Positional(Expr {
+                        kind: ExprKind::DotField(m),
+                        ..
+                    }) => m.name.clone(),
+                    _ => return None,
+                };
+                let offset = match args.get(1) {
+                    Some(CallArg::Positional(Expr {
+                        kind: ExprKind::Int(raw),
+                        ..
+                    })) => raw.replace('_', "").parse::<u64>().unwrap_or(1),
+                    _ => 1,
+                };
+                let c = in_tt.find_col(&col)?;
+                let wfn = if wname == "lag" {
+                    WindowFn::Lag {
+                        col,
+                        offset: BigInt::from(offset),
+                    }
+                } else {
+                    WindowFn::Lead {
+                        col,
+                        offset: BigInt::from(offset),
+                    }
+                };
+                Some((wfn, ensure_option_scalar(&c.ty), c.tags.union(ctx_tags)))
+            }
+            "rank" => {
+                let col = match args.first()? {
+                    CallArg::Positional(Expr {
+                        kind: ExprKind::DotField(m),
+                        ..
+                    }) => m.name.clone(),
+                    _ => return None,
+                };
+                let c = in_tt.find_col(&col)?;
+                Some((
+                    WindowFn::Rank { col },
+                    ScalarTy::Int,
+                    c.tags.union(ctx_tags),
+                ))
+            }
+            "running_sum" => {
+                let col = match args.first()? {
+                    CallArg::Positional(Expr {
+                        kind: ExprKind::DotField(m),
+                        ..
+                    }) => m.name.clone(),
+                    _ => return None,
+                };
+                let c = in_tt.find_col(&col)?;
+                let num = numeric_core_of_scalar(&c.ty)?;
+                Some((WindowFn::RunningSum { col }, num, c.tags.union(ctx_tags)))
+            }
+            "rolling_mean" => {
+                let col = match args.first()? {
+                    CallArg::Positional(Expr {
+                        kind: ExprKind::DotField(m),
+                        ..
+                    }) => m.name.clone(),
+                    _ => return None,
+                };
+                let window_size = match args.get(1) {
+                    Some(
+                        CallArg::Positional(Expr {
+                            kind: ExprKind::Int(raw),
+                            ..
+                        })
+                        | CallArg::Named {
+                            value:
+                                Expr {
+                                    kind: ExprKind::Int(raw),
+                                    ..
+                                },
+                            ..
+                        },
+                    ) => raw.replace('_', "").parse::<u64>().unwrap_or(1),
+                    _ => 1,
+                };
+                let c = in_tt.find_col(&col)?;
+                numeric_core_of_scalar(&c.ty)?;
+                Some((
+                    WindowFn::RollingMean {
+                        col,
+                        window_size: BigInt::from(window_size),
+                    },
+                    ScalarTy::Option(Box::new(ScalarTy::Float)),
+                    c.tags.union(ctx_tags),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn check_fill_gaps_verb(
+        &mut self,
+        in_plan: ExecPlan,
+        in_tt: TableTy,
+        outer_tags: TagSet,
+        args: &[CallArg],
+        span: Span,
+    ) -> (ExecExpr, LTy) {
+        let col = match args.first() {
+            Some(CallArg::Positional(Expr {
+                kind: ExprKind::DotField(m),
+                ..
+            })) => m.name.clone(),
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`fill_gaps` expects `.time_col, every: duration, ...`",
+                    )
+                    .with_span(span),
+                );
+                String::new()
+            }
+        };
+        let mut step_micros: i64 = MICROS_PER_MINUTE;
+        let mut over = Vec::new();
+        let mut fill = Vec::new();
+
+        for arg in args {
+            let CallArg::Named { name, value, .. } = arg else {
+                continue;
+            };
+            match name.name.as_str() {
+                "every" => {
+                    if let Some(us) = eval_const_duration_micros(value) {
+                        step_micros = us;
+                    }
+                }
+                "over" => {
+                    if let ExprKind::List(items) = &value.kind {
+                        for it in items {
+                            if let ExprKind::DotField(m) = &it.kind {
+                                over.push(m.name.clone());
+                            }
+                        }
+                    }
+                }
+                "fill" => {
+                    if let ExprKind::Map(entries) = &value.kind {
+                        for (k, v) in entries {
+                            let cname = match &k.kind {
+                                ExprKind::Ident(s) => s.clone(),
+                                ExprKind::Text { value: s, .. } => s.clone(),
+                                _ => continue,
+                            };
+                            let target_ty = in_tt.find_col(&cname).map(|c| match &c.ty {
+                                ScalarTy::Option(inner) => inner.to_ty(),
+                                other => other.to_ty(),
+                            });
+                            let (ve, _) = self.check_expr(
+                                v,
+                                &HashMap::new(),
+                                target_ty.as_ref(),
+                                &TagSet::empty(),
+                                LocalScopeKind::Normal,
+                                None,
+                            );
+                            if let ExecExpr::Lit(l) = ve {
+                                fill.push((cname, l));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Columns NOT in `col`, `over`, or `fill` become `Option(T)` for synthesized gap rows.
+        let mut out_tt = in_tt;
+        for c in &mut out_tt.cols {
+            let is_key = c.name == col || over.contains(&c.name);
+            let is_filled = fill.iter().any(|(fnm, _)| *fnm == c.name);
+            if !is_key && !is_filled {
+                c.ty = ensure_option_scalar(&c.ty);
+            }
+        }
+        (
+            ExecExpr::Rel(Box::new(ExecPlan::FillGaps {
+                input: Box::new(in_plan),
+                col,
+                step_micros: BigInt::from(step_micros),
+                over,
+                fill,
+            })),
+            LTy::new(Ty::Table(out_tt), outer_tags),
+        )
+    }
+
+    fn check_pivot_wider_verb(
+        &mut self,
+        in_plan: ExecPlan,
+        in_tt: TableTy,
+        outer_tags: TagSet,
+        args: &[CallArg],
+        span: Span,
+    ) -> (ExecExpr, LTy) {
+        let mut names_from = String::new();
+        let mut values_from = String::new();
+        let mut static_cols = Vec::new();
+        let mut fill_expr: Option<&Expr> = None;
+
+        for arg in args {
+            let CallArg::Named { name, value, .. } = arg else {
+                continue;
+            };
+            match name.name.as_str() {
+                "names_from" => {
+                    if let ExprKind::DotField(m) = &value.kind {
+                        names_from = m.name.clone();
+                    }
+                }
+                "values_from" => {
+                    if let ExprKind::DotField(m) = &value.kind {
+                        values_from = m.name.clone();
+                    }
+                }
+                "columns" => {
+                    if let ExprKind::List(items) = &value.kind {
+                        for it in items {
+                            if let ExprKind::Text { value: s, .. } = &it.kind {
+                                static_cols.push(s.clone());
+                            }
+                        }
+                    }
+                }
+                "fill" => fill_expr = Some(value),
+                _ => {}
+            }
+        }
+
+        let val_col = in_tt.find_col(&values_from).cloned();
+        let names_col = in_tt.find_col(&names_from).cloned();
+        let (val_ty, val_tags) = match (&val_col, &names_col) {
+            (Some(vc), Some(nc)) => (vc.ty.clone(), vc.tags.union(&nc.tags)),
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`pivot_wider` requires valid `names_from:` and `values_from:` columns",
+                    )
+                    .with_span(span),
+                );
+                (ScalarTy::Decimal, TagSet::empty())
+            }
+        };
+        let fill_lit = if let Some(fe) = fill_expr {
+            let t = val_ty.to_ty();
+            let (e, _) = self.check_expr(
+                fe,
+                &HashMap::new(),
+                Some(&t),
+                &TagSet::empty(),
+                LocalScopeKind::Normal,
+                None,
+            );
+            if let ExecExpr::Lit(l) = e {
+                l
+            } else {
+                Literal::Unit
+            }
+        } else {
+            Literal::NoneLit(val_ty.to_ty())
+        };
+
+        let mut out_cols: Vec<ColSpec> = in_tt
+            .cols
+            .iter()
+            .filter(|c| c.name != names_from && c.name != values_from)
+            .cloned()
+            .collect();
+        for sc in &static_cols {
+            out_cols.push(ColSpec {
+                name: sc.clone(),
+                ty: val_ty.clone(),
+                tags: val_tags.clone(),
+                bucketed: false,
+                agg_kind: AggKind::Raw,
+            });
+        }
+        let out_tt = TableTy {
+            cols: out_cols,
+            row_tags: in_tt.row_tags,
+            order_tags: TagSet::empty(),
+            grouped_by: None,
+            summarized: false,
+            distinct_by: None,
+        };
+        (
+            ExecExpr::Rel(Box::new(ExecPlan::PivotWider {
+                input: Box::new(in_plan),
+                names_from,
+                values_from,
+                static_cols,
+                fill: fill_lit,
+            })),
+            LTy::new(Ty::Table(out_tt), outer_tags),
+        )
+    }
+
+    fn check_crosstab_verb(
+        &mut self,
+        in_plan: ExecPlan,
+        in_tt: TableTy,
+        outer_tags: TagSet,
+        args: &[CallArg],
+        _span: Span,
+    ) -> (ExecExpr, LTy) {
+        let mut rows_col = String::new();
+        let mut cols_col = String::new();
+        let mut values_col = String::new();
+        let mut fill = Literal::int(0i64);
+        for arg in args {
+            let CallArg::Named { name, value, .. } = arg else {
+                continue;
+            };
+            match name.name.as_str() {
+                "rows" => {
+                    if let ExprKind::DotField(m) = &value.kind {
+                        rows_col = m.name.clone();
+                    }
+                }
+                "cols" => {
+                    if let ExprKind::DotField(m) = &value.kind {
+                        cols_col = m.name.clone();
+                    }
+                }
+                "values" => {
+                    if let ExprKind::DotField(m) = &value.kind {
+                        values_col = m.name.clone();
+                    }
+                }
+                "fill" => {
+                    let (e, _) = self.check_expr(
+                        value,
+                        &HashMap::new(),
+                        None,
+                        &TagSet::empty(),
+                        LocalScopeKind::Normal,
+                        None,
+                    );
+                    if let ExecExpr::Lit(l) = e {
+                        fill = l;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let tags = in_tt.total_tags().union(&outer_tags);
+        (
+            ExecExpr::Rel(Box::new(ExecPlan::Crosstab {
+                input: Box::new(in_plan),
+                rows_col,
+                cols_col,
+                values_col,
+                fill,
+            })),
+            LTy::new(Ty::DynamicTable(tags), TagSet::empty()),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "join verb validates keys, column collisions, suffixes, and tag propagation"
+    )]
+    fn check_join_verb(
+        &mut self,
+        kind: JoinKind,
+        left_plan: ExecPlan,
+        left_tt: TableTy,
+        outer_tags: TagSet,
+        args: &[CallArg],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        let Some(CallArg::Positional(right_e)) = args.first() else {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    "join requires a right-hand table argument",
+                )
+                .with_span(span),
+            );
+            return (
+                ExecExpr::Rel(Box::new(left_plan)),
+                LTy::new(Ty::Table(left_tt), outer_tags),
+            );
+        };
+        let (rex, rlty) = self.check_expr(right_e, env, None, pc, scope, ret_ctx);
+        let right_tt = match &rlty.ty {
+            Ty::Table(tt) => tt.clone(),
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "join right-hand operand must be a `Table`",
+                    )
+                    .with_span(right_e.span),
+                );
+                return (
+                    ExecExpr::Rel(Box::new(left_plan)),
+                    LTy::new(Ty::Table(left_tt), outer_tags),
+                );
+            }
+        };
+
+        let mut join_on = JoinOn::SameKeys(Vec::new());
+        let mut suffixes: Suffixes = None;
+        for arg in &args[1..] {
+            let CallArg::Named { name, value, .. } = arg else {
+                continue;
+            };
+            match name.name.as_str() {
+                "on" => {
+                    join_on = self.parse_join_on(value);
+                }
+                "suffixes" => {
+                    if let ExprKind::Tuple(ts) = &value.kind
+                        && ts.len() == 2
+                        && let (ExprKind::Text { value: s1, .. }, ExprKind::Text { value: s2, .. }) =
+                            (&ts[0].kind, &ts[1].kind)
+                    {
+                        suffixes = Some((s1.clone(), s2.clone()));
+                    } else {
+                        self.diags.push(
+                            Diagnostic::error(DiagCode::TypeError, "`suffixes:` must be a tuple of 2 strings, e.g. `(\"_left\", \"_right\")`")
+                                .with_span(value.span),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let key_pairs: Vec<(Ident, Ident)> = match &join_on {
+            JoinOn::SameKeys(ks) => ks.iter().map(|k| (k.clone(), k.clone())).collect(),
+            JoinOn::Pairs(ps) => ps.clone(),
+        };
+        let mut key_tags = TagSet::empty();
+        for (lk, rk) in &key_pairs {
+            match (left_tt.find_col(lk), right_tt.find_col(rk)) {
+                (Some(lc), Some(rc)) => {
+                    if lc.ty != rc.ty {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("join key type mismatch between `.{lk}` and `.{rk}`"),
+                            )
+                            .with_span(span),
+                        );
+                    }
+                    key_tags = key_tags.union(&lc.tags).union(&rc.tags);
+                }
+                (None, _) => self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("unknown left join key `.{lk}`"),
+                    )
+                    .with_span(span),
+                ),
+                (_, None) => self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("unknown right join key `.{rk}`"),
+                    )
+                    .with_span(span),
+                ),
+            }
+        }
+
+        let out_row_tags = left_tt.row_tags.union(&right_tt.row_tags).union(&key_tags);
+
+        let out_cols = match kind {
+            JoinKind::Semi | JoinKind::Anti => left_tt.cols.clone(),
+            _ => {
+                let is_left = matches!(kind, JoinKind::LeftOne | JoinKind::LeftManyToOne);
+                let right_skip: HashSet<&str> = match &join_on {
+                    JoinOn::SameKeys(ks) => ks.iter().map(String::as_str).collect(),
+                    JoinOn::Pairs(_) => HashSet::new(),
+                };
+                let left_names: HashSet<&str> =
+                    left_tt.cols.iter().map(|c| c.name.as_str()).collect();
+                let mut collisions = HashSet::new();
+                for rc in &right_tt.cols {
+                    if !right_skip.contains(rc.name.as_str())
+                        && left_names.contains(rc.name.as_str())
+                    {
+                        collisions.insert(rc.name.clone());
+                    }
+                }
+                if !collisions.is_empty() && suffixes.is_none() {
+                    let mut names: Vec<String> = collisions.into_iter().collect();
+                    names.sort();
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!(
+                                "overlapping non-key join column(s): {}; pass `suffixes: (\"_left\", \"_right\")` or `select`/`drop` first",
+                                names.join(", ")
+                            ),
+                        )
+                        .with_span(span),
+                    );
+                    left_tt.cols.clone()
+                } else {
+                    let mut cols = Vec::new();
+                    for lc in &left_tt.cols {
+                        let mut c = lc.clone();
+                        if collisions.contains(&c.name)
+                            && let Some((ls, _)) = &suffixes
+                        {
+                            c.name.push_str(ls);
+                        }
+                        cols.push(c);
+                    }
+                    for rc in &right_tt.cols {
+                        if right_skip.contains(rc.name.as_str()) {
+                            continue;
+                        }
+                        let mut c = rc.clone();
+                        if collisions.contains(&c.name)
+                            && let Some((_, rs)) = &suffixes
+                        {
+                            c.name.push_str(rs);
+                        }
+                        if is_left {
+                            c.ty = ensure_option_scalar(&c.ty);
+                        }
+                        cols.push(c);
+                    }
+                    cols
+                }
+            }
+        };
+
+        let out_tt = TableTy {
+            cols: out_cols,
+            row_tags: out_row_tags,
+            order_tags: TagSet::empty(),
+            grouped_by: None,
+            summarized: false,
+            distinct_by: None,
+        };
+        let right_plan = expr_to_plan(rex);
+        (
+            ExecExpr::Rel(Box::new(ExecPlan::Join {
+                kind,
+                left: Box::new(left_plan),
+                right: Box::new(right_plan),
+                on: join_on,
+                suffixes,
+            })),
+            LTy::new(Ty::Table(out_tt), outer_tags.union(&rlty.tags)),
+        )
+    }
+
+    fn parse_join_on(&mut self, expr: &Expr) -> JoinOn {
+        match &expr.kind {
+            ExprKind::DotField(m) => JoinOn::SameKeys(vec![m.name.clone()]),
+            ExprKind::List(items) => {
+                let mut ks = Vec::new();
+                for it in items {
+                    if let ExprKind::DotField(m) = &it.kind {
+                        ks.push(m.name.clone());
+                    }
+                }
+                JoinOn::SameKeys(ks)
+            }
+            ExprKind::Binary {
+                op: BinOp::Eq,
+                lhs,
+                rhs,
+            } => {
+                if let (
+                    ExprKind::Field {
+                        receiver: lr,
+                        member: lm,
+                    },
+                    ExprKind::Field {
+                        receiver: rr,
+                        member: rm,
+                    },
+                ) = (&lhs.kind, &rhs.kind)
+                    && matches!(&lr.kind, ExprKind::Ident(s) if s == "left")
+                    && matches!(&rr.kind, ExprKind::Ident(s) if s == "right")
+                {
+                    return JoinOn::Pairs(vec![(lm.name.clone(), rm.name.clone())]);
+                }
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "explicit join key must have form `left.a == right.b`",
+                    )
+                    .with_span(expr.span),
+                );
+                JoinOn::SameKeys(Vec::new())
+            }
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`on:` expects `.key`, `[.a, .b]`, or `left.a == right.b`",
+                    )
+                    .with_span(expr.span),
+                );
+                JoinOn::SameKeys(Vec::new())
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Field Access & Calls (Methods, Capabilities, Stdlib, User Functions)
+    // -----------------------------------------------------------------------
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "field access checks struct fields, table-row fields, properties, and duration units"
+    )]
+    fn check_field_access(
+        &mut self,
+        receiver: &Expr,
+        member: &ast::SpannedName,
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        let (rex, rlty) = self.check_expr(receiver, env, None, pc, scope, ret_ctx);
+
+        // Duration suffixes on Int (`5.minutes`, `30.days`, `10.seconds`, `2.hours`).
+        if rlty.ty == Ty::Int {
+            let mult = match member.name.as_str() {
+                "seconds" => Some(MICROS_PER_SECOND),
+                "minutes" => Some(MICROS_PER_MINUTE),
+                "hours" => Some(MICROS_PER_HOUR),
+                "days" => Some(MICROS_PER_DAY),
+                _ => None,
+            };
+            if let Some(m) = mult {
+                if let ExecExpr::Lit(Literal::Int(n)) = &rex
+                    && let Some(v) = n.to_i64()
+                {
+                    return (
+                        ExecExpr::Lit(Literal::duration(v.saturating_mul(m))),
+                        LTy::new(Ty::Duration, rlty.tags),
+                    );
+                }
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::MulInt),
+                        args: vec![rex, ExecExpr::Lit(Literal::int(m))],
+                    },
+                    LTy::new(Ty::Duration, rlty.tags),
+                );
+            }
+            if member.name == "to_decimal" {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::IntToDec),
+                        args: vec![rex],
+                    },
+                    LTy::new(Ty::Decimal, rlty.tags),
+                );
+            }
+            if member.name == "to_float" {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::IntToFloat,
+                        args: vec![rex],
+                    },
+                    LTy::new(Ty::Float, rlty.tags),
+                );
+            }
+            if member.name == "abs" {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::AbsInt,
+                        args: vec![rex],
+                    },
+                    rlty,
+                );
+            }
+        }
+
+        // Scalar properties (`abs`, `trim`, `ascii_lowercase`, `empty?`, `some?`, `none?`).
+        match (&rlty.ty, member.name.as_str()) {
+            (Ty::Float, "abs") => {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::AbsFloat,
+                        args: vec![rex],
+                    },
+                    rlty,
+                );
+            }
+            (Ty::Decimal, "abs") => {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::AbsDecimal,
+                        args: vec![rex],
+                    },
+                    rlty,
+                );
+            }
+            (Ty::Decimal, "to_float") => {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::DecToFloat,
+                        args: vec![rex],
+                    },
+                    LTy::new(Ty::Float, rlty.tags),
+                );
+            }
+            (Ty::Text, "empty?") => {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::EmptyText),
+                        args: vec![rex],
+                    },
+                    LTy::new(Ty::Bool, rlty.tags),
+                );
+            }
+            (Ty::Text, "trim") => {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::TrimText),
+                        args: vec![rex],
+                    },
+                    rlty,
+                );
+            }
+            (Ty::Text, "ascii_lowercase") => {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::LowerAsciiText),
+                        args: vec![rex],
+                    },
+                    rlty,
+                );
+            }
+            (Ty::Option(_), "some?") => {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::IsSome),
+                        args: vec![rex],
+                    },
+                    LTy::new(Ty::Bool, rlty.tags),
+                );
+            }
+            (Ty::Option(_), "none?") => {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::IsNone),
+                        args: vec![rex],
+                    },
+                    LTy::new(Ty::Bool, rlty.tags),
+                );
+            }
+            (Ty::List(_), "size" | "len") => {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::ListLen),
+                        args: vec![rex],
+                    },
+                    LTy::new(Ty::Int, rlty.tags),
+                );
+            }
+            (Ty::List(_), "empty?") => {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::ListEmpty),
+                        args: vec![rex],
+                    },
+                    LTy::new(Ty::Bool, rlty.tags),
+                );
+            }
+            (Ty::List(el), "first") => {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::ListFirst,
+                        args: vec![rex],
+                    },
+                    LTy::new(
+                        Ty::Option(Box::new(el.ty.clone())),
+                        rlty.tags.union(&el.tags),
+                    ),
+                );
+            }
+            (Ty::List(el), "first!") => {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::ListFirstBang,
+                        args: vec![rex],
+                    },
+                    LTy::new(el.ty.clone(), rlty.tags.union(&el.tags)),
+                );
+            }
+            (Ty::Table(tt), "empty?") => {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::TableEmpty,
+                        args: vec![rex],
+                    },
+                    LTy::new(Ty::Bool, tt.row_tags.union(&rlty.tags)),
+                );
+            }
+            (Ty::Table(tt), "first!") => {
+                let row_ty_name = self.register_table_row_type(tt);
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::TableFirstBang,
+                        args: vec![rex],
+                    },
+                    LTy::new(
+                        Ty::Data(row_ty_name),
+                        tt.row_tags.union(&tt.order_tags).union(&rlty.tags),
+                    ),
+                );
+            }
+            (Ty::Args, "list") => {
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::Core(HostOp::ArgsGet),
+                        args: vec![rex],
+                    },
+                    LTy::public(Ty::List(Box::new(LTy::public(Ty::Text)))),
+                );
+            }
+            (Ty::Args, "first") => {
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::ArgsFirst,
+                        args: vec![rex],
+                    },
+                    LTy::public(Ty::Option(Box::new(Ty::Text))),
+                );
+            }
+            (Ty::Console(_), "printed_lines") => {
+                self.require_spec_scope(scope, span, "`console.printed_lines`");
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::FakeConsoleLines,
+                        args: vec![rex],
+                    },
+                    LTy::public(Ty::List(Box::new(LTy::public(Ty::Text)))),
+                );
+            }
+            (Ty::Console(_), "printed_errors") => {
+                self.require_spec_scope(scope, span, "`console.printed_errors`");
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::FakeConsoleErrors,
+                        args: vec![rex],
+                    },
+                    LTy::public(Ty::List(Box::new(LTy::public(Ty::Text)))),
+                );
+            }
+            (Ty::Console(_), "printed_tables") => {
+                self.require_spec_scope(scope, span, "`console.printed_tables`");
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::FakeConsoleTables,
+                        args: vec![rex],
+                    },
+                    LTy::public(Ty::List(Box::new(LTy::public(Ty::Table(
+                        TableTy::default(),
+                    ))))),
+                );
+            }
+            (Ty::LinearModel, "slope" | "intercept" | "r_squared") => {
+                let idx = match member.name.as_str() {
+                    "slope" => 0,
+                    "intercept" => 1,
+                    _ => 2,
+                };
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::RecordField {
+                            type_name: "LinearModel".to_string(),
+                            field_name: member.name.clone(),
+                            field_idx: idx,
+                        },
+                        args: vec![rex],
+                    },
+                    LTy::new(Ty::Float, rlty.tags),
+                );
+            }
+            (Ty::StatTest, "t_stat" | "p_value" | "df") => {
+                let idx = match member.name.as_str() {
+                    "t_stat" => 0,
+                    "p_value" => 1,
+                    _ => 2,
+                };
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::RecordField {
+                            type_name: "StatTest".to_string(),
+                            field_name: member.name.clone(),
+                            field_idx: idx,
+                        },
+                        args: vec![rex],
+                    },
+                    LTy::new(Ty::Float, rlty.tags),
+                );
+            }
+            (Ty::Data(dname), "read_only") if dname == TY_IN_MEMORY_FILES => {
+                return (rex, LTy::public(Ty::ReadFiles));
+            }
+            (Ty::Data(dname), fname) => {
+                // TableRow column projection (`bad.line`, `out.first!.department`, ...).
+                if let Some(tt) = self.table_row_schemas.get(dname).cloned() {
+                    if let Some((idx, cs)) =
+                        tt.cols.iter().enumerate().find(|(_, c)| c.name == fname)
+                    {
+                        return (
+                            ExecExpr::Prim {
+                                op: ExecPrimOp::RecordField {
+                                    type_name: dname.clone(),
+                                    field_name: fname.to_string(),
+                                    field_idx: idx,
+                                },
+                                args: vec![rex],
+                            },
+                            LTy::new(cs.ty.to_ty(), cs.tags.union(&tt.row_tags).union(&rlty.tags)),
+                        );
+                    }
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("table row has no column `{fname}`"),
+                        )
+                        .with_span(member.span),
+                    );
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                }
+                // User struct or UpsertStats field projection.
+                if let Some(layout) = self.structs.get(dname).cloned()
+                    && let Some(idx) = layout.field_names.iter().position(|f| f == fname)
+                {
+                    let flty = layout.field_ltys[idx].clone();
+                    return (
+                        ExecExpr::Prim {
+                            op: ExecPrimOp::RecordField {
+                                type_name: dname.clone(),
+                                field_name: fname.to_string(),
+                                field_idx: idx,
+                            },
+                            args: vec![rex],
+                        },
+                        LTy::new(flty.ty, flty.tags.union(&rlty.tags)),
+                    );
+                }
+            }
+            _ => {}
+        }
+
+        self.diags.push(
+            Diagnostic::error(
+                DiagCode::TypeError,
+                format!("unknown field or property `.{}`", member.name),
+            )
+            .with_span(span),
+        );
+        (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "call checker dispatches static namespaces, methods, constructors, and functions"
+    )]
+    fn check_call(
+        &mut self,
+        callee: &Expr,
+        args: &[CallArg],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        expected: Option<&Ty>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        // 1. Namespace/module static calls: `Stats.corr(...)`, `Report.new(...)`, `Files.in_memory(...)`, etc.
+        if let ExprKind::Field { receiver, member } = &callee.kind
+            && let ExprKind::CapName(ns) = &receiver.kind
+        {
+            return self.check_namespace_call(
+                ns,
+                &member.name,
+                args,
+                span,
+                env,
+                pc,
+                scope,
+                ret_ctx,
+            );
+        }
+
+        // 2. Method calls on a receiver value: `files.read_csv(...)`, `console.print(...)`, `x.round(3)`, etc.
+        if let ExprKind::Field { receiver, member } = &callee.kind {
+            return self.check_method_call(receiver, member, args, span, env, pc, scope, ret_ctx);
+        }
+
+        // 3. Constructors (`Ok(...)`, `Error(...)`, `Some(...)`, user `Struct(...)`, user `EnumVariant(...)`).
+        if let ExprKind::CapName(cname) = &callee.kind {
+            return self.check_ctor_call(cname, args, span, env, expected, pc, scope, ret_ctx);
+        }
+
+        // 4. Built-in free functions (`date_trunc`, `months_between`) & user functions.
+        if let ExprKind::Ident(fname) = &callee.kind {
+            if fname == "date_trunc" {
+                return self.check_date_trunc_expr(args, span, env, pc, scope, ret_ctx);
+            }
+            if fname == "months_between"
+                && let [CallArg::Positional(a), CallArg::Positional(b)] = args
+            {
+                let (ea, la) = self.check_expr(a, env, Some(&Ty::Date), pc, scope, ret_ctx);
+                let (eb, lb) = self.check_expr(b, env, Some(&Ty::Date), pc, scope, ret_ctx);
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::MonthsBetween,
+                        args: vec![ea, eb],
+                    },
+                    LTy::new(Ty::Int, la.tags.union(&lb.tags)),
+                );
+            }
+            if let Some(sig) = self.fn_sigs.get(fname).cloned() {
+                let ret_lty = self
+                    .ensure_fn_checked(fname)
+                    .or(sig.ret)
+                    .unwrap_or_else(|| LTy::public(Ty::Unit));
+                if args.len() != sig.params.len() {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!(
+                                "function `{fname}` expects {} argument(s), got {}",
+                                sig.params.len(),
+                                args.len()
+                            ),
+                        )
+                        .with_span(span),
+                    );
+                }
+                let mut lowered_args = Vec::with_capacity(args.len());
+                let mut arg_tags = TagSet::empty();
+                for (i, arg) in args.iter().enumerate() {
+                    let expr_arg = match arg {
+                        CallArg::Positional(e) | CallArg::Named { value: e, .. } => e,
+                    };
+                    let param_lty = sig.params.get(i).map(|(_, l)| l);
+                    let (mut aex, alty) = self.check_expr(
+                        expr_arg,
+                        env,
+                        param_lty.map(|l| &l.ty),
+                        pc,
+                        scope,
+                        ret_ctx,
+                    );
+                    if let Some(plty) = param_lty {
+                        aex = self.coerce_expr(
+                            aex,
+                            &alty,
+                            plty,
+                            expr_arg.span,
+                            &format!("argument {} of `{fname}`", i + 1),
+                        );
+                    }
+                    arg_tags = arg_tags.union(&alty.tags);
+                    lowered_args.push(aex);
+                }
+                // Propagate argument tags into scalar/non-table return if any.
+                let out_ret = if matches!(ret_lty.ty, Ty::Table(_)) {
+                    ret_lty
+                } else {
+                    LTy::new(ret_lty.ty, ret_lty.tags.union(&arg_tags))
+                };
+                return (
+                    ExecExpr::Call {
+                        fn_name: fname.clone(),
+                        args: lowered_args,
+                    },
+                    out_ret,
+                );
+            }
+        }
+
+        // 5. Higher-order function value call (`f(x)`).
+        let (fex, flty) = self.check_expr(callee, env, None, pc, scope, ret_ctx);
+        let mut lowered = Vec::with_capacity(args.len());
+        for arg in args {
+            let e = match arg {
+                CallArg::Positional(e) | CallArg::Named { value: e, .. } => e,
+            };
+            let (ae, _) = self.check_expr(e, env, None, pc, scope, ret_ctx);
+            lowered.push(ae);
+        }
+        let ret = match &flty.ty {
+            Ty::Fn { ret, .. } => ret.as_ref().clone(),
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "attempted to call a non-function value",
+                    )
+                    .with_span(span),
+                );
+                LTy::public(Ty::Unit)
+            }
+        };
+        (
+            ExecExpr::App {
+                fn_expr: Box::new(fex),
+                args: lowered,
+            },
+            ret,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "namespace call handles stdlib modules and spec-only fake constructors"
+    )]
+    fn check_namespace_call(
+        &mut self,
+        ns: &str,
+        method: &str,
+        args: &[CallArg],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        match (ns, method) {
+            ("Report", "new") => {
+                let (tex, tlty) = match args.first() {
+                    Some(CallArg::Positional(e)) => {
+                        self.check_expr(e, env, Some(&Ty::Text), pc, scope, ret_ctx)
+                    }
+                    _ => (
+                        ExecExpr::Lit(Literal::Text(String::new())),
+                        LTy::public(Ty::Text),
+                    ),
+                };
+                (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::ReportNew),
+                        args: vec![tex],
+                    },
+                    LTy::new(Ty::Report(tlty.effective_tags()), TagSet::empty()),
+                )
+            }
+            ("Table", "concat") => {
+                let Some(CallArg::Positional(e)) = args.first() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`Table.concat` expects a `List(Table(...))`",
+                        )
+                        .with_span(span),
+                    );
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                let (lex, llty) = self.check_expr(e, env, None, pc, scope, ret_ctx);
+                let tt = match &llty.ty {
+                    Ty::List(el) => match &el.ty {
+                        Ty::Table(t) => t.clone(),
+                        _ => TableTy::default(),
+                    },
+                    _ => TableTy::default(),
+                };
+                (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::TableConcat(tt.clone())),
+                        args: vec![lex],
+                    },
+                    LTy::new(Ty::Table(tt), llty.tags),
+                )
+            }
+            ("Args", "of") => {
+                self.require_spec_scope(scope, span, "`Args.of(...)`");
+                let (lex, _) = match args.first() {
+                    Some(CallArg::Positional(e)) => self.check_expr(
+                        e,
+                        env,
+                        Some(&Ty::List(Box::new(LTy::public(Ty::Text)))),
+                        pc,
+                        scope,
+                        ret_ctx,
+                    ),
+                    _ => (
+                        ExecExpr::Prim {
+                            op: ExecPrimOp::Core(PrimOp::ListLit(LTy::public(Ty::Text))),
+                            args: Vec::new(),
+                        },
+                        LTy::public(Ty::List(Box::new(LTy::public(Ty::Text)))),
+                    ),
+                };
+                (
+                    ExecExpr::Host {
+                        op: ExecHostOp::FakeArgsOf,
+                        args: vec![lex],
+                    },
+                    LTy::public(Ty::Args),
+                )
+            }
+            ("Files", "in_memory") => {
+                self.require_spec_scope(scope, span, "`Files.in_memory(...)`");
+                let (mex, _) = match args.first() {
+                    Some(CallArg::Positional(e)) => {
+                        self.check_expr(e, env, None, pc, scope, ret_ctx)
+                    }
+                    _ => (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit)),
+                };
+                (
+                    ExecExpr::Host {
+                        op: ExecHostOp::FakeFilesInMemory,
+                        args: vec![mex],
+                    },
+                    LTy::public(Ty::Data(TY_IN_MEMORY_FILES.to_string())),
+                )
+            }
+            ("Console", "fake") => {
+                self.require_spec_scope(scope, span, "`Console.fake()`");
+                (
+                    ExecExpr::Host {
+                        op: ExecHostOp::Core(HostOp::FakeConsole(TagSet::empty())),
+                        args: Vec::new(),
+                    },
+                    LTy::public(Ty::Console(TagSet::empty())),
+                )
+            }
+            ("Secret", "fake") => {
+                self.require_spec_scope(scope, span, "`Secret.fake(...)`");
+                let (sex, _) = match args.first() {
+                    Some(CallArg::Positional(e)) => {
+                        self.check_expr(e, env, Some(&Ty::Text), pc, scope, ret_ctx)
+                    }
+                    _ => (
+                        ExecExpr::Lit(Literal::Text("fake-secret".to_string())),
+                        LTy::public(Ty::Text),
+                    ),
+                };
+                (
+                    ExecExpr::Host {
+                        op: ExecHostOp::Core(HostOp::FakeSecret("fake".to_string())),
+                        args: vec![sex],
+                    },
+                    LTy::public(Ty::Secret("fake".to_string())),
+                )
+            }
+            ("DB", "in_memory") => {
+                self.require_spec_scope(scope, span, "`DB.in_memory(...)`");
+                let db = match args.first() {
+                    Some(CallArg::Positional(Expr {
+                        kind: ExprKind::CapName(s),
+                        ..
+                    })) => s.clone(),
+                    _ => "InMemory".to_string(),
+                };
+                let mut table_names = Vec::new();
+                let mut tbl_args = Vec::new();
+                if let Some(CallArg::Positional(Expr {
+                    kind: ExprKind::Map(entries),
+                    ..
+                })) = args.get(1)
+                {
+                    for (k, v) in entries {
+                        let sname = match &k.kind {
+                            ExprKind::CapName(s) | ExprKind::Ident(s) => s.clone(),
+                            ExprKind::Text { value: s, .. } => s.clone(),
+                            _ => continue,
+                        };
+                        let expected_tbl = self
+                            .schemas
+                            .get(&sname)
+                            .map(|cs| Ty::Table(cs.decl.schema.clone()));
+                        let (mut vex, vlty) =
+                            self.check_expr(v, env, expected_tbl.as_ref(), pc, scope, ret_ctx);
+                        if let Some(Ty::Table(dst_tt)) = &expected_tbl {
+                            vex = self.coerce_expr(
+                                vex,
+                                &vlty,
+                                &LTy::public(Ty::Table(dst_tt.clone())),
+                                v.span,
+                                &format!("DB.in_memory table `{sname}`"),
+                            );
+                        }
+                        table_names.push(sname);
+                        tbl_args.push(vex);
+                    }
+                }
+                (
+                    ExecExpr::Host {
+                        op: ExecHostOp::FakeDbInMemory {
+                            db: db.clone(),
+                            table_names,
+                        },
+                        args: tbl_args,
+                    },
+                    LTy::public(Ty::ReadDB(db)),
+                )
+            }
+            ("Stats", "corr") => {
+                let Some(CallArg::Positional(tbl_e)) = args.first() else {
+                    return (
+                        ExecExpr::Lit(Literal::Float(Float64::ZERO)),
+                        LTy::public(Ty::Float),
+                    );
+                };
+                let (tex, tlty) = self.check_expr(tbl_e, env, None, pc, scope, ret_ctx);
+                let col_x = named_dot_col(args, "x").unwrap_or_default();
+                let col_y = named_dot_col(args, "y").unwrap_or_default();
+                let tags = stats_col_tags(&tlty, &[&col_x, &col_y]);
+                (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::StatsCorr { col_x, col_y }),
+                        args: vec![tex],
+                    },
+                    LTy::new(Ty::Float, tags),
+                )
+            }
+            ("Stats", "linear_regression") => {
+                let Some(CallArg::Positional(tbl_e)) = args.first() else {
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::LinearModel));
+                };
+                let (tex, tlty) = self.check_expr(tbl_e, env, None, pc, scope, ret_ctx);
+                let col_x = named_dot_col(args, "x").unwrap_or_default();
+                let col_y = named_dot_col(args, "y").unwrap_or_default();
+                let tags = stats_col_tags(&tlty, &[&col_x, &col_y]);
+                (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::StatsLinReg { col_x, col_y }),
+                        args: vec![tex],
+                    },
+                    LTy::new(Ty::LinearModel, tags),
+                )
+            }
+            ("Stats", "t_test") => {
+                if let (Some(CallArg::Positional(a_e)), Some(CallArg::Positional(b_e))) =
+                    (args.first(), args.get(1))
+                {
+                    let (ea, la) = self.check_expr(a_e, env, None, pc, scope, ret_ctx);
+                    let (eb, lb) = self.check_expr(b_e, env, None, pc, scope, ret_ctx);
+                    let col = named_dot_col(args, "column").unwrap_or_default();
+                    let tags = stats_col_tags(&la, &[&col]).union(&stats_col_tags(&lb, &[&col]));
+                    return (
+                        ExecExpr::Prim {
+                            op: ExecPrimOp::StatsWelchTTest { col },
+                            args: vec![ea, eb],
+                        },
+                        LTy::new(Ty::StatTest, tags),
+                    );
+                }
+                (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::StatTest))
+            }
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::ResolveError,
+                        format!("unknown static call `{ns}.{method}`"),
+                    )
+                    .with_span(span),
+                );
+                (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit))
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "method call handles capabilities, tables, scalars, lists, and privacy sink checks"
+    )]
+    fn check_method_call(
+        &mut self,
+        receiver: &Expr,
+        member: &ast::SpannedName,
+        args: &[CallArg],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        let (rex, rlty) = self.check_expr(receiver, env, None, pc, scope, ret_ctx);
+
+        // Capability methods: Console, ReadFiles, WriteFiles, ReadDB, WriteTable, HttpsAllow.
+        match (&rlty.ty, member.name.as_str()) {
+            (
+                Ty::Console(allows),
+                "print" | "error" | "print_table" | "print_chart" | "print_profile",
+            ) => {
+                let Some(CallArg::Positional(arg0)) = args.first() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`console.{}` requires 1 argument", member.name),
+                        )
+                        .with_span(span),
+                    );
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                let (aex, alty) = self.check_expr(arg0, env, None, pc, scope, ret_ctx);
+                let eff_tags = alty.effective_tags().union(pc);
+                if !eff_tags.is_subset(allows) {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::PrivacyError,
+                            format!(
+                                "cannot output sensitive value tagged {:?} to `Console` (allows {:?})",
+                                eff_tags.elems(),
+                                allows.elems()
+                            ),
+                        )
+                        .with_primary(arg0.span, "sensitive data flows into unauthorized `Console` sink")
+                        .with_hint("use `redact`, `pseudonymize`, or `suppress_small_groups` before printing"),
+                    );
+                }
+                let hop = match member.name.as_str() {
+                    "print" => ExecHostOp::Core(HostOp::ConsolePrint),
+                    "error" => ExecHostOp::Core(HostOp::ConsoleError),
+                    "print_table" => ExecHostOp::Core(HostOp::ConsolePrintTable),
+                    "print_chart" => ExecHostOp::ConsolePrintChart,
+                    _ => ExecHostOp::ConsolePrintProfile,
+                };
+                return (
+                    ExecExpr::Host {
+                        op: hop,
+                        args: vec![rex, aex],
+                    },
+                    LTy::public(Ty::Unit),
+                );
+            }
+            (Ty::ReadFiles, "read_csv" | "read_jsonl" | "read_xlsx") => {
+                let Some(CallArg::Positional(path_e)) = args.first() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`files.{}` requires a path argument", member.name),
+                        )
+                        .with_span(span),
+                    );
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                let (pex, plty) = self.check_expr(path_e, env, Some(&Ty::Text), pc, scope, ret_ctx);
+                let Some(schema_name) = named_cap_arg(args, "as") else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::SchemaError,
+                            format!("`files.{}` requires `as: SchemaName`", member.name),
+                        )
+                        .with_span(span),
+                    );
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                let Some(cs) = self.schemas.get(&schema_name).cloned() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::SchemaError,
+                            format!("unknown schema `{schema_name}`"),
+                        )
+                        .with_span(span),
+                    );
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                let bad_tt = quarantine_bad_row_table_ty(&cs.decl.schema);
+                let ok_ty = Ty::Tuple(vec![
+                    LTy::public(Ty::Table(cs.decl.schema)),
+                    LTy::public(Ty::Table(bad_tt)),
+                ]);
+                let res_ty = Ty::Result {
+                    ok_ty: Box::new(ok_ty),
+                    err_ty: Box::new(Ty::Text),
+                };
+                let hop = match member.name.as_str() {
+                    "read_csv" => ExecHostOp::Core(HostOp::ReadCsv(schema_name)),
+                    "read_jsonl" => ExecHostOp::ReadJsonl(schema_name),
+                    _ => ExecHostOp::ReadXlsx(schema_name),
+                };
+                return (
+                    ExecExpr::Host {
+                        op: hop,
+                        args: vec![rex, pex],
+                    },
+                    LTy::new(res_ty, plty.tags),
+                );
+            }
+            (Ty::ReadFiles, "read_parquet") => {
+                let Some(CallArg::Positional(path_e)) = args.first() else {
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                let (pex, plty) = self.check_expr(path_e, env, Some(&Ty::Text), pc, scope, ret_ctx);
+                let Some(schema_name) = named_cap_arg(args, "as") else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::SchemaError,
+                            "`read_parquet` requires `as: SchemaName`",
+                        )
+                        .with_span(span),
+                    );
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                let Some(cs) = self.schemas.get(&schema_name).cloned() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::SchemaError,
+                            format!("unknown schema `{schema_name}`"),
+                        )
+                        .with_span(span),
+                    );
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                let res_ty = Ty::Result {
+                    ok_ty: Box::new(Ty::Table(cs.decl.schema.clone())),
+                    err_ty: Box::new(Ty::Text),
+                };
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::Core(HostOp::ReadParquet(cs.decl.schema)),
+                        args: vec![rex, pex],
+                    },
+                    LTy::new(res_ty, plty.tags),
+                );
+            }
+            (
+                Ty::WriteFiles { root, allows },
+                "write_html" | "write_parquet" | "write_xlsx" | "write_csv" | "write_jsonl"
+                | "write_text",
+            ) => {
+                let Some(CallArg::Positional(path_e)) = args.first() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`out.{}` requires a relative path", member.name),
+                        )
+                        .with_span(span),
+                    );
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                if let ExprKind::Text { value: p, .. } = &path_e.kind
+                    && !crate::core::check::is_safe_relative_path(p)
+                {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::CapabilityError,
+                            format!("unsafe export path `{p}` escapes `WriteFiles(\"{root}\")` confinement"),
+                        )
+                        .with_span(path_e.span),
+                    );
+                }
+                let (pex, plty) = self.check_expr(path_e, env, Some(&Ty::Text), pc, scope, ret_ctx);
+                let payload_expr = match args.get(1) {
+                    Some(CallArg::Positional(e)) => Some(e),
+                    Some(CallArg::Named { name, value, .. }) if name.name == "sheets" => {
+                        Some(value)
+                    }
+                    _ => None,
+                };
+                let (pay_ex, pay_tags) = if let Some(pe) = payload_expr {
+                    let (ex, lty) = self.check_expr(pe, env, None, pc, scope, ret_ctx);
+                    (ex, lty.effective_tags())
+                } else {
+                    (ExecExpr::Lit(Literal::Unit), TagSet::empty())
+                };
+                let total_tags = pay_tags.union(&plty.effective_tags()).union(pc);
+                if !total_tags.is_subset(allows) {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::PrivacyError,
+                            format!(
+                                "cannot write sensitive data tagged {:?} to `WriteFiles(\"{root}\", allows: {:?})`",
+                                total_tags.elems(),
+                                allows.elems()
+                            ),
+                        )
+                        .with_span(span),
+                    );
+                }
+                let hop = match member.name.as_str() {
+                    "write_html" => ExecHostOp::Core(HostOp::WriteReportHtml),
+                    "write_parquet" => ExecHostOp::Core(HostOp::WriteParquet),
+                    "write_xlsx" => ExecHostOp::Core(HostOp::WriteXlsx),
+                    "write_csv" => ExecHostOp::WriteCsv,
+                    "write_jsonl" => ExecHostOp::WriteJsonl,
+                    _ => ExecHostOp::Core(HostOp::WriteFile),
+                };
+                let res_ty = Ty::Result {
+                    ok_ty: Box::new(Ty::Unit),
+                    err_ty: Box::new(Ty::Text),
+                };
+                return (
+                    ExecExpr::Host {
+                        op: hop,
+                        args: vec![rex, pex, pay_ex],
+                    },
+                    LTy::public(res_ty),
+                );
+            }
+            (Ty::ReadDB(_), "table") => {
+                let sname = match args.first() {
+                    Some(CallArg::Positional(Expr {
+                        kind: ExprKind::CapName(s),
+                        ..
+                    })) => s.clone(),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::SchemaError,
+                                "`db.table(Schema)` expects a schema name",
+                            )
+                            .with_span(span),
+                        );
+                        return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                    }
+                };
+                let Some(cs) = self.schemas.get(&sname).cloned() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::SchemaError,
+                            format!("unknown schema `{sname}`"),
+                        )
+                        .with_span(span),
+                    );
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                return (
+                    ExecExpr::Rel(Box::new(ExecPlan::SourceDB {
+                        cap: Box::new(rex),
+                        table_name: sname,
+                        schema: cs.decl.schema.clone(),
+                    })),
+                    LTy::public(Ty::Table(cs.decl.schema)),
+                );
+            }
+            (
+                Ty::WriteTable {
+                    db,
+                    table_name,
+                    allows,
+                    ..
+                },
+                "upsert",
+            ) => {
+                let Some(CallArg::Positional(tbl_e)) = args.first() else {
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                let (tex, tlty) = self.check_expr(tbl_e, env, None, pc, scope, ret_ctx);
+                let eff_tags = tlty.effective_tags().union(pc);
+                if !eff_tags.is_subset(allows) {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::PrivacyError,
+                            format!(
+                                "cannot upsert sensitive table tagged {:?} into `WriteTable({db}, \"{table_name}\", allows: {:?})`",
+                                eff_tags.elems(),
+                                allows.elems()
+                            ),
+                        )
+                        .with_span(span),
+                    );
+                }
+                let key_col = named_dot_col(args, "key").unwrap_or_default();
+                let res_ty = Ty::Result {
+                    ok_ty: Box::new(Ty::Data(TY_UPSERT_STATS.to_string())),
+                    err_ty: Box::new(Ty::Text),
+                };
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::WriteTableUpsert { key_col },
+                        args: vec![rex, tex],
+                    },
+                    LTy::public(res_ty),
+                );
+            }
+            (Ty::HttpsAllow { host, allows }, "get_json") => {
+                let Some(CallArg::Positional(url_e)) = args.first() else {
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                let (uex, ulty) = self.check_expr(url_e, env, Some(&Ty::Text), pc, scope, ret_ctx);
+                let url_tags = ulty.effective_tags().union(pc);
+                if !url_tags.is_subset(allows) {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::PrivacyError,
+                            format!(
+                                "cannot send URL tagged {:?} to `HttpsAllow(\"{host}\", allows: {:?})`",
+                                url_tags.elems(),
+                                allows.elems()
+                            ),
+                        )
+                        .with_span(url_e.span),
+                    );
+                }
+                let hdr_ex = if let Some(he) = named_expr_arg(args, "headers") {
+                    let (hex, hlty) = self.check_expr(he, env, None, pc, scope, ret_ctx);
+                    // Secrets are permitted in Authorization headers for authenticated HTTPS calls.
+                    let non_secret = hlty.effective_tags().remove("secret");
+                    if !non_secret.is_subset(allows) {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::PrivacyError,
+                                format!(
+                                    "cannot send headers tagged {:?} to `HttpsAllow(\"{host}\", allows: {:?})`",
+                                    non_secret.elems(),
+                                    allows.elems()
+                                ),
+                            )
+                            .with_span(he.span),
+                        );
+                    }
+                    hex
+                } else {
+                    ExecExpr::Lit(Literal::Unit)
+                };
+                let res_ty = Ty::Result {
+                    ok_ty: Box::new(Ty::Data(TY_JSON_RESPONSE.to_string())),
+                    err_ty: Box::new(Ty::Text),
+                };
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::Core(HostOp::HttpsGetJson),
+                        args: vec![rex, uex, hdr_ex],
+                    },
+                    LTy::public(res_ty),
+                );
+            }
+            (Ty::Data(dname), "parse_table") if dname == TY_JSON_RESPONSE => {
+                let (fex, _) = match args.first() {
+                    Some(CallArg::Positional(e)) => {
+                        self.check_expr(e, env, Some(&Ty::Text), pc, scope, ret_ctx)
+                    }
+                    _ => (
+                        ExecExpr::Lit(Literal::Text(String::new())),
+                        LTy::public(Ty::Text),
+                    ),
+                };
+                let Some(sname) = named_cap_arg(args, "as") else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::SchemaError,
+                            "`parse_table` requires `as: SchemaName`",
+                        )
+                        .with_span(span),
+                    );
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                let Some(cs) = self.schemas.get(&sname).cloned() else {
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                let bad_tt = quarantine_bad_row_table_ty(&cs.decl.schema);
+                let out_ty = Ty::Tuple(vec![
+                    LTy::public(Ty::Table(cs.decl.schema)),
+                    LTy::public(Ty::Table(bad_tt)),
+                ]);
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::JsonParseTable(sname),
+                        args: vec![rex, fex],
+                    },
+                    LTy::public(out_ty),
+                );
+            }
+            (Ty::Data(dname), "bool_at") if dname == TY_JSON_RESPONSE => {
+                let (fex, _) = match args.first() {
+                    Some(CallArg::Positional(e)) => {
+                        self.check_expr(e, env, Some(&Ty::Text), pc, scope, ret_ctx)
+                    }
+                    _ => (
+                        ExecExpr::Lit(Literal::Text(String::new())),
+                        LTy::public(Ty::Text),
+                    ),
+                };
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::JsonBoolAt,
+                        args: vec![rex, fex],
+                    },
+                    LTy::public(Ty::Bool),
+                );
+            }
+            (Ty::Option(inner), "or_return") => {
+                let Some(CallArg::Positional(ret_e)) = args.first() else {
+                    return (rex, LTy::new(inner.as_ref().clone(), rlty.tags));
+                };
+                let r_exp = ret_ctx.and_then(|(_, t)| t);
+                let (ret_ex, _) = self.check_expr(ret_e, env, r_exp, pc, scope, ret_ctx);
+                let ok_v = self.fresh("or_ret");
+                let none_arm = if let Some((lbl, _)) = ret_ctx {
+                    ExecExpr::Jump {
+                        label: lbl.to_string(),
+                        args: vec![ret_ex],
+                    }
+                } else {
+                    ret_ex
+                };
+                return (
+                    ExecExpr::CaseE {
+                        scrut: Box::new(rex),
+                        arms: vec![
+                            ExecCaseArm {
+                                pattern: ExecPattern::Ctor {
+                                    ctor: "Some".to_string(),
+                                    binders: vec![ok_v.clone()],
+                                },
+                                body: ExecExpr::Var(ok_v),
+                            },
+                            ExecCaseArm {
+                                pattern: ExecPattern::Ctor {
+                                    ctor: "None".to_string(),
+                                    binders: Vec::new(),
+                                },
+                                body: none_arm,
+                            },
+                        ],
+                    },
+                    LTy::new(inner.as_ref().clone(), rlty.tags),
+                );
+            }
+            (Ty::Text, "contains?") => {
+                if let Some(CallArg::Positional(e)) = args.first() {
+                    let (aex, alty) = self.check_expr(e, env, Some(&Ty::Text), pc, scope, ret_ctx);
+                    return (
+                        ExecExpr::Prim {
+                            op: ExecPrimOp::Core(PrimOp::ContainsText),
+                            args: vec![rex, aex],
+                        },
+                        LTy::new(Ty::Bool, rlty.tags.union(&alty.tags)),
+                    );
+                }
+            }
+            (Ty::Float, "round") => {
+                let (pex, plty) = match args.first() {
+                    Some(CallArg::Positional(e)) => {
+                        self.check_expr(e, env, Some(&Ty::Int), pc, scope, ret_ctx)
+                    }
+                    _ => (ExecExpr::Lit(Literal::int(0i64)), LTy::public(Ty::Int)),
+                };
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::RoundFloat,
+                        args: vec![rex, pex],
+                    },
+                    LTy::new(Ty::Float, rlty.tags.union(&plty.tags)),
+                );
+            }
+            (Ty::Decimal, "round") => {
+                let (pex, plty) = match args.first() {
+                    Some(CallArg::Positional(e)) => {
+                        self.check_expr(e, env, Some(&Ty::Int), pc, scope, ret_ctx)
+                    }
+                    _ => (ExecExpr::Lit(Literal::int(0i64)), LTy::public(Ty::Int)),
+                };
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::RoundDecimal,
+                        args: vec![rex, pex],
+                    },
+                    LTy::new(Ty::Decimal, rlty.tags.union(&plty.tags)),
+                );
+            }
+            (Ty::List(el), "append") => {
+                if let Some(CallArg::Positional(e)) = args.first() {
+                    let hint = if is_unresolved_list(&rlty.ty) {
+                        None
+                    } else {
+                        Some(&el.ty)
+                    };
+                    let (aex, alty) = self.check_expr(e, env, hint, pc, scope, ret_ctx);
+                    let new_el = if is_unresolved_list(&rlty.ty) {
+                        alty
+                    } else {
+                        LTy::new(el.ty.clone(), el.tags.union(&alty.tags))
+                    };
+                    return (
+                        ExecExpr::Prim {
+                            op: ExecPrimOp::Core(PrimOp::ListAppend),
+                            args: vec![rex, aex],
+                        },
+                        LTy::new(Ty::List(Box::new(new_el)), rlty.tags),
+                    );
+                }
+            }
+            (Ty::Table(tt), "count") => {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::TableCount),
+                        args: vec![rex],
+                    },
+                    LTy::new(Ty::Int, tt.row_tags.union(&rlty.tags)),
+                );
+            }
+            (Ty::Table(tt), "profile") => {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::TableProfile),
+                        args: vec![rex],
+                    },
+                    LTy::new(
+                        Ty::Profile(tt.total_tags().union(&rlty.tags)),
+                        TagSet::empty(),
+                    ),
+                );
+            }
+            (Ty::Table(tt), "sum" | "mean" | "stddev") => {
+                let col = match args.first() {
+                    Some(CallArg::Positional(Expr {
+                        kind: ExprKind::DotField(m),
+                        ..
+                    })) => m.name.clone(),
+                    _ => String::new(),
+                };
+                let Some(cs) = tt.find_col(&col) else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("unknown column `.{col}` in `table.{}(...)`", member.name),
+                        )
+                        .with_span(span),
+                    );
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                let tags = tt.row_tags.union(&cs.tags).union(&rlty.tags);
+                let (pop, out_ty) = match member.name.as_str() {
+                    "sum" => (
+                        ExecPrimOp::TableColSum(col),
+                        numeric_core_of_scalar(&cs.ty).map_or(Ty::Int, |s| s.to_ty()),
+                    ),
+                    "mean" => {
+                        let inner = match numeric_core_of_scalar(&cs.ty) {
+                            Some(ScalarTy::Decimal) => Ty::Decimal,
+                            _ => Ty::Float,
+                        };
+                        (ExecPrimOp::TableColMean(col), Ty::Option(Box::new(inner)))
+                    }
+                    _ => (
+                        ExecPrimOp::TableColStddev(col),
+                        Ty::Option(Box::new(Ty::Float)),
+                    ),
+                };
+                return (
+                    ExecExpr::Prim {
+                        op: pop,
+                        args: vec![rex],
+                    },
+                    LTy::new(out_ty, tags),
+                );
+            }
+            (Ty::Table(tt), verb) => {
+                // Allow method-style table verbs (`long.select(.a, .b)`).
+                let in_plan = expr_to_plan(rex);
+                return self.check_table_verb(
+                    in_plan,
+                    tt.clone(),
+                    rlty.tags,
+                    verb,
+                    args,
+                    span,
+                    env,
+                    pc,
+                    scope,
+                    ret_ctx,
+                );
+            }
+            _ => {}
+        }
+
+        self.diags.push(
+            Diagnostic::error(
+                DiagCode::TypeError,
+                format!("unknown method `.{}(...)`", member.name),
+            )
+            .with_span(span),
+        );
+        (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor call handles Ok/Error/Some, structs, and enums"
+    )]
+    fn check_ctor_call(
+        &mut self,
+        cname: &str,
+        args: &[CallArg],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        expected: Option<&Ty>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        match cname {
+            "Ok" => {
+                let (ok_hint, err_ty) = match expected {
+                    Some(Ty::Result { ok_ty, err_ty }) => {
+                        (Some(ok_ty.as_ref()), err_ty.as_ref().clone())
+                    }
+                    _ => (None, Ty::Text),
+                };
+                let (vex, vlty) = match args.first() {
+                    Some(CallArg::Positional(e)) => {
+                        self.check_expr(e, env, ok_hint, pc, scope, ret_ctx)
+                    }
+                    _ => (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit)),
+                };
+                (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::OkVal(err_ty.clone())),
+                        args: vec![vex],
+                    },
+                    LTy::new(
+                        Ty::Result {
+                            ok_ty: Box::new(vlty.ty),
+                            err_ty: Box::new(err_ty),
+                        },
+                        vlty.tags,
+                    ),
+                )
+            }
+            "Error" => {
+                let (ok_ty, err_hint) = match expected {
+                    Some(Ty::Result { ok_ty, err_ty }) => {
+                        (ok_ty.as_ref().clone(), Some(err_ty.as_ref()))
+                    }
+                    _ => (Ty::Unit, None),
+                };
+                let (eex, elty) = match args.first() {
+                    Some(CallArg::Positional(e)) => {
+                        self.check_expr(e, env, err_hint, pc, scope, ret_ctx)
+                    }
+                    _ => (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit)),
+                };
+                (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::ErrVal(ok_ty.clone())),
+                        args: vec![eex],
+                    },
+                    LTy::new(
+                        Ty::Result {
+                            ok_ty: Box::new(ok_ty),
+                            err_ty: Box::new(elty.ty),
+                        },
+                        elty.tags,
+                    ),
+                )
+            }
+            "Some" => {
+                let hint = match expected {
+                    Some(Ty::Option(t)) => Some(t.as_ref()),
+                    _ => None,
+                };
+                let (vex, vlty) = match args.first() {
+                    Some(CallArg::Positional(e)) => {
+                        self.check_expr(e, env, hint, pc, scope, ret_ctx)
+                    }
+                    _ => (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit)),
+                };
+                (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::SomeVal(vlty.ty.clone())),
+                        args: vec![vex],
+                    },
+                    LTy::new(Ty::Option(Box::new(vlty.ty)), vlty.tags),
+                )
+            }
+            _ => {
+                // Struct constructor (positional or named fields in any order).
+                if let Some(layout) = self.structs.get(cname).cloned() {
+                    let mut ordered: Vec<Option<ExecExpr>> = vec![None; layout.field_names.len()];
+                    for (idx, arg) in args.iter().enumerate() {
+                        let (fidx, expr_arg) = match arg {
+                            CallArg::Named { name, value, .. } => {
+                                if let Some(pos) =
+                                    layout.field_names.iter().position(|n| n == &name.name)
+                                {
+                                    (pos, value)
+                                } else {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::TypeError,
+                                            format!(
+                                                "struct `{cname}` has no field `{}`",
+                                                name.name
+                                            ),
+                                        )
+                                        .with_span(name.span),
+                                    );
+                                    continue;
+                                }
+                            }
+                            CallArg::Positional(e) => (idx, e),
+                        };
+                        if let Some(flty) = layout.field_ltys.get(fidx) {
+                            let (mut aex, alty) =
+                                self.check_expr(expr_arg, env, Some(&flty.ty), pc, scope, ret_ctx);
+                            aex = self.coerce_expr(
+                                aex,
+                                &alty,
+                                flty,
+                                expr_arg.span,
+                                &format!("field `{}.{}`", cname, layout.field_names[fidx]),
+                            );
+                            ordered[fidx] = Some(aex);
+                        }
+                    }
+                    let final_args = ordered
+                        .into_iter()
+                        .map(|o| o.unwrap_or(ExecExpr::Lit(Literal::Unit)))
+                        .collect();
+                    return (
+                        ExecExpr::Ctor {
+                            type_name: cname.to_string(),
+                            ctor_name: cname.to_string(),
+                            args: final_args,
+                        },
+                        LTy::public(Ty::Data(cname.to_string())),
+                    );
+                }
+
+                // Enum variant constructor.
+                if let Some((enum_name, vidx)) = self.ctor_to_enum.get(cname).cloned() {
+                    let cdecl = self
+                        .enums
+                        .get(&enum_name)
+                        .and_then(|d| d.ctors.get(vidx))
+                        .cloned();
+                    let mut cargs = Vec::with_capacity(args.len());
+                    for (i, arg) in args.iter().enumerate() {
+                        let e = match arg {
+                            CallArg::Positional(e) | CallArg::Named { value: e, .. } => e,
+                        };
+                        let hint = cdecl.as_ref().and_then(|c| c.fields.get(i)).map(|l| &l.ty);
+                        let (ae, _) = self.check_expr(e, env, hint, pc, scope, ret_ctx);
+                        cargs.push(ae);
+                    }
+                    return (
+                        ExecExpr::Ctor {
+                            type_name: enum_name.clone(),
+                            ctor_name: cname.to_string(),
+                            args: cargs,
+                        },
+                        LTy::public(Ty::Data(enum_name)),
+                    );
+                }
+
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::ResolveError,
+                        format!("unknown constructor `{cname}`"),
+                    )
+                    .with_span(span),
+                );
+                (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit))
+            }
+        }
+    }
+
+    fn check_date_trunc_expr(
+        &mut self,
+        args: &[CallArg],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        let (Some(CallArg::Positional(a)), Some(CallArg::Positional(b))) =
+            (args.first(), args.get(1))
+        else {
+            self.diags.push(
+                Diagnostic::error(DiagCode::TypeError, "`date_trunc` expects 2 arguments")
+                    .with_span(span),
+            );
+            return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+        };
+        let (ea, la) = self.check_expr(a, env, None, pc, scope, ret_ctx);
+        if let ExprKind::Atom(unit) = &b.kind {
+            if unit == "month" && la.ty == Ty::Date {
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::DateTruncMonth),
+                        args: vec![ea],
+                    },
+                    la,
+                );
+            }
+            return (
+                ExecExpr::Prim {
+                    op: ExecPrimOp::DateTruncUnit(unit.clone()),
+                    args: vec![ea],
+                },
+                la,
+            );
+        }
+        let (eb, lb) = self.check_expr(b, env, Some(&Ty::Duration), pc, scope, ret_ctx);
+        (
+            ExecExpr::Prim {
+                op: ExecPrimOp::DateTruncDuration,
+                args: vec![ea, eb],
+            },
+            LTy::new(la.ty, la.tags.union(&lb.tags)),
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Control Flow Expressions (`if`, `case`, `table ... end`)
+    // -----------------------------------------------------------------------
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inline if propagates expected type and sensitivity pc"
+    )]
+    fn check_if_inline(
+        &mut self,
+        cond: &Expr,
+        then_expr: &Expr,
+        else_ifs: &[(Expr, Expr)],
+        else_expr: &Expr,
+        env: &HashMap<Ident, VarBinding>,
+        expected: Option<&Ty>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        let (cex, clty) = self.check_expr(cond, env, Some(&Ty::Bool), pc, scope, ret_ctx);
+        let branch_pc = pc.union(&clty.tags);
+        let (tex, tlty) = self.check_expr(then_expr, env, expected, &branch_pc, scope, ret_ctx);
+        let (mut cur_else, mut acc_lty) = if let Some((ec, et)) = else_ifs.first() {
+            self.check_if_inline(
+                ec,
+                et,
+                &else_ifs[1..],
+                else_expr,
+                env,
+                expected.or(Some(&tlty.ty)),
+                &branch_pc,
+                scope,
+                ret_ctx,
+            )
+        } else {
+            self.check_expr(
+                else_expr,
+                env,
+                expected.or(Some(&tlty.ty)),
+                &branch_pc,
+                scope,
+                ret_ctx,
+            )
+        };
+        let merged_tags = tlty.tags.union(&acc_lty.tags).union(&branch_pc);
+        if tlty.ty != acc_lty.ty {
+            cur_else = self.coerce_expr(
+                cur_else,
+                &acc_lty,
+                &LTy::new(tlty.ty.clone(), merged_tags.clone()),
+                else_expr.span,
+                "`if` else branch",
+            );
+            acc_lty.ty = tlty.ty;
+        }
+        (
+            ExecExpr::IfE {
+                cond: Box::new(cex),
+                then_br: Box::new(tex),
+                else_br: Box::new(cur_else),
+            },
+            LTy::new(acc_lty.ty, merged_tags),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "block if propagates pc taint into all branches"
+    )]
+    fn check_if_block(
+        &mut self,
+        cond: &Expr,
+        then_body: &[Stmt],
+        else_ifs: &[(Expr, Vec<Stmt>)],
+        else_body: Option<&[Stmt]>,
+        env: &HashMap<Ident, VarBinding>,
+        expected: Option<&Ty>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        let (cex, clty) = self.check_expr(cond, env, Some(&Ty::Bool), pc, scope, ret_ctx);
+        let branch_pc = pc.union(&clty.tags);
+        let mut then_env = env.clone();
+        let (tex, tlty) = self.check_block(
+            then_body,
+            &mut then_env,
+            expected,
+            &branch_pc,
+            scope,
+            ret_ctx,
+        );
+
+        let (eex, elty) = if let Some((ec, eb)) = else_ifs.first() {
+            self.check_if_block(
+                ec,
+                eb,
+                &else_ifs[1..],
+                else_body,
+                env,
+                expected,
+                &branch_pc,
+                scope,
+                ret_ctx,
+            )
+        } else if let Some(eb) = else_body {
+            let mut else_env = env.clone();
+            self.check_block(eb, &mut else_env, expected, &branch_pc, scope, ret_ctx)
+        } else {
+            (
+                ExecExpr::Lit(Literal::Unit),
+                LTy::new(Ty::Unit, branch_pc.clone()),
+            )
+        };
+
+        let out_ty = if else_body.is_none() && else_ifs.is_empty() {
+            Ty::Unit
+        } else {
+            tlty.ty
+        };
+        (
+            ExecExpr::IfE {
+                cond: Box::new(cex),
+                then_br: Box::new(tex),
+                else_br: Box::new(eex),
+            },
+            LTy::new(out_ty, tlty.tags.union(&elty.tags).union(&branch_pc)),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "case expression groups flat arms, binds pattern vars, and propagates scrutinee taint"
+    )]
+    fn check_case(
+        &mut self,
+        scrut: &Expr,
+        lines: &[ast::CaseLine],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        expected: Option<&Ty>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        let (sex, slty) = self.check_expr(scrut, env, None, pc, scope, ret_ctx);
+        let case_pc = pc.union(&slty.tags);
+
+        // Group flat `CaseLine`s into `(pattern, Vec<Stmt>)` arms.
+        let mut grouped: Vec<(Expr, Vec<Stmt>)> = Vec::new();
+        for line in lines {
+            match line {
+                ast::CaseLine::ArmHeader { pattern, .. } => {
+                    grouped.push((pattern.clone(), Vec::new()));
+                }
+                ast::CaseLine::ArmInline { pattern, expr, .. } => {
+                    grouped.push((
+                        pattern.clone(),
+                        vec![Stmt {
+                            kind: StmtKind::Expr(expr.clone()),
+                            span: expr.span,
+                        }],
+                    ));
+                }
+                ast::CaseLine::Stmt(st) => {
+                    if let Some((_, body)) = grouped.last_mut() {
+                        body.push(st.clone());
+                    } else {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::ParseError,
+                                "statement inside `case` must follow a `pattern:` arm header",
+                            )
+                            .with_span(st.span),
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut arms = Vec::with_capacity(grouped.len());
+        let mut out_ty: Option<Ty> = expected.cloned();
+        let mut out_tags = case_pc.clone();
+
+        for (pat_expr, body_stmts) in grouped {
+            let mut arm_env = env.clone();
+            let pat = self.check_case_pattern(&pat_expr, &slty, &mut arm_env);
+            let (body_ex, body_lty) = self.check_block(
+                &body_stmts,
+                &mut arm_env,
+                out_ty.as_ref(),
+                &case_pc,
+                scope,
+                ret_ctx,
+            );
+            // If an arm jumps away via `return`, its static type is Unit; don't overwrite a real arm type!
+            let arm_diverges = body_stmts.last().is_some_and(|s| {
+                matches!(
+                    s.kind,
+                    StmtKind::Return { guard: None, .. } | StmtKind::Stop(_)
+                )
+            });
+            if out_ty.is_none() && !arm_diverges {
+                out_ty = Some(body_lty.ty);
+            }
+            out_tags = out_tags.union(&body_lty.tags);
+            arms.push(ExecCaseArm {
+                pattern: pat,
+                body: body_ex,
+            });
+        }
+
+        if arms.is_empty() {
+            self.diags.push(
+                Diagnostic::error(DiagCode::ExhaustivenessError, "`case` has no match arms")
+                    .with_span(span),
+            );
+        }
+
+        (
+            ExecExpr::CaseE {
+                scrut: Box::new(sex),
+                arms,
+            },
+            LTy::new(out_ty.unwrap_or(Ty::Unit), out_tags),
+        )
+    }
+
+    fn check_case_pattern(
+        &mut self,
+        pat: &Expr,
+        scrut_lty: &LTy,
+        arm_env: &mut HashMap<Ident, VarBinding>,
+    ) -> ExecPattern {
+        match &pat.kind {
+            ExprKind::Underscore => ExecPattern::Wildcard,
+            ExprKind::Ident(n) => {
+                arm_env.insert(
+                    n.clone(),
+                    VarBinding {
+                        lty: scrut_lty.clone(),
+                        mutable: false,
+                    },
+                );
+                ExecPattern::Bind(n.clone())
+            }
+            ExprKind::None => ExecPattern::Ctor {
+                ctor: "None".to_string(),
+                binders: Vec::new(),
+            },
+            ExprKind::CapName(cname) => ExecPattern::Ctor {
+                ctor: cname.clone(),
+                binders: Vec::new(),
+            },
+            ExprKind::Call { callee, args } => {
+                let cname = match &callee.kind {
+                    ExprKind::CapName(s) => s.clone(),
+                    _ => "_".to_string(),
+                };
+                let mut binders = Vec::with_capacity(args.len());
+                let field_ltys: Vec<LTy> = match (cname.as_str(), &scrut_lty.ty) {
+                    ("Ok", Ty::Result { ok_ty, .. }) => {
+                        vec![LTy::new(ok_ty.as_ref().clone(), scrut_lty.tags.clone())]
+                    }
+                    ("Error", Ty::Result { err_ty, .. }) => {
+                        vec![LTy::new(err_ty.as_ref().clone(), scrut_lty.tags.clone())]
+                    }
+                    ("Some", Ty::Option(inner)) => {
+                        vec![LTy::new(inner.as_ref().clone(), scrut_lty.tags.clone())]
+                    }
+                    (_, Ty::Data(dname)) => self
+                        .enums
+                        .get(dname)
+                        .and_then(|d| d.ctors.iter().find(|c| c.name == cname))
+                        .map(|c| {
+                            c.fields
+                                .iter()
+                                .map(|f| LTy::new(f.ty.clone(), f.tags.union(&scrut_lty.tags)))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                for (i, a) in args.iter().enumerate() {
+                    let bname = match a {
+                        CallArg::Positional(Expr {
+                            kind: ExprKind::Ident(s),
+                            ..
+                        }) => s.clone(),
+                        _ => self.fresh("wild"),
+                    };
+                    let blty = field_ltys
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| LTy::new(Ty::Unit, scrut_lty.tags.clone()));
+                    arm_env.insert(
+                        bname.clone(),
+                        VarBinding {
+                            lty: blty,
+                            mutable: false,
+                        },
+                    );
+                    binders.push(bname);
+                }
+                ExecPattern::Ctor {
+                    ctor: cname,
+                    binders,
+                }
+            }
+            ExprKind::List(items) => {
+                let elem_lty = match &scrut_lty.ty {
+                    Ty::List(el) => LTy::new(el.ty.clone(), el.tags.union(&scrut_lty.tags)),
+                    _ => LTy::new(Ty::Unit, scrut_lty.tags.clone()),
+                };
+                let mut names = Vec::with_capacity(items.len());
+                for it in items {
+                    let bname = match &it.kind {
+                        ExprKind::Ident(s) => s.clone(),
+                        _ => self.fresh("wild"),
+                    };
+                    arm_env.insert(
+                        bname.clone(),
+                        VarBinding {
+                            lty: elem_lty.clone(),
+                            mutable: false,
+                        },
+                    );
+                    names.push(bname);
+                }
+                ExecPattern::ListExact(names)
+            }
+            ExprKind::Int(raw) => {
+                let v = raw.replace('_', "").parse::<i64>().unwrap_or(0);
+                ExecPattern::Lit(Literal::int(v))
+            }
+            ExprKind::Text { value, .. } => ExecPattern::Lit(Literal::Text(value.clone())),
+            ExprKind::Bool(b) => ExecPattern::Lit(Literal::Bool(*b)),
+            _ => ExecPattern::Wildcard,
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "table literal inference resolves column types, nullability, and dynamic cells"
+    )]
+    fn check_table_lit(
+        &mut self,
+        headers: &[ast::SpannedName],
+        rows: &[Vec<Expr>],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        expected: Option<&Ty>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        let exp_tt = match expected {
+            Some(Ty::Table(tt)) => Some(tt),
+            _ => None,
+        };
+        let ncols = headers.len();
+        let mut col_tys: Vec<Option<ScalarTy>> = vec![None; ncols];
+        let mut col_has_none: Vec<bool> = vec![false; ncols];
+        let mut col_tags: Vec<TagSet> = vec![TagSet::empty(); ncols];
+
+        if let Some(ett) = exp_tt {
+            for (ci, h) in headers.iter().enumerate() {
+                if let Some(cs) = ett.find_col(&h.name) {
+                    col_tys[ci] = Some(cs.ty.clone());
+                }
+            }
+        }
+
+        // First pass: type-check every cell expression and determine unified column ScalarTy.
+        let mut cell_exprs: Vec<Vec<(ExecExpr, LTy)>> = Vec::with_capacity(rows.len());
+        let mut all_const_lits = true;
+
+        for row in rows {
+            if row.len() != ncols {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!(
+                            "table literal row has {} cells, expected {ncols}",
+                            row.len()
+                        ),
+                    )
+                    .with_span(span),
+                );
+                continue;
+            }
+            let mut r_out = Vec::with_capacity(ncols);
+            for (ci, cell) in row.iter().enumerate() {
+                let hint = col_tys[ci].as_ref().map(|st| match st {
+                    ScalarTy::Option(inner) => inner.to_ty(),
+                    other => other.to_ty(),
+                });
+                let (cex, clty) = self.check_expr(cell, env, hint.as_ref(), pc, scope, ret_ctx);
+                if !matches!(cex, ExecExpr::Lit(_)) {
+                    all_const_lits = false;
+                }
+                col_tags[ci] = col_tags[ci].union(&clty.effective_tags());
+                if matches!(cell.kind, ExprKind::None) {
+                    col_has_none[ci] = true;
+                } else if let Some(st) = clty.ty.to_scalar_ty() {
+                    let base_st = match &st {
+                        ScalarTy::Option(inner) => {
+                            col_has_none[ci] = true;
+                            inner.as_ref().clone()
+                        }
+                        other => other.clone(),
+                    };
+                    if col_tys[ci].is_none() {
+                        col_tys[ci] = Some(base_st);
+                    }
+                }
+                r_out.push((cex, clty));
+            }
+            cell_exprs.push(r_out);
+        }
+
+        let mut cols = Vec::with_capacity(ncols);
+        for (ci, h) in headers.iter().enumerate() {
+            let mut ty = col_tys[ci].clone().unwrap_or(ScalarTy::Text);
+            if col_has_none[ci] {
+                ty = ensure_option_scalar(&ty);
+            }
+            cols.push(ColSpec {
+                name: h.name.clone(),
+                ty,
+                tags: col_tags[ci].clone(),
+                bucketed: false,
+                agg_kind: AggKind::Raw,
+            });
+        }
+
+        let tt = TableTy {
+            cols: cols.clone(),
+            row_tags: TagSet::empty(),
+            order_tags: TagSet::empty(),
+            grouped_by: None,
+            summarized: false,
+            distinct_by: None,
+        };
+
+        // If all cells are constant literals AND no column needs Option wrapping of a literal,
+        // emit a pure Core IR v0.1 `TableLit`!
+        let needs_dynamic =
+            !all_const_lits || cols.iter().any(|c| c.ty.is_option()) && !rows.is_empty();
+        if !needs_dynamic {
+            let mut lit_rows = Vec::with_capacity(cell_exprs.len());
+            for r in cell_exprs {
+                let mut cells = Vec::with_capacity(ncols);
+                for (cex, _) in r {
+                    if let ExecExpr::Lit(l) = cex {
+                        cells.push(l);
+                    }
+                }
+                lit_rows.push(RowLit { cells });
+            }
+            return (
+                ExecExpr::TableLit {
+                    schema: tt.clone(),
+                    rows: lit_rows,
+                },
+                LTy::public(Ty::Table(tt)),
+            );
+        }
+
+        // Dynamic table builder (wraps non-null cells in `SomeVal` for `T?` columns and evaluates expressions).
+        let mut flat_args = Vec::with_capacity(cell_exprs.len() * ncols);
+        for r in cell_exprs {
+            for (ci, (mut cex, clty)) in r.into_iter().enumerate() {
+                if let ScalarTy::Option(inner) = &cols[ci].ty {
+                    if matches!(cex, ExecExpr::Lit(Literal::NoneLit(_))) {
+                        cex = ExecExpr::Lit(Literal::NoneLit(inner.to_ty()));
+                    } else if !clty.ty.is_option() {
+                        cex = ExecExpr::Prim {
+                            op: ExecPrimOp::Core(PrimOp::SomeVal(inner.to_ty())),
+                            args: vec![cex],
+                        };
+                    }
+                }
+                flat_args.push(cex);
+            }
+        }
+        (
+            ExecExpr::Prim {
+                op: ExecPrimOp::TableBuildDynamic(tt.clone()),
+                args: flat_args,
+            },
+            LTy::public(Ty::Table(tt)),
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Row Expression Checking (inside `where`, `derive`, `summarize`, `schema where`)
+    // -----------------------------------------------------------------------
+
+    fn check_row_expr(
+        &mut self,
+        expr: &Expr,
+        cols: &[ColSpec],
+        outer_env: &HashMap<Ident, VarBinding>,
+        expected: Option<&Ty>,
+        allow_dot_self: bool,
+    ) -> (ExecRowExpr, Ty, TagSet) {
+        match &expr.kind {
+            ExprKind::Int(raw) => {
+                let (e, lty) = self.check_int_lit(raw, expected, expr.span);
+                let lit = match e {
+                    ExecExpr::Lit(l) => l,
+                    _ => Literal::int(0i64),
+                };
+                (ExecRowExpr::Lit(lit), lty.ty, TagSet::empty())
+            }
+            ExprKind::Decimal(raw) => {
+                let (e, lty) = self.check_decimal_lit(raw, expected, expr.span);
+                let lit = match e {
+                    ExecExpr::Lit(l) => l,
+                    _ => Literal::Decimal(BigInt::ZERO),
+                };
+                (ExecRowExpr::Lit(lit), lty.ty, TagSet::empty())
+            }
+            ExprKind::Date(raw) => {
+                let d = parse_iso_date(raw).unwrap_or(0);
+                (
+                    ExecRowExpr::Lit(Literal::date(d)),
+                    Ty::Date,
+                    TagSet::empty(),
+                )
+            }
+            ExprKind::Timestamp(raw) => {
+                let ts = parse_iso_timestamp(raw).unwrap_or(0);
+                (
+                    ExecRowExpr::Lit(Literal::timestamp(ts)),
+                    Ty::Timestamp,
+                    TagSet::empty(),
+                )
+            }
+            ExprKind::Text { value, .. } => (
+                ExecRowExpr::Lit(Literal::Text(value.clone())),
+                Ty::Text,
+                TagSet::empty(),
+            ),
+            ExprKind::InterpText { parts, .. } => {
+                let mut acc: Option<ExecRowExpr> = None;
+                let mut tags = TagSet::empty();
+                for part in parts {
+                    let piece = match part {
+                        ast::InterpPart::Literal { value, .. } => {
+                            if value.is_empty() {
+                                continue;
+                            }
+                            ExecRowExpr::Lit(Literal::Text(value.clone()))
+                        }
+                        ast::InterpPart::Expr(ex) => {
+                            let (re, rty, rtags) =
+                                self.check_row_expr(ex, cols, outer_env, None, allow_dot_self);
+                            tags = tags.union(&rtags);
+                            if rty == Ty::Text {
+                                re
+                            } else {
+                                ExecRowExpr::Prim {
+                                    op: ExecPrimOp::ValToText,
+                                    args: vec![re],
+                                }
+                            }
+                        }
+                    };
+                    acc = Some(match acc {
+                        None => piece,
+                        Some(prev) => ExecRowExpr::Prim {
+                            op: ExecPrimOp::Core(PrimOp::ConcatText),
+                            args: vec![prev, piece],
+                        },
+                    });
+                }
+                (
+                    acc.unwrap_or_else(|| ExecRowExpr::Lit(Literal::Text(String::new()))),
+                    Ty::Text,
+                    tags,
+                )
+            }
+            ExprKind::Atom(a) => (
+                ExecRowExpr::Lit(Literal::Text(format!(":{a}"))),
+                Ty::Text,
+                TagSet::empty(),
+            ),
+            ExprKind::Bool(b) => (
+                ExecRowExpr::Lit(Literal::Bool(*b)),
+                Ty::Bool,
+                TagSet::empty(),
+            ),
+            ExprKind::None => {
+                let inner = match expected {
+                    Some(Ty::Option(t)) => t.as_ref().clone(),
+                    _ => Ty::Unit,
+                };
+                (
+                    ExecRowExpr::Lit(Literal::NoneLit(inner.clone())),
+                    Ty::Option(Box::new(inner)),
+                    TagSet::empty(),
+                )
+            }
+            ExprKind::DotSelf => {
+                if allow_dot_self && let Some(sc) = cols.iter().find(|c| c.name == "__self") {
+                    return (
+                        ExecRowExpr::Col("__self".to_string()),
+                        sc.ty.to_ty(),
+                        sc.tags.clone(),
+                    );
+                }
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`.` is only valid inside a `schema where` or `promise` clause",
+                    )
+                    .with_span(expr.span),
+                );
+                (ExecRowExpr::Lit(Literal::Unit), Ty::Unit, TagSet::empty())
+            }
+            ExprKind::DotField(m) => {
+                // Inside `schema where`, `.empty?` means `.__self.empty?`!
+                if allow_dot_self
+                    && let Some(sc) = cols.iter().find(|c| c.name == "__self")
+                    && let Some((re, ty)) = row_property(
+                        ExecRowExpr::Col("__self".to_string()),
+                        &sc.ty.to_ty(),
+                        &m.name,
+                    )
+                {
+                    return (re, ty, sc.tags.clone());
+                }
+                if let Some(c) = cols.iter().find(|c| c.name == m.name) {
+                    (
+                        ExecRowExpr::Col(c.name.clone()),
+                        c.ty.to_ty(),
+                        c.tags.clone(),
+                    )
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("unknown column `.{}` in row expression", m.name),
+                        )
+                        .with_span(m.span),
+                    );
+                    (ExecRowExpr::Lit(Literal::Unit), Ty::Unit, TagSet::empty())
+                }
+            }
+            ExprKind::Ident(name) => {
+                if let Some(b) = outer_env.get(name) {
+                    (
+                        ExecRowExpr::OuterVar(name.clone()),
+                        b.lty.ty.clone(),
+                        b.lty.tags.clone(),
+                    )
+                } else if let Some(c) = self.consts.get(name) {
+                    (
+                        ExecRowExpr::ConstRef(name.clone()),
+                        c.lty.ty.clone(),
+                        c.lty.tags.clone(),
+                    )
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::ResolveError,
+                            format!("unknown variable `{name}` in row expression (use `.{name}` for a column)"),
+                        )
+                        .with_span(expr.span),
+                    );
+                    (ExecRowExpr::Lit(Literal::Unit), Ty::Unit, TagSet::empty())
+                }
+            }
+            ExprKind::Paren(inner) => {
+                self.check_row_expr(inner, cols, outer_env, expected, allow_dot_self)
+            }
+            ExprKind::Unary { op, expr: inner } => {
+                let (re, rty, rtags) =
+                    self.check_row_expr(inner, cols, outer_env, expected, allow_dot_self);
+                let (pop, out_ty) = match op {
+                    UnaryOp::Not => (ExecPrimOp::Core(PrimOp::NotBool), Ty::Bool),
+                    UnaryOp::Neg => match rty {
+                        Ty::Decimal => (ExecPrimOp::Core(PrimOp::NegDec), Ty::Decimal),
+                        Ty::Float => (ExecPrimOp::NegFloat, Ty::Float),
+                        _ => (ExecPrimOp::Core(PrimOp::NegInt), Ty::Int),
+                    },
+                    UnaryOp::Try => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`try` is not allowed inside a pure row expression",
+                            )
+                            .with_span(expr.span),
+                        );
+                        return (re, rty, rtags);
+                    }
+                };
+                (
+                    ExecRowExpr::Prim {
+                        op: pop,
+                        args: vec![re],
+                    },
+                    out_ty,
+                    rtags,
+                )
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                if *op == BinOp::Coalesce {
+                    let (lre, lty, ltags) =
+                        self.check_row_expr(lhs, cols, outer_env, None, allow_dot_self);
+                    let inner = match &lty {
+                        Ty::Option(t) => t.as_ref().clone(),
+                        other => other.clone(),
+                    };
+                    let (rre, _, rtags) =
+                        self.check_row_expr(rhs, cols, outer_env, Some(&inner), allow_dot_self);
+                    return (
+                        ExecRowExpr::Coalesce {
+                            opt_expr: Box::new(lre),
+                            default_expr: Box::new(rre),
+                        },
+                        inner,
+                        ltags.union(&rtags),
+                    );
+                }
+
+                let (mut lre, mut lty, ltags) =
+                    self.check_row_expr(lhs, cols, outer_env, None, allow_dot_self);
+                let (mut rre, mut rty, rtags) =
+                    self.check_row_expr(rhs, cols, outer_env, Some(&lty), allow_dot_self);
+
+                if lty != rty {
+                    if matches!(lty, Ty::Decimal) && matches!(rty, Ty::Float) && is_numeric_lit(lhs)
+                    {
+                        let (e, l) = self.check_decimal_from_expr(lhs, &Ty::Float);
+                        if let ExecExpr::Lit(lit) = e {
+                            lre = ExecRowExpr::Lit(lit);
+                            lty = l.ty;
+                        }
+                    } else if matches!(lty, Ty::Int)
+                        && matches!(rty, Ty::Decimal | Ty::Float)
+                        && is_numeric_lit(lhs)
+                    {
+                        let (e, l) = self.check_decimal_from_expr(lhs, &rty);
+                        if let ExecExpr::Lit(lit) = e {
+                            lre = ExecRowExpr::Lit(lit);
+                            lty = l.ty;
+                        }
+                    } else if matches!(rty, Ty::Int | Ty::Decimal)
+                        && matches!(lty, Ty::Float)
+                        && is_numeric_lit(rhs)
+                    {
+                        let (e, l) = self.check_decimal_from_expr(rhs, &Ty::Float);
+                        if let ExecExpr::Lit(lit) = e {
+                            rre = ExecRowExpr::Lit(lit);
+                            rty = l.ty;
+                        }
+                    } else if matches!(rty, Ty::Int)
+                        && matches!(lty, Ty::Decimal)
+                        && is_numeric_lit(rhs)
+                    {
+                        let (e, l) = self.check_decimal_from_expr(rhs, &Ty::Decimal);
+                        if let ExecExpr::Lit(lit) = e {
+                            rre = ExecRowExpr::Lit(lit);
+                            rty = l.ty;
+                        }
+                    }
+                }
+                let tags = ltags.union(&rtags);
+                let (pop, out_ty) = match op {
+                    BinOp::And => (ExecPrimOp::Core(PrimOp::AndBool), Ty::Bool),
+                    BinOp::Or => (ExecPrimOp::Core(PrimOp::OrBool), Ty::Bool),
+                    BinOp::Eq => (ExecPrimOp::Core(PrimOp::Eq), Ty::Bool),
+                    BinOp::Ne => (ExecPrimOp::Core(PrimOp::Ne), Ty::Bool),
+                    BinOp::Lt => (ExecPrimOp::Core(PrimOp::Lt), Ty::Bool),
+                    BinOp::Le => (ExecPrimOp::Core(PrimOp::Le), Ty::Bool),
+                    BinOp::Gt => (ExecPrimOp::Core(PrimOp::Gt), Ty::Bool),
+                    BinOp::Ge => (ExecPrimOp::Core(PrimOp::Ge), Ty::Bool),
+                    BinOp::Add => match (&lty, &rty) {
+                        (Ty::Decimal, Ty::Decimal) => {
+                            (ExecPrimOp::Core(PrimOp::AddDec), Ty::Decimal)
+                        }
+                        (Ty::Float, Ty::Float) => (ExecPrimOp::AddFloat, Ty::Float),
+                        (Ty::Text, Ty::Text) => (ExecPrimOp::Core(PrimOp::ConcatText), Ty::Text),
+                        (Ty::Timestamp, Ty::Duration) => {
+                            (ExecPrimOp::Core(PrimOp::AddDuration), Ty::Timestamp)
+                        }
+                        _ => (ExecPrimOp::Core(PrimOp::AddInt), Ty::Int),
+                    },
+                    BinOp::Sub => match (&lty, &rty) {
+                        (Ty::Decimal, Ty::Decimal) => {
+                            (ExecPrimOp::Core(PrimOp::SubDec), Ty::Decimal)
+                        }
+                        (Ty::Float, Ty::Float) => (ExecPrimOp::SubFloat, Ty::Float),
+                        (Ty::Timestamp, Ty::Timestamp) => {
+                            (ExecPrimOp::Core(PrimOp::DiffTimestamp), Ty::Duration)
+                        }
+                        _ => (ExecPrimOp::Core(PrimOp::SubInt), Ty::Int),
+                    },
+                    BinOp::Mul => match (&lty, &rty) {
+                        (Ty::Decimal, Ty::Decimal) => {
+                            (ExecPrimOp::Core(PrimOp::MulDec), Ty::Decimal)
+                        }
+                        (Ty::Float, Ty::Float) => (ExecPrimOp::MulFloat, Ty::Float),
+                        _ => (ExecPrimOp::Core(PrimOp::MulInt), Ty::Int),
+                    },
+                    BinOp::Div => match (&lty, &rty) {
+                        (Ty::Decimal, Ty::Decimal) => {
+                            (ExecPrimOp::Core(PrimOp::DivDec), Ty::Decimal)
+                        }
+                        (Ty::Float, Ty::Float) => (ExecPrimOp::DivFloat, Ty::Float),
+                        _ => (ExecPrimOp::Core(PrimOp::DivInt), Ty::Int),
+                    },
+                    BinOp::Mod => (ExecPrimOp::Core(PrimOp::ModInt), Ty::Int),
+                    _ => (ExecPrimOp::Core(PrimOp::Eq), Ty::Bool),
+                };
+                (
+                    ExecRowExpr::Prim {
+                        op: pop,
+                        args: vec![lre, rre],
+                    },
+                    out_ty,
+                    tags,
+                )
+            }
+            ExprKind::Field { receiver, member } => {
+                // Duration literals inside row expressions (`5.minutes`).
+                if let Some(us) = eval_const_duration_micros(expr) {
+                    return (
+                        ExecRowExpr::Lit(Literal::duration(us)),
+                        Ty::Duration,
+                        TagSet::empty(),
+                    );
+                }
+                let (re, rty, rtags) =
+                    self.check_row_expr(receiver, cols, outer_env, None, allow_dot_self);
+                if let Some((out_re, out_ty)) = row_property(re, &rty, &member.name) {
+                    (out_re, out_ty, rtags)
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("unknown row property `.{}`", member.name),
+                        )
+                        .with_span(expr.span),
+                    );
+                    (ExecRowExpr::Lit(Literal::Unit), Ty::Unit, rtags)
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                // Shorthand `.contains?("@")` in `schema where`!
+                if allow_dot_self
+                    && let ExprKind::DotField(m) = &callee.kind
+                    && let Some(sc) = cols.iter().find(|c| c.name == "__self")
+                    && m.name == "contains?"
+                    && let Some(CallArg::Positional(a0)) = args.first()
+                {
+                    let (a_re, _, a_tags) =
+                        self.check_row_expr(a0, cols, outer_env, Some(&Ty::Text), allow_dot_self);
+                    return (
+                        ExecRowExpr::Prim {
+                            op: ExecPrimOp::Core(PrimOp::ContainsText),
+                            args: vec![ExecRowExpr::Col("__self".to_string()), a_re],
+                        },
+                        Ty::Bool,
+                        sc.tags.union(&a_tags),
+                    );
+                }
+                // Method calls inside row expressions (`.contains?`, `.round(n)`).
+                if let ExprKind::Field { receiver, member } = &callee.kind {
+                    let (re, rty, rtags) =
+                        self.check_row_expr(receiver, cols, outer_env, None, allow_dot_self);
+                    match member.name.as_str() {
+                        "contains?" => {
+                            if let Some(CallArg::Positional(a0)) = args.first() {
+                                let (are, _, atags) = self.check_row_expr(
+                                    a0,
+                                    cols,
+                                    outer_env,
+                                    Some(&Ty::Text),
+                                    allow_dot_self,
+                                );
+                                return (
+                                    ExecRowExpr::Prim {
+                                        op: ExecPrimOp::Core(PrimOp::ContainsText),
+                                        args: vec![re, are],
+                                    },
+                                    Ty::Bool,
+                                    rtags.union(&atags),
+                                );
+                            }
+                        }
+                        "round" => {
+                            let (are, _, atags) = match args.first() {
+                                Some(CallArg::Positional(a0)) => self.check_row_expr(
+                                    a0,
+                                    cols,
+                                    outer_env,
+                                    Some(&Ty::Int),
+                                    allow_dot_self,
+                                ),
+                                _ => (
+                                    ExecRowExpr::Lit(Literal::int(0i64)),
+                                    Ty::Int,
+                                    TagSet::empty(),
+                                ),
+                            };
+                            let pop = if rty == Ty::Decimal {
+                                ExecPrimOp::RoundDecimal
+                            } else {
+                                ExecPrimOp::RoundFloat
+                            };
+                            return (
+                                ExecRowExpr::Prim {
+                                    op: pop,
+                                    args: vec![re, are],
+                                },
+                                rty,
+                                rtags.union(&atags),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                // Free row functions (`date_trunc`, `months_between`, or pure user `fn`).
+                if let ExprKind::Ident(fname) = &callee.kind {
+                    if fname == "date_trunc"
+                        && let [CallArg::Positional(a), CallArg::Positional(b)] = args.as_slice()
+                    {
+                        let (ea, ta, tga) =
+                            self.check_row_expr(a, cols, outer_env, None, allow_dot_self);
+                        if let ExprKind::Atom(unit) = &b.kind {
+                            let op = if unit == "month" && ta == Ty::Date {
+                                ExecPrimOp::Core(PrimOp::DateTruncMonth)
+                            } else {
+                                ExecPrimOp::DateTruncUnit(unit.clone())
+                            };
+                            return (ExecRowExpr::Prim { op, args: vec![ea] }, ta, tga);
+                        }
+                        let (eb, _, tgb) = self.check_row_expr(
+                            b,
+                            cols,
+                            outer_env,
+                            Some(&Ty::Duration),
+                            allow_dot_self,
+                        );
+                        return (
+                            ExecRowExpr::Prim {
+                                op: ExecPrimOp::DateTruncDuration,
+                                args: vec![ea, eb],
+                            },
+                            ta,
+                            tga.union(&tgb),
+                        );
+                    }
+                    if fname == "months_between"
+                        && let [CallArg::Positional(a), CallArg::Positional(b)] = args.as_slice()
+                    {
+                        let (ea, _, tga) = self.check_row_expr(
+                            a,
+                            cols,
+                            outer_env,
+                            Some(&Ty::Date),
+                            allow_dot_self,
+                        );
+                        let (eb, _, tgb) = self.check_row_expr(
+                            b,
+                            cols,
+                            outer_env,
+                            Some(&Ty::Date),
+                            allow_dot_self,
+                        );
+                        return (
+                            ExecRowExpr::Prim {
+                                op: ExecPrimOp::MonthsBetween,
+                                args: vec![ea, eb],
+                            },
+                            Ty::Int,
+                            tga.union(&tgb),
+                        );
+                    }
+                    if let Some(sig) = self.fn_sigs.get(fname).cloned() {
+                        if !sig.is_pure {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::CapabilityError,
+                                    format!("impure function `{fname}` cannot be called inside a pure table pipeline"),
+                                )
+                                .with_span(expr.span),
+                            );
+                        }
+                        let ret_lty = self
+                            .ensure_fn_checked(fname)
+                            .or(sig.ret)
+                            .unwrap_or_else(|| LTy::public(Ty::Unit));
+                        let mut rargs = Vec::with_capacity(args.len());
+                        let mut tags = ret_lty.tags;
+                        for (i, arg) in args.iter().enumerate() {
+                            let e = match arg {
+                                CallArg::Positional(e) | CallArg::Named { value: e, .. } => e,
+                            };
+                            let hint = sig.params.get(i).map(|(_, l)| &l.ty);
+                            let (are, _, atags) =
+                                self.check_row_expr(e, cols, outer_env, hint, allow_dot_self);
+                            tags = tags.union(&atags);
+                            rargs.push(are);
+                        }
+                        return (
+                            ExecRowExpr::CallPure {
+                                fn_name: fname.clone(),
+                                args: rargs,
+                            },
+                            ret_lty.ty,
+                            tags,
+                        );
+                    }
+                }
+                self.diags.push(
+                    Diagnostic::error(DiagCode::TypeError, "unsupported call in row expression")
+                        .with_span(expr.span),
+                );
+                (ExecRowExpr::Lit(Literal::Unit), Ty::Unit, TagSet::empty())
+            }
+            ExprKind::IfInline {
+                cond,
+                then_expr,
+                else_ifs,
+                else_expr,
+            } => self.check_row_if_inline(
+                cond,
+                then_expr,
+                else_ifs,
+                else_expr,
+                cols,
+                outer_env,
+                expected,
+                allow_dot_self,
+            ),
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "unsupported construct in pure row expression",
+                    )
+                    .with_span(expr.span),
+                );
+                (ExecRowExpr::Lit(Literal::Unit), Ty::Unit, TagSet::empty())
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "row-level inline if chains branches with type and tag union"
+    )]
+    fn check_row_if_inline(
+        &mut self,
+        cond: &Expr,
+        then_expr: &Expr,
+        else_ifs: &[(Expr, Expr)],
+        else_expr: &Expr,
+        cols: &[ColSpec],
+        outer_env: &HashMap<Ident, VarBinding>,
+        expected: Option<&Ty>,
+        allow_dot_self: bool,
+    ) -> (ExecRowExpr, Ty, TagSet) {
+        let (cre, _, ctags) =
+            self.check_row_expr(cond, cols, outer_env, Some(&Ty::Bool), allow_dot_self);
+        let (tre, tty, ttags) =
+            self.check_row_expr(then_expr, cols, outer_env, expected, allow_dot_self);
+        let (ere, _, etags) = if let Some((ec, et)) = else_ifs.first() {
+            self.check_row_if_inline(
+                ec,
+                et,
+                &else_ifs[1..],
+                else_expr,
+                cols,
+                outer_env,
+                expected.or(Some(&tty)),
+                allow_dot_self,
+            )
+        } else {
+            self.check_row_expr(
+                else_expr,
+                cols,
+                outer_env,
+                expected.or(Some(&tty)),
+                allow_dot_self,
+            )
+        };
+        (
+            ExecRowExpr::IfE {
+                cond: Box::new(cre),
+                then_br: Box::new(tre),
+                else_br: Box::new(ere),
+            },
+            tty,
+            ctags.union(&ttags).union(&etags),
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Subtyping, Boundary Coercion & Privacy Enforcement
+    // -----------------------------------------------------------------------
+
+    fn coerce_expr(
+        &mut self,
+        expr: ExecExpr,
+        actual: &LTy,
+        expected: &LTy,
+        span: Span,
+        context: &str,
+    ) -> ExecExpr {
+        // Table structural subtyping & boundary coercion:
+        // - Width subtyping: `src_tt` may carry extra columns; every column required by `dst_tt`
+        //   must be present with compatible scalar type (`T <: T?`, literal `Decimal -> Float`)
+        //   and `sc.tags ⊆ dc.tags`.
+        // - Row-tag privacy: `src_tt.row_tags ⊆ dst_tt.total_tags()`.
+        if let (Ty::Table(src_tt), Ty::Table(dst_tt)) = (&actual.ty, &expected.ty) {
+            let allowed_row_tags = dst_tt.total_tags();
+            if !src_tt.row_tags.is_subset(&allowed_row_tags) {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::PrivacyError,
+                        format!(
+                            "{context}: table carries row sensitivity tags {:?} not permitted by expected schema {:?}",
+                            src_tt.row_tags.elems(),
+                            allowed_row_tags.elems()
+                        ),
+                    )
+                    .with_span(span),
+                );
+            }
+            let is_empty_lit =
+                matches!(expr, ExecExpr::TableLit { ref rows, .. } if rows.is_empty());
+            let exact_layout_match = src_tt.cols.len() == dst_tt.cols.len()
+                && src_tt
+                    .cols
+                    .iter()
+                    .zip(&dst_tt.cols)
+                    .all(|(s, d)| s.name == d.name && s.ty == d.ty);
+            let mut needs_coerce = !exact_layout_match;
+            for dc in &dst_tt.cols {
+                let Some(sc) = src_tt.find_col(&dc.name) else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("{context}: table is missing required column `{}`", dc.name),
+                        )
+                        .with_span(span),
+                    );
+                    continue;
+                };
+                let ty_compat = scalar_ty_coercible(&sc.ty, &dc.ty) || is_empty_lit;
+                if !ty_compat {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("{context}: incompatible type for column `{}`", dc.name),
+                        )
+                        .with_span(span),
+                    );
+                }
+                if !sc.tags.is_subset(&dc.tags) {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::PrivacyError,
+                            format!(
+                                "{context}: column `{}` carries sensitivity tags {:?} not allowed by target {:?}",
+                                dc.name,
+                                sc.tags.elems(),
+                                dc.tags.elems()
+                            ),
+                        )
+                        .with_span(span),
+                    );
+                }
+            }
+            if needs_coerce {
+                return ExecExpr::Prim {
+                    op: ExecPrimOp::TableCoerce(dst_tt.clone()),
+                    args: vec![expr],
+                };
+            }
+            needs_coerce = false;
+            let _ = needs_coerce;
+            return expr;
+        }
+
+        // Scalar/general `T <: Option(T)` promotion.
+        if let Ty::Option(inner) = &expected.ty
+            && **inner == actual.ty
+        {
+            return ExecExpr::Prim {
+                op: ExecPrimOp::Core(PrimOp::SomeVal(actual.ty.clone())),
+                args: vec![expr],
+            };
+        }
+
+        // Strictly enforce sensitivity tag non-laundering on all scalar/record boundaries:
+        // tagged values may never flow into an untagged or under-tagged target.
+        if !actual.tags.is_subset(&expected.tags) {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::PrivacyError,
+                    format!(
+                        "{context}: sensitivity tags {:?} exceed target {:?}",
+                        actual.tags.elems(),
+                        expected.tags.elems()
+                    ),
+                )
+                .with_span(span),
+            );
+        }
+
+        expr
+    }
+
+    fn require_spec_scope(&mut self, scope: LocalScopeKind, span: Span, what: &str) {
+        if !matches!(scope, LocalScopeKind::Spec) {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::CapabilityError,
+                    format!("{what} is a test double and may only be used inside `test`, `examples`, or `promise` blocks"),
+                )
+                .with_span(span),
+            );
+        }
+    }
+}
+
+enum BlockStep {
+    Bind(Ident, LTy, ExecExpr),
+    Effect(ExecExpr),
+    Final(ExecExpr),
+    Loop(Box<LoopStep>),
+}
+
+enum LoopStep {
+    For {
+        item_var: Ident,
+        iter_expr: ExecExpr,
+        state_vars: Vec<(Ident, LTy)>,
+        body: ExecExpr,
+    },
+    While {
+        cond: ExecExpr,
+        state_vars: Vec<(Ident, LTy)>,
+        body: ExecExpr,
+    },
+}
+
+fn expr_jumps_to(expr: &ExecExpr, label: &str) -> bool {
+    let mut stack = vec![expr];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            ExecExpr::Jump { label: l, args } => {
+                if l == label {
+                    return true;
+                }
+                stack.extend(args.iter());
+            }
+            ExecExpr::LetE { bound, body, .. }
+            | ExecExpr::Join {
+                rhs: bound, body, ..
+            } => {
+                stack.push(bound);
+                stack.push(body);
+            }
+            ExecExpr::IfE {
+                cond,
+                then_br,
+                else_br,
+            } => {
+                stack.push(cond);
+                stack.push(then_br);
+                stack.push(else_br);
+            }
+            ExecExpr::CaseE { scrut, arms } => {
+                stack.push(scrut);
+                for a in arms {
+                    stack.push(&a.body);
+                }
+            }
+            ExecExpr::ForLoop {
+                iter_expr,
+                body,
+                after,
+                ..
+            } => {
+                stack.push(iter_expr);
+                stack.push(body);
+                stack.push(after);
+            }
+            ExecExpr::WhileLoop {
+                cond, body, after, ..
+            } => {
+                stack.push(cond);
+                stack.push(body);
+                stack.push(after);
+            }
+            ExecExpr::App { fn_expr, args } => {
+                stack.push(fn_expr);
+                stack.extend(args.iter());
+            }
+            ExecExpr::Call { args, .. }
+            | ExecExpr::Tuple(args)
+            | ExecExpr::Ctor { args, .. }
+            | ExecExpr::Prim { args, .. }
+            | ExecExpr::Host { args, .. } => {
+                stack.extend(args.iter());
+            }
+            ExecExpr::Proj { tup: e, .. }
+            | ExecExpr::Assert { cond: e, .. }
+            | ExecExpr::Fail(e) => stack.push(e),
+            ExecExpr::Stop {
+                detail: Some(e), ..
+            } => stack.push(e),
+            _ => {}
+        }
+    }
+    false
+}
+
+fn scalar_ty_coercible(src: &ScalarTy, dst: &ScalarTy) -> bool {
+    if src == dst {
+        return true;
+    }
+    match (src, dst) {
+        (ScalarTy::Option(s), ScalarTy::Option(d)) => scalar_ty_coercible(s, d),
+        (s, ScalarTy::Option(d)) => scalar_ty_coercible(s, d),
+        (ScalarTy::Int, ScalarTy::Decimal | ScalarTy::Float)
+        | (ScalarTy::Decimal, ScalarTy::Float) => true,
+        _ => false,
+    }
+}
+
+fn expr_to_plan(expr: ExecExpr) -> ExecPlan {
+    match expr {
+        ExecExpr::Rel(plan) => *plan,
+        other => ExecPlan::SourceExpr(Box::new(other)),
+    }
+}
+
+fn upsert_col(cols: &mut Vec<ColSpec>, spec: ColSpec) {
+    if let Some(existing) = cols.iter_mut().find(|c| c.name == spec.name) {
+        *existing = spec;
+    } else {
+        cols.push(spec);
+    }
+}
+
+fn is_capability_ty(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Args
+            | Ty::Clock
+            | Ty::Console(_)
+            | Ty::ReadFiles
+            | Ty::WriteFiles { .. }
+            | Ty::ReadDB(_)
+            | Ty::WriteTable { .. }
+            | Ty::RawReadDB(_)
+            | Ty::HttpsAllow { .. }
+            | Ty::Secret(_)
+            | Ty::Declassify(_)
+    )
+}
+
+fn is_unresolved_list(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::List(el) if matches!(&el.ty, Ty::Data(n) if n == TY_UNRESOLVED_LIST_ELEM)
+    )
+}
+
+fn is_numeric_lit(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Int(_) | ExprKind::Decimal(_) => true,
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            expr: inner,
+        } => is_numeric_lit(inner),
+        _ => false,
+    }
+}
+
+fn eval_const_duration_micros(expr: &Expr) -> Option<i64> {
+    if let ExprKind::Field { receiver, member } = &expr.kind
+        && let ExprKind::Int(raw) = &receiver.kind
+    {
+        let n: i64 = raw.replace('_', "").parse().ok()?;
+        let mult = match member.name.as_str() {
+            "seconds" => MICROS_PER_SECOND,
+            "minutes" => MICROS_PER_MINUTE,
+            "hours" => MICROS_PER_HOUR,
+            "days" => MICROS_PER_DAY,
+            _ => return None,
+        };
+        return n.checked_mul(mult);
+    }
+    None
+}
+
+fn row_property(re: ExecRowExpr, ty: &Ty, prop: &str) -> Option<(ExecRowExpr, Ty)> {
+    match (ty, prop) {
+        (Ty::Option(_), "some?") => Some((
+            ExecRowExpr::Prim {
+                op: ExecPrimOp::Core(PrimOp::IsSome),
+                args: vec![re],
+            },
+            Ty::Bool,
+        )),
+        (Ty::Option(_), "none?") => Some((
+            ExecRowExpr::Prim {
+                op: ExecPrimOp::Core(PrimOp::IsNone),
+                args: vec![re],
+            },
+            Ty::Bool,
+        )),
+        (Ty::Text, "empty?") => Some((
+            ExecRowExpr::Prim {
+                op: ExecPrimOp::Core(PrimOp::EmptyText),
+                args: vec![re],
+            },
+            Ty::Bool,
+        )),
+        (Ty::Text, "trim") => Some((
+            ExecRowExpr::Prim {
+                op: ExecPrimOp::Core(PrimOp::TrimText),
+                args: vec![re],
+            },
+            Ty::Text,
+        )),
+        (Ty::Text, "ascii_lowercase") => Some((
+            ExecRowExpr::Prim {
+                op: ExecPrimOp::Core(PrimOp::LowerAsciiText),
+                args: vec![re],
+            },
+            Ty::Text,
+        )),
+        (Ty::Int, "to_decimal") => Some((
+            ExecRowExpr::Prim {
+                op: ExecPrimOp::Core(PrimOp::IntToDec),
+                args: vec![re],
+            },
+            Ty::Decimal,
+        )),
+        (Ty::Int, "to_float") => Some((
+            ExecRowExpr::Prim {
+                op: ExecPrimOp::IntToFloat,
+                args: vec![re],
+            },
+            Ty::Float,
+        )),
+        (Ty::Int, "abs") => Some((
+            ExecRowExpr::Prim {
+                op: ExecPrimOp::AbsInt,
+                args: vec![re],
+            },
+            Ty::Int,
+        )),
+        (Ty::Float, "abs") => Some((
+            ExecRowExpr::Prim {
+                op: ExecPrimOp::AbsFloat,
+                args: vec![re],
+            },
+            Ty::Float,
+        )),
+        (Ty::Decimal, "abs") => Some((
+            ExecRowExpr::Prim {
+                op: ExecPrimOp::AbsDecimal,
+                args: vec![re],
+            },
+            Ty::Decimal,
+        )),
+        (Ty::Decimal, "to_float") => Some((
+            ExecRowExpr::Prim {
+                op: ExecPrimOp::DecToFloat,
+                args: vec![re],
+            },
+            Ty::Float,
+        )),
+        _ => None,
+    }
+}
+
+fn named_dot_col(args: &[CallArg], key: &str) -> Option<Ident> {
+    args.iter().find_map(|a| match a {
+        CallArg::Named { name, value, .. } if name.name == key => {
+            if let ExprKind::DotField(m) = &value.kind {
+                Some(m.name.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    })
+}
+
+fn named_cap_arg(args: &[CallArg], key: &str) -> Option<Ident> {
+    args.iter().find_map(|a| match a {
+        CallArg::Named { name, value, .. } if name.name == key => {
+            if let ExprKind::CapName(s) = &value.kind {
+                Some(s.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    })
+}
+
+fn named_expr_arg<'a>(args: &'a [CallArg], key: &str) -> Option<&'a Expr> {
+    args.iter().find_map(|a| match a {
+        CallArg::Named { name, value, .. } if name.name == key => Some(value),
+        _ => None,
+    })
+}
+
+fn stats_col_tags(tlty: &LTy, cols: &[&str]) -> TagSet {
+    let mut tags = tlty.tags.clone();
+    if let Ty::Table(tt) = &tlty.ty {
+        tags = tags.union(&tt.row_tags);
+        for c in cols {
+            if let Some(cs) = tt.find_col(c) {
+                tags = tags.union(&cs.tags);
+            }
+        }
+    }
+    tags
+}
+
+fn sanitize_ident(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .take(48)
+        .collect()
+}
+
+/// Rewrite standalone `.` and bare table-aggregate calls (`sum(.col)`, `mean(.col)`, `count()`)
+/// inside a `promise` expression to refer to `self_var`.
+fn rewrite_promise_self(expr: &Expr, self_var: &str, is_table: bool) -> Expr {
+    let sp = expr.span;
+    match &expr.kind {
+        ExprKind::DotSelf => Expr {
+            kind: ExprKind::Ident(self_var.to_string()),
+            span: sp,
+        },
+        ExprKind::Call { callee, args } if is_table => {
+            if let ExprKind::Ident(fname) = &callee.kind
+                && matches!(fname.as_str(), "sum" | "mean" | "stddev" | "count")
+            {
+                return Expr {
+                    kind: ExprKind::Call {
+                        callee: Box::new(Expr {
+                            kind: ExprKind::Field {
+                                receiver: Box::new(Expr {
+                                    kind: ExprKind::Ident(self_var.to_string()),
+                                    span: sp,
+                                }),
+                                member: ast::SpannedName::new(fname.clone(), callee.span),
+                            },
+                            span: callee.span,
+                        }),
+                        args: args.clone(),
+                    },
+                    span: sp,
+                };
+            }
+            Expr {
+                kind: ExprKind::Call {
+                    callee: Box::new(rewrite_promise_self(callee, self_var, is_table)),
+                    args: args
+                        .iter()
+                        .map(|a| match a {
+                            CallArg::Positional(e) => {
+                                CallArg::Positional(rewrite_promise_self(e, self_var, is_table))
+                            }
+                            CallArg::Named { name, value, span } => CallArg::Named {
+                                name: name.clone(),
+                                value: rewrite_promise_self(value, self_var, is_table),
+                                span: *span,
+                            },
+                        })
+                        .collect(),
+                },
+                span: sp,
+            }
+        }
+        ExprKind::Binary { op, lhs, rhs } => Expr {
+            kind: ExprKind::Binary {
+                op: *op,
+                lhs: Box::new(rewrite_promise_self(lhs, self_var, is_table)),
+                rhs: Box::new(rewrite_promise_self(rhs, self_var, is_table)),
+            },
+            span: sp,
+        },
+        ExprKind::Unary { op, expr: inner } => Expr {
+            kind: ExprKind::Unary {
+                op: *op,
+                expr: Box::new(rewrite_promise_self(inner, self_var, is_table)),
+            },
+            span: sp,
+        },
+        ExprKind::Paren(inner) => Expr {
+            kind: ExprKind::Paren(Box::new(rewrite_promise_self(inner, self_var, is_table))),
+            span: sp,
+        },
+        _ => expr.clone(),
+    }
+}

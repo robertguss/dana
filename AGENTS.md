@@ -9,8 +9,9 @@ this repository. `CLAUDE.md` imports this file.
 fast, private, database-native data work—the data sibling to
 [Mo](https://github.com/robertguss/mo).
 
-Phase 0 (Design & Executable Grammar) is complete. Phase 1 (Lean Core & Naive Rust Oracle)
-is next. Run `make grammar` after any change to `grammar/`, `examples/`, or
+Phases 0 & 1 (Design, Executable Grammar, Lean 4 Formal Core & Naive Rust Oracle) are
+complete. Phase 2 (Core Toolchain & Vectorized Columnar VM) is in progress. Run
+`make check-all` after changes to `grammar/`, `examples/`, `formal/`, `src/`, or
 `docs/reference/README.md`.
 
 ## Documents in Order of Authority
