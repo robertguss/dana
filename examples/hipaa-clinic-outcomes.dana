@@ -31,7 +31,9 @@ fn department_outcomes(encounters: Table(PatientEncounter))
          patients: count_distinct(.patient_id),
          encounters: count(),
          avg_los_days: mean(.length_of_stay_days),
-         median_los_days: median(.length_of_stay_days),
+         # Blending dispersion clears under `suppress_small_groups`;
+         # order statistics (`median`, `percentile`, `min`, `max`) stay `[health]`.
+         stddev_los_days: stddev(.length_of_stay_days),
          readmission_rate: mean(if .readmitted_30d?: 1.0 else: 0.0)
        )
     |> suppress_small_groups(min: 10, distinct_by: .patient_id)

@@ -331,9 +331,10 @@ Full rules live in `docs/design/privacy.md`. Summary for authors and agents:
      compile-time-constant public labels; stays tagged on individual rows and clears under
      `suppress_small_groups`.
    - `suppress_small_groups(min: k, distinct_by: .id)` — enforces `>= k` distinct entities
-     (default floor `5`); clears `row_tags`, blending aggregates (`count`, `sum`, `mean`,
-     `median`, `stddev`, `variance`, `percentile`), and `bucketed` group keys, while
-     keeping non-bucketed group keys and `min`/`max` tagged.
+     (default floor `5`); clears `row_tags`, blending aggregates (`count`, `count_distinct`,
+     `sum`, `mean`, `stddev`, `variance`), and `bucketed` group keys, while keeping
+     non-bucketed group keys and order statistics / extremes (`median`, `percentile`, `min`,
+     `max`, `first`, `last`) tagged.
 4. **Authorized sinks & optional `dana.policy`:** output capabilities default to
    `allows: []`; authorized sinks list `allows: [...]`, `WriteTable` checks column-by-column
    schema tag compatibility, external sensitive exports require runtime `--allow-export=...`,

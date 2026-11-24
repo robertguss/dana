@@ -1,0 +1,10 @@
+name = "dana-core"
+version = "0.1.0"
+defaultTargets = ["DanaCore", "danacore"]
+
+[[lean_lib]]
+name = "DanaCore"
+
+[[lean_exe]]
+name = "danacore"
+root = "Main"

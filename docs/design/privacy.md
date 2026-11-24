@@ -98,7 +98,7 @@ The effective sensitivity of emitting a column `c` from table `T` is always
 | `semi_join` / `anti_join` | Left column tags preserved | `L.row_tags ∪ R.row_tags ∪ tags(pred)` | Row survival depends on right table match. |
 | `union(R)` | Per-column `L.col_tags(c) ∪ R.col_tags(c)` | `L.row_tags ∪ R.row_tags` | |
 | `group_by(keys...)` | Grouping key columns retain their tags | `row_tags ∪ tags(keys)` | Records grouping keys for `summarize` and `suppress_small_groups`. |
-| `summarize(a: agg(e), ...)` | `col_tags(a) = tags(e) ∪ row_tags`; each output col records whether it is a **blending aggregate** (`count`, `sum`, `mean`, `median`, `stddev`, `variance`, `percentile`) or **non-blending** (`min`, `max`, `first`, `last`, `collect`) | Preserves `row_tags`; tracks exact hidden group size (and distinct entity count if specified) | Re-sorting/grouping clears prior `order_tags`. |
+| `summarize(a: agg(e), ...)` | `col_tags(a) = tags(e) ∪ row_tags`; each output col records whether it is a **blending aggregate** (`count`, `count_distinct`, `sum`, `mean`, `stddev`, `variance`) or **non-blending** (`median`, `percentile`, `min`, `max`, `first`, `last`, `collect`) | Preserves `row_tags`; tracks exact hidden group size (and distinct entity count if specified) | Re-sorting/grouping clears prior `order_tags`. |
 | `window(x: wfn(e), over: part, order: ord)` | `col_tags(x) = tags(e) ∪ tags(part) ∪ tags(ord)` | Unchanged | |
 | `pivot_wider(names_from: n, values_from: v, columns: [...])` | Static output columns each inherit `tags(n) ∪ tags(v)` | `row_tags ∪ tags(n)` | Output column names are compile-time constants, so headers cannot leak tagged data. |
 | `crosstab(rows: r, cols: c, values: v)` | Returns `DynamicTable` tagged `row_tags ∪ tags(r) ∪ tags(c) ∪ tags(v)` | Folded into `DynamicTable` tags | Display-only matrix; cannot be statically dot-indexed and cannot leak sensitive headers to public sinks. |
@@ -157,21 +157,24 @@ through two auditable mechanisms:
      student with 5 course rows from masquerading as 5 students).
    - Enforces `k >= min_group_size` (default floor `5`; may be raised by `dana.policy`).
    - Drops groups smaller than `k` (or, with `mode: :mask`, masks suppressed aggregate cells
-     while enforcing complementary suppression so suppressed counts cannot be recovered by
-     subtraction from a grand total).
+     and applies complementary suppression so whenever any groups remain unmasked, the
+     combined count across suppressed cells is at least `k`, preventing exact single-cell
+     recovery from a grand total).
    - **What it clears:**
      - Clears `row_tags` to `[]` (except tags present on any remaining non-bucketed group-by
        key column).
-     - Clears sensitivity tags on **blending aggregates** (`count`, `sum`, `mean`, `median`,
-       `stddev`, `variance`, `percentile`).
+     - Clears sensitivity tags on **blending aggregates** (`count`, `count_distinct`, `sum`,
+       `mean`, `stddev`, `variance`).
      - Clears sensitivity tags on **`bucketed` group-by key columns** created via
        `bucket(...)` (since each surviving bucket represents `>= k` distinct entities and its
        label is a compile-time constant).
    - **What it NEVER clears:**
      - **Non-bucketed group-by key columns** keep their tags (`group_by(.email)` keeps
        `.email` as `[pii]`; `group_by(.clinical_notes)` keeps `[health]`).
-     - **Single-record extremes** (`min`, `max`, `first`, `last`, `collect`) keep their tags
-       because a single individual's exact value can surface even in a large group.
+     - **Single-record extremes and order statistics** (`median`, `percentile`, `min`, `max`,
+       `first`, `last`, `collect`) keep their tags because a single individual's exact value
+       can surface even in a large group (e.g., `median` on an odd-sized group, or
+       `percentile(0)`/`percentile(1)`).
 
 ```ruby
 students
@@ -284,22 +287,39 @@ In `formal/` (Phase 1), Dana Core IR models:
 ### What Lean Proves
 
 1. **Schema & Type Soundness:** Every well-typed Core IR program evaluates without missing
-   column errors, type errors, or untagged null crashes.
-2. **Termination-Insensitive Non-Interference (up to Audited Declassifiers & Authorized Sinks):**
-   For any tag `t`, any program `P` that does **not** hold a sink allowing `t`, a `Declassify`
-   capability for `t`, or an audited declassifier clearing `t` along a path to output:
-   running `P` on any two inputs `I1` and `I2` that agree on all data not tagged with `t`
-   produces **byte-for-byte identical** outputs (and identical redacted diagnostics).
+   column errors, type errors, or untagged null crashes (and every `suppress_small_groups`
+   stage enforces `min_k >= min_group_floor >= 5` against its tracked group-size counters).
+2. **Termination- and Error-Insensitive Non-Interference (up to Audited Declassifiers & Authorized Sinks):**
+   For any observer clearance `L` (e.g., public `L = []`), any well-typed program `P` that
+   contains no audited declassifier (`DeclassifyApprove`, `Pseudonymize`, `SuppressSmallGroups`)
+   clearing a tag outside `L`, whose sinks all satisfy `allows ⊆ L`, whose declared `Data`
+   types satisfy `progDatasSortableForNI`, and whose stored DB tables satisfy `progRespectsDB`:
+   running `P` on any two `L`-equivalent worlds `W1 ≈_L W2` that both complete normally
+   (`status = ok`) produces **byte-for-byte identical** observable `ExecReport`s. Separately,
+   Theorem 2E proves that when an explicit `.stop` node with a sensitive payload executes from
+   publicly equivalent states (`L = []`) and its detail expression evaluates normally on both
+   runs, both executions emit identical `[REDACTED:tag]` diagnostics and observable reports.
 
 ### Explicit Trust Boundary (What Lies Outside the Proof)
 
 Being honest about boundaries matters as much as the proof itself:
 - **Timing & memory side channels** are out of scope (Dana targets accidental and
   agent-induced disclosure in data pipelines, not cryptographic constant-time execution).
+- **Termination and stop/trap position divergence (`ok` vs. `stopped`)** are outside the static
+  non-interference proof: Theorems 2A–2D assume both runs terminate normally with `status = ok`.
+  Because `extractReport` retains output emitted before a stop, the *position* of a runtime
+  trap (such as `100 / (secret - i)` divide-by-zero or `Int64`/`Decimal` overflow) or an
+  explicit `.stop` executed conditionally under a sensitive `pc` is observable and can leak an
+  entire small-domain sensitive value in one run (though explicit `.stop` diagnostic payloads
+  are proven redacted by Theorem 2E when the detail expression evaluates normally).
+- **Database schema & tag fidelity (`progRespectsDB`)**: stored database tables read via
+  `SourceDB` are trusted to match their declared `SourceDB` / `schema.lock` column types and
+  sensitivity tags (verified offline against `schema.lock` and at runtime by the DB driver).
 - **Differential privacy / composition attacks across multiple independent runs** (e.g.,
   running two slightly different `suppress_small_groups(min: 5)` reports and differencing
   them by hand) are outside the static proof; `suppress_small_groups` is modeled as a
   trusted audited declassification boundary whose minimum `k` and blending-aggregate rules
   are statically enforced.
-- **Native parsers and DB wire protocols** are verified by Zero-Crate Rust memory safety,
-  the differential reference oracle, and continuous fuzzing rather than Lean.
+- **Native parsers, statistical CDFs (`statsTTest`), and DB wire protocols** are verified by
+  Zero-Crate Rust memory safety, the differential reference oracle, and continuous fuzzing
+  rather than Lean.

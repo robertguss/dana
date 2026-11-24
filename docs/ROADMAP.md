@@ -13,23 +13,22 @@ when its declared checks pass.
 | 4. Formats, Analytics, Charts & REPL | Native Parquet & `.xlsx`, HTTPS allowlist, windows/pivots/stats, SVG/HTML reports, `dana repl` | **v0.2** |
 | 5. Hardening & Learnability Gate | Full parser fuzzing, differential soak tests, real-world pipelines, multi-model AI learnability gate | **v1.0** |
 
-## Now: Phase 0 Complete — Ready for Phase 1 (Formal Core & Oracle)
+## Now: Phase 1A Complete — Moving to Phase 1B (Zero-Crate Rust Core IR & Naive Oracle)
 
-Phase 0 established and verified the language specification before compiler implementation
-starts:
+Phase 0 and Phase 1A established and formally verified the language specification and Core IR:
 
 - [x] **Design Charter & Architecture Overview** (`docs/CHARTER.md`, `docs/design/architecture.md`, `docs/ROADMAP.md`)
 - [x] **Privacy & Declassification Model** (`docs/design/privacy.md`): sensitivity tag algebra, direct and implicit flows (filters/group-bys/counts), audited declassifiers (`redact`, `pseudonymize`, `bucket`, `suppress_small_groups`), capability sink rules, optional `dana.policy`, and runtime redaction rules.
 - [x] **Real-World Sample Programs** (`examples/`): 10 realistic `.dana` scripts (plus `examples/dana.policy`) covering general CSV, higher-ed/FERPA, SaaS, fintech/e-commerce, DevOps streaming logs, healthcare/HIPAA, and exploratory statistics.
 - [x] **Dana Core IR Specification** (`docs/design/core-ir.md`): exact typed Core IR, pure relational `Plan` sub-calculus, sensitivity algebra, canonical S-expression text protocol `(dana-core 0.1 ...)`, and Lean theorem statements.
 - [x] **Dana Language Reference v0.1** (`docs/reference/README.md`) & **Executable Grammar** (`grammar/`): 0-conflict Bison IELR(1) grammar (`%expect 0`, no precedence declarations) passing all 10 `examples/*.dana`, every fenced snippet in `docs/reference/README.md` and `README.md`, and positive/negative syntax tests (`make grammar`).
+- [x] **Phase 1A — Lean 4 Formal Core & Non-Interference Proofs** (`formal/`): zero-dependency Lean 4 (`v4.36.0`) formalization of Dana Core IR, decidable static checker, deterministic evaluator, canonical `(dana-core 0.1 ...)` wire codec, `danacore` CLI oracle, and machine-checked proofs of Schema & Type Soundness (Theorems 1A–1D) and Termination-/Error-Insensitive Non-Interference + Redacted Explicit-Stop Diagnostics (Theorems 2A–2E), zero `sorry`/custom axioms (`make formal`).
 
 ## Upcoming Phases
 
-### Phase 1 — Formal Core & Differential Oracle
-- Formalize Dana Core IR in Lean (`formal/`): syntax, static schema/type rules, sensitivity/taint rules, capability boundary rules, and operational semantics.
-- Prove **schema/type soundness** and **PII/FERPA non-interference** in Lean.
-- Implement the ~300-line naive row-by-row reference evaluator in Zero-Crate Rust (`src/oracle/`) and verify agreement with the Lean Core evaluator via shared Core IR text format.
+### Phase 1B — Zero-Crate Rust Core IR & Naive Differential Oracle (Next)
+- Implement `Cargo.toml` (zero external Rust crates, `#![forbid(unsafe_code)]`), `src/core/` (Core IR AST, canonical `(dana-core 0.1 ...)` parser/printer, static verifier), and `src/oracle/` (compact naive row-by-row reference evaluator + `(dana-report 0.1 ...)` serializer).
+- Build automated differential verification asserting byte-for-byte agreement between the Rust oracle and the Lean `danacore` CLI oracle across programs, edge cases, privacy rejections, and runtime reports.
 
 ### Phase 2 — Core Toolchain & Vectorized Columnar VM
 - Implement the Zero-Crate Rust CLI (`dana check`, `dana run`, `dana test`, `dana format`, `dana fake`, `dana infer-schema`, `dana guide`).

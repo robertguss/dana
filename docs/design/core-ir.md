@@ -177,8 +177,8 @@ Where:
 - `JoinKind ::= InnerOne | InnerManyToOne | InnerMany | LeftOne | LeftManyToOne | Semi | Anti`
 - `JoinOn ::= SameKeys(List(Ident)) | Pairs(List((Ident, Ident)))`
 - `AggItem ::= { name: Ident, op: AggOp, arg: Option(RowExpr) }` with `AggOp` partitioned into:
-  - **Blending:** `Count`, `CountDistinct`, `Sum`, `Mean`, `Median`, `Stddev`, `Variance`, `Percentile(Float)`
-  - **Non-blending:** `Min`, `Max`, `First`, `Last`
+  - **Blending:** `Count`, `CountDistinct`, `Sum`, `Mean`, `Stddev`, `Variance`
+  - **Non-blending:** `Median`, `Percentile(Float)`, `Min`, `Max`, `First`, `Last`
 - `SuppressMode ::= Drop | MaskComplementary`
 
 ### Row Expressions (`RowExpr`)
@@ -287,7 +287,7 @@ If `checkProgram P = ok` and `eval fuel P env [] world expr = out`, then:
    exact `TableTy` column order, scalar types, nullability, and group-size invariants after
    `SuppressSmallGroups`).
 
-### Theorem 2 — Termination-Insensitive Non-Interference (Up to Audited Declassifiers & Authorized Sinks)
+### Theorem 2 — Termination- and Error-Insensitive Non-Interference (Up to Audited Declassifiers & Authorized Sinks)
 
 Fix any observer clearance level `L : TagSet` (the tags the observer is authorized to learn).
 Define `L`-equivalence (`≈_L`) on values, tables, and `World`s:
@@ -297,18 +297,53 @@ Define `L`-equivalence (`≈_L`) on values, tables, and `World`s:
   every column `c` with `col_tags(c) ⊆ L` has identical values (modulo row order if
   `order_tags ⊈ L`); if `row_tags ⊈ L`, `T1` and `T2` are always `≈_L`.
 
-**Theorem:** For any well-typed program `P` containing no `Redact`/`Pseudonymize`/
-`SuppressSmallGroups`/`DeclassifyApprove` boundary clearing a tag outside `L`, and whose
-output sinks all satisfy `sink.allows ⊆ L`:
-if `W1 ≈_L W2`, and both `eval fuel P ... W1` and `eval fuel P ... W2` terminate without
-`outOfFuel`, then their observable reports satisfy **`Report(out1) == Report(out2)`**
-(including identical stdout, stderr, written files/tables, and redacted error diagnostics).
+**Theorem (2A–2D — Termination- and Error-Insensitive Non-Interference on `ok` runs):**
+For any well-typed program `P` whose non-spec functions contain no `Pseudonymize`/
+`SuppressSmallGroups`/`DeclassifyApprove` boundary clearing a tag outside `L`, whose output
+sinks all satisfy `sink.allows ⊆ L`, whose declared `Data` types satisfy
+`progDatasSortableForNI`, and whose stored DB tables satisfy `progRespectsDB`:
+if `W1 ≈_L W2`, and both `runProgram fuel P W1` and `runProgram fuel P W2` complete normally
+with `status = ok`, then their observable reports satisfy **`rep1 == rep2`** (identical
+stdout, stderr, written files/tables, and fake handle snapshots).
 
-*Corollary:* Every flow of a sensitive tag `t ∉ L` into a public sink is **structurally
-guaranteed** to pass through either an explicitly audited declassifier (`redact`,
-`pseudonymize`, `bucket` + `suppress_small_groups`) or an explicitly authorized capability
-(`allows:` / `Declassify`)—never through an accidental filter, sort, join, `bad_rows`
-message, or crash diagnostic.
+**Theorem (2E — Redacted Explicit-Stop Non-Interference):**
+Whenever an explicit `.stop kind (some detailExpr)` executes from publicly equivalent states
+(`L = []`) and `detailExpr` evaluates normally on both runs, both runs stop with the exact
+same `Bug` (sensitive payloads redacted to `[REDACTED:tag]`), preserve `WorldEquiv`, and emit
+identical observable `ExecReport`s.
+
+**Explicit Trust Boundary:**
+- Timing, memory, termination, and stop/trap position divergence (`ok` vs. `stopped`) lie
+  outside the static proof: because `extractReport` retains output emitted before a stop, the
+  position of a runtime trap (e.g., `100 / (secret - i)` divide-by-zero or `Int64`/`Decimal`
+  overflow) or an explicit `.stop` executed conditionally under a sensitive `pc` is observable
+  and can leak an entire small-domain value in one run.
+- Stored DB tables are trusted to match their declared `SourceDB` schemas (`progRespectsDB`).
+- Audited declassifiers crossing `L` (`DeclassifyApprove`, `Pseudonymize`,
+  `SuppressSmallGroups` clearing tags outside `L`) are explicitly excluded from `progSafeForNI`
+  as the audited trust boundary.
+- Binary wire/file codecs (`rawSqlQuery`, `httpsGetJson`, `readParquet`, `writeParquet`,
+  `writeXlsx`) and `statsTTest` (which requires a Student-t CDF / incomplete beta function)
+  return `BugKind.outsideBoundary` in the Lean Core oracle and are verified in the Rust
+  runtime/oracle.
+- Numeric/statistical oracle conventions: `variance`/`stddev` use population denominator (`/ n`,
+  giving `some(0.0)` for `n = 1` and `none` for `n = 0`, with scaled deviations in `stddev`);
+  `percentile(p)` requires finite `p ∈ [0.0, 1.0]` with linear interpolation; `Decimal`
+  `median` uses exact scaled integer midpoint toward zero while `Float`/`Int` `median` uses
+  `(lo / 2.0) + (hi / 2.0)`; `statsCorr`/`statsLinReg` reject non-finite inputs and scale
+  deviations by `max |d|` to avoid overflow/underflow, with degenerate `statsLinReg` (`n < 2`,
+  non-finite inputs, or zero `x`-variance) stopping with `BugKind.divByZero`.
+- File-write path confinement: `.writeFile`, `.writeReportHtml`, `.writeParquet`, and
+  `.writeXlsx` reject non-safe `relPath` values (empty, leading `/`, `\`, or any `".."`
+  segment) by returning `Err(...)` without writing, and join `(root, relPath)` with a single
+  `/` (`joinConfinedPath`) so a capability rooted at `"out"` writes `"out/_evil/x"`, never
+  `"out_evil/x"`.
+
+*Corollary:* Every direct or implicit flow of a sensitive tag `t ∉ L` into a public normal
+output is **structurally guaranteed** to pass through either an explicitly audited
+declassifier (`redact`, `pseudonymize`, `bucket` + `suppress_small_groups`) or an explicitly
+authorized capability (`allows:` / `Declassify`)—never through an accidental filter, sort,
+join, `bad_rows` message, or explicit `.stop` diagnostic payload.
 
 ---
 
