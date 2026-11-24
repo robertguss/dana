@@ -13,6 +13,7 @@ use dana::check::{check_module, check_resolved, parse_policy, resolve_path};
 use dana::lower::lower_program;
 use dana::runtime::{RunConfig, RunResult, run_exec_program, run_program_tests};
 use dana::syntax::parse_module;
+use dana::vm::{VmConfig, run_core_program_vm, run_program_tests_vm};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -39,6 +40,14 @@ fn all_ten_examples_check_and_pass_all_tests() -> Result<(), String> {
     assert_eq!(files.len(), 10, "expected 10 example programs");
 
     let cfg = RunConfig::default();
+    let vm_default = VmConfig::default();
+    let vm_par_low = VmConfig {
+        batch_size: 4,
+        parallel_threshold_rows: 4,
+        max_threads: Some(4),
+        optimize: true,
+        ..VmConfig::default()
+    };
     let mut total_tests = 0usize;
 
     for path in files {
@@ -58,20 +67,53 @@ fn all_ten_examples_check_and_pass_all_tests() -> Result<(), String> {
             )
         })?;
 
-        let outcomes = run_program_tests(&lowered.exec, None, &cfg);
+        let oracle_outcomes = run_program_tests(&lowered.exec, None, &cfg);
+        let vm_def_outcomes = run_program_tests_vm(&lowered.exec, None, &cfg, &vm_default);
+        let vm_par_outcomes = run_program_tests_vm(&lowered.exec, None, &cfg, &vm_par_low);
+
         assert!(
-            !outcomes.is_empty(),
+            !oracle_outcomes.is_empty(),
             "expected at least 1 test/example in {}",
             path.display()
         );
-        for o in outcomes {
+        assert_eq!(
+            oracle_outcomes.len(),
+            vm_def_outcomes.len(),
+            "oracle vs vm(default) test count mismatch in {}",
+            path.display()
+        );
+        assert_eq!(
+            oracle_outcomes.len(),
+            vm_par_outcomes.len(),
+            "oracle vs vm(par_low) test count mismatch in {}",
+            path.display()
+        );
+        for ((o, vd), vp) in oracle_outcomes
+            .iter()
+            .zip(&vm_def_outcomes)
+            .zip(&vm_par_outcomes)
+        {
             total_tests += 1;
             assert!(
                 o.passed,
-                "test `{}` in {} failed: {:?}",
+                "oracle test `{}` in {} failed: {:?}",
                 o.name,
                 path.display(),
                 o.message
+            );
+            assert!(
+                vd.passed,
+                "vm(default) test `{}` in {} failed: {:?}",
+                vd.name,
+                path.display(),
+                vd.message
+            );
+            assert!(
+                vp.passed,
+                "vm(par_low) test `{}` in {} failed: {:?}",
+                vp.name,
+                path.display(),
+                vp.message
             );
         }
     }
@@ -1344,5 +1386,203 @@ fn core_extractable_control_flow_and_mut_vars_verify_cleanly() -> Result<(), Str
         dana::core::check_program(core)
             .map_err(|e| format!("{name} core::check_program failed: {e}"))?;
     }
+    Ok(())
+}
+
+#[test]
+fn cli_run_test_and_explain_vm_vs_oracle() -> Result<(), String> {
+    let root = repo_root();
+    let policy_str = root.join("examples/dana.policy").display().to_string();
+    let expenses_str = root.join("examples/expenses.dana").display().to_string();
+    let examples_dir_str = root.join("examples").display().to_string();
+
+    // 1. `dana explain --policy examples/dana.policy examples/expenses.dana`
+    assert_eq!(
+        dana::cli::run_cli(&[
+            "explain".to_string(),
+            "--policy".to_string(),
+            policy_str.clone(),
+            expenses_str.clone(),
+        ]),
+        0,
+        "dana explain failed"
+    );
+
+    // 2. `dana test` (default VM) and `dana test --oracle` across all examples
+    assert_eq!(
+        dana::cli::run_cli(&[
+            "test".to_string(),
+            "--policy".to_string(),
+            policy_str.clone(),
+            examples_dir_str.clone(),
+        ]),
+        0,
+        "dana test (VM) failed"
+    );
+    assert_eq!(
+        dana::cli::run_cli(&[
+            "test".to_string(),
+            "--oracle".to_string(),
+            "--policy".to_string(),
+            policy_str.clone(),
+            examples_dir_str,
+        ]),
+        0,
+        "dana test --oracle failed"
+    );
+
+    // 3. `dana run` (default VM) and `dana run --oracle` on both clean and quarantined CSVs
+    let tmp_dir = std::env::temp_dir().join(format!("dana_cli_e2e_{}", std::process::id()));
+    fs::create_dir_all(&tmp_dir).map_err(|e| format!("create tmp dir: {e}"))?;
+    let clean_csv = tmp_dir.join("clean.csv");
+    let bad_csv = tmp_dir.join("bad.csv");
+    fs::write(
+        &clean_csv,
+        "date,category,amount\n2026-10-01,food,12.50\n2026-10-02,rent,900.00\n",
+    )
+    .map_err(|e| format!("write clean csv: {e}"))?;
+    fs::write(
+        &bad_csv,
+        "date,category,amount\n2026-10-01,food,12.50\n2026-10-02,food,not_a_num\n",
+    )
+    .map_err(|e| format!("write bad csv: {e}"))?;
+
+    let clean_str = clean_csv.display().to_string();
+    let bad_str = bad_csv.display().to_string();
+
+    let vm_clean = dana::cli::run_cli(&[
+        "run".to_string(),
+        "--policy".to_string(),
+        policy_str.clone(),
+        expenses_str.clone(),
+        "--".to_string(),
+        clean_str.clone(),
+    ]);
+    let oracle_clean = dana::cli::run_cli(&[
+        "run".to_string(),
+        "--oracle".to_string(),
+        "--policy".to_string(),
+        policy_str.clone(),
+        expenses_str.clone(),
+        "--".to_string(),
+        clean_str,
+    ]);
+    let vm_bad = dana::cli::run_cli(&[
+        "run".to_string(),
+        "--policy".to_string(),
+        policy_str.clone(),
+        expenses_str.clone(),
+        "--".to_string(),
+        bad_str.clone(),
+    ]);
+    let oracle_bad = dana::cli::run_cli(&[
+        "run".to_string(),
+        "--oracle".to_string(),
+        "--policy".to_string(),
+        policy_str,
+        expenses_str,
+        "--".to_string(),
+        bad_str,
+    ]);
+    let _ = fs::remove_dir_all(&tmp_dir);
+
+    assert_eq!(vm_clean, 0, "dana run clean CSV expected exit 0");
+    assert_eq!(
+        oracle_clean, 0,
+        "dana run --oracle clean CSV expected exit 0"
+    );
+    assert_eq!(vm_bad, 1, "dana run quarantined CSV expected exit 1");
+    assert_eq!(
+        oracle_bad, 1,
+        "dana run --oracle quarantined CSV expected exit 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn pure_core_rename_verified_core_oracle_and_vm_parity() -> Result<(), String> {
+    let src = r#"
+module PureRename
+
+schema RawMetric
+  old_col: Text
+  qty: Int
+end
+
+fn transform(t: Table(RawMetric)) : Table(new_col: Text, total: Int)
+  t
+    |> rename(new_col: .old_col)
+    |> where(.qty > 0)
+    |> group_by(.new_col)
+    |> summarize(total: sum(.qty))
+    |> sort_by(.new_col)
+end
+
+fn main(console: Console) : Int
+  sample = table
+    | old_col | qty |
+    | "b"     | 10  |
+    | "a"     | 25  |
+    | "b"     | 0   |
+    | "a"     | 5   |
+  end
+  out = transform(sample)
+  console.print_table(out)
+  0
+end
+"#;
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("pure_rename.dana", src);
+    let m = parse_module(fid, src)
+        .map_err(|d| format!("parse error:\n{}", render_diagnostic(&d, &sm)))?;
+    let checked = check_module(fid, m, None, &sm).map_err(|ds| {
+        ds.iter()
+            .map(|d| render_diagnostic(d, &sm))
+            .collect::<String>()
+    })?;
+    let lowered = lower_program(checked)
+        .map_err(|d| format!("lower error:\n{}", render_diagnostic(&d, &sm)))?;
+    let core_prog = lowered.verified_core.as_ref().ok_or_else(|| {
+        "expected rename(new_col: .old_col) program to extract verified_core".to_string()
+    })?;
+
+    dana::core::check_program(core_prog).map_err(|e| format!("core::check_program failed: {e}"))?;
+
+    let oracle_rep = dana::oracle::run_program(50_000, core_prog, dana::oracle::World::default())
+        .map_err(|e| format!("oracle run: {e:?}"))?;
+    let vm_su = run_core_program_vm(
+        50_000,
+        core_prog,
+        dana::oracle::World::default(),
+        &VmConfig::sequential_unoptimized(),
+    )
+    .map_err(|e| format!("vm seq unopt: {e:?}"))?;
+    let vm_so = run_core_program_vm(
+        50_000,
+        core_prog,
+        dana::oracle::World::default(),
+        &VmConfig::sequential_optimized(),
+    )
+    .map_err(|e| format!("vm seq opt: {e:?}"))?;
+    let vm_po = run_core_program_vm(
+        50_000,
+        core_prog,
+        dana::oracle::World::default(),
+        &VmConfig {
+            batch_size: 2,
+            parallel_threshold_rows: 2,
+            max_threads: Some(2),
+            optimize: true,
+            ..VmConfig::parallel_optimized(2, 2)
+        },
+    )
+    .map_err(|e| format!("vm par opt: {e:?}"))?;
+
+    assert_eq!(oracle_rep.status, dana::oracle::ExitStatus::Ok);
+    let s_o = dana::core::print_report(&oracle_rep);
+    assert!(s_o.contains("new_col"), "expected renamed header in {s_o}");
+    assert_eq!(s_o, dana::core::print_report(&vm_su));
+    assert_eq!(s_o, dana::core::print_report(&vm_so));
+    assert_eq!(s_o, dana::core::print_report(&vm_po));
     Ok(())
 }

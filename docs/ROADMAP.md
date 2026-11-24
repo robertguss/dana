@@ -13,9 +13,9 @@ when its declared checks pass.
 | 4. Formats, Analytics, Charts & REPL | Native Parquet & `.xlsx`, HTTPS allowlist, windows/pivots/stats, SVG/HTML reports, `dana repl` | **v0.2** |
 | 5. Hardening & Learnability Gate | Full parser fuzzing, differential soak tests, real-world pipelines, multi-model AI learnability gate | **v1.0** |
 
-## Now: Phase 1 Complete — Ready for Phase 2 (Core Toolchain & Vectorized Columnar VM)
+## Now: Phase 2 Complete — Ready for Phase 3 (Databases & SQL Pushdown)
 
-Phase 0 and Phase 1 established, formally proved, and differentially verified the language specification, Core IR, Lean 4 proofs, and Zero-Crate Rust reference oracle:
+Phases 0, 1, and 2 established, formally proved, implemented, and differentially verified the language specification, Core IR, Lean 4 proofs, naive Rust reference oracle, Zero-Crate Rust compiler/CLI, streaming formats/FFI codecs, and 2,048-row vectorized columnar VM:
 
 - [x] **Design Charter & Architecture Overview** (`docs/CHARTER.md`, `docs/design/architecture.md`, `docs/ROADMAP.md`)
 - [x] **Privacy & Declassification Model** (`docs/design/privacy.md`): sensitivity tag algebra, direct and implicit flows (filters/group-bys/counts), audited declassifiers (`redact`, `pseudonymize`, `bucket`, `suppress_small_groups`), capability sink rules, optional `dana.policy`, and runtime redaction rules.
@@ -24,17 +24,13 @@ Phase 0 and Phase 1 established, formally proved, and differentially verified th
 - [x] **Dana Language Reference v0.1** (`docs/reference/README.md`) & **Executable Grammar** (`grammar/`): 0-conflict Bison IELR(1) grammar (`%expect 0`, no precedence declarations) passing all 10 `examples/*.dana`, every fenced snippet in `docs/reference/README.md` and `README.md`, and positive/negative syntax tests (`make grammar`).
 - [x] **Phase 1A — Lean 4 Formal Core & Non-Interference Proofs** (`formal/`): zero-dependency Lean 4 (`v4.36.0`) formalization of Dana Core IR, decidable static checker, deterministic evaluator, canonical `(dana-core 0.1 ...)` wire codec, `danacore` CLI oracle, and machine-checked proofs of Schema & Type Soundness (Theorems 1A–1D) and Termination-/Error-Insensitive Non-Interference + Redacted Explicit-Stop Diagnostics (Theorems 2A–2E), zero `sorry`/custom axioms (`make formal`).
 - [x] **Phase 1B — Zero-Crate Rust Core IR & Naive Differential Oracle** (`Cargo.toml`, `src/core/`, `src/oracle/`, `src/bin/dana-oracle.rs`, `tests/`): zero-dependency Rust (`std` only, `#![forbid(unsafe_code)]`, strict clippy denies) Core IR AST, arbitrary-precision `BigInt`, iterative $O(1)$-stack canonical `(dana-core 0.1 ...)` parser/printer, static verifier, persistent `Arc`-environment reference evaluator, and `dana-oracle` CLI (`make oracle`), differentially verified byte-for-byte against the Lean `danacore` CLI across curated corpora, privacy/policy rejections, unbounded `Nat >= 2^64` wire payloads, deep AST/type/value shapes, closure chains, fuel boundaries, and 300 PRNG-generated programs.
+- [x] **Phase 2A — Zero-Crate Compiler Front End & Core IR Bridge** (`src/base/`, `src/syntax/`, `src/check/`, `src/lower/`, `src/runtime/`, `src/cli/`): 100% Bison IELR(1) parity parser and canonical formatter, module & `dana.policy` resolver, structural table/privacy/capability/implicit-flow checker, iterative stack-safe lowering with `verified_core` extraction, and `dana` CLI (`check`, `run`, `test`, `format`, `guide`).
+- [x] **Phase 2B — Audited FFI Codecs & Streaming Formats** (`src/ffi/`, `src/formats/`): minimal audited RAII FFI wrappers for system `zlib` and `libzstd` (only `unsafe` in the repo), IANA TZif timezone calendar math, HMAC-SHA256 pseudonymization, streaming CSV/TSV quarantine parser & JSON/JSONL codecs, `dana infer-schema`, and deterministic constraint-satisfying `dana fake`.
+- [x] **Phase 2C — Relational Query Optimizer & 2,048-Row Vectorized Columnar VM** (`src/plan/`, `src/vm/`): stop-, tag-, and cardinality-preserving relational optimizer (filter fusion, predicate pushdown, dead-derive pruning, limit folding) with `dana explain`, 2,048-row contiguous columnar batch engine with bit-packed null bitmaps, compiled register-based row bytecode with automatic pure UDF inlining (zero UDF cliff), vectorized physical operators (`HashJoin`, radix-partitioned `HashAggregate`, `SuppressSmallGroups`, `Window`, `Sort`, `Distinct`, `FillGaps`, `PivotWider`, `Crosstab`, `Redact`, `Pseudonymize`), deterministic `std::thread::scope` multi-core execution, 1M-row throughput smoke benchmark, and 5,000+ generated-pipeline differential verification (`Lean danacore == naive oracle == vectorized VM`).
 
 ## Upcoming Phases
 
-### Phase 2 — Core Toolchain & Vectorized Columnar VM (Next)
-- Implement the Zero-Crate Rust CLI (`dana check`, `dana run`, `dana test`, `dana format`, `dana fake`, `dana infer-schema`, `dana guide`).
-- Front end: lexer, parser, name/module resolver, boundary schema + inferred structural table type checker, sensitivity/capability checker, `examples` and `promise` lowering.
-- Back end: relational plan builder + 2,048-row contiguous columnar batch VM (streaming, multi-threaded partitions, compiled vectorized expressions with zero UDF cliff).
-- Built-in types & codecs: `Int`, `Float`, `Decimal`, `Bool`, `Text`, `Bytes`, `Date`, `Timestamp` (IANA TZ), `Duration`, unified `T?`, CSV/TSV (quarantine mode), JSON/JSONL, transparent gzip/zstd.
-- Gate: differential fuzzing asserts `naive oracle == vectorized VM` across thousands of generated pipelines (values, nulls, join cardinality errors, and sensitivity tags).
-
-### Phase 3 — Databases & SQL Pushdown (**v0.1**)
+### Phase 3 — Databases & SQL Pushdown (**v0.1**, Next)
 - Minimal audited `extern "C"` shims for embedded SQLite amalgamation and system TLS.
 - Native PostgreSQL wire-protocol client (TLS, SCRAM-SHA-256 auth, typed binary/text decoding, parameterized queries only).
 - `dana schema-sync` / `schema.lock` offline database schema snapshots.

@@ -2,7 +2,7 @@ CC ?= gcc
 BISON ?= bison
 CFLAGS ?= -std=c17 -Wall -Wextra -Werror -O2
 
-.PHONY: grammar formal oracle check-all clean
+.PHONY: grammar formal oracle test-parser-parity test-examples test-diff check-all clean
 
 build/dana.tab.c build/dana.tab.h: grammar/dana.y
 	mkdir -p build
@@ -42,6 +42,15 @@ oracle:
 	cargo clippy --all-targets -- -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 	cargo test --all-targets
+
+test-parser-parity:
+	cargo test --test parser_parity
+
+test-examples:
+	cargo test --test examples_e2e
+
+test-diff:
+	cargo test --test differential_vm --test differential_lean
 
 check-all: grammar formal oracle
 
