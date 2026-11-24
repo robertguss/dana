@@ -969,5 +969,380 @@ fn long_left_associative_chains_never_overflow_stack() -> Result<(), String> {
     let outcomes3 = run_program_tests(&lowered3.exec, None, &RunConfig::default());
     assert_eq!(outcomes3.len(), 1);
     assert!(outcomes3[0].passed, "{:?}", outcomes3[0].message);
+
+    // 4. Deep postfix chains (`append`, `.abs`, `.round(1)`, `()()`, `[1][1]`) and 5,000-arm `else if` chains.
+    let append_src = format!(
+        "module LongAppend\n\nfn f() : List(Int)\n  xs = [0]{}\n  xs\nend\n",
+        ".append(1)".repeat(5_000)
+    );
+    let fid4 = sm.add_file("long_append.dana", append_src.clone());
+    let m4 = parse_module(fid4, &append_src).map_err(|d| render_diagnostic(&d, &sm))?;
+    let fmt4 = dana::syntax::format_module(&m4);
+    let fid4b = sm.add_file("long_append_fmt.dana", fmt4.clone());
+    let m4b = parse_module(fid4b, &fmt4).map_err(|d| render_diagnostic(&d, &sm))?;
+    assert_eq!(dana::syntax::format_module(&m4b), fmt4);
+    let checked4 = check_module(fid4, m4, None, &sm).map_err(|ds| format!("{ds:?}"))?;
+    let _ = lower_program(checked4).map_err(|d| render_diagnostic(&d, &sm))?;
+
+    let abs_src = format!(
+        "module LongAbs\n\nfn f(x: Int) : Int\n  x{}\nend\n",
+        ".abs".repeat(5_000)
+    );
+    let fid5 = sm.add_file("long_abs.dana", abs_src.clone());
+    let m5 = parse_module(fid5, &abs_src).map_err(|d| render_diagnostic(&d, &sm))?;
+    let _ = dana::syntax::format_module(&m5);
+    let _ = check_module(fid5, m5, None, &sm).map_err(|ds| format!("{ds:?}"))?;
+
+    let app_src = format!(
+        "module LongApp\n\nfn f(x: Int) : Int\n  x{}\nend\n",
+        "()".repeat(5_000)
+    );
+    let fid6 = sm.add_file("long_app.dana", app_src.clone());
+    let m6 = parse_module(fid6, &app_src).map_err(|d| render_diagnostic(&d, &sm))?;
+    let _ = dana::syntax::format_module(&m6);
+    assert!(check_module(fid6, m6, None, &sm).is_err());
+
+    let idx_src = format!(
+        "module LongIdx\n\nfn f(m: Map(Int, Int)) : Int\n  m{}\nend\n",
+        "[1]".repeat(5_000)
+    );
+    let fid7 = sm.add_file("long_idx.dana", idx_src.clone());
+    let m7 = parse_module(fid7, &idx_src).map_err(|d| render_diagnostic(&d, &sm))?;
+    let _ = dana::syntax::format_module(&m7);
+    assert!(check_module(fid7, m7, None, &sm).is_err());
+
+    let mut elif_blk =
+        String::from("module LongElifBlk\n\nfn f(x: Int) : Int\n  if x == 0\n    0\n");
+    for i in 1..5_000 {
+        use std::fmt::Write as _;
+        let _ = writeln!(elif_blk, "  else if x == {i}\n    {i}");
+    }
+    elif_blk.push_str("  else\n    5000\n  end\nend\n");
+    let fid8 = sm.add_file("long_elif_blk.dana", elif_blk.clone());
+    let m8 = parse_module(fid8, &elif_blk).map_err(|d| render_diagnostic(&d, &sm))?;
+    let _ = dana::syntax::format_module(&m8);
+    let checked8 = check_module(fid8, m8, None, &sm).map_err(|ds| format!("{ds:?}"))?;
+    let _ = lower_program(checked8).map_err(|d| render_diagnostic(&d, &sm))?;
+
+    let mut elif_inl = String::from("module LongElifInl\n\nfn f(x: Int) : Int\n  y = if x == 0: 0");
+    for i in 1..5_000 {
+        use std::fmt::Write as _;
+        let _ = write!(elif_inl, " else if x == {i}: {i}");
+    }
+    elif_inl.push_str(" else: 5000\n  y\nend\n");
+    let fid9 = sm.add_file("long_elif_inl.dana", elif_inl.clone());
+    let m9 = parse_module(fid9, &elif_inl).map_err(|d| render_diagnostic(&d, &sm))?;
+    let _ = dana::syntax::format_module(&m9);
+    let checked9 = check_module(fid9, m9, None, &sm).map_err(|ds| format!("{ds:?}"))?;
+    let _ = lower_program(checked9).map_err(|d| render_diagnostic(&d, &sm))?;
+    Ok(())
+}
+
+#[test]
+fn impure_calls_short_circuit_and_closures_rejected_in_noncore_modules() -> Result<(), String> {
+    let cases: &[(&str, &str, DiagCode)] = &[
+        (
+            "impure_call_under_if_pc_noncore",
+            r#"
+module ImpureIf
+schema S
+  id: Int [pii]
+end
+fn helper(console: Console) : Unit
+  console.print("big")
+end
+fn leak(t: Table(S), console: Console) : Unit
+  var k = 0
+  while k < 1
+    k = k + 1
+  end
+  if t.first!.id > 5
+    helper(console)
+  end
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "impure_call_after_guarded_return_noncore",
+            r#"
+module ImpureGret
+schema S
+  id: Int [pii]
+end
+fn helper(console: Console) : Unit
+  console.print("small")
+end
+fn leak(t: Table(S), console: Console) : Int
+  var k = 0
+  while k < 1
+    k = k + 1
+  end
+  return 1 if t.first!.id > 5
+  helper(console)
+  0
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "impure_call_after_guarded_break_noncore",
+            r#"
+module ImpureBrk
+schema S
+  id: Int [pii]
+end
+fn helper(console: Console) : Unit
+  console.print("hit")
+end
+fn leak(t: Table(S), console: Console) : Unit
+  for i in [1, 2]
+    break if t.first!.id == i
+    helper(console)
+  end
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "impure_pipe_call_under_pc_noncore",
+            r#"
+module ImpurePipe
+schema S
+  id: Int [pii]
+end
+fn helper(console: Console) : Unit
+  console.print("pipe")
+end
+fn leak(t: Table(S), console: Console) : Unit
+  var k = 0
+  while k < 1
+    k = k + 1
+  end
+  if t.first!.id > 5
+    console |> helper()
+  end
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "impure_call_short_circuit_and_noncore",
+            r#"
+module ImpureAnd
+fn helper(console: Console) : Bool
+  console.print("and")
+  true
+end
+fn leak(secret: Bool [pii], console: Console) : Int
+  var k = 0
+  while k < 1
+    k = k + 1
+  end
+  _ = secret and helper(console)
+  0
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "impure_call_short_circuit_coalesce_noncore",
+            r#"
+module ImpureCoal
+fn helper(console: Console) : Int
+  console.print("coal")
+  0
+end
+fn leak(x: Int? [pii], console: Console) : Int
+  var k = 0
+  while k < 1
+    k = k + 1
+  end
+  _ = x ?? helper(console)
+  0
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "closure_arg_launder",
+            r#"
+module LamArg
+schema S
+  id: Int [pii]
+end
+fn leak(t: Table(S)) : Int
+  f = fn(x)
+    x
+  end
+  f(t.first!.id)
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "closure_pipe_arg_launder",
+            r#"
+module LamArgPipe
+schema S
+  id: Int [pii]
+end
+fn leak(t: Table(S)) : Int
+  f = fn(x)
+    x
+  end
+  t.first!.id |> f()
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "closure_under_sensitive_pc",
+            r#"
+module LamPc
+schema S
+  id: Int [pii]
+end
+fn leak(t: Table(S), console: Console) : Unit
+  f = fn(x)
+    console.print("hi")
+  end
+  if t.first!.id > 5
+    f(1)
+  end
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "closure_mutable_capture_rejected",
+            r#"
+module LamMutCap
+fn f() : Int
+  var leaked = 0
+  g = fn(x)
+    leaked + x
+  end
+  g(1)
+end
+"#,
+            DiagCode::PrivacyError,
+        ),
+        (
+            "main_non_capability_param_frontend_error",
+            r#"
+module BadMain
+fn main(k: Int) : Int
+  k
+end
+"#,
+            DiagCode::CapabilityError,
+        ),
+    ];
+
+    for (name, src, expected_code) in cases {
+        let mut sm = SourceMap::new();
+        let fid = sm.add_file(format!("{name}.dana"), (*src).to_string());
+        let m = parse_module(fid, src)
+            .map_err(|d| format!("{name} parse error:\n{}", render_diagnostic(&d, &sm)))?;
+        match check_module(fid, m, None, &sm) {
+            Ok(_) => {
+                return Err(format!("case `{name}` unexpectedly passed check_module"));
+            }
+            Err(diags) => {
+                assert!(
+                    diags.iter().any(|d| d.code() == *expected_code),
+                    "case `{name}` expected {:?}, got {:?}",
+                    expected_code,
+                    diags
+                        .iter()
+                        .map(|d| (d.code(), d.message()))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn core_extractable_control_flow_and_mut_vars_verify_cleanly() -> Result<(), String> {
+    let cases: &[(&str, &str)] = &[
+        (
+            "if_only",
+            "module CoreIfOnly\nfn f(k: Int) : Int\n  var x = 0\n  if k == 0\n    x = 7\n  end\n  x\nend\n",
+        ),
+        (
+            "if_else",
+            "module CoreIfElse\nfn f(k: Int) : Int\n  var x = 0\n  if k == 0\n    x = 7\n  else\n    x = 9\n  end\n  x\nend\n",
+        ),
+        (
+            "if_else_2var",
+            "module CoreIf2Var\nfn f(k: Int) : Int\n  var x = 0\n  var y = 1\n  if k == 0\n    x = 7\n    y = 2\n  else\n    x = 9\n  end\n  x + y\nend\n",
+        ),
+        (
+            "elif_else",
+            "module CoreElif\nfn f(k: Int) : Int\n  var x = 0\n  if k == 0\n    x = 1\n  else if k == 1\n    x = 2\n  else\n    x = 3\n  end\n  x\nend\n",
+        ),
+        (
+            "ret_guard",
+            "module CoreRetGuard\nfn f(k: Int) : Int\n  return 5 if k == 0\n  0\nend\n",
+        ),
+        (
+            "if_ret",
+            "module CoreIfRet\nfn f(k: Int) : Int\n  if k == 0\n    return 5\n  end\n  0\nend\n",
+        ),
+        (
+            "if_pub_mut_secret",
+            "module CoreIfAsym\nfn f(k: Int, s: Int [pii]) : Int [pii]\n  var x = 0\n  if k == 0\n    x = s\n  else\n    x = 1\n  end\n  x\nend\n",
+        ),
+        (
+            "if_secret_mut_pub",
+            "module CoreIfSecret\nfn f(b: Bool [pii]) : Int [pii]\n  var x = 0\n  if b\n    x = 1\n  end\n  x\nend\n",
+        ),
+        (
+            "elif_mixed_tags",
+            "module CoreElifMixed\nfn f(a: Bool, b: Bool [pii]) : Int [pii]\n  var x = 0\n  if a\n    x = 1\n  else if b\n    x = 2\n  end\n  x\nend\n",
+        ),
+        (
+            "gret_secret_mut",
+            "module CoreGretSecret\nfn f(k: Int [pii]) : Int [pii]\n  var x = 0\n  return 1 if k == 0\n  x = 2\n  x\nend\n",
+        ),
+        (
+            "case_mut_asym",
+            "module CoreCaseAsym\nfn f(o: Int?, s: Int [pii]) : Int [pii]\n  var x = 0\n  case o\n    Some(v):\n      x = s\n    None:\n      x = 1\n  end\n  x\nend\n",
+        ),
+        (
+            "or_return_core",
+            "module CoreOrRet\nfn f(x: Int?) : Int\n  v = x.or_return(0)\n  v + 1\nend\n",
+        ),
+        (
+            "try_core",
+            "module CoreTry\nfn f(r: Result(Int, Text)) : Result(Int, Text)\n  x = try r\n  Ok(x + 1)\nend\n",
+        ),
+    ];
+
+    for (name, src) in cases {
+        let mut sm = SourceMap::new();
+        let fid = sm.add_file(format!("{name}.dana"), (*src).to_string());
+        let m = parse_module(fid, src)
+            .map_err(|d| format!("{name} parse error:\n{}", render_diagnostic(&d, &sm)))?;
+        let checked = check_module(fid, m, None, &sm).map_err(|ds| {
+            format!(
+                "{name} check error:\n{}",
+                ds.iter()
+                    .map(|d| render_diagnostic(d, &sm))
+                    .collect::<String>()
+            )
+        })?;
+        let lowered = lower_program(checked)
+            .map_err(|d| format!("{name} lower error:\n{}", render_diagnostic(&d, &sm)))?;
+        let core = lowered
+            .verified_core
+            .as_ref()
+            .ok_or_else(|| format!("{name} expected verified_core extraction"))?;
+        dana::core::check_program(core)
+            .map_err(|e| format!("{name} core::check_program failed: {e}"))?;
+    }
     Ok(())
 }

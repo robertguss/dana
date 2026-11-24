@@ -398,12 +398,15 @@ impl<'a> Formatter<'a> {
                 self.out.push_str(" = ");
                 let rendered = self.render_expr(value, level);
                 self.out.push_str(&rendered);
+                self.emit_inline_comment_after(st.span);
                 self.out.push('\n');
             }
             StmtKind::Assert(e) => {
                 self.indent(level);
                 let rendered = self.render_expr(e, level);
-                let _ = writeln!(self.out, "assert {rendered}");
+                let _ = write!(self.out, "assert {rendered}");
+                self.emit_inline_comment_after(st.span);
+                self.out.push('\n');
             }
             StmtKind::Return { value, guard } => {
                 self.indent(level);
@@ -416,6 +419,7 @@ impl<'a> Formatter<'a> {
                     let rendered = self.render_expr(g, level);
                     let _ = write!(self.out, " if {rendered}");
                 }
+                self.emit_inline_comment_after(st.span);
                 self.out.push('\n');
             }
             StmtKind::Break { guard } => {
@@ -425,6 +429,7 @@ impl<'a> Formatter<'a> {
                     let rendered = self.render_expr(g, level);
                     let _ = write!(self.out, " if {rendered}");
                 }
+                self.emit_inline_comment_after(st.span);
                 self.out.push('\n');
             }
             StmtKind::Continue { guard } => {
@@ -434,6 +439,7 @@ impl<'a> Formatter<'a> {
                     let rendered = self.render_expr(g, level);
                     let _ = write!(self.out, " if {rendered}");
                 }
+                self.emit_inline_comment_after(st.span);
                 self.out.push('\n');
             }
             StmtKind::Stop(e) => {
@@ -443,6 +449,7 @@ impl<'a> Formatter<'a> {
                     let rendered = self.render_expr(ex, level);
                     let _ = write!(self.out, " {rendered}");
                 }
+                self.emit_inline_comment_after(st.span);
                 self.out.push('\n');
             }
             StmtKind::For { target, iter, body } => {
@@ -465,12 +472,16 @@ impl<'a> Formatter<'a> {
                 self.indent(level);
                 let l = self.render_expr(lhs, level);
                 let r = self.render_expr(rhs, level);
-                let _ = writeln!(self.out, "{l} = {r}");
+                let _ = write!(self.out, "{l} = {r}");
+                self.emit_inline_comment_after(st.span);
+                self.out.push('\n');
             }
             StmtKind::Expr(e) => {
                 self.indent(level);
                 let r = self.render_expr(e, level);
-                let _ = writeln!(self.out, "{r}");
+                self.out.push_str(&r);
+                self.emit_inline_comment_after(st.span);
+                self.out.push('\n');
             }
         }
     }
@@ -619,75 +630,88 @@ impl<'a> Formatter<'a> {
                 }
                 out
             }
-            ExprKind::Field { receiver, member } => {
-                let mut members: Vec<&str> = Vec::new();
-                members.push(member.name.as_str());
-                let mut cur = receiver.as_ref();
-                while let ExprKind::Field {
-                    receiver: inner,
-                    member: m,
-                } = &cur.kind
-                {
-                    members.push(m.name.as_str());
-                    cur = inner.as_ref();
+            ExprKind::Field { .. } | ExprKind::Call { .. } | ExprKind::Index { .. } => {
+                // Iteratively flatten arbitrarily long postfix chains (`xs.append(1).append(1)...`,
+                // `f()()()...`, `m[1][1]...`, `a.b.c...`) so 200,000+ links format in O(1) stack.
+                enum PostfixFmt<'b> {
+                    Field(&'b str),
+                    Call(&'b [CallArg], u32),
+                    Index(&'b Expr),
                 }
-                let mut out = self.render_expr(cur, level);
-                while let Some(m) = members.pop() {
-                    out.push('.');
-                    out.push_str(m);
-                }
-                out
-            }
-            ExprKind::Call { callee, args } => {
-                let head = self.render_expr(callee, level);
-                if args.is_empty() {
-                    return format!("{head}()");
-                }
-                let has_internal_comment = args
-                    .iter()
-                    .any(|a| self.has_comment_between(callee.span.end, a.span().start));
-                let rendered_inline: Vec<String> = args
-                    .iter()
-                    .map(|a| self.render_call_arg(a, level + 1))
-                    .collect();
-                let single = format!("{head}({})", rendered_inline.join(", "));
-                if !has_internal_comment && single.len() <= LINE_WIDTH && !single.contains('\n') {
-                    single
-                } else {
-                    let pad = " ".repeat((level + 1) * 2);
-                    let close_pad = " ".repeat(level * 2);
-                    let mut out = format!("{head}(\n");
-                    for (i, arg) in args.iter().enumerate() {
-                        self.append_comments_inline(&mut out, arg.span().start, level + 1);
-                        let rendered = self.render_call_arg(arg, level + 1);
-                        out.push_str(&pad);
-                        out.push_str(&rendered);
-                        if i + 1 < args.len() {
-                            out.push(',');
+                let mut steps: Vec<PostfixFmt<'_>> = Vec::new();
+                let mut cur = expr;
+                loop {
+                    match &cur.kind {
+                        ExprKind::Field { receiver, member } => {
+                            steps.push(PostfixFmt::Field(member.name.as_str()));
+                            cur = receiver.as_ref();
                         }
-                        out.push('\n');
+                        ExprKind::Call { callee, args } => {
+                            steps.push(PostfixFmt::Call(args.as_slice(), callee.span.end));
+                            cur = callee.as_ref();
+                        }
+                        ExprKind::Index { target, index } => {
+                            steps.push(PostfixFmt::Index(index.as_ref()));
+                            cur = target.as_ref();
+                        }
+                        _ => break,
                     }
-                    out.push_str(&close_pad);
-                    out.push(')');
-                    out
-                }
-            }
-            ExprKind::Index { target, index } => {
-                let mut indices: Vec<&Expr> = Vec::new();
-                indices.push(index.as_ref());
-                let mut cur = target.as_ref();
-                while let ExprKind::Index {
-                    target: inner,
-                    index: idx,
-                } = &cur.kind
-                {
-                    indices.push(idx.as_ref());
-                    cur = inner.as_ref();
                 }
                 let mut out = self.render_expr(cur, level);
-                while let Some(idx) = indices.pop() {
-                    let rendered = self.render_expr(idx, level);
-                    let _ = write!(out, "[{rendered}]");
+                while let Some(step) = steps.pop() {
+                    match step {
+                        PostfixFmt::Field(m) => {
+                            out.push('.');
+                            out.push_str(m);
+                        }
+                        PostfixFmt::Call(args, callee_end) => {
+                            if args.is_empty() {
+                                out.push_str("()");
+                                continue;
+                            }
+                            let has_internal_comment = args
+                                .iter()
+                                .any(|a| self.has_comment_between(callee_end, a.span().start));
+                            let rendered_inline: Vec<String> = args
+                                .iter()
+                                .map(|a| self.render_call_arg(a, level + 1))
+                                .collect();
+                            let inline_args = rendered_inline.join(", ");
+                            let last_line_len = out.rsplit('\n').next().map_or(out.len(), str::len);
+                            if !has_internal_comment
+                                && last_line_len + inline_args.len() + 2 <= LINE_WIDTH
+                                && !inline_args.contains('\n')
+                            {
+                                out.push('(');
+                                out.push_str(&inline_args);
+                                out.push(')');
+                            } else {
+                                let pad = " ".repeat((level + 1) * 2);
+                                let close_pad = " ".repeat(level * 2);
+                                out.push_str("(\n");
+                                for (i, arg) in args.iter().enumerate() {
+                                    self.append_comments_inline(
+                                        &mut out,
+                                        arg.span().start,
+                                        level + 1,
+                                    );
+                                    let rendered = self.render_call_arg(arg, level + 1);
+                                    out.push_str(&pad);
+                                    out.push_str(&rendered);
+                                    if i + 1 < args.len() {
+                                        out.push(',');
+                                    }
+                                    out.push('\n');
+                                }
+                                out.push_str(&close_pad);
+                                out.push(')');
+                            }
+                        }
+                        PostfixFmt::Index(idx) => {
+                            let rendered = self.render_expr(idx, level);
+                            let _ = write!(out, "[{rendered}]");
+                        }
+                    }
                 }
                 out
             }

@@ -1619,142 +1619,159 @@ impl<'a> Evaluator<'a> {
         cells: &[Val],
         outer_env: &RTEnv,
     ) -> EvalOut {
-        match re {
-            ExecRowExpr::Lit(l) => EvalOut::Ok(eval_literal(l)),
-            ExecRowExpr::Col(name) => cols
-                .iter()
-                .position(|c| c.name == *name)
-                .and_then(|i| cells.get(i))
-                .cloned()
-                .map_or_else(
-                    || EvalOut::Failed(format!("unknown row column `{name}`")),
-                    EvalOut::Ok,
-                ),
-            ExecRowExpr::OuterVar(name) => outer_env.get(name).cloned().map_or_else(
-                || EvalOut::Failed(format!("unknown outer variable `{name}`")),
-                EvalOut::Ok,
-            ),
-            ExecRowExpr::ConstRef(name) => self
-                .prog
-                .find_const(name)
-                .map(|c| eval_literal(&c.value))
-                .map_or_else(
-                    || EvalOut::Failed(format!("unknown constant `{name}`")),
-                    EvalOut::Ok,
-                ),
-            ExecRowExpr::IfE {
-                cond,
-                then_br,
-                else_br,
-            } => match self.eval_row_expr(cond, cols, cells, outer_env) {
-                EvalOut::Ok(Val::Bool(true)) => self.eval_row_expr(then_br, cols, cells, outer_env),
-                EvalOut::Ok(Val::Bool(false)) => {
-                    self.eval_row_expr(else_br, cols, cells, outer_env)
+        // Tail-iterate `IfE` chains so deep row `else if` cascades run in O(1) call stack.
+        let mut cur = re;
+        loop {
+            match cur {
+                ExecRowExpr::Lit(l) => return EvalOut::Ok(eval_literal(l)),
+                ExecRowExpr::Col(name) => {
+                    return cols
+                        .iter()
+                        .position(|c| c.name == *name)
+                        .and_then(|i| cells.get(i))
+                        .cloned()
+                        .map_or_else(
+                            || EvalOut::Failed(format!("unknown row column `{name}`")),
+                            EvalOut::Ok,
+                        );
                 }
-                EvalOut::Ok(_) => EvalOut::Failed("non-Bool condition in row `if`".to_string()),
-                other => other,
-            },
-            ExecRowExpr::Coalesce {
-                opt_expr,
-                default_expr,
-            } => match self.eval_row_expr(opt_expr, cols, cells, outer_env) {
-                EvalOut::Ok(Val::OptSome(ref v)) => EvalOut::Ok(v.as_ref().clone()),
-                EvalOut::Ok(Val::OptNone) => {
-                    self.eval_row_expr(default_expr, cols, cells, outer_env)
+                ExecRowExpr::OuterVar(name) => {
+                    return outer_env.get(name).cloned().map_or_else(
+                        || EvalOut::Failed(format!("unknown outer variable `{name}`")),
+                        EvalOut::Ok,
+                    );
                 }
-                EvalOut::Ok(_) => EvalOut::Failed("coalesce on non-Option".to_string()),
-                other => other,
-            },
-            ExecRowExpr::Prim { op, args } => {
-                // Iteratively flatten left-leaning non-short-circuit row primitive chains
-                // (`a + b + c + ...`) so long row expressions run in O(1) call stack.
-                let is_short_circuit = |o: &ExecPrimOp| {
-                    matches!(
-                        o,
-                        ExecPrimOp::Core(PrimOp::AndBool) | ExecPrimOp::Core(PrimOp::OrBool)
-                    )
-                };
-                if !is_short_circuit(op)
-                    && let Some(ExecRowExpr::Prim { op: inner_op, .. }) = args.first()
-                    && !is_short_circuit(inner_op)
-                {
-                    let mut chain: Vec<(&ExecPrimOp, &[ExecRowExpr])> = Vec::new();
-                    chain.push((op, &args[1..]));
-                    let mut base = &args[0];
-                    while let ExecRowExpr::Prim {
-                        op: iop,
-                        args: iargs,
-                    } = base
-                    {
-                        if is_short_circuit(iop) {
-                            break;
-                        }
-                        if let Some(first) = iargs.first() {
-                            chain.push((iop, &iargs[1..]));
-                            base = first;
-                        } else {
-                            break;
-                        }
+                ExecRowExpr::ConstRef(name) => {
+                    return self
+                        .prog
+                        .find_const(name)
+                        .map(|c| eval_literal(&c.value))
+                        .map_or_else(
+                            || EvalOut::Failed(format!("unknown constant `{name}`")),
+                            EvalOut::Ok,
+                        );
+                }
+                ExecRowExpr::IfE {
+                    cond,
+                    then_br,
+                    else_br,
+                } => match self.eval_row_expr(cond, cols, cells, outer_env) {
+                    EvalOut::Ok(Val::Bool(true)) => {
+                        cur = then_br;
+                        continue;
                     }
-                    let mut acc = match self.eval_row_expr(base, cols, cells, outer_env) {
-                        EvalOut::Ok(v) => v,
-                        other => return other,
+                    EvalOut::Ok(Val::Bool(false)) => {
+                        cur = else_br;
+                        continue;
+                    }
+                    EvalOut::Ok(_) => {
+                        return EvalOut::Failed("non-Bool condition in row `if`".to_string());
+                    }
+                    other => return other,
+                },
+                ExecRowExpr::Coalesce {
+                    opt_expr,
+                    default_expr,
+                } => match self.eval_row_expr(opt_expr, cols, cells, outer_env) {
+                    EvalOut::Ok(Val::OptSome(ref v)) => return EvalOut::Ok(v.as_ref().clone()),
+                    EvalOut::Ok(Val::OptNone) => {
+                        cur = default_expr;
+                        continue;
+                    }
+                    EvalOut::Ok(_) => return EvalOut::Failed("coalesce on non-Option".to_string()),
+                    other => return other,
+                },
+                ExecRowExpr::Prim { op, args } => {
+                    // Iteratively flatten left-leaning non-short-circuit row primitive chains
+                    // (`a + b + c + ...`) so long row expressions run in O(1) call stack.
+                    let is_short_circuit = |o: &ExecPrimOp| {
+                        matches!(
+                            o,
+                            ExecPrimOp::Core(PrimOp::AndBool) | ExecPrimOp::Core(PrimOp::OrBool)
+                        )
                     };
-                    while let Some((pop, rest_args)) = chain.pop() {
-                        let mut vals = Vec::with_capacity(1 + rest_args.len());
-                        vals.push(acc);
-                        for a in rest_args {
-                            match self.eval_row_expr(a, cols, cells, outer_env) {
-                                EvalOut::Ok(v) => vals.push(v),
-                                other => return other,
+                    if !is_short_circuit(op)
+                        && let Some(ExecRowExpr::Prim { op: inner_op, .. }) = args.first()
+                        && !is_short_circuit(inner_op)
+                    {
+                        let mut chain: Vec<(&ExecPrimOp, &[ExecRowExpr])> = Vec::new();
+                        chain.push((op, &args[1..]));
+                        let mut base = &args[0];
+                        while let ExecRowExpr::Prim {
+                            op: iop,
+                            args: iargs,
+                        } = base
+                        {
+                            if is_short_circuit(iop) {
+                                break;
+                            }
+                            if let Some(first) = iargs.first() {
+                                chain.push((iop, &iargs[1..]));
+                                base = first;
+                            } else {
+                                break;
                             }
                         }
-                        acc = match self.eval_exec_prim(pop, &vals) {
+                        let mut acc = match self.eval_row_expr(base, cols, cells, outer_env) {
                             EvalOut::Ok(v) => v,
                             other => return other,
                         };
-                    }
-                    return EvalOut::Ok(acc);
-                }
-                // Short-circuit `AndBool` and `OrBool`.
-                if matches!(op, ExecPrimOp::Core(PrimOp::AndBool)) && args.len() == 2 {
-                    return match self.eval_row_expr(&args[0], cols, cells, outer_env) {
-                        EvalOut::Ok(Val::Bool(false)) => EvalOut::Ok(Val::Bool(false)),
-                        EvalOut::Ok(Val::Bool(true)) => {
-                            self.eval_row_expr(&args[1], cols, cells, outer_env)
+                        while let Some((pop, rest_args)) = chain.pop() {
+                            let mut vals = Vec::with_capacity(1 + rest_args.len());
+                            vals.push(acc);
+                            for a in rest_args {
+                                match self.eval_row_expr(a, cols, cells, outer_env) {
+                                    EvalOut::Ok(v) => vals.push(v),
+                                    other => return other,
+                                }
+                            }
+                            acc = match self.eval_exec_prim(pop, &vals) {
+                                EvalOut::Ok(v) => v,
+                                other => return other,
+                            };
                         }
-                        EvalOut::Ok(_) => EvalOut::Failed("AndBool non-Bool".to_string()),
-                        other => other,
-                    };
-                }
-                if matches!(op, ExecPrimOp::Core(PrimOp::OrBool)) && args.len() == 2 {
-                    return match self.eval_row_expr(&args[0], cols, cells, outer_env) {
-                        EvalOut::Ok(Val::Bool(true)) => EvalOut::Ok(Val::Bool(true)),
-                        EvalOut::Ok(Val::Bool(false)) => {
-                            self.eval_row_expr(&args[1], cols, cells, outer_env)
+                        return EvalOut::Ok(acc);
+                    }
+                    // Short-circuit `AndBool` and `OrBool`.
+                    if matches!(op, ExecPrimOp::Core(PrimOp::AndBool)) && args.len() == 2 {
+                        return match self.eval_row_expr(&args[0], cols, cells, outer_env) {
+                            EvalOut::Ok(Val::Bool(false)) => EvalOut::Ok(Val::Bool(false)),
+                            EvalOut::Ok(Val::Bool(true)) => {
+                                self.eval_row_expr(&args[1], cols, cells, outer_env)
+                            }
+                            EvalOut::Ok(_) => EvalOut::Failed("AndBool non-Bool".to_string()),
+                            other => other,
+                        };
+                    }
+                    if matches!(op, ExecPrimOp::Core(PrimOp::OrBool)) && args.len() == 2 {
+                        return match self.eval_row_expr(&args[0], cols, cells, outer_env) {
+                            EvalOut::Ok(Val::Bool(true)) => EvalOut::Ok(Val::Bool(true)),
+                            EvalOut::Ok(Val::Bool(false)) => {
+                                self.eval_row_expr(&args[1], cols, cells, outer_env)
+                            }
+                            EvalOut::Ok(_) => EvalOut::Failed("OrBool non-Bool".to_string()),
+                            other => other,
+                        };
+                    }
+                    let mut vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        match self.eval_row_expr(a, cols, cells, outer_env) {
+                            EvalOut::Ok(v) => vals.push(v),
+                            other => return other,
                         }
-                        EvalOut::Ok(_) => EvalOut::Failed("OrBool non-Bool".to_string()),
-                        other => other,
-                    };
-                }
-                let mut vals = Vec::with_capacity(args.len());
-                for a in args {
-                    match self.eval_row_expr(a, cols, cells, outer_env) {
-                        EvalOut::Ok(v) => vals.push(v),
-                        other => return other,
                     }
+                    return self.eval_exec_prim(op, &vals);
                 }
-                self.eval_exec_prim(op, &vals)
-            }
-            ExecRowExpr::CallPure { fn_name, args } => {
-                let mut vals = Vec::with_capacity(args.len());
-                for a in args {
-                    match self.eval_row_expr(a, cols, cells, outer_env) {
-                        EvalOut::Ok(v) => vals.push(v),
-                        other => return other,
+                ExecRowExpr::CallPure { fn_name, args } => {
+                    let mut vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        match self.eval_row_expr(a, cols, cells, outer_env) {
+                            EvalOut::Ok(v) => vals.push(v),
+                            other => return other,
+                        }
                     }
+                    return self.eval_call(fn_name, vals);
                 }
-                self.eval_call(fn_name, vals)
             }
         }
     }

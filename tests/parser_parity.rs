@@ -201,7 +201,8 @@ schema Section
 end
 
 fn f(c: Bool) : Int
-  x = 1
+  var x = 0  # init
+  x = 1  # why
 
   if c
     # comment in then

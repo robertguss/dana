@@ -1138,6 +1138,25 @@ impl<'a> Checker<'a> {
         self.checked_funs.insert(sig.name.clone(), exec_fn);
         self.in_progress_fns.remove(name);
 
+        // Validate that top-level `main` only declares capability parameters (front-end check
+        // matching Core IR v0.1, run after body checking so body privacy diagnostics still fire).
+        if sig.name == "main" {
+            for (p_ast, (_, plty)) in sig.ast_decl.params.iter().zip(&sig.params) {
+                if !is_capability_ty(&plty.ty) {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::CapabilityError,
+                            format!(
+                                "entry `main` parameter `{}` must be a capability (e.g. `Args`, `Console`, `ReadFiles`, `WriteFiles`, `ReadDB`, `Clock`)",
+                                p_ast.name.name
+                            ),
+                        )
+                        .with_span(p_ast.span),
+                    );
+                }
+            }
+        }
+
         // Commit this function's diagnostics and restore caller context before running examples.
         self.committed_diags.extend(std::mem::take(&mut self.diags));
         self.diags = outer_diags;
@@ -1470,7 +1489,19 @@ impl<'a> Checker<'a> {
         for (idx, st) in stmts.iter().enumerate() {
             let is_last = idx == last_idx;
             let want_val = is_last && !matches!(tail, BlockTail::StateTuple(_));
-            let exp_ty = if want_val { expected_ret } else { None };
+            let exp_ty = if want_val {
+                expected_ret
+            } else if matches!(
+                st.kind,
+                StmtKind::Expr(Expr {
+                    kind: ExprKind::IfBlock { .. } | ExprKind::Case { .. },
+                    ..
+                })
+            ) {
+                Some(&Ty::Unit)
+            } else {
+                None
+            };
             match &st.kind {
                 StmtKind::Var { name, ty, value } => {
                     let ann = ty.as_ref().map(|t| self.resolve_type(t));
@@ -1550,10 +1581,13 @@ impl<'a> Checker<'a> {
                             .with_span(cond.span),
                         );
                     }
-                    steps.push(BlockStep::Effect(ExecExpr::Assert {
-                        cond: Box::new(cex),
-                        message: "assertion failed".to_string(),
-                    }));
+                    steps.push(BlockStep::Effect(
+                        LTy::new(Ty::Unit, cur_pc.clone()),
+                        ExecExpr::Assert {
+                            cond: Box::new(cex),
+                            message: "assertion failed".to_string(),
+                        },
+                    ));
                 }
                 StmtKind::Return { value, guard } => {
                     let mut ret_pc = cur_pc.clone();
@@ -1641,7 +1675,7 @@ impl<'a> Checker<'a> {
                             |rt| LTy::new(rt, val_lty.tags.clone()),
                         );
                     }
-                    steps.push(BlockStep::Effect(eff));
+                    steps.push(BlockStep::Effect(LTy::new(Ty::Unit, cur_pc.clone()), eff));
                 }
                 StmtKind::Break { guard } => {
                     let mut jmp_pc = cur_pc.clone();
@@ -1659,7 +1693,10 @@ impl<'a> Checker<'a> {
                         label: "__break".to_string(),
                         args: self.capture_active_loop_vars(env),
                     };
-                    steps.push(BlockStep::Effect(wrap_guard_expr(jmp, guard_ex)));
+                    steps.push(BlockStep::Effect(
+                        LTy::new(Ty::Unit, cur_pc.clone()),
+                        wrap_guard_expr(jmp, guard_ex),
+                    ));
                 }
                 StmtKind::Continue { guard } => {
                     let mut jmp_pc = cur_pc.clone();
@@ -1677,7 +1714,10 @@ impl<'a> Checker<'a> {
                         label: "__continue".to_string(),
                         args: self.capture_active_loop_vars(env),
                     };
-                    steps.push(BlockStep::Effect(wrap_guard_expr(jmp, guard_ex)));
+                    steps.push(BlockStep::Effect(
+                        LTy::new(Ty::Unit, cur_pc.clone()),
+                        wrap_guard_expr(jmp, guard_ex),
+                    ));
                 }
                 StmtKind::Stop(opt) => {
                     // Termination under sensitive `cur_pc` matches Core IR v0.1 Theorems 2B/2C;
@@ -1697,11 +1737,14 @@ impl<'a> Checker<'a> {
                         }
                         None => (None, cur_pc.clone()),
                     };
-                    steps.push(BlockStep::Effect(ExecExpr::Stop {
-                        kind: BugKind::UserStop,
-                        detail,
-                        detail_tags,
-                    }));
+                    steps.push(BlockStep::Effect(
+                        LTy::new(Ty::Unit, cur_pc.clone()),
+                        ExecExpr::Stop {
+                            kind: BugKind::UserStop,
+                            detail,
+                            detail_tags,
+                        },
+                    ));
                 }
                 StmtKind::For { target, iter, body } => {
                     self.lower_for_stmt(
@@ -1730,23 +1773,34 @@ impl<'a> Checker<'a> {
                     );
                     lty.tags = lty.tags.union(&cur_pc);
                     if assert_bare_bool_exprs && lty.ty == Ty::Bool {
-                        steps.push(BlockStep::Effect(ExecExpr::Assert {
-                            cond: Box::new(ex),
-                            message: format!("example assertion failed in `{spec_name}`"),
-                        }));
+                        steps.push(BlockStep::Effect(
+                            LTy::new(Ty::Unit, cur_pc.clone()),
+                            ExecExpr::Assert {
+                                cond: Box::new(ex),
+                                message: format!("example assertion failed in `{spec_name}`"),
+                            },
+                        ));
                     } else if want_val {
-                        final_lty = lty;
                         match tail {
-                            BlockTail::Value => steps.push(BlockStep::Final(ex)),
-                            BlockTail::ValueAndState(_) => {
-                                let tmp = self.fresh("br_val");
-                                steps.push(BlockStep::Bind(tmp.clone(), final_lty.clone(), ex));
-                                branch_val_var = Some(tmp);
+                            BlockTail::Value => {
+                                final_lty = lty;
+                                steps.push(BlockStep::Final(ex));
                             }
-                            BlockTail::StateTuple(_) => steps.push(BlockStep::Effect(ex)),
+                            BlockTail::ValueAndState(_) => {
+                                if matches!(expected_ret, Some(Ty::Unit)) {
+                                    final_lty = LTy::new(Ty::Unit, lty.tags.clone());
+                                    steps.push(BlockStep::Effect(lty, ex));
+                                } else {
+                                    final_lty = lty;
+                                    let tmp = self.fresh("br_val");
+                                    steps.push(BlockStep::Bind(tmp.clone(), final_lty.clone(), ex));
+                                    branch_val_var = Some(tmp);
+                                }
+                            }
+                            BlockTail::StateTuple(_) => steps.push(BlockStep::Effect(lty, ex)),
                         }
                     } else {
-                        steps.push(BlockStep::Effect(ex));
+                        steps.push(BlockStep::Effect(lty, ex));
                     }
                 }
             }
@@ -1813,7 +1867,7 @@ impl<'a> Checker<'a> {
                 if written.is_empty() {
                     (if_ex, if_lty)
                 } else {
-                    merge_branch_mut_vars(env, &written, &branch_envs);
+                    merge_branch_mut_vars(env, &written, &branch_envs, &if_lty.tags);
                     let res_tmp = self.fresh("if_res");
                     let mut tup_ltys = Vec::with_capacity(1 + written.len());
                     tup_ltys.push(if_lty.clone());
@@ -1868,7 +1922,7 @@ impl<'a> Checker<'a> {
                 if written.is_empty() {
                     (case_ex, case_lty)
                 } else {
-                    merge_branch_mut_vars(env, &written, &arm_envs);
+                    merge_branch_mut_vars(env, &written, &arm_envs, &case_lty.tags);
                     let res_tmp = self.fresh("case_res");
                     let mut tup_ltys = Vec::with_capacity(1 + written.len());
                     tup_ltys.push(case_lty.clone());
@@ -2004,7 +2058,7 @@ impl<'a> Checker<'a> {
                 steps.push(BlockStep::Bind(name.clone(), rhs_lty, rhs_ex));
             }
             ExprKind::Underscore => {
-                steps.push(BlockStep::Effect(rhs_ex));
+                steps.push(BlockStep::Effect(rhs_lty, rhs_ex));
             }
             ExprKind::Tuple(elems) => {
                 let tmp = self.fresh("tup");
@@ -2334,22 +2388,55 @@ impl<'a> Checker<'a> {
         for step in steps.into_iter().rev() {
             match step {
                 BlockStep::Final(e) => acc = e,
-                BlockStep::Bind(name, lty, bound) => {
-                    acc = ExecExpr::LetE {
-                        name,
-                        lty,
-                        bound: Box::new(bound),
-                        body: Box::new(acc),
-                    };
+                BlockStep::Bind(name, lty, mut bound) => {
+                    if matches!(
+                        bound,
+                        ExecExpr::Jump { .. } | ExecExpr::Stop { .. } | ExecExpr::Fail(_)
+                    ) {
+                        // Unconditional control transfer makes `acc` unreachable; keep jump in tail position.
+                        acc = bound;
+                    } else if expr_has_any_jump(&bound) {
+                        // Lower conditional early exits (`if { return }`, `or_return`, `try`, etc.)
+                        // via a Core IR tail-position `Join` continuation so `no_free_jumps` holds!
+                        let cont_lbl = self.fresh("cont");
+                        rewrite_tail_to_jump(&mut bound, &cont_lbl);
+                        acc = ExecExpr::Join {
+                            label: cont_lbl,
+                            params: vec![(name, lty)],
+                            rhs: Box::new(acc),
+                            body: Box::new(bound),
+                        };
+                    } else {
+                        acc = ExecExpr::LetE {
+                            name,
+                            lty,
+                            bound: Box::new(bound),
+                            body: Box::new(acc),
+                        };
+                    }
                 }
-                BlockStep::Effect(e) => {
-                    if matches!(acc, ExecExpr::Lit(Literal::Unit)) {
+                BlockStep::Effect(lty, mut e) => {
+                    if matches!(
+                        e,
+                        ExecExpr::Jump { .. } | ExecExpr::Stop { .. } | ExecExpr::Fail(_)
+                    ) || (matches!(acc, ExecExpr::Lit(Literal::Unit)) && lty.ty == Ty::Unit)
+                    {
                         acc = e;
+                    } else if expr_has_any_jump(&e) {
+                        let cont_lbl = self.fresh("cont");
+                        let tmp = self.fresh("seq");
+                        rewrite_tail_to_jump(&mut e, &cont_lbl);
+                        acc = ExecExpr::Join {
+                            label: cont_lbl,
+                            params: vec![(tmp, lty)],
+                            rhs: Box::new(acc),
+                            body: Box::new(e),
+                        };
                     } else {
                         let tmp = self.fresh("seq");
                         acc = ExecExpr::LetE {
                             name: tmp,
-                            lty: LTy::public(Ty::Unit),
+                            lty,
                             bound: Box::new(e),
                             body: Box::new(acc),
                         };
@@ -2607,34 +2694,8 @@ impl<'a> Checker<'a> {
             ExprKind::Binary { op, lhs, rhs } => {
                 self.check_binary(*op, lhs, rhs, expr.span, env, expected, pc, scope, ret_ctx)
             }
-            ExprKind::Field { receiver, member } => {
-                self.check_field_access(receiver, member, expr.span, env, pc, scope, ret_ctx)
-            }
-            ExprKind::Call { callee, args } => {
-                self.check_call(callee, args, expr.span, env, expected, pc, scope, ret_ctx)
-            }
-            ExprKind::Index { target, index } => {
-                let (tex, tlty) = self.check_expr(target, env, None, pc, scope, ret_ctx);
-                let (iex, ilty) = self.check_expr(index, env, None, pc, scope, ret_ctx);
-                match &tlty.ty {
-                    Ty::Map { val, .. } => (
-                        ExecExpr::Prim {
-                            op: ExecPrimOp::Core(PrimOp::MapGet),
-                            args: vec![tex, iex],
-                        },
-                        LTy::new(
-                            Ty::Option(Box::new(val.ty.clone())),
-                            tlty.tags.union(&ilty.tags).union(&val.tags),
-                        ),
-                    ),
-                    _ => {
-                        self.diags.push(
-                            Diagnostic::error(DiagCode::TypeError, "indexing requires a `Map`")
-                                .with_span(expr.span),
-                        );
-                        (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit))
-                    }
-                }
+            ExprKind::Field { .. } | ExprKind::Call { .. } | ExprKind::Index { .. } => {
+                self.check_postfix_chain(expr, env, expected, pc, scope, ret_ctx)
             }
             ExprKind::IfInline {
                 cond,
@@ -2682,12 +2743,14 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Lambda { params, body } => {
                 let mut l_env = env.clone();
+                let mut param_names: HashSet<Ident> = HashSet::new();
                 let mut l_params = Vec::with_capacity(params.len());
                 for p in params {
                     let pname = match p {
                         ast::LambdaParam::Name(n) => n.name.clone(),
                         ast::LambdaParam::Wildcard(_) => self.fresh("wild"),
                     };
+                    param_names.insert(pname.clone());
                     let plty = LTy::public(Ty::Int);
                     l_env.insert(
                         pname.clone(),
@@ -2697,6 +2760,21 @@ impl<'a> Checker<'a> {
                         },
                     );
                     l_params.push((pname, plty));
+                }
+                // Closures cannot capture mutable `var` bindings (prevents stale-snapshot tag
+                // laundering and hidden mutation side effects across closure boundaries).
+                let mut_captures = collect_captured_mut_vars_lambda(body, env, &param_names);
+                if !mut_captures.is_empty() {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::PrivacyError,
+                            format!(
+                                "closure cannot capture mutable `var` binding(s) {:?}",
+                                mut_captures
+                            ),
+                        )
+                        .with_span(expr.span),
+                    );
                 }
                 let (bex, blty) = match body {
                     ast::LambdaBody::Expr(ex) => {
@@ -2718,7 +2796,7 @@ impl<'a> Checker<'a> {
                         ret: blty,
                         body: Arc::new(bex),
                     },
-                    LTy::public(fn_ty),
+                    LTy::new(fn_ty, pc.clone()),
                 )
             }
             ExprKind::TableLit { headers, rows } => {
@@ -3004,7 +3082,8 @@ impl<'a> Checker<'a> {
                     llty.ty.clone()
                 }
             };
-            let (rex, rlty) = self.check_expr(rhs, env, Some(&inner_ty), pc, scope, ret_ctx);
+            let rhs_pc = pc.union(&llty.effective_tags());
+            let (rex, rlty) = self.check_expr(rhs, env, Some(&inner_ty), &rhs_pc, scope, ret_ctx);
             let tags = llty.tags.union(&rlty.tags);
             // Short-circuit coalesce via CaseE so `rhs` is only evaluated when `lhs` is `none`.
             let some_v = self.fresh("coal_v");
@@ -3093,7 +3172,14 @@ impl<'a> Checker<'a> {
             Ty::Option(inner) if matches!(op, BinOp::Eq | BinOp::Ne) => Some(inner.as_ref()),
             t => Some(t),
         };
-        let (mut rex, mut rlty) = self.check_expr(rhs, env, rhs_hint, pc, scope, ret_ctx);
+        let short_circuit_pc;
+        let rhs_pc = if matches!(op, BinOp::And | BinOp::Or) {
+            short_circuit_pc = pc.union(&llty.effective_tags());
+            &short_circuit_pc
+        } else {
+            pc
+        };
+        let (mut rex, mut rlty) = self.check_expr(rhs, env, rhs_hint, rhs_pc, scope, ret_ctx);
 
         // Numeric literal cross-coercion when left side was a literal and right side resolved concretely.
         if llty.ty != rlty.ty {
@@ -3565,6 +3651,18 @@ impl<'a> Checker<'a> {
         }
 
         if let Some(sig) = self.fn_sigs.get(fname).cloned() {
+            if !sig.is_pure && !pc.is_empty() {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::PrivacyError,
+                        format!(
+                            "cannot call impure function `{fname}` under sensitive control flow {:?}",
+                            pc.elems()
+                        ),
+                    )
+                    .with_span(span),
+                );
+            }
             let ret_lty = self
                 .ensure_fn_checked(fname)
                 .or(sig.ret)
@@ -3615,11 +3713,7 @@ impl<'a> Checker<'a> {
                 arg_tags = arg_tags.union(&alty.tags);
                 lowered_args.push(aex);
             }
-            let out_ret = if matches!(ret_lty.ty, Ty::Table(_)) {
-                ret_lty
-            } else {
-                LTy::new(ret_lty.ty, ret_lty.tags.union(&arg_tags))
-            };
+            let out_ret = taint_return_with_pc(ret_lty, &arg_tags, pc);
             return (
                 ExecExpr::Call {
                     fn_name: fname.to_string(),
@@ -3631,34 +3725,16 @@ impl<'a> Checker<'a> {
 
         // Higher-order function value in generic pipe (`x |> f(a)`).
         let (fex, flty) = self.check_expr(callee, env, None, pc, scope, ret_ctx);
-        let mut lowered = Vec::with_capacity(1 + rest_args.len());
-        lowered.push(first_ex);
-        for arg in rest_args {
-            let e = match arg {
-                CallArg::Positional(e) | CallArg::Named { value: e, .. } => e,
-            };
-            let (ae, _) = self.check_expr(e, env, None, pc, scope, ret_ctx);
-            lowered.push(ae);
-        }
-        let ret = match &flty.ty {
-            Ty::Fn { ret, .. } => ret.as_ref().clone(),
-            _ => {
-                self.diags.push(
-                    Diagnostic::error(
-                        DiagCode::TypeError,
-                        "attempted to call a non-function value",
-                    )
-                    .with_span(span),
-                );
-                LTy::public(Ty::Unit)
-            }
-        };
-        (
-            ExecExpr::App {
-                fn_expr: Box::new(fex),
-                args: lowered,
-            },
-            ret,
+        self.check_hof_app(
+            fex,
+            flty,
+            Some((first_ex, first_lty, first_span)),
+            rest_args,
+            span,
+            env,
+            pc,
+            scope,
+            ret_ctx,
         )
     }
 
@@ -5804,22 +5880,114 @@ impl<'a> Checker<'a> {
     // Field Access & Calls (Methods, Capabilities, Stdlib, User Functions)
     // -----------------------------------------------------------------------
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "field access checks struct fields, table-row fields, properties, and duration units"
-    )]
-    fn check_field_access(
+    /// Iteratively check arbitrarily deep left-leaning postfix chains (`xs.append(1).append(1)...`,
+    /// `f()()()...`, `m[1][1]...`, `a.b.c...`) in O(1) call stack.
+    fn check_postfix_chain(
         &mut self,
-        receiver: &Expr,
-        member: &ast::SpannedName,
-        span: Span,
+        expr: &Expr,
         env: &HashMap<Ident, VarBinding>,
+        expected: Option<&Ty>,
         pc: &TagSet,
         scope: LocalScopeKind,
         ret_ctx: Option<(&str, Option<&Ty>)>,
     ) -> (ExecExpr, LTy) {
-        let (rex, rlty) = self.check_expr(receiver, env, None, pc, scope, ret_ctx);
+        enum PostfixStep<'b> {
+            Field(&'b ast::SpannedName, Span),
+            MethodCall(&'b ast::SpannedName, &'b [CallArg], Span),
+            App(&'b [CallArg], Span),
+            Index(&'b Expr, Span),
+        }
 
+        let mut steps: Vec<PostfixStep<'_>> = Vec::new();
+        let mut cur = expr;
+        loop {
+            match &cur.kind {
+                ExprKind::Field { receiver, member } => {
+                    steps.push(PostfixStep::Field(member, cur.span));
+                    cur = receiver.as_ref();
+                }
+                ExprKind::Index { target, index } => {
+                    steps.push(PostfixStep::Index(index.as_ref(), cur.span));
+                    cur = target.as_ref();
+                }
+                ExprKind::Call { callee, args } => match &callee.kind {
+                    // Static namespace calls (`Stats.corr(...)`, `Report.new(...)`), constructors
+                    // (`Ok(...)`), and direct free-function calls (`foo(...)`) terminate the spine.
+                    ExprKind::Field { receiver, .. }
+                        if matches!(receiver.kind, ExprKind::CapName(_)) =>
+                    {
+                        break;
+                    }
+                    ExprKind::CapName(_) | ExprKind::Ident(_) => break,
+                    ExprKind::Field { receiver, member } => {
+                        steps.push(PostfixStep::MethodCall(member, args.as_slice(), cur.span));
+                        cur = receiver.as_ref();
+                    }
+                    _ => {
+                        steps.push(PostfixStep::App(args.as_slice(), cur.span));
+                        cur = callee.as_ref();
+                    }
+                },
+                _ => break,
+            }
+        }
+
+        let base_exp = if steps.is_empty() { expected } else { None };
+        let (mut cur_ex, mut cur_lty) = match &cur.kind {
+            ExprKind::Call { callee, args } => {
+                self.check_call(callee, args, cur.span, env, base_exp, pc, scope, ret_ctx)
+            }
+            _ => self.check_expr(cur, env, base_exp, pc, scope, ret_ctx),
+        };
+
+        while let Some(step) = steps.pop() {
+            let (next_ex, next_lty) = match step {
+                PostfixStep::Field(member, sp) => {
+                    self.check_field_access_on_val(cur_ex, cur_lty, member, sp, scope)
+                }
+                PostfixStep::MethodCall(member, args, sp) => self.check_method_call_on_val(
+                    cur_ex, cur_lty, member, args, sp, env, pc, scope, ret_ctx,
+                ),
+                PostfixStep::App(args, sp) => {
+                    self.check_hof_app(cur_ex, cur_lty, None, args, sp, env, pc, scope, ret_ctx)
+                }
+                PostfixStep::Index(index, sp) => {
+                    let (iex, ilty) = self.check_expr(index, env, None, pc, scope, ret_ctx);
+                    match &cur_lty.ty {
+                        Ty::Map { val, .. } => (
+                            ExecExpr::Prim {
+                                op: ExecPrimOp::Core(PrimOp::MapGet),
+                                args: vec![cur_ex, iex],
+                            },
+                            LTy::new(
+                                Ty::Option(Box::new(val.ty.clone())),
+                                cur_lty.tags.union(&ilty.tags).union(&val.tags),
+                            ),
+                        ),
+                        _ => {
+                            self.diags.push(
+                                Diagnostic::error(DiagCode::TypeError, "indexing requires a `Map`")
+                                    .with_span(sp),
+                            );
+                            (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit))
+                        }
+                    }
+                }
+            };
+            cur_ex = next_ex;
+            cur_lty = next_lty;
+        }
+        (cur_ex, cur_lty)
+    }
+
+    fn check_field_access_on_val(
+        &mut self,
+        rex: ExecExpr,
+        rlty: LTy,
+        member: &ast::SpannedName,
+        span: Span,
+        scope: LocalScopeKind,
+    ) -> (ExecExpr, LTy) {
         // Duration suffixes on Int (`5.minutes`, `30.days`, `10.seconds`, `2.hours`).
         if rlty.ty == Ty::Int {
             let mult = match member.name.as_str() {
@@ -6190,7 +6358,9 @@ impl<'a> Checker<'a> {
 
         // 2. Method calls on a receiver value: `files.read_csv(...)`, `console.print(...)`, `x.round(3)`, etc.
         if let ExprKind::Field { receiver, member } = &callee.kind {
-            return self.check_method_call(receiver, member, args, span, env, pc, scope, ret_ctx);
+            let (rex, rlty) = self.check_expr(receiver, env, None, pc, scope, ret_ctx);
+            return self
+                .check_method_call_on_val(rex, rlty, member, args, span, env, pc, scope, ret_ctx);
         }
 
         // 3. Constructors (`Ok(...)`, `Error(...)`, `Some(...)`, user `Struct(...)`, user `EnumVariant(...)`).
@@ -6217,6 +6387,18 @@ impl<'a> Checker<'a> {
                 );
             }
             if let Some(sig) = self.fn_sigs.get(fname).cloned() {
+                if !sig.is_pure && !pc.is_empty() {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::PrivacyError,
+                            format!(
+                                "cannot call impure function `{fname}` under sensitive control flow {:?}",
+                                pc.elems()
+                            ),
+                        )
+                        .with_span(span),
+                    );
+                }
                 let ret_lty = self
                     .ensure_fn_checked(fname)
                     .or(sig.ret)
@@ -6261,12 +6443,7 @@ impl<'a> Checker<'a> {
                     arg_tags = arg_tags.union(&alty.tags);
                     lowered_args.push(aex);
                 }
-                // Propagate argument tags into scalar/non-table return if any.
-                let out_ret = if matches!(ret_lty.ty, Ty::Table(_)) {
-                    ret_lty
-                } else {
-                    LTy::new(ret_lty.ty, ret_lty.tags.union(&arg_tags))
-                };
+                let out_ret = taint_return_with_pc(ret_lty, &arg_tags, pc);
                 return (
                     ExecExpr::Call {
                         fn_name: fname.clone(),
@@ -6279,16 +6456,34 @@ impl<'a> Checker<'a> {
 
         // 5. Higher-order function value call (`f(x)`).
         let (fex, flty) = self.check_expr(callee, env, None, pc, scope, ret_ctx);
-        let mut lowered = Vec::with_capacity(args.len());
-        for arg in args {
-            let e = match arg {
-                CallArg::Positional(e) | CallArg::Named { value: e, .. } => e,
-            };
-            let (ae, _) = self.check_expr(e, env, None, pc, scope, ret_ctx);
-            lowered.push(ae);
-        }
-        let ret = match &flty.ty {
-            Ty::Fn { ret, .. } => ret.as_ref().clone(),
+        self.check_hof_app(fex, flty, None, args, span, env, pc, scope, ret_ctx)
+    }
+
+    /// Check higher-order function / closure application enforcing `pc`, arity, per-argument
+    /// sensitivity subtyping (`arg_i.tags ⊆ param_i.tags`), and return-tag propagation.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "closure application checker validates pc ceiling, arity, and argument sensitivity"
+    )]
+    fn check_hof_app(
+        &mut self,
+        fex: ExecExpr,
+        flty: LTy,
+        first_pre_arg: Option<(ExecExpr, LTy, Span)>,
+        rest_args: &[CallArg],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        let total_args = usize::from(first_pre_arg.is_some()) + rest_args.len();
+        let (param_ltys, fn_pc, ret_lty) = match &flty.ty {
+            Ty::Fn {
+                params,
+                pc: fpc,
+                ret,
+            } => (params.clone(), fpc.clone(), ret.as_ref().clone()),
             _ => {
                 self.diags.push(
                     Diagnostic::error(
@@ -6297,15 +6492,91 @@ impl<'a> Checker<'a> {
                     )
                     .with_span(span),
                 );
-                LTy::public(Ty::Unit)
+                let mut lowered = Vec::with_capacity(total_args);
+                if let Some((a0, _, _)) = first_pre_arg {
+                    lowered.push(a0);
+                }
+                for arg in rest_args {
+                    let e = match arg {
+                        CallArg::Positional(e) | CallArg::Named { value: e, .. } => e,
+                    };
+                    let (ae, _) = self.check_expr(e, env, None, pc, scope, ret_ctx);
+                    lowered.push(ae);
+                }
+                return (
+                    ExecExpr::App {
+                        fn_expr: Box::new(fex),
+                        args: lowered,
+                    },
+                    LTy::public(Ty::Unit),
+                );
             }
         };
+
+        let call_pc = pc.union(&flty.tags);
+        if !call_pc.is_subset(&fn_pc) {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::PrivacyError,
+                    format!(
+                        "cannot call closure under sensitive control flow {:?} exceeding closure bound {:?}",
+                        call_pc.elems(),
+                        fn_pc.elems()
+                    ),
+                )
+                .with_span(span),
+            );
+        }
+        if total_args != param_ltys.len() {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!(
+                        "closure expects {} argument(s), got {total_args}",
+                        param_ltys.len()
+                    ),
+                )
+                .with_span(span),
+            );
+        }
+
+        let mut lowered = Vec::with_capacity(total_args);
+        let mut arg_tags = TagSet::empty();
+        let mut arg_idx = 0usize;
+        if let Some((mut a0, a0_lty, a0_span)) = first_pre_arg {
+            if let Some(plty) = param_ltys.first() {
+                a0 = self.coerce_expr(a0, &a0_lty, plty, a0_span, "closure call argument 1");
+            }
+            arg_tags = arg_tags.union(&a0_lty.tags);
+            lowered.push(a0);
+            arg_idx = 1;
+        }
+        for arg in rest_args {
+            let e = match arg {
+                CallArg::Positional(e) | CallArg::Named { value: e, .. } => e,
+            };
+            let plty = param_ltys.get(arg_idx);
+            let (mut aex, alty) = self.check_expr(e, env, plty.map(|l| &l.ty), pc, scope, ret_ctx);
+            if let Some(p) = plty {
+                aex = self.coerce_expr(
+                    aex,
+                    &alty,
+                    p,
+                    e.span,
+                    &format!("closure call argument {}", arg_idx + 1),
+                );
+            }
+            arg_tags = arg_tags.union(&alty.tags);
+            lowered.push(aex);
+            arg_idx += 1;
+        }
+        let out_ret = taint_return_with_pc(ret_lty, &arg_tags, &call_pc);
         (
             ExecExpr::App {
                 fn_expr: Box::new(fex),
                 args: lowered,
             },
-            ret,
+            out_ret,
         )
     }
 
@@ -6564,9 +6835,10 @@ impl<'a> Checker<'a> {
         clippy::too_many_arguments,
         reason = "method call handles capabilities, tables, scalars, lists, and privacy sink checks"
     )]
-    fn check_method_call(
+    fn check_method_call_on_val(
         &mut self,
-        receiver: &Expr,
+        rex: ExecExpr,
+        rlty: LTy,
         member: &ast::SpannedName,
         args: &[CallArg],
         span: Span,
@@ -6575,8 +6847,6 @@ impl<'a> Checker<'a> {
         scope: LocalScopeKind,
         ret_ctx: Option<(&str, Option<&Ty>)>,
     ) -> (ExecExpr, LTy) {
-        let (rex, rlty) = self.check_expr(receiver, env, None, pc, scope, ret_ctx);
-
         // Capability methods: Console, ReadFiles, WriteFiles, ReadDB, WriteTable, HttpsAllow.
         match (&rlty.ty, member.name.as_str()) {
             (
@@ -7410,7 +7680,7 @@ impl<'a> Checker<'a> {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "inline if propagates expected type and sensitivity pc"
+        reason = "iterative inline if handles arbitrarily long else-if chains in O(1) stack"
     )]
     fn check_if_inline(
         &mut self,
@@ -7424,55 +7694,60 @@ impl<'a> Checker<'a> {
         scope: LocalScopeKind,
         ret_ctx: Option<(&str, Option<&Ty>)>,
     ) -> (ExecExpr, LTy) {
-        let (cex, clty) = self.check_expr(cond, env, Some(&Ty::Bool), pc, scope, ret_ctx);
-        let branch_pc = pc.union(&clty.tags);
-        let (tex, tlty) = self.check_expr(then_expr, env, expected, &branch_pc, scope, ret_ctx);
-        let (mut cur_else, mut acc_lty) = if let Some((ec, et)) = else_ifs.first() {
-            self.check_if_inline(
-                ec,
-                et,
-                &else_ifs[1..],
-                else_expr,
-                env,
-                expected.or(Some(&tlty.ty)),
-                &branch_pc,
-                scope,
-                ret_ctx,
-            )
-        } else {
-            self.check_expr(
-                else_expr,
-                env,
-                expected.or(Some(&tlty.ty)),
-                &branch_pc,
-                scope,
-                ret_ctx,
-            )
-        };
-        let merged_tags = tlty.tags.union(&acc_lty.tags).union(&branch_pc);
-        if tlty.ty != acc_lty.ty {
-            cur_else = self.coerce_expr(
-                cur_else,
-                &acc_lty,
-                &LTy::new(tlty.ty.clone(), merged_tags.clone()),
+        let mut cur_pc = pc.clone();
+        let mut arms: Vec<(ExecExpr, ExecExpr, LTy, Span)> = Vec::with_capacity(1 + else_ifs.len());
+
+        let (c0, cl0) = self.check_expr(cond, env, Some(&Ty::Bool), &cur_pc, scope, ret_ctx);
+        cur_pc = cur_pc.union(&cl0.tags);
+        let (t0, tl0) = self.check_expr(then_expr, env, expected, &cur_pc, scope, ret_ctx);
+        let target_ty = expected.cloned().unwrap_or_else(|| tl0.ty.clone());
+        let mut all_tags = cur_pc.union(&tl0.tags);
+        arms.push((c0, t0, tl0, then_expr.span));
+
+        for (ec, et) in else_ifs {
+            let (cex, clty) = self.check_expr(ec, env, Some(&Ty::Bool), &cur_pc, scope, ret_ctx);
+            cur_pc = cur_pc.union(&clty.tags);
+            let (tex, tlty) = self.check_expr(et, env, Some(&target_ty), &cur_pc, scope, ret_ctx);
+            all_tags = all_tags.union(&cur_pc).union(&tlty.tags);
+            arms.push((cex, tex, tlty, et.span));
+        }
+
+        let (mut acc_else, else_lty) =
+            self.check_expr(else_expr, env, Some(&target_ty), &cur_pc, scope, ret_ctx);
+        all_tags = all_tags.union(&else_lty.tags);
+        if else_lty.ty != target_ty {
+            acc_else = self.coerce_expr(
+                acc_else,
+                &else_lty,
+                &LTy::new(target_ty.clone(), all_tags.clone()),
                 else_expr.span,
                 "`if` else branch",
             );
-            acc_lty.ty = tlty.ty;
         }
-        (
-            ExecExpr::IfE {
+
+        while let Some((cex, mut tex, tlty, tspan)) = arms.pop() {
+            if tlty.ty != target_ty {
+                tex = self.coerce_expr(
+                    tex,
+                    &tlty,
+                    &LTy::new(target_ty.clone(), all_tags.clone()),
+                    tspan,
+                    "`if` branch",
+                );
+            }
+            acc_else = ExecExpr::IfE {
                 cond: Box::new(cex),
                 then_br: Box::new(tex),
-                else_br: Box::new(cur_else),
-            },
-            LTy::new(acc_lty.ty, merged_tags),
-        )
+                else_br: Box::new(acc_else),
+            };
+        }
+
+        (acc_else, LTy::new(target_ty, all_tags))
     }
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "block if propagates pc taint, branch flows, and mutated var tuples across all branches"
+        reason = "iterative block if handles arbitrarily long else-if chains, branch pc taint, and mutated var tuples"
     )]
     fn check_if_block_with_state(
         &mut self,
@@ -7488,20 +7763,31 @@ impl<'a> Checker<'a> {
         state_vars: &[Ident],
         branch_envs: &mut Vec<HashMap<Ident, VarBinding>>,
     ) -> (ExecExpr, LTy) {
-        let (cex, clty) = self.check_expr(cond, env, Some(&Ty::Bool), pc, scope, ret_ctx);
-        let branch_pc = pc.union(&clty.tags);
+        // Without a trailing `else`, the implicit fallthrough produces `Unit`, so every branch
+        // must also produce `Unit` at slot 0 (preventing Core IR branch type mismatch).
+        let branch_expected = if else_body.is_none() {
+            Some(&Ty::Unit)
+        } else {
+            expected
+        };
         let tail = if state_vars.is_empty() {
             BlockTail::Value
         } else {
             BlockTail::ValueAndState(state_vars)
         };
 
+        let mut cur_pc = pc.clone();
+        let mut arms: Vec<(ExecExpr, ExecExpr, LTy, bool, usize, TagSet)> =
+            Vec::with_capacity(1 + else_ifs.len());
+
+        let (c0, cl0) = self.check_expr(cond, env, Some(&Ty::Bool), &cur_pc, scope, ret_ctx);
+        cur_pc = cur_pc.union(&cl0.tags);
         let mut then_env = env.clone();
-        let (tex, tlty) = self.check_block_inner(
+        let (t0, tl0) = self.check_block_inner(
             then_body,
             &mut then_env,
-            expected,
-            &branch_pc,
+            branch_expected,
+            &cur_pc,
             scope,
             ret_ctx,
             tail,
@@ -7509,29 +7795,29 @@ impl<'a> Checker<'a> {
             false,
             "",
         );
+        let t0_div = block_ends_diverging(then_body);
+        let env0_idx = branch_envs.len();
         branch_envs.push(then_env);
+        let mut all_tags = cur_pc.union(&tl0.tags);
+        let mut out_ty: Option<Ty> = if else_body.is_none() {
+            Some(Ty::Unit)
+        } else if !t0_div {
+            Some(tl0.ty.clone())
+        } else {
+            None
+        };
+        arms.push((c0, t0, tl0, t0_div, env0_idx, cur_pc.clone()));
 
-        let (eex, elty) = if let Some(first_ei) = else_ifs.first() {
-            self.check_if_block_with_state(
-                &first_ei.cond,
-                &first_ei.body,
-                &else_ifs[1..],
-                else_body,
-                env,
-                expected,
-                &branch_pc,
-                scope,
-                ret_ctx,
-                state_vars,
-                branch_envs,
-            )
-        } else if let Some(eb) = else_body {
-            let mut else_env = env.clone();
-            let res = self.check_block_inner(
-                &eb.body,
-                &mut else_env,
-                expected,
-                &branch_pc,
+        for ei in else_ifs {
+            let (cex, clty) =
+                self.check_expr(&ei.cond, env, Some(&Ty::Bool), &cur_pc, scope, ret_ctx);
+            cur_pc = cur_pc.union(&clty.tags);
+            let mut ei_env = env.clone();
+            let (bex, blty) = self.check_block_inner(
+                &ei.body,
+                &mut ei_env,
+                branch_expected.or(out_ty.as_ref()),
+                &cur_pc,
                 scope,
                 ret_ctx,
                 tail,
@@ -7539,39 +7825,201 @@ impl<'a> Checker<'a> {
                 false,
                 "",
             );
+            let div = block_ends_diverging(&ei.body);
+            let env_idx = branch_envs.len();
+            branch_envs.push(ei_env);
+            all_tags = all_tags.union(&cur_pc).union(&blty.tags);
+            if out_ty.is_none() && !div {
+                out_ty = Some(blty.ty.clone());
+            }
+            arms.push((cex, bex, blty, div, env_idx, cur_pc.clone()));
+        }
+
+        let (mut acc_else, else_lty, else_div, else_env_idx) = if let Some(eb) = else_body {
+            let mut else_env = env.clone();
+            let (eex, elty) = self.check_block_inner(
+                &eb.body,
+                &mut else_env,
+                branch_expected.or(out_ty.as_ref()),
+                &cur_pc,
+                scope,
+                ret_ctx,
+                tail,
+                Vec::new(),
+                false,
+                "",
+            );
+            let div = block_ends_diverging(&eb.body);
+            let env_idx = branch_envs.len();
             branch_envs.push(else_env);
-            res
+            all_tags = all_tags.union(&elty.tags);
+            if out_ty.is_none() && !div {
+                out_ty = Some(elty.ty.clone());
+            }
+            (eex, elty, div, env_idx)
         } else {
+            let env_idx = branch_envs.len();
             branch_envs.push(env.clone());
             let unit_branch = if state_vars.is_empty() {
                 ExecExpr::Lit(Literal::Unit)
             } else {
                 build_val_and_var_tuple(ExecExpr::Lit(Literal::Unit), state_vars)
             };
-            (unit_branch, LTy::new(Ty::Unit, branch_pc.clone()))
+            (
+                unit_branch,
+                LTy::new(Ty::Unit, cur_pc.clone()),
+                false,
+                env_idx,
+            )
         };
 
-        let then_diverges = then_body.last().is_some_and(|s| {
-            matches!(
-                s.kind,
-                StmtKind::Return { guard: None, .. } | StmtKind::Stop(_)
-            )
-        });
-        let out_ty = if else_body.is_none() && else_ifs.is_empty() {
-            Ty::Unit
-        } else if then_diverges {
-            elty.ty
+        let resolved_ty = out_ty.unwrap_or(Ty::Unit);
+        // When returning a state tuple across branches in Core IR, ensure every non-diverging
+        // branch tuple carries identical merged element `LTy.tags` so `t_lty.ty == e_lty.ty`.
+        if !state_vars.is_empty() {
+            let merged_val_lty = LTy::new(resolved_ty.clone(), all_tags.clone());
+            let merged_var_ltys = compute_merged_var_ltys(env, state_vars, branch_envs, &cur_pc);
+            if !else_div {
+                acc_else = self.harmonize_state_tuple_branch(
+                    acc_else,
+                    &else_lty,
+                    &branch_envs[else_env_idx],
+                    &cur_pc,
+                    state_vars,
+                    &merged_val_lty,
+                    &merged_var_ltys,
+                );
+            }
+            while let Some((cex, mut tex, tlty, div, eidx, arm_pc)) = arms.pop() {
+                if !div {
+                    tex = self.harmonize_state_tuple_branch(
+                        tex,
+                        &tlty,
+                        &branch_envs[eidx],
+                        &arm_pc,
+                        state_vars,
+                        &merged_val_lty,
+                        &merged_var_ltys,
+                    );
+                }
+                acc_else = ExecExpr::IfE {
+                    cond: Box::new(cex),
+                    then_br: Box::new(tex),
+                    else_br: Box::new(acc_else),
+                };
+            }
         } else {
-            tlty.ty
-        };
-        (
-            ExecExpr::IfE {
-                cond: Box::new(cex),
-                then_br: Box::new(tex),
-                else_br: Box::new(eex),
-            },
-            LTy::new(out_ty, tlty.tags.union(&elty.tags).union(&branch_pc)),
-        )
+            if else_body.is_none() && !else_div && else_lty.ty != Ty::Unit {
+                acc_else = self.discard_branch_to_unit(acc_else, else_lty);
+            }
+            while let Some((cex, mut tex, tlty, div, _, _)) = arms.pop() {
+                if else_body.is_none() && !div && tlty.ty != Ty::Unit {
+                    tex = self.discard_branch_to_unit(tex, tlty);
+                }
+                acc_else = ExecExpr::IfE {
+                    cond: Box::new(cex),
+                    then_br: Box::new(tex),
+                    else_br: Box::new(acc_else),
+                };
+            }
+        }
+
+        (acc_else, LTy::new(resolved_ty, all_tags))
+    }
+
+    fn discard_branch_to_unit(&mut self, mut br_ex: ExecExpr, br_lty: LTy) -> ExecExpr {
+        let tmp = self.fresh("seq");
+        if expr_has_any_jump(&br_ex) {
+            let cont = self.fresh("cont");
+            rewrite_tail_to_jump(&mut br_ex, &cont);
+            ExecExpr::Join {
+                label: cont,
+                params: vec![(tmp, br_lty)],
+                rhs: Box::new(ExecExpr::Lit(Literal::Unit)),
+                body: Box::new(br_ex),
+            }
+        } else {
+            ExecExpr::LetE {
+                name: tmp,
+                lty: br_lty,
+                bound: Box::new(br_ex),
+                body: Box::new(ExecExpr::Lit(Literal::Unit)),
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "state tuple harmonization needs branch pc, env, and merged target element types"
+    )]
+    fn harmonize_state_tuple_branch(
+        &mut self,
+        mut br_ex: ExecExpr,
+        br_val_lty: &LTy,
+        br_env: &HashMap<Ident, VarBinding>,
+        branch_pc: &TagSet,
+        state_vars: &[Ident],
+        merged_val_lty: &LTy,
+        merged_var_ltys: &[LTy],
+    ) -> ExecExpr {
+        let actual_val_lty = br_val_lty.add_tags(branch_pc);
+        let mut needs_widen = actual_val_lty.tags != merged_val_lty.tags;
+        let mut br_tup_ltys = Vec::with_capacity(1 + state_vars.len());
+        br_tup_ltys.push(actual_val_lty);
+        for (v, target_lty) in state_vars.iter().zip(merged_var_ltys) {
+            let cur_lty = br_env
+                .get(v)
+                .map_or_else(|| target_lty.clone(), |b| b.lty.add_tags(branch_pc));
+            if cur_lty.tags != target_lty.tags {
+                needs_widen = true;
+            }
+            br_tup_ltys.push(cur_lty);
+        }
+        if !needs_widen {
+            return br_ex;
+        }
+        let tup_tmp = self.fresh("br_tup");
+        let mut proj_names = Vec::with_capacity(1 + state_vars.len());
+        let val_name = self.fresh("br_el");
+        proj_names.push((val_name, merged_val_lty.clone()));
+        for target_lty in merged_var_ltys {
+            proj_names.push((self.fresh("br_el"), target_lty.clone()));
+        }
+        let mut body = ExecExpr::Tuple(
+            proj_names
+                .iter()
+                .map(|(n, _)| ExecExpr::Var(n.clone()))
+                .collect(),
+        );
+        for (idx, (el_name, target_lty)) in proj_names.into_iter().enumerate().rev() {
+            body = ExecExpr::LetE {
+                name: el_name,
+                lty: target_lty,
+                bound: Box::new(ExecExpr::Proj {
+                    tup: Box::new(ExecExpr::Var(tup_tmp.clone())),
+                    idx: BigInt::from(idx),
+                }),
+                body: Box::new(body),
+            };
+        }
+        let tup_lty = LTy::new(Ty::Tuple(br_tup_ltys), merged_val_lty.tags.clone());
+        if expr_has_any_jump(&br_ex) {
+            let cont = self.fresh("br_join");
+            rewrite_tail_to_jump(&mut br_ex, &cont);
+            ExecExpr::Join {
+                label: cont,
+                params: vec![(tup_tmp, tup_lty)],
+                rhs: Box::new(body),
+                body: Box::new(br_ex),
+            }
+        } else {
+            ExecExpr::LetE {
+                name: tup_tmp,
+                lty: tup_lty,
+                bound: Box::new(br_ex),
+                body: Box::new(body),
+            }
+        }
     }
 
     #[expect(
@@ -7629,7 +8077,8 @@ impl<'a> Checker<'a> {
             }
         }
 
-        let mut arms = Vec::with_capacity(grouped.len());
+        let mut raw_arms: Vec<(ExecPattern, ExecExpr, LTy, bool, usize)> =
+            Vec::with_capacity(grouped.len());
         let mut out_ty: Option<Ty> = expected.cloned();
         let mut out_tags = case_pc.clone();
 
@@ -7663,23 +8112,58 @@ impl<'a> Checker<'a> {
                     let diverges = body_stmts.last().is_some_and(|s| {
                         matches!(
                             s.kind,
-                            StmtKind::Return { guard: None, .. } | StmtKind::Stop(_)
+                            StmtKind::Return { guard: None, .. }
+                                | StmtKind::Break { guard: None, .. }
+                                | StmtKind::Continue { guard: None, .. }
+                                | StmtKind::Stop(_)
                         )
                     });
                     (ex, lty, diverges)
                 }
             };
+            let env_idx = arm_envs.len();
             arm_envs.push(arm_env);
             // If an arm jumps away via `return`, its static type is Unit; don't overwrite a real arm type!
             if out_ty.is_none() && !arm_diverges {
-                out_ty = Some(body_lty.ty);
+                out_ty = Some(body_lty.ty.clone());
             }
             out_tags = out_tags.union(&body_lty.tags);
-            arms.push(ExecCaseArm {
-                pattern: pat,
-                body: body_ex,
-            });
+            raw_arms.push((pat, body_ex, body_lty, arm_diverges, env_idx));
         }
+
+        let resolved_ty = out_ty.unwrap_or(Ty::Unit);
+        let arms: Vec<ExecCaseArm> = if !state_vars.is_empty() {
+            let merged_val_lty = LTy::new(resolved_ty.clone(), out_tags.clone());
+            let merged_var_ltys = compute_merged_var_ltys(env, state_vars, arm_envs, &case_pc);
+            raw_arms
+                .into_iter()
+                .map(|(pat, mut body_ex, body_lty, div, eidx)| {
+                    if !div {
+                        body_ex = self.harmonize_state_tuple_branch(
+                            body_ex,
+                            &body_lty,
+                            &arm_envs[eidx],
+                            &case_pc,
+                            state_vars,
+                            &merged_val_lty,
+                            &merged_var_ltys,
+                        );
+                    }
+                    ExecCaseArm {
+                        pattern: pat,
+                        body: body_ex,
+                    }
+                })
+                .collect()
+        } else {
+            raw_arms
+                .into_iter()
+                .map(|(pat, body_ex, _, _, _)| ExecCaseArm {
+                    pattern: pat,
+                    body: body_ex,
+                })
+                .collect()
+        };
 
         if arms.is_empty() {
             self.diags.push(
@@ -7693,7 +8177,7 @@ impl<'a> Checker<'a> {
                 scrut: Box::new(sex),
                 arms,
             },
-            LTy::new(out_ty.unwrap_or(Ty::Unit), out_tags),
+            LTy::new(resolved_ty, out_tags),
         )
     }
 
@@ -8545,7 +9029,7 @@ impl<'a> Checker<'a> {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "row-level inline if chains branches with type and tag union"
+        reason = "iterative row-level inline if handles arbitrarily long else-if chains in O(1) stack"
     )]
     fn check_row_if_inline(
         &mut self,
@@ -8558,39 +9042,32 @@ impl<'a> Checker<'a> {
         expected: Option<&Ty>,
         allow_dot_self: bool,
     ) -> (ExecRowExpr, Ty, TagSet) {
-        let (cre, _, ctags) =
+        let mut arms: Vec<(ExecRowExpr, ExecRowExpr)> = Vec::with_capacity(1 + else_ifs.len());
+        let (c0, _, ct0) =
             self.check_row_expr(cond, cols, outer_env, Some(&Ty::Bool), allow_dot_self);
-        let (tre, tty, ttags) =
+        let (t0, tty, tt0) =
             self.check_row_expr(then_expr, cols, outer_env, expected, allow_dot_self);
-        let (ere, _, etags) = if let Some((ec, et)) = else_ifs.first() {
-            self.check_row_if_inline(
-                ec,
-                et,
-                &else_ifs[1..],
-                else_expr,
-                cols,
-                outer_env,
-                expected.or(Some(&tty)),
-                allow_dot_self,
-            )
-        } else {
-            self.check_row_expr(
-                else_expr,
-                cols,
-                outer_env,
-                expected.or(Some(&tty)),
-                allow_dot_self,
-            )
-        };
-        (
-            ExecRowExpr::IfE {
+        let mut tags = ct0.union(&tt0);
+        arms.push((c0, t0));
+        let hint = expected.or(Some(&tty));
+        for (ec, et) in else_ifs {
+            let (cre, _, ctags) =
+                self.check_row_expr(ec, cols, outer_env, Some(&Ty::Bool), allow_dot_self);
+            let (tre, _, ttags) = self.check_row_expr(et, cols, outer_env, hint, allow_dot_self);
+            tags = tags.union(&ctags).union(&ttags);
+            arms.push((cre, tre));
+        }
+        let (mut acc, _, etags) =
+            self.check_row_expr(else_expr, cols, outer_env, hint, allow_dot_self);
+        tags = tags.union(&etags);
+        while let Some((cre, tre)) = arms.pop() {
+            acc = ExecRowExpr::IfE {
                 cond: Box::new(cre),
                 then_br: Box::new(tre),
-                else_br: Box::new(ere),
-            },
-            tty,
-            ctags.union(&ttags).union(&etags),
-        )
+                else_br: Box::new(acc),
+            };
+        }
+        (acc, tty, tags)
     }
 
     // -----------------------------------------------------------------------
@@ -8792,12 +9269,13 @@ fn merge_branch_mut_vars(
     outer: &mut HashMap<Ident, VarBinding>,
     written: &[Ident],
     branch_envs: &[HashMap<Ident, VarBinding>],
+    branch_pc: &TagSet,
 ) {
     for name in written {
         let Some(ob) = outer.get_mut(name) else {
             continue;
         };
-        let mut merged_tags = ob.lty.tags.clone();
+        let mut merged_tags = ob.lty.tags.union(branch_pc);
         let mut refined_ty: Option<Ty> = None;
         for benv in branch_envs {
             if let Some(bb) = benv.get(name) {
@@ -8938,9 +9416,317 @@ fn record_assign_lhs(lhs: &Expr, env: &HashMap<Ident, VarBinding>, found: &mut H
     }
 }
 
+fn taint_return_with_pc(mut ret_lty: LTy, arg_tags: &TagSet, pc: &TagSet) -> LTy {
+    let extra = arg_tags.union(pc);
+    if extra.is_empty() {
+        return ret_lty;
+    }
+    if let Ty::Table(ref mut tt) = ret_lty.ty {
+        tt.row_tags = tt.row_tags.union(pc);
+        tt.order_tags = tt.order_tags.union(pc);
+        ret_lty.tags = ret_lty.tags.union(pc);
+    } else {
+        ret_lty.tags = ret_lty.tags.union(&extra);
+    }
+    ret_lty
+}
+
+fn block_ends_diverging(stmts: &[Stmt]) -> bool {
+    stmts.last().is_some_and(|s| {
+        matches!(
+            s.kind,
+            StmtKind::Return { guard: None, .. } | StmtKind::Stop(_)
+        )
+    })
+}
+
+fn compute_merged_var_ltys(
+    outer: &HashMap<Ident, VarBinding>,
+    state_vars: &[Ident],
+    branch_envs: &[HashMap<Ident, VarBinding>],
+    branch_pc: &TagSet,
+) -> Vec<LTy> {
+    state_vars
+        .iter()
+        .map(|name| {
+            let mut lty = outer
+                .get(name)
+                .map_or_else(|| LTy::public(Ty::Unit), |b| b.lty.clone());
+            lty.tags = lty.tags.union(branch_pc);
+            for benv in branch_envs {
+                if let Some(bb) = benv.get(name) {
+                    let merged_tags = lty.tags.union(&bb.lty.tags);
+                    if is_unresolved_list(&lty.ty) && !is_unresolved_list(&bb.lty.ty) {
+                        lty = LTy::new(bb.lty.ty.clone(), merged_tags);
+                    } else {
+                        lty.tags = merged_tags;
+                    }
+                }
+            }
+            lty
+        })
+        .collect()
+}
+
+/// Iteratively check whether `expr` contains any `ExecExpr::Jump` node.
+fn expr_has_any_jump(expr: &ExecExpr) -> bool {
+    let mut stack = vec![expr];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            ExecExpr::Jump { .. } => return true,
+            ExecExpr::LetE { bound, body, .. }
+            | ExecExpr::Join {
+                rhs: bound, body, ..
+            } => {
+                stack.push(bound);
+                stack.push(body);
+            }
+            ExecExpr::IfE {
+                cond,
+                then_br,
+                else_br,
+            } => {
+                stack.push(cond);
+                stack.push(then_br);
+                stack.push(else_br);
+            }
+            ExecExpr::CaseE { scrut, arms } => {
+                stack.push(scrut);
+                for a in arms {
+                    stack.push(&a.body);
+                }
+            }
+            ExecExpr::ForLoop {
+                iter_expr,
+                body,
+                after,
+                ..
+            } => {
+                stack.push(iter_expr);
+                stack.push(body);
+                stack.push(after);
+            }
+            ExecExpr::WhileLoop {
+                cond, body, after, ..
+            } => {
+                stack.push(cond);
+                stack.push(body);
+                stack.push(after);
+            }
+            ExecExpr::App { fn_expr, args } => {
+                stack.push(fn_expr);
+                stack.extend(args.iter());
+            }
+            ExecExpr::Call { args, .. }
+            | ExecExpr::Tuple(args)
+            | ExecExpr::Ctor { args, .. }
+            | ExecExpr::Prim { args, .. }
+            | ExecExpr::Host { args, .. } => stack.extend(args.iter()),
+            ExecExpr::Proj { tup: e, .. }
+            | ExecExpr::Assert { cond: e, .. }
+            | ExecExpr::Fail(e) => stack.push(e),
+            ExecExpr::Stop {
+                detail: Some(e), ..
+            } => stack.push(e),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Iteratively rewrite all non-diverging tail leaves of `expr` into `Jump(cont_lbl, [leaf])`
+/// so conditional early exits lower into strict tail-position Core IR `Join` continuations.
+fn rewrite_tail_to_jump(expr: &mut ExecExpr, cont_lbl: &str) {
+    let mut stack: Vec<&mut ExecExpr> = vec![expr];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            ExecExpr::Jump { .. } | ExecExpr::Stop { .. } | ExecExpr::Fail(_) => {}
+            ExecExpr::IfE {
+                then_br, else_br, ..
+            } => {
+                stack.push(then_br.as_mut());
+                stack.push(else_br.as_mut());
+            }
+            ExecExpr::CaseE { arms, .. } => {
+                for a in arms {
+                    stack.push(&mut a.body);
+                }
+            }
+            ExecExpr::LetE { body, .. } => {
+                stack.push(body.as_mut());
+            }
+            ExecExpr::Join { rhs, body, .. } => {
+                stack.push(rhs.as_mut());
+                stack.push(body.as_mut());
+            }
+            ExecExpr::ForLoop { after, .. } | ExecExpr::WhileLoop { after, .. } => {
+                stack.push(after.as_mut());
+            }
+            other => {
+                let leaf = std::mem::replace(other, ExecExpr::Lit(Literal::Unit));
+                *other = ExecExpr::Jump {
+                    label: cont_lbl.to_string(),
+                    args: vec![leaf],
+                };
+            }
+        }
+    }
+}
+
+/// Iteratively collect outer mutable `var` names referenced or assigned inside a lambda body.
+fn collect_captured_mut_vars_lambda(
+    body: &ast::LambdaBody,
+    env: &HashMap<Ident, VarBinding>,
+    shadowed: &HashSet<Ident>,
+) -> Vec<Ident> {
+    let mut found: HashSet<Ident> = HashSet::new();
+    let mut expr_stack: Vec<&Expr> = Vec::new();
+    let mut stmt_slices: Vec<&[Stmt]> = Vec::new();
+    match body {
+        ast::LambdaBody::Expr(e) => expr_stack.push(e.as_ref()),
+        ast::LambdaBody::Block(stmts) => stmt_slices.push(stmts.as_slice()),
+    }
+
+    loop {
+        while let Some(stmts) = stmt_slices.pop() {
+            for st in stmts {
+                match &st.kind {
+                    StmtKind::Var { value, .. } => expr_stack.push(value),
+                    StmtKind::Assign { lhs, rhs } => {
+                        expr_stack.push(lhs);
+                        expr_stack.push(rhs);
+                    }
+                    StmtKind::Assert(e) | StmtKind::Expr(e) => expr_stack.push(e),
+                    StmtKind::Return { value, guard } => {
+                        if let Some(v) = value {
+                            expr_stack.push(v);
+                        }
+                        if let Some(g) = guard {
+                            expr_stack.push(g);
+                        }
+                    }
+                    StmtKind::Break { guard } | StmtKind::Continue { guard } => {
+                        if let Some(g) = guard {
+                            expr_stack.push(g);
+                        }
+                    }
+                    StmtKind::Stop(Some(e)) => expr_stack.push(e),
+                    StmtKind::Stop(None) => {}
+                    StmtKind::For { iter, body, .. } => {
+                        expr_stack.push(iter);
+                        stmt_slices.push(body);
+                    }
+                    StmtKind::While { cond, body } => {
+                        expr_stack.push(cond);
+                        stmt_slices.push(body);
+                    }
+                }
+            }
+        }
+        let Some(ex) = expr_stack.pop() else {
+            break;
+        };
+        match &ex.kind {
+            ExprKind::Ident(name) => {
+                if !shadowed.contains(name) && env.get(name).is_some_and(|b| b.mutable) {
+                    found.insert(name.clone());
+                }
+            }
+            ExprKind::Paren(e) | ExprKind::Unary { expr: e, .. } => expr_stack.push(e),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                expr_stack.push(lhs);
+                expr_stack.push(rhs);
+            }
+            ExprKind::Field { receiver, .. } => expr_stack.push(receiver),
+            ExprKind::Index { target, index } => {
+                expr_stack.push(target);
+                expr_stack.push(index);
+            }
+            ExprKind::Tuple(xs) | ExprKind::List(xs) => expr_stack.extend(xs.iter()),
+            ExprKind::Map(pairs) => {
+                for (k, v) in pairs {
+                    expr_stack.push(k);
+                    expr_stack.push(v);
+                }
+            }
+            ExprKind::InterpText { parts, .. } => {
+                for p in parts {
+                    if let ast::InterpPart::Expr(e) = p {
+                        expr_stack.push(e);
+                    }
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                expr_stack.push(callee);
+                for a in args {
+                    match a {
+                        CallArg::Positional(e) | CallArg::Named { value: e, .. } => {
+                            expr_stack.push(e);
+                        }
+                    }
+                }
+            }
+            ExprKind::IfInline {
+                cond,
+                then_expr,
+                else_ifs,
+                else_expr,
+            } => {
+                expr_stack.push(cond);
+                expr_stack.push(then_expr);
+                for (c, t) in else_ifs {
+                    expr_stack.push(c);
+                    expr_stack.push(t);
+                }
+                expr_stack.push(else_expr);
+            }
+            ExprKind::IfBlock {
+                cond,
+                then_body,
+                else_ifs,
+                else_body,
+            } => {
+                expr_stack.push(cond);
+                stmt_slices.push(then_body);
+                for ei in else_ifs {
+                    expr_stack.push(&ei.cond);
+                    stmt_slices.push(&ei.body);
+                }
+                if let Some(eb) = else_body {
+                    stmt_slices.push(&eb.body);
+                }
+            }
+            ExprKind::Case { scrut, lines } => {
+                expr_stack.push(scrut);
+                for line in lines {
+                    match line {
+                        ast::CaseLine::ArmHeader { .. } => {}
+                        ast::CaseLine::ArmInline { expr, .. } => expr_stack.push(expr),
+                        ast::CaseLine::Stmt(st) => stmt_slices.push(std::slice::from_ref(st)),
+                    }
+                }
+            }
+            ExprKind::Lambda { body: inner, .. } => match inner {
+                ast::LambdaBody::Expr(e) => expr_stack.push(e),
+                ast::LambdaBody::Block(ss) => stmt_slices.push(ss),
+            },
+            ExprKind::TableLit { rows, .. } => {
+                for r in rows {
+                    expr_stack.extend(r.iter());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out: Vec<Ident> = found.into_iter().collect();
+    out.sort();
+    out
+}
+
 enum BlockStep {
     Bind(Ident, LTy, ExecExpr),
-    Effect(ExecExpr),
+    Effect(LTy, ExecExpr),
     Final(ExecExpr),
     Loop(Box<LoopStep>),
 }
