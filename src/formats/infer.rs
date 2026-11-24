@@ -13,7 +13,7 @@ use std::path::Path;
 use crate::formats::compress::{open_auto_decoded_file, strip_compression_ext};
 use crate::formats::csv::CsvBatchReader;
 use crate::formats::json::{JsonValue, JsonlBatchReader, parse_json};
-use crate::formats::time::{parse_decimal_bigint, parse_iso_date, parse_iso_timestamp};
+use crate::formats::time::{parse_decimal_bigint_strict, parse_iso_date, parse_iso_timestamp};
 
 /// Input data format for schema inference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +118,14 @@ impl InferredSchema {
     }
 }
 
+fn has_leading_zero_int(s: &str) -> bool {
+    let digits = s
+        .strip_prefix('-')
+        .or_else(|| s.strip_prefix('+'))
+        .unwrap_or(s);
+    digits.len() > 1 && digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn classify_text_cell(raw: &str) -> Option<InferredTy> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -133,10 +141,14 @@ fn classify_text_cell(raw: &str) -> Option<InferredTy> {
     if parse_iso_timestamp(trimmed).is_ok() {
         return Some(InferredTy::Timestamp);
     }
+    // Preserve leading-zero codes (e.g. ZIP codes `00123`) as Text rather than Int.
+    if has_leading_zero_int(trimmed) {
+        return Some(InferredTy::Text);
+    }
     if trimmed.parse::<i64>().is_ok() {
         return Some(InferredTy::Int);
     }
-    if parse_decimal_bigint(trimmed).is_ok() {
+    if parse_decimal_bigint_strict(trimmed).is_ok() {
         return Some(InferredTy::Decimal);
     }
     if let Ok(f) = trimmed.parse::<f64>()
@@ -154,7 +166,7 @@ fn classify_json_value(v: &JsonValue) -> Option<InferredTy> {
         JsonValue::Number(raw) => {
             if raw.parse::<i64>().is_ok() {
                 Some(InferredTy::Int)
-            } else if parse_decimal_bigint(raw).is_ok() {
+            } else if parse_decimal_bigint_strict(raw).is_ok() {
                 Some(InferredTy::Decimal)
             } else {
                 Some(InferredTy::Float)
@@ -173,6 +185,48 @@ fn classify_json_value(v: &JsonValue) -> Option<InferredTy> {
     }
 }
 
+fn is_dana_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "module"
+            | "expose"
+            | "use"
+            | "tag"
+            | "schema"
+            | "struct"
+            | "enum"
+            | "const"
+            | "fn"
+            | "var"
+            | "if"
+            | "else"
+            | "case"
+            | "for"
+            | "in"
+            | "while"
+            | "break"
+            | "continue"
+            | "return"
+            | "try"
+            | "and"
+            | "or"
+            | "not"
+            | "is"
+            | "true"
+            | "false"
+            | "none"
+            | "stop"
+            | "promise"
+            | "examples"
+            | "test"
+            | "assert"
+            | "table"
+            | "where"
+            | "end"
+            | "as"
+    )
+}
+
 fn sanitize_col_name(raw: &str, idx: usize) -> String {
     let mut s = String::new();
     for ch in raw.trim().chars() {
@@ -185,6 +239,8 @@ fn sanitize_col_name(raw: &str, idx: usize) -> String {
     let trimmed = s.trim_matches('_');
     if trimmed.is_empty() || trimmed.as_bytes()[0].is_ascii_digit() {
         format!("col_{}", idx + 1)
+    } else if is_dana_keyword(trimmed) {
+        format!("{trimmed}_col")
     } else {
         trimmed.to_string()
     }
@@ -257,6 +313,9 @@ pub fn infer_schema_from_reader<R: Read>(
                 })
                 .collect();
 
+            if header.fields.len() == 1 {
+                csv_r.set_preserve_empty_lines(true);
+            }
             let mut rows_sampled = 0usize;
             while rows_sampled < limit {
                 let batch = csv_r

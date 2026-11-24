@@ -3662,7 +3662,25 @@ impl<'a> Checker<'a> {
         if (fname == "in_tz" || fname == "date_in_tz")
             && let [CallArg::Positional(z)] = rest_args
         {
+            if first_lty.ty != Ty::Timestamp {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("`{fname}` expects `Timestamp` as first argument"),
+                    )
+                    .with_span(first_span),
+                );
+            }
             let (ez, lz) = self.check_expr(z, env, Some(&Ty::Text), pc, scope, ret_ctx);
+            if lz.ty != Ty::Text {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("`{fname}` expects a `Text` IANA timezone name"),
+                    )
+                    .with_span(z.span),
+                );
+            }
             let (op, out_ty) = if fname == "in_tz" {
                 (ExecPrimOp::InTz, Ty::Text)
             } else {
@@ -6417,7 +6435,25 @@ impl<'a> Checker<'a> {
                 && let [CallArg::Positional(a), CallArg::Positional(z)] = args
             {
                 let (ea, la) = self.check_expr(a, env, Some(&Ty::Timestamp), pc, scope, ret_ctx);
+                if la.ty != Ty::Timestamp {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`{fname}` expects `Timestamp` as first argument"),
+                        )
+                        .with_span(a.span),
+                    );
+                }
                 let (ez, lz) = self.check_expr(z, env, Some(&Ty::Text), pc, scope, ret_ctx);
+                if lz.ty != Ty::Text {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`{fname}` expects a `Text` IANA timezone name"),
+                        )
+                        .with_span(z.span),
+                    );
+                }
                 let (op, out_ty) = if fname == "in_tz" {
                     (ExecPrimOp::InTz, Ty::Text)
                 } else {
@@ -7348,6 +7384,15 @@ impl<'a> Checker<'a> {
             (Ty::Timestamp, "in_tz" | "date_in_tz") => {
                 if let Some(CallArg::Positional(e)) = args.first() {
                     let (aex, alty) = self.check_expr(e, env, Some(&Ty::Text), pc, scope, ret_ctx);
+                    if alty.ty != Ty::Text {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("`.{}` expects a `Text` IANA timezone name", member.name),
+                            )
+                            .with_span(e.span),
+                        );
+                    }
                     let (op, out_ty) = if member.name == "in_tz" {
                         (ExecPrimOp::InTz, Ty::Text)
                     } else {
@@ -8971,13 +9016,37 @@ impl<'a> Checker<'a> {
                         }
                         "in_tz" | "date_in_tz" => {
                             if let Some(CallArg::Positional(a0)) = args.first() {
-                                let (are, _, atags) = self.check_row_expr(
+                                if rty != Ty::Timestamp {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::TypeError,
+                                            format!(
+                                                "`.{}` requires a `Timestamp` receiver",
+                                                member.name
+                                            ),
+                                        )
+                                        .with_span(receiver.span),
+                                    );
+                                }
+                                let (are, aty, atags) = self.check_row_expr(
                                     a0,
                                     cols,
                                     outer_env,
                                     Some(&Ty::Text),
                                     allow_dot_self,
                                 );
+                                if aty != Ty::Text {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::TypeError,
+                                            format!(
+                                                "`.{}` expects a `Text` IANA timezone name",
+                                                member.name
+                                            ),
+                                        )
+                                        .with_span(a0.span),
+                                    );
+                                }
                                 let (op, out_ty) = if member.name == "in_tz" {
                                     (ExecPrimOp::InTz, Ty::Text)
                                 } else {
@@ -9056,20 +9125,38 @@ impl<'a> Checker<'a> {
                     if (fname == "in_tz" || fname == "date_in_tz")
                         && let [CallArg::Positional(a), CallArg::Positional(z)] = args.as_slice()
                     {
-                        let (ea, _, tga) = self.check_row_expr(
+                        let (ea, ta, tga) = self.check_row_expr(
                             a,
                             cols,
                             outer_env,
                             Some(&Ty::Timestamp),
                             allow_dot_self,
                         );
-                        let (ez, _, tgz) = self.check_row_expr(
+                        if ta != Ty::Timestamp {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("`{fname}` expects `Timestamp` as first argument"),
+                                )
+                                .with_span(a.span),
+                            );
+                        }
+                        let (ez, tz, tgz) = self.check_row_expr(
                             z,
                             cols,
                             outer_env,
                             Some(&Ty::Text),
                             allow_dot_self,
                         );
+                        if tz != Ty::Text {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("`{fname}` expects a `Text` IANA timezone name"),
+                                )
+                                .with_span(z.span),
+                            );
+                        }
                         let (op, out_ty) = if fname == "in_tz" {
                             (ExecPrimOp::InTz, Ty::Text)
                         } else {

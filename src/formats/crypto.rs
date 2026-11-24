@@ -1,6 +1,7 @@
 //! Pure-Rust FIPS 180-4 SHA-256 and RFC 2104 HMAC-SHA256 for keyed `pseudonymize`.
 //!
-//! Zero external crates, `#![forbid(unsafe_code)]`, verified against FIPS 180-4 and RFC 4231 test vectors.
+//! Zero external crates, compiled under `#[forbid(unsafe_code)]` (enforced in `src/lib.rs`),
+//! verified against FIPS 180-4 and RFC 4231 test vectors.
 
 use std::fmt::Write as _;
 
@@ -269,18 +270,18 @@ pub fn to_hex_lower(bytes: &[u8]) -> String {
 
 /// Compute a keyed HMAC-SHA256 pseudonym token (`"ps_<32-hex>"`, 128-bit MAC) for a Dana value.
 ///
-/// Domain-separated by value type and canonical value representation so distinct types/values
-/// never collide and the same `(key, value)` pair always produces the same join-preserving token.
+/// Transparently unwraps `Option::Some` so nullable and non-nullable join keys produce identical
+/// tokens, and encodes raw `Bytes` directly (avoiding length-only collisions).
 #[must_use]
 pub fn hmac_sha256_pseudonym(key: &[u8], val: &Val) -> String {
+    let mut cur = val;
+    while let Val::OptSome(inner) = cur {
+        cur = inner.as_ref();
+    }
     let mut payload = Vec::new();
     payload.extend_from_slice(b"dana.pseudonym.v1\0");
-    match val {
+    match cur {
         Val::OptNone => payload.extend_from_slice(b"none"),
-        Val::OptSome(inner) => {
-            payload.extend_from_slice(b"some:");
-            payload.extend_from_slice(render_public_val(inner).as_bytes());
-        }
         Val::Text(s) => {
             payload.extend_from_slice(b"text:");
             payload.extend_from_slice(s.as_bytes());

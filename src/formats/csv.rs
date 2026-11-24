@@ -10,7 +10,8 @@ use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use crate::core::bigint::BigInt;
 use crate::core::check::quarantine_bad_row_table_ty;
 use crate::core::syntax::{Float64, ScalarTy, TableTy};
-use crate::formats::time::{parse_decimal_bigint, parse_iso_date, parse_iso_timestamp};
+use crate::formats::crypto::to_hex_lower;
+use crate::formats::time::{parse_decimal_bigint_strict, parse_iso_date, parse_iso_timestamp};
 use crate::oracle::value::{TableRow, TableVal, Val};
 
 /// Default streaming batch size for CSV/TSV record iteration (matches the Phase 2C VM batch size).
@@ -34,6 +35,7 @@ pub struct CsvBatchReader<R: BufRead> {
     line_no: usize,
     started: bool,
     eof: bool,
+    preserve_empty_lines: bool,
     pending: [u8; 3],
     pending_pos: usize,
     pending_len: usize,
@@ -58,10 +60,17 @@ impl<R: BufRead> CsvBatchReader<R> {
             line_no: 1,
             started: false,
             eof: false,
+            preserve_empty_lines: false,
             pending: [0; 3],
             pending_pos: 0,
             pending_len: 0,
         }
+    }
+
+    /// When enabled (used for single-column schemas), empty lines represent a valid 1-field empty row
+    /// rather than being skipped, preserving `Option(T)` `none` rows across write/read round-trips.
+    pub fn set_preserve_empty_lines(&mut self, preserve: bool) {
+        self.preserve_empty_lines = preserve;
     }
 
     fn push_pending(&mut self, byte: u8) {
@@ -130,18 +139,34 @@ impl<R: BufRead> CsvBatchReader<R> {
             let Some(first) = self.next_byte()? else {
                 return Ok(None);
             };
-            // Skip pure blank lines (`\n` or `\r\n`).
+            // Skip pure blank lines (`\n` or `\r\n`), unless preserving empty rows for 1-column schemas.
             if first == b'\n' {
+                let rec_line = self.line_no;
                 self.line_no += 1;
+                if self.preserve_empty_lines {
+                    return Ok(Some(CsvRecord {
+                        line: rec_line,
+                        raw_line: String::new(),
+                        fields: vec![String::new()],
+                    }));
+                }
                 continue;
             }
             if first == b'\r' {
+                let rec_line = self.line_no;
                 if let Some(next) = self.next_byte()?
                     && next != b'\n'
                 {
                     self.push_pending(next);
                 }
                 self.line_no += 1;
+                if self.preserve_empty_lines {
+                    return Ok(Some(CsvRecord {
+                        line: rec_line,
+                        raw_line: String::new(),
+                        fields: vec![String::new()],
+                    }));
+                }
                 continue;
             }
 
@@ -154,10 +179,10 @@ impl<R: BufRead> CsvBatchReader<R> {
                 let mut field_bytes = Vec::new();
                 if cur_byte == Some(b'"') {
                     raw_bytes.push(b'"');
+                    let mut closed = false;
                     loop {
                         match self.next_byte()? {
                             None => {
-                                cur_byte = None;
                                 break;
                             }
                             Some(b'"') => {
@@ -168,6 +193,7 @@ impl<R: BufRead> CsvBatchReader<R> {
                                         field_bytes.push(b'"');
                                     }
                                     other => {
+                                        closed = true;
                                         cur_byte = other;
                                         break;
                                     }
@@ -181,6 +207,12 @@ impl<R: BufRead> CsvBatchReader<R> {
                                 field_bytes.push(b);
                             }
                         }
+                    }
+                    if !closed {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unterminated quoted field starting at CSV line {rec_line}"),
+                        ));
                     }
                     // Consume any stray characters after closing quote up to delimiter or newline.
                     while let Some(b) = cur_byte {
@@ -320,7 +352,7 @@ pub fn parse_csv_cell(raw: &str, ty: &ScalarTy) -> Result<Val, &'static str> {
             if trimmed.is_empty() {
                 return Err("MissingRequired");
             }
-            let d = parse_decimal_bigint(trimmed).map_err(|_| "BadDecimal")?;
+            let d = parse_decimal_bigint_strict(trimmed).map_err(|_| "BadDecimal")?;
             Ok(Val::Decimal(d))
         }
         ScalarTy::Float => {
@@ -401,6 +433,9 @@ where
             return Err(format!("missing required CSV column `{}`", col.name));
         };
         col_indices.push(idx);
+    }
+    if header.fields.len() == 1 {
+        batch_reader.set_preserve_empty_lines(true);
     }
 
     let mut good_rows = Vec::new();
@@ -544,6 +579,18 @@ pub fn render_csv_cell(v: &Val) -> String {
         Val::OptNone => String::new(),
         Val::OptSome(inner) => render_csv_cell(inner),
         Val::Text(s) => s.clone(),
+        Val::Float(f) => {
+            let fv = f.to_f64();
+            if fv.is_finite() {
+                format!("{fv}")
+            } else {
+                String::new()
+            }
+        }
+        Val::Bytes(bs) => match std::str::from_utf8(bs) {
+            Ok(s) => s.to_string(),
+            Err(_) => to_hex_lower(bs),
+        },
         Val::Date(d) => d
             .to_i64()
             .map_or_else(|| d.to_string(), crate::formats::time::format_iso_date),

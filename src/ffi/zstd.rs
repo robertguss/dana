@@ -11,6 +11,7 @@ use std::io::{self, Read, Write};
 use std::ptr;
 
 const ZSTD_C_COMPRESSION_LEVEL: c_int = 100;
+const ZSTD_C_CHECKSUM_FLAG: c_int = 201;
 const ZSTD_E_CONTINUE: c_int = 0;
 const ZSTD_E_FLUSH: c_int = 1;
 const ZSTD_E_END: c_int = 2;
@@ -265,6 +266,14 @@ impl<W: Write> ZstdWriter<W> {
         let rc =
             unsafe { ZSTD_CCtx_setParameter(cstream, ZSTD_C_COMPRESSION_LEVEL, level as c_int) };
         if let Err(e) = check_zstd(rc, "zstd set compression level failed") {
+            // SAFETY: free the freshly created context before returning error.
+            let _ = unsafe { ZSTD_freeCStream(cstream) };
+            return Err(e);
+        }
+        // Enable 32-bit xxHash content checksum on every written frame so bit flips are caught.
+        // SAFETY: `cstream` is non-null and freshly allocated.
+        let crc_rc = unsafe { ZSTD_CCtx_setParameter(cstream, ZSTD_C_CHECKSUM_FLAG, 1) };
+        if let Err(e) = check_zstd(crc_rc, "zstd enable checksum flag failed") {
             // SAFETY: free the freshly created context before returning error.
             let _ = unsafe { ZSTD_freeCStream(cstream) };
             return Err(e);

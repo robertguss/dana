@@ -767,3 +767,333 @@ end
     );
     Ok(())
 }
+
+#[test]
+fn review2b_b1_b4_and_minor_regressions() -> Result<(), String> {
+    // B1: Non-ASCII timestamp must NEVER panic; must quarantine cleanly in JSONL & CSV and infer as Text.
+    assert!(parse_iso_timestamp("2026-01-01T00:00:0\u{00e9}Z").is_err());
+    let bad_ts_csv = "ts\n2026-01-01T00:00:0\u{00e9}Z\n";
+    let inf_bad_ts = infer_schema_from_reader(
+        Cursor::new(bad_ts_csv.as_bytes()),
+        "BadTs",
+        InferFormat::Csv,
+        100,
+    )?;
+    assert!(inf_bad_ts.render_dana().contains("ts: Text"));
+
+    let ts_schema = TableTy {
+        cols: vec![ColSpec {
+            name: "at".to_string(),
+            ty: ScalarTy::Timestamp,
+            tags: TagSet::empty(),
+            bucketed: false,
+            agg_kind: AggKind::Raw,
+        }],
+        row_tags: TagSet::empty(),
+        order_tags: TagSet::empty(),
+        grouped_by: None,
+        summarized: false,
+        distinct_by: None,
+    };
+    let (g_ts, b_ts) = parse_jsonl_with_schema(
+        "{\"at\":\"2026-01-01T00:00:0\u{00e9}Z\"}\n",
+        &ts_schema,
+        |_, _| true,
+    )?;
+    assert_eq!(g_ts.rows.len(), 0);
+    assert_eq!(b_ts.rows.len(), 1);
+    assert!(val_eq(
+        &b_ts.rows[0].cells[2],
+        &Val::Text("BadTimestamp".to_string())
+    ));
+
+    // B2: `dana fake` satisfies Float CSV, upper-bound-only Int, sub-cent Decimal, and `!=` in both CSV and JSONL!
+    let dir = temp_test_dir("b2_fake")?;
+    let schema_file = dir.join("constraints.dana");
+    let schema_src = r#"
+module FakeConstraints
+
+schema Tight
+  f: Float
+  neg: Int where . < 0
+  small: Int where . <= 0
+  tiny: Decimal where . < 0.005
+  nz: Int where . >= 0 and . <= 2 and . != 1
+  raw: Bytes
+end
+
+fn main(args: Args, files: ReadFiles, console: Console) : Int
+  path = args.first.or_return(2)
+  (good, bad) = try files.read_csv(path, as: Tight)
+  console.print("good=#{good.count()} bad=#{bad.count()}")
+  if bad.count() > 0
+    1
+  else
+    0
+  end
+end
+"#;
+    fs::write(&schema_file, schema_src).map_err(|e| e.to_string())?;
+    let fake_csv = dir.join("tight.csv");
+    let fake_jsonl = dir.join("tight.jsonl");
+    assert_eq!(
+        dana::cli::run_cli(&[
+            "fake".to_string(),
+            schema_file.display().to_string(),
+            "--schema".to_string(),
+            "Tight".to_string(),
+            "--rows".to_string(),
+            "25".to_string(),
+            "--seed".to_string(),
+            "3".to_string(),
+            "--format".to_string(),
+            "csv".to_string(),
+            "--out".to_string(),
+            fake_csv.display().to_string(),
+        ]),
+        0
+    );
+    assert_eq!(
+        dana::cli::run_cli(&[
+            "fake".to_string(),
+            schema_file.display().to_string(),
+            "--schema".to_string(),
+            "Tight".to_string(),
+            "--rows".to_string(),
+            "25".to_string(),
+            "--seed".to_string(),
+            "3".to_string(),
+            "--format".to_string(),
+            "jsonl".to_string(),
+            "--out".to_string(),
+            fake_jsonl.display().to_string(),
+        ]),
+        0
+    );
+    assert_eq!(
+        dana::cli::run_cli(&[
+            "run".to_string(),
+            schema_file.display().to_string(),
+            "--".to_string(),
+            fake_csv.display().to_string(),
+        ]),
+        0,
+        "CSV fake rows must satisfy all Tight schema constraints"
+    );
+
+    // Also verify JSONL reading of the fake JSONL output passes 100% with 0 bad rows!
+    let jsonl_check_src = r#"
+module FakeConstraintsJsonl
+
+schema Tight
+  f: Float
+  neg: Int where . < 0
+  small: Int where . <= 0
+  tiny: Decimal where . < 0.005
+  nz: Int where . >= 0 and . <= 2 and . != 1
+  raw: Bytes
+end
+
+fn main(args: Args, files: ReadFiles, console: Console) : Int
+  path = args.first.or_return(2)
+  (good, bad) = try files.read_jsonl(path, as: Tight)
+  console.print("good=#{good.count()} bad=#{bad.count()}")
+  if bad.count() > 0
+    1
+  else
+    0
+  end
+end
+"#;
+    let jsonl_file = dir.join("constraints_jsonl.dana");
+    fs::write(&jsonl_file, jsonl_check_src).map_err(|e| e.to_string())?;
+    assert_eq!(
+        dana::cli::run_cli(&[
+            "run".to_string(),
+            jsonl_file.display().to_string(),
+            "--".to_string(),
+            fake_jsonl.display().to_string(),
+        ]),
+        0,
+        "JSONL fake rows must satisfy all Tight schema constraints"
+    );
+
+    // B3: `in_tz` / `date_in_tz` statically reject non-Timestamp / non-Text arguments across all call forms.
+    for (name, bad_tz_src) in [
+        (
+            "row_method_non_ts",
+            "module T\nschema S\n  name: Text\nend\nfn f(t: Table(S))\n  t |> derive(a: .name.in_tz(\"UTC\"))\nend\n",
+        ),
+        (
+            "row_free_non_ts",
+            "module T\nschema S\n  id: Int\nend\nfn f(t: Table(S))\n  t |> derive(b: in_tz(.id, \"UTC\"))\nend\n",
+        ),
+        (
+            "outer_free_non_ts",
+            "module T\nfn f() : Text\n  in_tz(5, \"UTC\")\nend\n",
+        ),
+        (
+            "outer_pipe_non_ts",
+            "module T\nfn f() : Text\n  5 |> in_tz(\"UTC\")\nend\n",
+        ),
+        (
+            "outer_bad_zone_ty",
+            "module T\nfn f(ts: Timestamp) : Text\n  ts.in_tz(123)\nend\n",
+        ),
+    ] {
+        let mut sm = SourceMap::new();
+        let fid = sm.add_file(format!("{name}.dana"), bad_tz_src);
+        let m = parse_module(fid, bad_tz_src).map_err(|d| render_diagnostic(&d, &sm))?;
+        let Err(diags) = check_module(fid, m, None, &sm) else {
+            return Err(format!("B3 case `{name}` unexpectedly passed check_module"));
+        };
+        assert!(
+            diags.iter().any(|d| d.code() == DiagCode::TypeError),
+            "B3 case `{name}` expected E0201 TypeError, got {diags:?}"
+        );
+    }
+
+    // B4 + Minor 9: Keyword column names sanitized & leading-zero codes stay Text; invalid `--name` exits 2.
+    let kw_csv =
+        "end,fn,schema,module,table,case,try,not,true,none,if,zip\n1,2,3,4,5,6,7,8,9,10,11,00123\n";
+    let inf_kw = infer_schema_from_reader(
+        Cursor::new(kw_csv.as_bytes()),
+        "KwSafe",
+        InferFormat::Csv,
+        100,
+    )?;
+    let kw_dana = format!("module KwMod\n\n{}", inf_kw.render_dana());
+    assert!(kw_dana.contains("end_col: Int"));
+    assert!(kw_dana.contains("zip: Text"));
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("kw_safe.dana", kw_dana.clone());
+    let parsed_kw = parse_module(fid, &kw_dana).map_err(|d| render_diagnostic(&d, &sm))?;
+    assert_eq!(format_module(&parsed_kw), kw_dana);
+    let _ = check_module(fid, parsed_kw, None, &sm).map_err(|ds| format!("{ds:?}"))?;
+
+    let kw_csv_path = dir.join("kw.csv");
+    fs::write(&kw_csv_path, kw_csv).map_err(|e| e.to_string())?;
+    assert_eq!(
+        dana::cli::run_cli(&[
+            "infer-schema".to_string(),
+            kw_csv_path.display().to_string(),
+            "--name".to_string(),
+            "bad name; drop".to_string(),
+        ]),
+        2,
+        "invalid --name must be rejected with exit code 2"
+    );
+
+    // Minor 1: Pseudonym unwraps Option::Some cleanly and hashes actual Bytes contents (no length collision).
+    let b_abc = hmac_sha256_pseudonym(b"k", &Val::OptSome(Box::new(Val::Bytes(b"abc".to_vec()))));
+    let b_xyz = hmac_sha256_pseudonym(b"k", &Val::OptSome(Box::new(Val::Bytes(b"xyz".to_vec()))));
+    assert_ne!(b_abc, b_xyz, "Some(Bytes) of equal length must not collide");
+    let t_plain = hmac_sha256_pseudonym(b"k", &Val::Text("alice".to_string()));
+    let t_opt = hmac_sha256_pseudonym(
+        b"k",
+        &Val::OptSome(Box::new(Val::Text("alice".to_string()))),
+    );
+    assert_eq!(t_plain, t_opt, "Text and Some(Text) must join identically");
+
+    // Minor 2: Zstd frame checksum detects single-bit flips in Dana-written `.zst` payloads!
+    let orig = b"deterministic zstd checksum verification payload 0123456789".repeat(32);
+    let zst = compress_bytes(&orig, CompressionKind::Zstd).map_err(|e| e.to_string())?;
+    for flip_pos in [zst.len() / 2, zst.len() - 2] {
+        let mut flipped = zst.clone();
+        flipped[flip_pos] ^= 0x01;
+        assert!(
+            decompress_bytes(&flipped).is_err(),
+            "zstd checksum must detect single-bit flip at byte {flip_pos}"
+        );
+    }
+
+    // Minor 4: Unterminated CSV quote returns error instead of swallowing rest of file.
+    let unterm = "a,b\n\"x,2\n3,4\n";
+    let two_col = TableTy {
+        cols: vec![
+            ColSpec {
+                name: "a".to_string(),
+                ty: ScalarTy::Text,
+                tags: TagSet::empty(),
+                bucketed: false,
+                agg_kind: AggKind::Raw,
+            },
+            ColSpec {
+                name: "b".to_string(),
+                ty: ScalarTy::Text,
+                tags: TagSet::empty(),
+                bucketed: false,
+                agg_kind: AggKind::Raw,
+            },
+        ],
+        row_tags: TagSet::empty(),
+        order_tags: TagSet::empty(),
+        grouped_by: None,
+        summarized: false,
+        distinct_by: None,
+    };
+    assert!(
+        read_csv_stream_with_schema(Cursor::new(unterm.as_bytes()), &two_col, b',', |_, _| true)
+            .is_err(),
+        "unterminated CSV quote must error"
+    );
+
+    // Minor 5: Single-column nullable CSV preserves empty `None` rows across write & read!
+    let one_col = TableTy {
+        cols: vec![ColSpec {
+            name: "note".to_string(),
+            ty: ScalarTy::Option(Box::new(ScalarTy::Text)),
+            tags: TagSet::empty(),
+            bucketed: false,
+            agg_kind: AggKind::Raw,
+        }],
+        row_tags: TagSet::empty(),
+        order_tags: TagSet::empty(),
+        grouped_by: None,
+        summarized: false,
+        distinct_by: None,
+    };
+    let one_csv = "note\nhello\n\nworld\n";
+    let (g1, b1) =
+        read_csv_stream_with_schema(Cursor::new(one_csv.as_bytes()), &one_col, b',', |_, _| true)?;
+    assert_eq!(b1.rows.len(), 0);
+    assert_eq!(
+        g1.rows.len(),
+        3,
+        "1-column nullable CSV must preserve None row"
+    );
+    assert!(val_eq(&g1.rows[1].cells[0], &Val::OptNone));
+
+    // Minor 6: Sub-minute LMT timezone offset (1874 America/New_York = -04:56:02).
+    let y1874 = parse_iso_timestamp("1874-06-01T12:00:00Z").map_err(|e| e.message)?;
+    assert_eq!(
+        format_timestamp_in_tz(y1874, "America/New_York").map_err(|e| e.message)?,
+        "1874-06-01T07:03:58-04:56:02"
+    );
+
+    // Minor 8: Strict JSONL decimal rejects underscored strings like `"1_0"`.
+    let dec_schema = TableTy {
+        cols: vec![ColSpec {
+            name: "v".to_string(),
+            ty: ScalarTy::Decimal,
+            tags: TagSet::empty(),
+            bucketed: false,
+            agg_kind: AggKind::Raw,
+        }],
+        row_tags: TagSet::empty(),
+        order_tags: TagSet::empty(),
+        grouped_by: None,
+        summarized: false,
+        distinct_by: None,
+    };
+    let (gd, bd) = parse_jsonl_with_schema("{\"v\":\"1_0\"}\n", &dec_schema, |_, _| true)?;
+    assert_eq!(gd.rows.len(), 0);
+    assert_eq!(bd.rows.len(), 1);
+    assert!(val_eq(
+        &bd.rows[0].cells[2],
+        &Val::Text("BadDecimal".to_string())
+    ));
+
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}

@@ -559,7 +559,18 @@ fn cmd_infer_schema(args: &[String]) -> i32 {
         eprintln!("dana infer-schema: missing data file path");
         return 2;
     };
-    let name = schema_name.unwrap_or_else(|| default_schema_name_from_path(&path));
+    let name = match schema_name {
+        Some(n) => {
+            if !is_valid_schema_cap_name(&n) {
+                eprintln!(
+                    "dana infer-schema: invalid schema name `{n}` (must match `[A-Z][A-Za-z0-9_]*`)"
+                );
+                return 2;
+            }
+            n
+        }
+        None => default_schema_name_from_path(&path),
+    };
     match infer_schema_from_file(&path, &name, format_override, sample_rows) {
         Ok(schema) => {
             print!("{}", schema.render_dana());
@@ -570,6 +581,14 @@ fn cmd_infer_schema(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+fn is_valid_schema_cap_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_uppercase() && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn default_schema_name_from_path(path: &Path) -> String {

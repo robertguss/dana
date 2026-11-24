@@ -95,6 +95,11 @@ pub const fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// # Errors
 /// Returns [`ParseFormatError`] on malformed syntax or invalid calendar dates.
 pub fn parse_iso_date(s: &str) -> Result<i64, ParseFormatError> {
+    if !s.is_ascii() {
+        return Err(ParseFormatError::new(format!(
+            "invalid ISO date `{s}` (must be ASCII YYYY-MM-DD)"
+        )));
+    }
     let b = s.as_bytes();
     if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
         return Err(ParseFormatError::new(format!(
@@ -136,7 +141,7 @@ pub fn format_iso_date(days: i64) -> String {
 /// # Errors
 /// Returns [`ParseFormatError`] on malformed syntax or out-of-range fields.
 pub fn parse_iso_timestamp(s: &str) -> Result<i64, ParseFormatError> {
-    if s.len() < 20 {
+    if !s.is_ascii() || s.len() < 20 {
         return Err(ParseFormatError::new(format!(
             "invalid ISO timestamp `{s}`"
         )));
@@ -317,13 +322,34 @@ pub const fn months_between_days(d1: i64, d2: i64) -> i64 {
     (y2 - y1) * 12 + (m2 as i64 - m1 as i64)
 }
 
-/// Parse an exact fixed-point `Decimal` string (e.g., `"-12.50"`, `"900"`, `"0.0001"`)
+/// Parse an exact fixed-point `Decimal` string from Dana source (allows `_` digit separators)
 /// into a `10^-18`-scaled [`BigInt`] checked against `[DEC_MIN, DEC_MAX]`.
 ///
 /// # Errors
 /// Returns [`ParseFormatError`] on syntax errors, >18 fractional digits, or range overflow.
 pub fn parse_decimal_bigint(raw: &str) -> Result<BigInt, ParseFormatError> {
-    let cleaned: String = raw.trim().chars().filter(|&c| c != '_').collect();
+    parse_decimal_bigint_inner(raw, true)
+}
+
+/// Strictly parse an exact fixed-point `Decimal` string from data files (CSV/JSONL; rejects `_` separators)
+/// into a `10^-18`-scaled [`BigInt`] checked against `[DEC_MIN, DEC_MAX]`.
+///
+/// # Errors
+/// Returns [`ParseFormatError`] on syntax errors, underscores, >18 fractional digits, or range overflow.
+pub fn parse_decimal_bigint_strict(raw: &str) -> Result<BigInt, ParseFormatError> {
+    parse_decimal_bigint_inner(raw, false)
+}
+
+fn parse_decimal_bigint_inner(
+    raw: &str,
+    allow_underscores: bool,
+) -> Result<BigInt, ParseFormatError> {
+    let trimmed = raw.trim();
+    let cleaned: String = if allow_underscores {
+        trimmed.chars().filter(|&c| c != '_').collect()
+    } else {
+        trimmed.to_string()
+    };
     if cleaned.is_empty() {
         return Err(ParseFormatError::new("empty decimal literal"));
     }
@@ -1008,16 +1034,22 @@ pub fn format_timestamp_in_tz(utc_micros: i64, iana: &str) -> Result<String, Par
     let abs_off = offset_secs.abs();
     let off_h = abs_off / 3600;
     let off_m = (abs_off % 3600) / 60;
+    let off_s = abs_off % 60;
+    let off_suffix = if off_s == 0 {
+        format!("{sign}{off_h:02}:{off_m:02}")
+    } else {
+        format!("{sign}{off_h:02}:{off_m:02}:{off_s:02}")
+    };
 
     if frac == 0 {
         Ok(format!(
-            "{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}{sign}{off_h:02}:{off_m:02}"
+            "{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}{off_suffix}"
         ))
     } else {
         let frac_str = format!("{frac:06}");
         let trimmed = frac_str.trim_end_matches('0');
         Ok(format!(
-            "{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.{trimmed}{sign}{off_h:02}:{off_m:02}"
+            "{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.{trimmed}{off_suffix}"
         ))
     }
 }

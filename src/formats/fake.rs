@@ -2,17 +2,19 @@
 //!
 //! Uses a zero-crate `SplitMix64` -> `Xoshiro256StarStar` PRNG to generate constraint-satisfying
 //! synthetic rows for any Dana [`CompiledSchema`], honoring column types, `T?` nullability,
-//! simple `where` clauses (ranges, non-empty text, `contains("@")`), and safe placeholders for
-//! sensitivity-tagged columns.
+//! `where` clauses (inclusive/exclusive bounds on `Int`/`Decimal`/`Float`, exact sub-cent
+//! `Decimal` ranges, `==` / `!=`, `and`, `not .empty?`, `.contains?(...)`), and safe placeholders
+//! for sensitivity-tagged columns.
 
 use std::io::{self, Write};
 
-use crate::core::bigint::{BigInt, DEC_SCALE};
+use crate::core::bigint::{BigInt, DEC_MIN, DEC_SCALE};
 use crate::core::syntax::{ColSpec, Float64, Literal, PrimOp, ScalarTy};
 use crate::formats::csv::{push_csv_escaped, render_csv_cell};
 use crate::formats::json::{push_dana_val_as_json, push_json_string};
 use crate::formats::time::{MICROS_PER_DAY, days_from_civil};
-use crate::oracle::value::{TableRow, TableVal, Val};
+use crate::oracle::eval::eval_literal;
+use crate::oracle::value::{TableRow, TableVal, Val, val_eq};
 use crate::runtime::ir::{CompiledSchema, ExecPrimOp, ExecRowExpr};
 
 /// Output serialization format for `dana fake`.
@@ -62,9 +64,26 @@ impl DeterministicRng {
         if hi <= lo {
             return lo;
         }
-        let span = (hi as i128 - lo as i128 + 1) as u128;
+        let span = (i128::from(hi) - i128::from(lo) + 1) as u128;
         let offset = (u128::from(self.next_u64()) % span) as i128;
-        (lo as i128 + offset) as i64
+        (i128::from(lo) + offset) as i64
+    }
+
+    #[must_use]
+    pub fn range_i128(&mut self, lo: i128, hi: i128) -> i128 {
+        if hi <= lo {
+            return lo;
+        }
+        let span_u = hi.abs_diff(lo).saturating_add(1);
+        let r = (u128::from(self.next_u64()) << 64) | u128::from(self.next_u64());
+        let off = if span_u == 0 { r } else { r % span_u };
+        lo.wrapping_add_unsigned(off)
+    }
+
+    #[must_use]
+    pub fn unit_f64(&mut self) -> f64 {
+        // 53 bits of uniform mantissa in [0.0, 1.0).
+        ((self.next_u64() >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
     }
 }
 
@@ -72,8 +91,14 @@ impl DeterministicRng {
 struct ColumnHints {
     min_int: Option<i64>,
     max_int: Option<i64>,
-    min_dec_cents: Option<i64>,
-    max_dec_cents: Option<i64>,
+    /// Exact 10^-18-scaled decimal bounds (preserves sub-cent constraints such as `< 0.005`).
+    min_dec: Option<i128>,
+    max_dec: Option<i128>,
+    /// Float bounds with strict-inequality flags `(bound, is_strict)`.
+    min_float: Option<(f64, bool)>,
+    max_float: Option<(f64, bool)>,
+    eq_val: Option<Val>,
+    not_equal: Vec<Val>,
     must_contain: Option<String>,
     non_empty: bool,
 }
@@ -108,6 +133,14 @@ fn extract_hints(re: Option<&ExecRowExpr>) -> ColumnHints {
                 ) => {
                     hints.must_contain = Some(sub.clone());
                 }
+                (ExecPrimOp::Core(PrimOp::Eq), [ExecRowExpr::Col(_), ExecRowExpr::Lit(lit)])
+                | (ExecPrimOp::Core(PrimOp::Eq), [ExecRowExpr::Lit(lit), ExecRowExpr::Col(_)]) => {
+                    hints.eq_val = Some(eval_literal(lit));
+                }
+                (ExecPrimOp::Core(PrimOp::Ne), [ExecRowExpr::Col(_), ExecRowExpr::Lit(lit)])
+                | (ExecPrimOp::Core(PrimOp::Ne), [ExecRowExpr::Lit(lit), ExecRowExpr::Col(_)]) => {
+                    hints.not_equal.push(eval_literal(lit));
+                }
                 (ExecPrimOp::Core(PrimOp::Gt), [ExecRowExpr::Col(_), ExecRowExpr::Lit(lit)])
                 | (ExecPrimOp::Core(PrimOp::Lt), [ExecRowExpr::Lit(lit), ExecRowExpr::Col(_)]) => {
                     apply_lower_hint(&mut hints, lit, true);
@@ -131,14 +164,32 @@ fn extract_hints(re: Option<&ExecRowExpr>) -> ColumnHints {
     hints
 }
 
-fn literal_to_cents(lit: &Literal) -> Option<i64> {
+fn literal_to_dec_i128(lit: &Literal) -> Option<i128> {
     match lit {
-        Literal::Int(n) => n.to_i64().and_then(|v| v.checked_mul(100)),
-        Literal::Decimal(d) => {
-            let scale_cents = BigInt::from(DEC_SCALE / 100);
-            d.div_euclid(&scale_cents).and_then(|q| q.to_i64())
+        Literal::Int(n) => n
+            .to_i64()
+            .and_then(|v| i128::from(v).checked_mul(DEC_SCALE)),
+        Literal::Decimal(d) => d.to_i128(),
+        Literal::Float(f) => {
+            let fv = f.to_f64();
+            if fv.is_finite() {
+                Some((fv * (DEC_SCALE as f64)).round() as i128)
+            } else {
+                None
+            }
         }
-        Literal::Float(f) => Some((f.to_f64() * 100.0).round() as i64),
+        _ => None,
+    }
+}
+
+fn literal_to_f64(lit: &Literal) -> Option<f64> {
+    match lit {
+        Literal::Int(n) => n.to_i64().map(|v| v as f64),
+        Literal::Decimal(d) => d.to_i128().map(|v| (v as f64) / (DEC_SCALE as f64)),
+        Literal::Float(f) => {
+            let fv = f.to_f64();
+            if fv.is_finite() { Some(fv) } else { None }
+        }
         _ => None,
     }
 }
@@ -150,9 +201,22 @@ fn apply_lower_hint(hints: &mut ColumnHints, lit: &Literal, strict: bool) {
         let bound = if strict { v.saturating_add(1) } else { v };
         hints.min_int = Some(hints.min_int.map_or(bound, |p| p.max(bound)));
     }
-    if let Some(c) = literal_to_cents(lit) {
-        let bound = if strict { c.saturating_add(1) } else { c };
-        hints.min_dec_cents = Some(hints.min_dec_cents.map_or(bound, |p| p.max(bound)));
+    if let Some(d) = literal_to_dec_i128(lit) {
+        let bound = if strict {
+            d.saturating_add(1)
+        } else {
+            d.max(DEC_MIN)
+        };
+        hints.min_dec = Some(hints.min_dec.map_or(bound, |p| p.max(bound)));
+    }
+    if let Some(f) = literal_to_f64(lit) {
+        let replace = match hints.min_float {
+            None => true,
+            Some((prev, prev_s)) => f > prev || (f == prev && strict && !prev_s),
+        };
+        if replace {
+            hints.min_float = Some((f, strict));
+        }
     }
 }
 
@@ -163,10 +227,27 @@ fn apply_upper_hint(hints: &mut ColumnHints, lit: &Literal, strict: bool) {
         let bound = if strict { v.saturating_sub(1) } else { v };
         hints.max_int = Some(hints.max_int.map_or(bound, |p| p.min(bound)));
     }
-    if let Some(c) = literal_to_cents(lit) {
-        let bound = if strict { c.saturating_sub(1) } else { c };
-        hints.max_dec_cents = Some(hints.max_dec_cents.map_or(bound, |p| p.min(bound)));
+    if let Some(d) = literal_to_dec_i128(lit) {
+        let bound = if strict {
+            d.saturating_sub(1).max(DEC_MIN)
+        } else {
+            d.max(DEC_MIN)
+        };
+        hints.max_dec = Some(hints.max_dec.map_or(bound, |p| p.min(bound)));
     }
+    if let Some(f) = literal_to_f64(lit) {
+        let replace = match hints.max_float {
+            None => true,
+            Some((prev, prev_s)) => f < prev || (f == prev && strict && !prev_s),
+        };
+        if replace {
+            hints.max_float = Some((f, strict));
+        }
+    }
+}
+
+fn value_violates_not_equal(v: &Val, hints: &ColumnHints) -> bool {
+    hints.not_equal.iter().any(|bad| val_eq(v, bad))
 }
 
 fn gen_scalar_val(
@@ -176,36 +257,115 @@ fn gen_scalar_val(
     hints: &ColumnHints,
     row_idx: usize,
 ) -> Val {
-    match ty {
-        ScalarTy::Option(inner) => {
-            if rng.next_u64().is_multiple_of(10) {
-                Val::OptNone
-            } else {
-                Val::OptSome(Box::new(gen_scalar_val(rng, col, inner, hints, row_idx)))
-            }
+    if let ScalarTy::Option(inner) = ty {
+        return if rng.next_u64().is_multiple_of(10) {
+            Val::OptNone
+        } else {
+            Val::OptSome(Box::new(gen_scalar_val(rng, col, inner, hints, row_idx)))
+        };
+    }
+
+    if let Some(eq) = &hints.eq_val {
+        return eq.clone();
+    }
+
+    // Generate with bounded retry loop to avoid `!=` forbidden values.
+    let mut candidate = gen_non_opt_once(rng, col, ty, hints, row_idx);
+    for attempt in 1..64usize {
+        if !value_violates_not_equal(&candidate, hints) {
+            break;
         }
+        candidate = gen_non_opt_once(rng, col, ty, hints, row_idx.wrapping_add(attempt));
+    }
+    candidate
+}
+
+fn gen_non_opt_once(
+    rng: &mut DeterministicRng,
+    col: &ColSpec,
+    ty: &ScalarTy,
+    hints: &ColumnHints,
+    row_idx: usize,
+) -> Val {
+    match ty {
+        ScalarTy::Option(inner) => gen_non_opt_once(rng, col, inner, hints, row_idx),
         ScalarTy::Bool => Val::Bool(rng.next_u64() & 1 == 1),
         ScalarTy::Int => {
-            let lo = hints.min_int.unwrap_or(1);
-            let hi = hints.max_int.unwrap_or_else(|| lo.saturating_add(9_999));
+            let (lo, hi) = match (hints.min_int, hints.max_int) {
+                (Some(l), Some(h)) => (l, h),
+                (Some(l), None) => (l, l.saturating_add(9_999)),
+                (None, Some(h)) => (h.saturating_sub(9_999), h),
+                (None, None) => (1, 10_000),
+            };
             Val::Int(BigInt::from(rng.range_i64(lo, hi)))
         }
         ScalarTy::Decimal => {
-            let lo = hints.min_dec_cents.unwrap_or(100);
-            let hi = hints
-                .max_dec_cents
-                .unwrap_or_else(|| lo.saturating_add(50_000));
-            let cents = rng.range_i64(lo, hi);
-            let scaled = i128::from(cents) * (DEC_SCALE / 100);
+            let default_span = 500i128 * DEC_SCALE;
+            let (lo, hi) = match (hints.min_dec, hints.max_dec) {
+                (Some(l), Some(h)) => (l, h),
+                (Some(l), None) => (l, l.saturating_add(default_span)),
+                (None, Some(h)) => {
+                    let span = if h > 0 {
+                        h.min(default_span)
+                    } else {
+                        default_span
+                    };
+                    (h.saturating_sub(span).max(DEC_MIN), h)
+                }
+                (None, None) => (DEC_SCALE, 500i128 * DEC_SCALE),
+            };
+            // Prefer clean cent-aligned values when the interval is wide enough to contain multiple cents;
+            // otherwise sample exact 10^-18 sub-cent units within `[lo, hi]`.
+            let cent = DEC_SCALE / 100;
+            let lo_cents = lo.div_euclid(cent) + i128::from(lo.rem_euclid(cent) != 0);
+            let hi_cents = hi.div_euclid(cent);
+            let scaled = if hi_cents >= lo_cents {
+                let c = rng.range_i128(lo_cents, hi_cents);
+                c * cent
+            } else {
+                rng.range_i128(lo, hi)
+            };
             Val::Decimal(BigInt::from(scaled))
         }
         ScalarTy::Float => {
-            let lo = hints.min_dec_cents.unwrap_or(0);
-            let hi = hints
-                .max_dec_cents
-                .unwrap_or_else(|| lo.saturating_add(10_000));
-            let cents = rng.range_i64(lo, hi);
-            Val::Float(Float64::from_f64((cents as f64) / 100.0))
+            let (mut lo, lo_strict, mut hi, hi_strict) = match (hints.min_float, hints.max_float) {
+                (Some((l, ls)), Some((h, hs))) => (l, ls, h, hs),
+                (Some((l, ls)), None) => (l, ls, l + 100.0, false),
+                (None, Some((h, hs))) => {
+                    let span = if h > 0.0 { h.min(100.0) } else { 100.0 };
+                    (h - span, false, h, hs)
+                }
+                (None, None) => (0.0, false, 100.0, false),
+            };
+            if lo > hi {
+                std::mem::swap(&mut lo, &mut hi);
+            }
+            let t = if lo_strict || hi_strict {
+                0.05 + rng.unit_f64() * 0.90
+            } else {
+                rng.unit_f64()
+            };
+            let mut v = lo + t * (hi - lo);
+            if lo_strict && v <= lo {
+                v = lo + (hi - lo) * 0.5;
+            }
+            if hi_strict && v >= hi {
+                v = lo + (hi - lo) * 0.5;
+            }
+            // Round to 4 decimal places only if rounding still respects the bounds.
+            let rounded = (v * 10_000.0).round() / 10_000.0;
+            let fits_lo = if lo_strict {
+                rounded > lo
+            } else {
+                rounded >= lo
+            };
+            let fits_hi = if hi_strict {
+                rounded < hi
+            } else {
+                rounded <= hi
+            };
+            let final_f = if fits_lo && fits_hi { rounded } else { v };
+            Val::Float(Float64::from_f64(final_f))
         }
         ScalarTy::Date => {
             let base = days_from_civil(2025, 1, 1);

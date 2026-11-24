@@ -7,8 +7,9 @@ use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use crate::core::bigint::BigInt;
 use crate::core::check::quarantine_bad_row_table_ty;
 use crate::core::syntax::{Float64, ScalarTy, TableTy};
+use crate::formats::crypto::to_hex_lower;
 use crate::formats::time::{
-    format_iso_date, format_iso_timestamp, parse_decimal_bigint, parse_iso_date,
+    format_iso_date, format_iso_timestamp, parse_decimal_bigint_strict, parse_iso_date,
     parse_iso_timestamp,
 };
 use crate::oracle::value::{TableRow, TableVal, Val, render_public_val};
@@ -17,6 +18,8 @@ use crate::oracle::value::{TableRow, TableVal, Val, render_public_val};
 pub const MAX_JSON_DEPTH: usize = 256;
 /// Default streaming batch size for JSONL record iteration.
 pub const JSONL_BATCH_SIZE: usize = 2048;
+/// Maximum byte length of a single JSONL line (16 MiB) to bound memory on adversarial streams.
+pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Typed error for strict RFC 8259 JSON parsing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,7 +116,7 @@ impl JsonValue {
     #[must_use]
     pub fn as_decimal(&self) -> Option<BigInt> {
         match self {
-            Self::Number(raw) | Self::Str(raw) => parse_decimal_bigint(raw).ok(),
+            Self::Number(raw) | Self::Str(raw) => parse_decimal_bigint_strict(raw).ok(),
             _ => None,
         }
     }
@@ -642,20 +645,36 @@ impl<R: BufRead> JsonlBatchReader<R> {
         }
     }
 
-    /// Read up to `max_rows` non-empty JSONL lines.
+    /// Read up to `max_rows` non-empty JSONL lines (capped at [`MAX_JSONL_LINE_BYTES`] per line).
     ///
     /// # Errors
-    /// Returns any underlying I/O or UTF-8 error.
+    /// Returns any underlying I/O, UTF-8, or oversized-line error.
     pub fn next_batch(&mut self, max_rows: usize) -> io::Result<Vec<JsonlLine>> {
         let mut out = Vec::with_capacity(max_rows.min(JSONL_BATCH_SIZE));
-        let mut buf = String::new();
+        let mut raw_buf = Vec::new();
         while out.len() < max_rows {
-            buf.clear();
-            let n = self.reader.read_line(&mut buf)?;
+            raw_buf.clear();
+            let mut limited = (&mut self.reader).take((MAX_JSONL_LINE_BYTES + 1) as u64);
+            let n = limited.read_until(b'\n', &mut raw_buf)?;
             if n == 0 {
                 break;
             }
+            if raw_buf.len() > MAX_JSONL_LINE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "JSONL line {} exceeds maximum line length ({MAX_JSONL_LINE_BYTES} bytes)",
+                        self.line_no + 1
+                    ),
+                ));
+            }
             self.line_no += 1;
+            let buf = String::from_utf8(std::mem::take(&mut raw_buf)).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid UTF-8 in JSONL line {}: {e}", self.line_no),
+                )
+            })?;
             let trimmed_end = buf.trim_end_matches(['\r', '\n']);
             let line_str = if !self.started {
                 self.started = true;
@@ -698,7 +717,7 @@ pub fn json_value_to_dana(val: Option<&JsonValue>, ty: &ScalarTy) -> Result<Val,
                 }
                 (ScalarTy::Int, _) => Err("BadInt"),
                 (ScalarTy::Decimal, JsonValue::Number(raw) | JsonValue::Str(raw)) => {
-                    let d = parse_decimal_bigint(raw).map_err(|_| "BadDecimal")?;
+                    let d = parse_decimal_bigint_strict(raw).map_err(|_| "BadDecimal")?;
                     Ok(Val::Decimal(d))
                 }
                 (ScalarTy::Decimal, _) => Err("BadDecimal"),
@@ -888,6 +907,10 @@ pub fn push_dana_val_as_json(out: &mut String, v: &Val) {
             }
         }
         Val::Text(s) => push_json_string(out, s),
+        Val::Bytes(bs) => match std::str::from_utf8(bs) {
+            Ok(s) => push_json_string(out, s),
+            Err(_) => push_json_string(out, &to_hex_lower(bs)),
+        },
         Val::Date(d) => {
             let s = d.to_i64().map_or_else(|| d.to_string(), format_iso_date);
             push_json_string(out, &s);
