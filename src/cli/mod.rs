@@ -8,13 +8,17 @@
 //! - `dana guide [SECTION]`
 //! - `dana infer-schema` / `dana fake` (Slice 2B)
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
 
 use crate::base::{DiagCode, Diagnostic, SourceMap, render_diagnostic, render_diagnostics_json};
 use crate::check::{check_resolved, parse_policy, resolve_path};
 use crate::core::syntax::{Policy, TagSet};
 use crate::core::text::print_program;
+use crate::formats::compress::{AutoEncodeWriter, detect_compression_path};
+use crate::formats::fake::{FakeFormat, write_fake_rows};
+use crate::formats::infer::{InferFormat, infer_schema_from_file};
 use crate::lower::lower_program;
 use crate::oracle::cli::parse_comma_tags;
 use crate::runtime::{RunConfig, RunResult, run_exec_program, run_program_tests};
@@ -40,10 +44,10 @@ COMMANDS:
       Format Dana source file(s) canonically with 2-space indentation.
   guide [SECTION]
       Print the embedded Dana Language Reference v0.1 (optionally filtered by section).
-  infer-schema <DATA_FILE> [--name Schema]
-      Infer a typed Dana schema from CSV/TSV/JSONL (Slice 2B).
-  fake <FILE.dana> [--schema Name] [--rows N] [--seed S]
-      Generate synthetic constraint-satisfying test data (Slice 2B).
+  infer-schema <DATA_FILE> [--name Schema] [--sample-rows N] [--format csv|tsv|jsonl]
+      Infer a typed Dana schema from CSV/TSV/JSONL (supports .gz and .zst transparently).
+  fake <FILE.dana> [--schema Name] [--rows N] [--seed S] [--format csv|tsv|jsonl] [--out PATH]
+      Generate deterministic synthetic constraint-satisfying test data.
   help, --help, -h
       Show this help message.
 ";
@@ -66,10 +70,8 @@ pub fn run_cli(args: &[String]) -> i32 {
         "check" => cmd_check(rest),
         "test" => cmd_test(rest),
         "run" => cmd_run(rest),
-        "infer-schema" | "fake" => {
-            eprintln!("dana {cmd}: scheduled for Slice 2B (native codecs & data generation)");
-            2
-        }
+        "infer-schema" => cmd_infer_schema(rest),
+        "fake" => cmd_fake(rest),
         other => {
             eprintln!("dana: unknown command `{other}`\n\n{USAGE}");
             2
@@ -490,6 +492,294 @@ fn cmd_run(args: &[String]) -> i32 {
             eprintln!("dana runtime error: {message}");
             1
         }
+    }
+}
+
+fn cmd_infer_schema(args: &[String]) -> i32 {
+    let mut data_path: Option<PathBuf> = None;
+    let mut schema_name: Option<String> = None;
+    let mut sample_rows: usize = 10_000;
+    let mut format_override: Option<InferFormat> = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--name" => {
+                i += 1;
+                let Some(n) = args.get(i) else {
+                    eprintln!("dana infer-schema: `--name` requires a schema identifier");
+                    return 2;
+                };
+                schema_name = Some(n.clone());
+            }
+            "--sample-rows" => {
+                i += 1;
+                let Some(raw) = args.get(i) else {
+                    eprintln!("dana infer-schema: `--sample-rows` requires a positive integer");
+                    return 2;
+                };
+                match raw.parse::<usize>() {
+                    Ok(n) if n > 0 => sample_rows = n,
+                    _ => {
+                        eprintln!("dana infer-schema: invalid `--sample-rows` `{raw}`");
+                        return 2;
+                    }
+                }
+            }
+            "--format" => {
+                i += 1;
+                let Some(raw) = args.get(i) else {
+                    eprintln!("dana infer-schema: `--format` requires csv, tsv, or jsonl");
+                    return 2;
+                };
+                format_override = match raw.to_ascii_lowercase().as_str() {
+                    "csv" => Some(InferFormat::Csv),
+                    "tsv" => Some(InferFormat::Tsv),
+                    "jsonl" | "ndjson" => Some(InferFormat::Jsonl),
+                    other => {
+                        eprintln!("dana infer-schema: unsupported format `{other}`");
+                        return 2;
+                    }
+                };
+            }
+            flag if flag.starts_with('-') => {
+                eprintln!("dana infer-schema: unknown flag `{flag}`");
+                return 2;
+            }
+            p if data_path.is_none() => data_path = Some(PathBuf::from(p)),
+            other => {
+                eprintln!("dana infer-schema: unexpected argument `{other}`");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    let Some(path) = data_path else {
+        eprintln!("dana infer-schema: missing data file path");
+        return 2;
+    };
+    let name = schema_name.unwrap_or_else(|| default_schema_name_from_path(&path));
+    match infer_schema_from_file(&path, &name, format_override, sample_rows) {
+        Ok(schema) => {
+            print!("{}", schema.render_dana());
+            0
+        }
+        Err(msg) => {
+            eprintln!("dana infer-schema: {msg}");
+            1
+        }
+    }
+}
+
+fn default_schema_name_from_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let stripped = crate::formats::compress::strip_compression_ext(&raw);
+    let stem = Path::new(stripped)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Record");
+    let mut out = String::new();
+    for part in stem.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            out.push(first.to_ascii_uppercase());
+            for ch in chars {
+                out.push(ch.to_ascii_lowercase());
+            }
+        }
+    }
+    if out.is_empty() || !out.as_bytes()[0].is_ascii_uppercase() {
+        "Record".to_string()
+    } else {
+        out
+    }
+}
+
+fn cmd_fake(args: &[String]) -> i32 {
+    let mut script_path: Option<PathBuf> = None;
+    let mut schema_name: Option<String> = None;
+    let mut rows: usize = 100;
+    let mut seed: u64 = 1;
+    let mut format: Option<FakeFormat> = None;
+    let mut out_path: Option<PathBuf> = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--schema" => {
+                i += 1;
+                let Some(s) = args.get(i) else {
+                    eprintln!("dana fake: `--schema` requires a schema name");
+                    return 2;
+                };
+                schema_name = Some(s.clone());
+            }
+            "--rows" => {
+                i += 1;
+                let Some(raw) = args.get(i) else {
+                    eprintln!("dana fake: `--rows` requires a non-negative integer");
+                    return 2;
+                };
+                match raw.parse::<usize>() {
+                    Ok(n) => rows = n,
+                    Err(_) => {
+                        eprintln!("dana fake: invalid `--rows` `{raw}`");
+                        return 2;
+                    }
+                }
+            }
+            "--seed" => {
+                i += 1;
+                let Some(raw) = args.get(i) else {
+                    eprintln!("dana fake: `--seed` requires a u64 integer");
+                    return 2;
+                };
+                match raw.parse::<u64>() {
+                    Ok(s) => seed = s,
+                    Err(_) => {
+                        eprintln!("dana fake: invalid `--seed` `{raw}`");
+                        return 2;
+                    }
+                }
+            }
+            "--format" => {
+                i += 1;
+                let Some(raw) = args.get(i) else {
+                    eprintln!("dana fake: `--format` requires csv, tsv, or jsonl");
+                    return 2;
+                };
+                format = match raw.to_ascii_lowercase().as_str() {
+                    "csv" => Some(FakeFormat::Csv),
+                    "tsv" => Some(FakeFormat::Tsv),
+                    "jsonl" | "ndjson" => Some(FakeFormat::Jsonl),
+                    other => {
+                        eprintln!("dana fake: unsupported format `{other}`");
+                        return 2;
+                    }
+                };
+            }
+            "--out" => {
+                i += 1;
+                let Some(p) = args.get(i) else {
+                    eprintln!("dana fake: `--out` requires an output path");
+                    return 2;
+                };
+                out_path = Some(PathBuf::from(p));
+            }
+            flag if flag.starts_with('-') => {
+                eprintln!("dana fake: unknown flag `{flag}`");
+                return 2;
+            }
+            p if script_path.is_none() => script_path = Some(PathBuf::from(p)),
+            other => {
+                eprintln!("dana fake: unexpected argument `{other}`");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    let Some(path) = script_path else {
+        eprintln!("dana fake: missing `.dana` file path");
+        return 2;
+    };
+
+    let mut sm = SourceMap::new();
+    let policy = match load_policy_for(&path, None, &mut sm) {
+        Ok(p) => p,
+        Err(d) => {
+            eprint!("{}", render_diagnostic(&d, &sm));
+            return 1;
+        }
+    };
+    let resolved = match resolve_path(&path, policy, &mut sm) {
+        Ok(r) => r,
+        Err(ds) => {
+            for d in &ds {
+                eprint!("{}", render_diagnostic(d, &sm));
+            }
+            return 1;
+        }
+    };
+    let checked = match check_resolved(&resolved, &sm) {
+        Ok(c) => c,
+        Err(ds) => {
+            for d in &ds {
+                eprint!("{}", render_diagnostic(d, &sm));
+            }
+            return 1;
+        }
+    };
+    let lowered = match lower_program(checked) {
+        Ok(l) => l,
+        Err(d) => {
+            eprint!("{}", render_diagnostic(&d, &sm));
+            return 1;
+        }
+    };
+
+    let target_schema = match &schema_name {
+        Some(name) => match lowered.exec.find_schema(name) {
+            Some(s) => s,
+            None => {
+                eprintln!("dana fake: unknown schema `{name}` in `{}`", path.display());
+                return 1;
+            }
+        },
+        None => match lowered.exec.schemas.first() {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "dana fake: no `schema` declarations found in `{}`",
+                    path.display()
+                );
+                return 1;
+            }
+        },
+    };
+
+    let chosen_fmt = format.unwrap_or_else(|| {
+        if let Some(op) = &out_path {
+            let inner = crate::formats::compress::strip_compression_ext(&op.to_string_lossy())
+                .to_ascii_lowercase();
+            if inner.ends_with(".tsv") {
+                FakeFormat::Tsv
+            } else if inner.ends_with(".jsonl") || inner.ends_with(".ndjson") {
+                FakeFormat::Jsonl
+            } else {
+                FakeFormat::Csv
+            }
+        } else {
+            FakeFormat::Csv
+        }
+    });
+
+    if let Some(op) = out_path {
+        let comp = detect_compression_path(&op.to_string_lossy());
+        let res = File::create(&op).and_then(|f| {
+            let mut enc = AutoEncodeWriter::new(BufWriter::new(f), comp)?;
+            write_fake_rows(&mut enc, target_schema, rows, seed, chosen_fmt)?;
+            enc.finish()?;
+            Ok(())
+        });
+        if let Err(e) = res {
+            eprintln!("dana fake: failed writing `{}`: {e}", op.display());
+            return 1;
+        }
+        0
+    } else {
+        let stdout = io::stdout();
+        let mut handle = BufWriter::new(stdout.lock());
+        if let Err(e) = write_fake_rows(&mut handle, target_schema, rows, seed, chosen_fmt) {
+            eprintln!("dana fake: write error: {e}");
+            return 1;
+        }
+        if let Err(e) = std::io::Write::flush(&mut handle) {
+            eprintln!("dana fake: flush error: {e}");
+            return 1;
+        }
+        0
     }
 }
 

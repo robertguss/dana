@@ -11,7 +11,8 @@ license = "MIT OR Apache-2.0"
 [dev-dependencies]
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"
 
 [lints.clippy]
@@ -24,3 +25,4 @@ dbg_macro = "deny"
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
 or_fun_call = "deny"
+undocumented_unsafe_blocks = "deny"

@@ -6,16 +6,24 @@
 //! - Isolated `dana test` fake capabilities (`Args.of`, `Files.in_memory`, `DB.in_memory`, `Console.fake`, `Secret.fake`).
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Cursor, Write};
 use std::path::Path;
 
 use crate::core::bigint::{BigInt, DEC_MAX, DEC_MIN, DEC_SCALE, INT64_MAX, INT64_MIN};
 use crate::core::check::{is_safe_relative_path, join_confined_path};
 use crate::core::syntax::*;
-use crate::formats::csv::{format_csv_table, parse_csv_with_schema};
+use crate::formats::compress::{
+    AutoDecodeReader, AutoEncodeWriter, CompressionKind, detect_compression_path,
+    open_auto_decoded_file, strip_compression_ext,
+};
+use crate::formats::crypto::hmac_sha256_pseudonym;
+use crate::formats::csv::{format_csv_table, read_csv_stream_with_schema, write_csv_table};
+use crate::formats::json::{format_jsonl_table, read_jsonl_stream_with_schema, write_jsonl_table};
 use crate::formats::time::{
     date_trunc_date, date_trunc_timestamp_duration, date_trunc_timestamp_unit, format_iso_date,
-    format_iso_timestamp, months_between_days, round_decimal_bigint,
+    format_iso_timestamp, format_timestamp_in_tz, local_date_in_tz, months_between_days,
+    round_decimal_bigint,
 };
 use crate::oracle::eval::{PrimResult, eval_literal, eval_prim_op, pseudonymize_token};
 use crate::oracle::value::{
@@ -46,7 +54,7 @@ impl Default for RunConfig {
             work_dir: None,
             live_io: true,
             fuel: DEFAULT_FUEL,
-            pseudonymize_mode: PseudonymizeMode::CoreV01Fnv1a,
+            pseudonymize_mode: PseudonymizeMode::HmacSha256,
         }
     }
 }
@@ -279,6 +287,12 @@ fn real_cap_for_ty(ty: &Ty) -> Val {
         Ty::Declassify(allows) => Val::CapDeclassify(allows.clone()),
         _ => Val::Unit,
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TableWriteFmt {
+    Csv(u8),
+    Jsonl,
 }
 
 struct Evaluator<'a> {
@@ -946,6 +960,32 @@ impl<'a> Evaluator<'a> {
                 }
                 _ => EvalOut::Failed("MonthsBetween requires two Dates".to_string()),
             },
+            ExecPrimOp::InTz => match args {
+                [Val::Timestamp(ts), Val::Text(zone)] => match ts.to_i64() {
+                    Some(us) => match format_timestamp_in_tz(us, zone) {
+                        Ok(s) => EvalOut::Ok(Val::Text(s)),
+                        Err(e) => EvalOut::Stopped(Bug {
+                            kind: BugKind::OutsideBoundary,
+                            message: e.message,
+                        }),
+                    },
+                    None => EvalOut::Failed("InTz Timestamp overflow".to_string()),
+                },
+                _ => EvalOut::Failed("InTz requires (Timestamp, Text)".to_string()),
+            },
+            ExecPrimOp::DateInTz => match args {
+                [Val::Timestamp(ts), Val::Text(zone)] => match ts.to_i64() {
+                    Some(us) => match local_date_in_tz(us, zone) {
+                        Ok(days) => EvalOut::Ok(Val::Date(BigInt::from(days))),
+                        Err(e) => EvalOut::Stopped(Bug {
+                            kind: BugKind::OutsideBoundary,
+                            message: e.message,
+                        }),
+                    },
+                    None => EvalOut::Failed("DateInTz Timestamp overflow".to_string()),
+                },
+                _ => EvalOut::Failed("DateInTz requires (Timestamp, Text)".to_string()),
+            },
             ExecPrimOp::ListFirst => match args {
                 [Val::List(xs)] => match xs.first() {
                     Some(v) => EvalOut::Ok(Val::OptSome(Box::new(v.clone()))),
@@ -1297,10 +1337,38 @@ impl<'a> Evaluator<'a> {
                     EvalOut::Failed("console print expects (Console, value)".to_string())
                 }
             }
-            ExecHostOp::ReadJsonl(_) | ExecHostOp::WriteJsonl => EvalOut::Stopped(Bug {
-                kind: BugKind::OutsideBoundary,
-                message: "JSONL streaming codec is delivered in Slice 2B".to_string(),
-            }),
+            ExecHostOp::ReadJsonl(schema_name) => {
+                if let [Val::CapReadFiles(handle), Val::Text(path)] = args {
+                    self.eval_read_jsonl(schema_name, *handle, path)
+                } else {
+                    EvalOut::Failed("read_jsonl expects (ReadFiles, path)".to_string())
+                }
+            }
+            ExecHostOp::WriteJsonl => {
+                if let [
+                    Val::CapWriteFiles {
+                        handle,
+                        root,
+                        allows,
+                    },
+                    Val::Text(rel),
+                    Val::Table(tv),
+                ] = args
+                {
+                    if let Some(bug) = self.check_export_gate(*handle, allows) {
+                        return EvalOut::Stopped(bug);
+                    }
+                    if !is_safe_relative_path(rel) {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                            "unsafe write path `{rel}`"
+                        )))));
+                    }
+                    let full_rel = join_confined_path(root, rel);
+                    self.write_confined_table(*handle, &full_rel, tv, TableWriteFmt::Jsonl)
+                } else {
+                    EvalOut::Failed("write_jsonl expects (WriteFiles, path, table)".to_string())
+                }
+            }
             ExecHostOp::WriteCsv => {
                 if let [
                     Val::CapWriteFiles {
@@ -1321,8 +1389,12 @@ impl<'a> Evaluator<'a> {
                         )))));
                     }
                     let full_rel = join_confined_path(root, rel);
-                    let csv = format_csv_table(tv, b',');
-                    self.write_confined_output(*handle, &full_rel, csv)
+                    let delim = if strip_compression_ext(rel).ends_with(".tsv") {
+                        b'\t'
+                    } else {
+                        b','
+                    };
+                    self.write_confined_table(*handle, &full_rel, tv, TableWriteFmt::Csv(delim))
                 } else {
                     EvalOut::Failed("write_csv expects (WriteFiles, path, table)".to_string())
                 }
@@ -1403,72 +1475,7 @@ impl<'a> Evaluator<'a> {
                 EvalOut::Ok(Val::Unit)
             }
             (HostOp::ReadCsv(schema_name), [Val::CapReadFiles(handle), Val::Text(path)]) => {
-                let Some(cs) = self.prog.find_schema(schema_name) else {
-                    return EvalOut::Failed(format!("unknown schema `{schema_name}`"));
-                };
-                let csv_text = match handle {
-                    CapHandle::Fake(idx) => {
-                        let Some(ff) = self.ew.world.fake_files.get(*idx) else {
-                            return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
-                                "file not found: {path}"
-                            )))));
-                        };
-                        match ff.files.iter().find(|(p, _)| p == path) {
-                            Some((_, content)) => content.clone(),
-                            None => {
-                                return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
-                                    "file not found: {path}"
-                                )))));
-                            }
-                        }
-                    }
-                    CapHandle::Real => {
-                        if !self.ew.live_io {
-                            return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
-                                "file I/O disabled in spec mode: {path}"
-                            )))));
-                        }
-                        let resolved = match &self.ew.work_dir {
-                            Some(base) if !Path::new(path).is_absolute() => base.join(path),
-                            _ => std::path::PathBuf::from(path),
-                        };
-                        match fs::read_to_string(&resolved) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
-                                    "{path}: {e}"
-                                )))));
-                            }
-                        }
-                    }
-                };
-                let delimiter = if path.ends_with(".tsv") { b'\t' } else { b',' };
-                let constraints = cs.constraints.clone();
-                let schema_tt = cs.decl.schema.clone();
-                let empty_env = RTEnv::new();
-                let parsed = parse_csv_with_schema(&csv_text, &schema_tt, delimiter, |ci, val| {
-                    let Some(Some(re)) = constraints.get(ci) else {
-                        return true;
-                    };
-                    let self_cols = vec![ColSpec {
-                        name: "__self".to_string(),
-                        ty: schema_tt.cols[ci].ty.clone(),
-                        tags: TagSet::empty(),
-                        bucketed: false,
-                        agg_kind: AggKind::Raw,
-                    }];
-                    matches!(
-                        self.eval_row_expr(re, &self_cols, std::slice::from_ref(val), &empty_env),
-                        EvalOut::Ok(Val::Bool(true))
-                    )
-                });
-                match parsed {
-                    Ok((good, bad)) => EvalOut::Ok(Val::ResOk(Box::new(Val::Tuple(vec![
-                        Val::Table(good),
-                        Val::Table(bad),
-                    ])))),
-                    Err(msg) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(msg)))),
-                }
+                self.eval_read_csv(schema_name, *handle, path)
             }
             (
                 HostOp::WriteFile,
@@ -1571,6 +1578,221 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    fn eval_read_csv(&mut self, schema_name: &str, handle: CapHandle, path: &str) -> EvalOut {
+        let Some(cs) = self.prog.find_schema(schema_name) else {
+            return EvalOut::Failed(format!("unknown schema `{schema_name}`"));
+        };
+        let delimiter = if strip_compression_ext(path).ends_with(".tsv") {
+            b'\t'
+        } else {
+            b','
+        };
+        let constraints = cs.constraints.clone();
+        let schema_tt = cs.decl.schema.clone();
+        let empty_env = RTEnv::new();
+
+        let parsed = match handle {
+            CapHandle::Fake(idx) => {
+                let Some(ff) = self.ew.world.fake_files.get(idx) else {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                        "file not found: {path}"
+                    )))));
+                };
+                let Some((_, content)) = ff.files.iter().find(|(p, _)| p == path) else {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                        "file not found: {path}"
+                    )))));
+                };
+                let content = content.clone();
+                let reader = match AutoDecodeReader::new(Cursor::new(content.as_bytes())) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                            "{path}: {e}"
+                        )))));
+                    }
+                };
+                read_csv_stream_with_schema(reader, &schema_tt, delimiter, |ci, val| {
+                    self.eval_schema_constraint(&schema_tt, &constraints, ci, val, &empty_env)
+                })
+            }
+            CapHandle::Real => {
+                if !self.ew.live_io {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                        "file I/O disabled in spec mode: {path}"
+                    )))));
+                }
+                let resolved = match &self.ew.work_dir {
+                    Some(base) if !Path::new(path).is_absolute() => base.join(path),
+                    _ => std::path::PathBuf::from(path),
+                };
+                let reader = match open_auto_decoded_file(&resolved) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                            "{path}: {e}"
+                        )))));
+                    }
+                };
+                read_csv_stream_with_schema(reader, &schema_tt, delimiter, |ci, val| {
+                    self.eval_schema_constraint(&schema_tt, &constraints, ci, val, &empty_env)
+                })
+            }
+        };
+        match parsed {
+            Ok((good, bad)) => EvalOut::Ok(Val::ResOk(Box::new(Val::Tuple(vec![
+                Val::Table(good),
+                Val::Table(bad),
+            ])))),
+            Err(msg) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(msg)))),
+        }
+    }
+
+    fn eval_read_jsonl(&mut self, schema_name: &str, handle: CapHandle, path: &str) -> EvalOut {
+        let Some(cs) = self.prog.find_schema(schema_name) else {
+            return EvalOut::Failed(format!("unknown schema `{schema_name}`"));
+        };
+        let constraints = cs.constraints.clone();
+        let schema_tt = cs.decl.schema.clone();
+        let empty_env = RTEnv::new();
+
+        let parsed = match handle {
+            CapHandle::Fake(idx) => {
+                let Some(ff) = self.ew.world.fake_files.get(idx) else {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                        "file not found: {path}"
+                    )))));
+                };
+                let Some((_, content)) = ff.files.iter().find(|(p, _)| p == path) else {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                        "file not found: {path}"
+                    )))));
+                };
+                let content = content.clone();
+                let reader = match AutoDecodeReader::new(Cursor::new(content.as_bytes())) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                            "{path}: {e}"
+                        )))));
+                    }
+                };
+                read_jsonl_stream_with_schema(reader, &schema_tt, |ci, val| {
+                    self.eval_schema_constraint(&schema_tt, &constraints, ci, val, &empty_env)
+                })
+            }
+            CapHandle::Real => {
+                if !self.ew.live_io {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                        "file I/O disabled in spec mode: {path}"
+                    )))));
+                }
+                let resolved = match &self.ew.work_dir {
+                    Some(base) if !Path::new(path).is_absolute() => base.join(path),
+                    _ => std::path::PathBuf::from(path),
+                };
+                let reader = match open_auto_decoded_file(&resolved) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                            "{path}: {e}"
+                        )))));
+                    }
+                };
+                read_jsonl_stream_with_schema(reader, &schema_tt, |ci, val| {
+                    self.eval_schema_constraint(&schema_tt, &constraints, ci, val, &empty_env)
+                })
+            }
+        };
+        match parsed {
+            Ok((good, bad)) => EvalOut::Ok(Val::ResOk(Box::new(Val::Tuple(vec![
+                Val::Table(good),
+                Val::Table(bad),
+            ])))),
+            Err(msg) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(msg)))),
+        }
+    }
+
+    fn eval_schema_constraint(
+        &mut self,
+        schema_tt: &TableTy,
+        constraints: &[Option<ExecRowExpr>],
+        ci: usize,
+        val: &Val,
+        empty_env: &RTEnv,
+    ) -> bool {
+        let Some(Some(re)) = constraints.get(ci) else {
+            return true;
+        };
+        let self_cols = vec![ColSpec {
+            name: "__self".to_string(),
+            ty: schema_tt.cols[ci].ty.clone(),
+            tags: TagSet::empty(),
+            bucketed: false,
+            agg_kind: AggKind::Raw,
+        }];
+        matches!(
+            self.eval_row_expr(re, &self_cols, std::slice::from_ref(val), empty_env),
+            EvalOut::Ok(Val::Bool(true))
+        )
+    }
+
+    fn write_confined_table(
+        &mut self,
+        handle: CapHandle,
+        full_rel: &str,
+        tv: &TableVal,
+        fmt: TableWriteFmt,
+    ) -> EvalOut {
+        let comp = detect_compression_path(full_rel);
+        match handle {
+            CapHandle::Fake(idx) => {
+                let text = match fmt {
+                    TableWriteFmt::Csv(delim) => format_csv_table(tv, delim),
+                    TableWriteFmt::Jsonl => format_jsonl_table(tv),
+                };
+                if let Some(ff) = self.ew.world.fake_files.get_mut(idx) {
+                    ff.files.push((full_rel.to_string(), text));
+                }
+                EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)))
+            }
+            CapHandle::Real => {
+                if self.ew.live_io {
+                    let out_path = match &self.ew.work_dir {
+                        Some(base) => base.join(full_rel),
+                        None => std::path::PathBuf::from(full_rel),
+                    };
+                    if let Some(parent) = out_path.parent()
+                        && let Err(e) = fs::create_dir_all(parent)
+                    {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
+                    }
+                    let res = File::create(&out_path).and_then(|f| {
+                        let mut enc = AutoEncodeWriter::new(BufWriter::new(f), comp)?;
+                        match fmt {
+                            TableWriteFmt::Csv(delim) => write_csv_table(&mut enc, tv, delim)?,
+                            TableWriteFmt::Jsonl => write_jsonl_table(&mut enc, tv)?,
+                        }
+                        enc.finish()?;
+                        Ok(())
+                    });
+                    if let Err(e) = res {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
+                    }
+                }
+                let text = match fmt {
+                    TableWriteFmt::Csv(delim) => format_csv_table(tv, delim),
+                    TableWriteFmt::Jsonl => format_jsonl_table(tv),
+                };
+                self.ew
+                    .world
+                    .written_files
+                    .push((full_rel.to_string(), text));
+                EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)))
+            }
+        }
+    }
+
     fn write_confined_output(
         &mut self,
         handle: CapHandle,
@@ -1595,7 +1817,18 @@ impl<'a> Evaluator<'a> {
                     {
                         return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
                     }
-                    if let Err(e) = fs::write(&out_path, &content) {
+                    let comp = detect_compression_path(full_rel);
+                    let write_res: io::Result<()> = if comp == CompressionKind::Plain {
+                        fs::write(&out_path, &content)
+                    } else {
+                        File::create(&out_path).and_then(|f| {
+                            let mut enc = AutoEncodeWriter::new(BufWriter::new(f), comp)?;
+                            enc.write_all(content.as_bytes())?;
+                            enc.finish()?;
+                            Ok(())
+                        })
+                    };
+                    if let Err(e) = write_res {
                         return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
                     }
                 }
@@ -2300,12 +2533,19 @@ impl<'a> Evaluator<'a> {
                 if let Some(idx) = tv.cols.iter().position(|c| c.name == *col) {
                     tv.cols[idx].ty = ScalarTy::Text;
                     tv.cols[idx].tags = tv.cols[idx].tags.remove("pii");
+                    let mode = self.ew.pseudonymize_mode;
                     for r in &mut tv.rows {
-                        let tok = pseudonymize_token(&sec_material, &r.cells[idx]);
+                        let tok = match mode {
+                            PseudonymizeMode::CoreV01Fnv1a => {
+                                pseudonymize_token(&sec_material, &r.cells[idx])
+                            }
+                            PseudonymizeMode::HmacSha256 => {
+                                hmac_sha256_pseudonym(sec_material.as_bytes(), &r.cells[idx])
+                            }
+                        };
                         r.cells[idx] = Val::Text(tok);
                     }
                 }
-                let _ = self.ew.pseudonymize_mode;
                 EvalOut::Ok(Val::Table(tv))
             }
             _ => EvalOut::Failed("unexpected leaf in eval_plan_unary_stage".to_string()),

@@ -56,6 +56,8 @@ pub enum ExecPrimOp {
     DateTruncUnit(String),
     DateTruncDuration,
     MonthsBetween,
+    InTz,
+    DateInTz,
     // Collection & Table surface helpers
     ListFirst,
     ListFirstBang,

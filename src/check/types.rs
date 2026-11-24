@@ -2563,6 +2563,16 @@ impl<'a> Checker<'a> {
                 if name == "Unit" {
                     return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
                 }
+                if name == "None" && !self.ctor_to_enum.contains_key("None") {
+                    let inner = match expected {
+                        Some(Ty::Option(t)) => t.as_ref().clone(),
+                        _ => Ty::Unit,
+                    };
+                    return (
+                        ExecExpr::Lit(Literal::NoneLit(inner.clone())),
+                        LTy::public(Ty::Option(Box::new(inner))),
+                    );
+                }
                 if let Some((enum_name, idx)) = self.ctor_to_enum.get(name).cloned() {
                     let fields_len = self
                         .enums
@@ -3647,6 +3657,23 @@ impl<'a> Checker<'a> {
                     args: vec![first_ex, eb],
                 },
                 LTy::new(Ty::Int, first_lty.tags.union(&lb.tags)),
+            );
+        }
+        if (fname == "in_tz" || fname == "date_in_tz")
+            && let [CallArg::Positional(z)] = rest_args
+        {
+            let (ez, lz) = self.check_expr(z, env, Some(&Ty::Text), pc, scope, ret_ctx);
+            let (op, out_ty) = if fname == "in_tz" {
+                (ExecPrimOp::InTz, Ty::Text)
+            } else {
+                (ExecPrimOp::DateInTz, Ty::Date)
+            };
+            return (
+                ExecExpr::Prim {
+                    op,
+                    args: vec![first_ex, ez],
+                },
+                LTy::new(out_ty, first_lty.tags.union(&lz.tags)),
             );
         }
 
@@ -6386,6 +6413,24 @@ impl<'a> Checker<'a> {
                     LTy::new(Ty::Int, la.tags.union(&lb.tags)),
                 );
             }
+            if (fname == "in_tz" || fname == "date_in_tz")
+                && let [CallArg::Positional(a), CallArg::Positional(z)] = args
+            {
+                let (ea, la) = self.check_expr(a, env, Some(&Ty::Timestamp), pc, scope, ret_ctx);
+                let (ez, lz) = self.check_expr(z, env, Some(&Ty::Text), pc, scope, ret_ctx);
+                let (op, out_ty) = if fname == "in_tz" {
+                    (ExecPrimOp::InTz, Ty::Text)
+                } else {
+                    (ExecPrimOp::DateInTz, Ty::Date)
+                };
+                return (
+                    ExecExpr::Prim {
+                        op,
+                        args: vec![ea, ez],
+                    },
+                    LTy::new(out_ty, la.tags.union(&lz.tags)),
+                );
+            }
             if let Some(sig) = self.fn_sigs.get(fname).cloned() {
                 if !sig.is_pure && !pc.is_empty() {
                     self.diags.push(
@@ -7297,6 +7342,23 @@ impl<'a> Checker<'a> {
                             args: vec![rex, aex],
                         },
                         LTy::new(Ty::Bool, rlty.tags.union(&alty.tags)),
+                    );
+                }
+            }
+            (Ty::Timestamp, "in_tz" | "date_in_tz") => {
+                if let Some(CallArg::Positional(e)) = args.first() {
+                    let (aex, alty) = self.check_expr(e, env, Some(&Ty::Text), pc, scope, ret_ctx);
+                    let (op, out_ty) = if member.name == "in_tz" {
+                        (ExecPrimOp::InTz, Ty::Text)
+                    } else {
+                        (ExecPrimOp::DateInTz, Ty::Date)
+                    };
+                    return (
+                        ExecExpr::Prim {
+                            op,
+                            args: vec![rex, aex],
+                        },
+                        LTy::new(out_ty, rlty.tags.union(&alty.tags)),
                     );
                 }
             }
@@ -8220,6 +8282,16 @@ impl<'a> Checker<'a> {
                     ("Error", Ty::Result { err_ty, .. }) => {
                         vec![LTy::new(err_ty.as_ref().clone(), scrut_lty.tags.clone())]
                     }
+                    ("Err", Ty::Result { .. }) => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`Result` error variant is `Error(...)`, not `Err(...)`",
+                            )
+                            .with_span(pat.span),
+                        );
+                        Vec::new()
+                    }
                     ("Some", Ty::Option(inner)) => {
                         vec![LTy::new(inner.as_ref().clone(), scrut_lty.tags.clone())]
                     }
@@ -8897,6 +8969,30 @@ impl<'a> Checker<'a> {
                                 rtags.union(&atags),
                             );
                         }
+                        "in_tz" | "date_in_tz" => {
+                            if let Some(CallArg::Positional(a0)) = args.first() {
+                                let (are, _, atags) = self.check_row_expr(
+                                    a0,
+                                    cols,
+                                    outer_env,
+                                    Some(&Ty::Text),
+                                    allow_dot_self,
+                                );
+                                let (op, out_ty) = if member.name == "in_tz" {
+                                    (ExecPrimOp::InTz, Ty::Text)
+                                } else {
+                                    (ExecPrimOp::DateInTz, Ty::Date)
+                                };
+                                return (
+                                    ExecRowExpr::Prim {
+                                        op,
+                                        args: vec![re, are],
+                                    },
+                                    out_ty,
+                                    rtags.union(&atags),
+                                );
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -8955,6 +9051,37 @@ impl<'a> Checker<'a> {
                             },
                             Ty::Int,
                             tga.union(&tgb),
+                        );
+                    }
+                    if (fname == "in_tz" || fname == "date_in_tz")
+                        && let [CallArg::Positional(a), CallArg::Positional(z)] = args.as_slice()
+                    {
+                        let (ea, _, tga) = self.check_row_expr(
+                            a,
+                            cols,
+                            outer_env,
+                            Some(&Ty::Timestamp),
+                            allow_dot_self,
+                        );
+                        let (ez, _, tgz) = self.check_row_expr(
+                            z,
+                            cols,
+                            outer_env,
+                            Some(&Ty::Text),
+                            allow_dot_self,
+                        );
+                        let (op, out_ty) = if fname == "in_tz" {
+                            (ExecPrimOp::InTz, Ty::Text)
+                        } else {
+                            (ExecPrimOp::DateInTz, Ty::Date)
+                        };
+                        return (
+                            ExecRowExpr::Prim {
+                                op,
+                                args: vec![ea, ez],
+                            },
+                            out_ty,
+                            tga.union(&tgz),
                         );
                     }
                     if let Some(sig) = self.fn_sigs.get(fname).cloned() {
