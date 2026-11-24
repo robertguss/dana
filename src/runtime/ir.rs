@@ -2116,7 +2116,12 @@ fn try_exec_expr_to_core(root: &ExecExpr) -> Option<Expr> {
                     let input = Box::new(plans.pop()?);
                     plans.push(Plan::Rename {
                         input,
-                        pairs: pairs.to_vec(),
+                        // `ExecPlan::Rename` stores `(old_name, new_name)`, while Core IR
+                        // `Plan::Rename` stores `(new_name, old_name)`.
+                        pairs: pairs
+                            .iter()
+                            .map(|(old_n, new_n)| (new_n.clone(), old_n.clone()))
+                            .collect(),
                     });
                 }
                 BuildPlanOp::Derive(items) => {

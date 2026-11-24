@@ -126,9 +126,20 @@ enum EvalOut {
 
 type RTEnv = HashMap<Ident, Val>;
 
-/// Execute `main(...)` of a lowered [`ExecProgram`].
+/// Execute `main(...)` of a lowered [`ExecProgram`] using the reference row-by-row engine (`--oracle`).
 #[must_use]
 pub fn run_exec_program(prog: &ExecProgram, cfg: &RunConfig) -> RunResult {
+    run_exec_program_with_engine(prog, cfg, None)
+}
+
+/// Execute `main(...)` of a lowered [`ExecProgram`] on either the reference engine (`vm_cfg = None`)
+/// or the vectorized columnar batch VM (`vm_cfg = Some(...)`).
+#[must_use]
+pub(crate) fn run_exec_program_with_engine(
+    prog: &ExecProgram,
+    cfg: &RunConfig,
+    vm_cfg: Option<crate::vm::VmConfig>,
+) -> RunResult {
     let Some(entry_name) = &prog.entry else {
         return RunResult::Failed {
             message: "program has no `main` entry function".to_string(),
@@ -155,6 +166,7 @@ pub fn run_exec_program(prog: &ExecProgram, cfg: &RunConfig) -> RunResult {
         prog,
         ew: &mut ew,
         fuel: cfg.fuel,
+        vm_cfg,
     };
     let out = ev.eval_expr(&entry_fn.body, &env);
     match out {
@@ -187,12 +199,24 @@ pub fn run_exec_program(prog: &ExecProgram, cfg: &RunConfig) -> RunResult {
     }
 }
 
-/// Run all `examples` and `test` spec blocks in a lowered [`ExecProgram`].
+/// Run all `examples` and `test` spec blocks in a lowered [`ExecProgram`] using the reference engine.
 #[must_use]
 pub fn run_program_tests(
     prog: &ExecProgram,
     filter: Option<&str>,
     cfg: &RunConfig,
+) -> Vec<TestOutcome> {
+    run_program_tests_with_engine(prog, filter, cfg, None)
+}
+
+/// Run all `examples` and `test` spec blocks on either the reference engine (`vm_cfg = None`)
+/// or the vectorized columnar batch VM (`vm_cfg = Some(...)`).
+#[must_use]
+pub(crate) fn run_program_tests_with_engine(
+    prog: &ExecProgram,
+    filter: Option<&str>,
+    cfg: &RunConfig,
+    vm_cfg: Option<crate::vm::VmConfig>,
 ) -> Vec<TestOutcome> {
     let mut outcomes = Vec::new();
     for f in &prog.funs {
@@ -220,6 +244,7 @@ pub fn run_program_tests(
             prog,
             ew: &mut ew,
             fuel: cfg.fuel,
+            vm_cfg,
         };
         match ev.eval_expr(&f.body, &env) {
             EvalOut::Ok(_) => outcomes.push(TestOutcome {
@@ -249,6 +274,36 @@ pub fn run_program_tests(
         }
     }
     outcomes
+}
+
+/// Evaluate a pure user function call in an isolated world (used by vectorized VM
+/// fallback when a pure UDF is recursive or uses non-inlinable control flow).
+pub(crate) fn eval_pure_exec_call(
+    prog: &ExecProgram,
+    fn_name: &str,
+    args: Vec<Val>,
+    fuel: usize,
+) -> Result<Val, crate::vm::expr::RowEvalErr> {
+    let cfg = RunConfig {
+        live_io: false,
+        fuel,
+        ..RunConfig::default()
+    };
+    let mut ew = ExecWorld::from_config(&cfg);
+    let mut ev = Evaluator {
+        prog,
+        ew: &mut ew,
+        fuel,
+        vm_cfg: None,
+    };
+    match ev.eval_call(fn_name, args) {
+        EvalOut::Ok(v) => Ok(v),
+        EvalOut::Stopped(bug) => Err(crate::vm::expr::RowEvalErr::Stopped { lane: 0, bug }),
+        EvalOut::Failed(m) => Err(crate::vm::expr::RowEvalErr::Failed(m)),
+        EvalOut::Jumped(lbl, _) => Err(crate::vm::expr::RowEvalErr::Failed(format!(
+            "uncaught jump `{lbl}`"
+        ))),
+    }
 }
 
 fn real_cap_for_ty(ty: &Ty) -> Val {
@@ -299,6 +354,97 @@ struct Evaluator<'a> {
     prog: &'a ExecProgram,
     ew: &'a mut ExecWorld,
     fuel: usize,
+    vm_cfg: Option<crate::vm::VmConfig>,
+}
+
+impl crate::vm::exec::ExecPlanBridge for Evaluator<'_> {
+    fn eval_outer_expr(
+        &mut self,
+        expr: &ExecExpr,
+        env: &HashMap<Ident, Val>,
+    ) -> Result<Val, crate::vm::OpErr> {
+        match self.eval_expr(expr, env) {
+            EvalOut::Ok(v) => Ok(v),
+            EvalOut::Stopped(b) => Err(crate::vm::OpErr::Stopped(b)),
+            EvalOut::Failed(m) => Err(crate::vm::OpErr::Failed(m)),
+            EvalOut::Jumped(lbl, _) => {
+                Err(crate::vm::OpErr::Failed(format!("uncaught jump `{lbl}`")))
+            }
+        }
+    }
+
+    fn load_fake_db_table(
+        &mut self,
+        cap_v: Val,
+        table_name: &str,
+        schema: &TableTy,
+    ) -> Result<TableVal, crate::vm::OpErr> {
+        match cap_v {
+            Val::CapReadDB {
+                handle: CapHandle::Fake(idx),
+                ..
+            } => {
+                let stored = self
+                    .ew
+                    .world
+                    .fake_dbs
+                    .get(idx)
+                    .and_then(|db| db.tables.iter().find(|t| t.table_name == table_name));
+                match stored {
+                    Some(st) => {
+                        let rows = st
+                            .rows
+                            .iter()
+                            .map(|r| TableRow {
+                                cells: r.clone(),
+                                group_meta: None,
+                            })
+                            .collect();
+                        Ok(TableVal {
+                            cols: schema.cols.clone(),
+                            rows,
+                        })
+                    }
+                    None => Ok(TableVal {
+                        cols: schema.cols.clone(),
+                        rows: Vec::new(),
+                    }),
+                }
+            }
+            _ => Err(crate::vm::OpErr::Stopped(Bug {
+                kind: BugKind::OutsideBoundary,
+                message: "live ReadDB queries require Phase 3 database driver".to_string(),
+            })),
+        }
+    }
+
+    fn resolve_secret_material(&self, sec_val: &Val) -> String {
+        match sec_val {
+            Val::CapSecret {
+                handle: CapHandle::Fake(idx),
+                ..
+            } => self
+                .ew
+                .world
+                .fake_secrets
+                .get(*idx)
+                .cloned()
+                .unwrap_or_default(),
+            Val::CapSecret {
+                handle: CapHandle::Real,
+                name,
+            } => self
+                .ew
+                .world
+                .real_secrets
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .or_else(|| std::env::var(name.to_ascii_uppercase()).ok())
+                .unwrap_or_else(|| format!("env:{name}")),
+            _ => String::new(),
+        }
+    }
 }
 
 impl<'a> Evaluator<'a> {
@@ -687,7 +833,23 @@ impl<'a> Evaluator<'a> {
                     }
                     return self.eval_exec_prim(op, &vals);
                 }
-                ExecExpr::Rel(plan) => return self.eval_plan(plan, cur_env),
+                ExecExpr::Rel(plan) => {
+                    if let Some(vm_cfg) = self.vm_cfg {
+                        let prog = self.prog;
+                        let fuel = self.fuel;
+                        return match crate::vm::exec::eval_exec_plan_vm(
+                            plan, prog, cur_env, &vm_cfg, fuel, self,
+                        ) {
+                            Ok(v) => EvalOut::Ok(v),
+                            Err(crate::vm::OpErr::Stopped(b)) => EvalOut::Stopped(b),
+                            Err(crate::vm::OpErr::Failed(m)) => EvalOut::Failed(m),
+                            Err(crate::vm::OpErr::Wrong) => {
+                                EvalOut::Failed("internal VM plan evaluation error".to_string())
+                            }
+                        };
+                    }
+                    return self.eval_plan(plan, cur_env);
+                }
                 ExecExpr::Host { op, args } => {
                     let mut vals = Vec::with_capacity(args.len());
                     for a in args {

@@ -21,8 +21,10 @@ use crate::formats::fake::{FakeFormat, write_fake_rows};
 use crate::formats::infer::{InferFormat, infer_schema_from_file};
 use crate::lower::lower_program;
 use crate::oracle::cli::parse_comma_tags;
+use crate::plan::{explain_exec_plan, optimize_exec_plan};
 use crate::runtime::{RunConfig, RunResult, run_exec_program, run_program_tests};
 use crate::syntax::{format_module, parse_module};
+use crate::vm::{VmConfig, run_exec_program_vm, run_program_tests_vm};
 
 /// Authoritative Dana Language Reference v0.1 embedded for offline `dana guide`.
 pub const EMBEDDED_GUIDE: &str = include_str!("../../docs/reference/README.md");
@@ -37,9 +39,12 @@ COMMANDS:
   check [--policy FILE] [--json] <FILE...>
       Parse, type-check, privacy-check, and verify Dana source file(s).
   run [--oracle] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]
-      Compile and execute a Dana program's `main` function.
+      Compile and execute a Dana program's `main` function (vectorized columnar VM by default;
+      pass `--oracle` for the reference row-by-row engine).
   test [--oracle] [--policy FILE] [--filter SUBSTR] [PATH...]
       Run all inline `examples` and `test` blocks across file(s) or directory.
+  explain [--policy FILE] <FILE>
+      Show logical vs. optimized relational plans for every function in a `.dana` module.
   format [--check] <PATH...>
       Format Dana source file(s) canonically with 2-space indentation.
   guide [SECTION]
@@ -70,6 +75,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         "check" => cmd_check(rest),
         "test" => cmd_test(rest),
         "run" => cmd_run(rest),
+        "explain" => cmd_explain(rest),
         "infer-schema" => cmd_infer_schema(rest),
         "fake" => cmd_fake(rest),
         other => {
@@ -235,13 +241,14 @@ fn cmd_check(args: &[String]) -> i32 {
 }
 
 fn cmd_test(args: &[String]) -> i32 {
+    let mut use_oracle = false;
     let mut policy_path: Option<PathBuf> = None;
     let mut filter: Option<String> = None;
     let mut paths = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--oracle" => {}
+            "--oracle" => use_oracle = true,
             "--policy" => {
                 i += 1;
                 let Some(p) = args.get(i) else {
@@ -281,6 +288,7 @@ fn cmd_test(args: &[String]) -> i32 {
     let mut total = 0usize;
     let mut failed = 0usize;
     let cfg = RunConfig::default();
+    let vm_cfg = VmConfig::default();
 
     for path in files {
         let policy = match load_policy_for(&path, policy_path.as_deref(), &mut sm) {
@@ -315,7 +323,11 @@ fn cmd_test(args: &[String]) -> i32 {
                 return 1;
             }
         };
-        let outcomes = run_program_tests(&lowered.exec, filter.as_deref(), &cfg);
+        let outcomes = if use_oracle {
+            run_program_tests(&lowered.exec, filter.as_deref(), &cfg)
+        } else {
+            run_program_tests_vm(&lowered.exec, filter.as_deref(), &cfg, &vm_cfg)
+        };
         for o in outcomes {
             total += 1;
             if o.passed {
@@ -342,6 +354,7 @@ fn cmd_test(args: &[String]) -> i32 {
 }
 
 fn cmd_run(args: &[String]) -> i32 {
+    let mut use_oracle = false;
     let mut policy_path: Option<PathBuf> = None;
     let mut allow_export = TagSet::empty();
     let mut emit_core = false;
@@ -355,7 +368,7 @@ fn cmd_run(args: &[String]) -> i32 {
                 prog_args.extend(args[i + 1..].iter().cloned());
                 break;
             }
-            "--oracle" => {}
+            "--oracle" => use_oracle = true,
             "--emit-core" => emit_core = true,
             "--policy" => {
                 i += 1;
@@ -450,7 +463,12 @@ fn cmd_run(args: &[String]) -> i32 {
         live_io: true,
         ..RunConfig::default()
     };
-    match run_exec_program(&lowered.exec, &cfg) {
+    let res = if use_oracle {
+        run_exec_program(&lowered.exec, &cfg)
+    } else {
+        run_exec_program_vm(&lowered.exec, &cfg, &VmConfig::default())
+    };
+    match res {
         RunResult::Ok {
             exit_code,
             stdout,
@@ -493,6 +511,179 @@ fn cmd_run(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+fn collect_exec_plans<'a>(
+    expr: &'a crate::runtime::ExecExpr,
+    out: &mut Vec<&'a crate::runtime::ExecPlan>,
+) {
+    use crate::runtime::ExecExpr;
+    match expr {
+        ExecExpr::Rel(plan) => out.push(plan),
+        ExecExpr::LetE { bound, body, .. }
+        | ExecExpr::Join {
+            rhs: bound, body, ..
+        } => {
+            collect_exec_plans(bound, out);
+            collect_exec_plans(body, out);
+        }
+        ExecExpr::IfE {
+            cond,
+            then_br,
+            else_br,
+        } => {
+            collect_exec_plans(cond, out);
+            collect_exec_plans(then_br, out);
+            collect_exec_plans(else_br, out);
+        }
+        ExecExpr::CaseE { scrut, arms } => {
+            collect_exec_plans(scrut, out);
+            for a in arms {
+                collect_exec_plans(&a.body, out);
+            }
+        }
+        ExecExpr::ForLoop {
+            iter_expr,
+            body,
+            after,
+            ..
+        } => {
+            collect_exec_plans(iter_expr, out);
+            collect_exec_plans(body, out);
+            collect_exec_plans(after, out);
+        }
+        ExecExpr::WhileLoop {
+            cond, body, after, ..
+        } => {
+            collect_exec_plans(cond, out);
+            collect_exec_plans(body, out);
+            collect_exec_plans(after, out);
+        }
+        ExecExpr::App { fn_expr, args } => {
+            collect_exec_plans(fn_expr, out);
+            for a in args {
+                collect_exec_plans(a, out);
+            }
+        }
+        ExecExpr::Call { args, .. }
+        | ExecExpr::Jump { args, .. }
+        | ExecExpr::Tuple(args)
+        | ExecExpr::Ctor { args, .. }
+        | ExecExpr::Prim { args, .. }
+        | ExecExpr::Host { args, .. } => {
+            for a in args {
+                collect_exec_plans(a, out);
+            }
+        }
+        ExecExpr::Proj { tup: e, .. } | ExecExpr::Assert { cond: e, .. } | ExecExpr::Fail(e) => {
+            collect_exec_plans(e, out);
+        }
+        ExecExpr::Lam { body, .. } => collect_exec_plans(body, out),
+        ExecExpr::Stop { detail, .. } => {
+            if let Some(d) = detail {
+                collect_exec_plans(d, out);
+            }
+        }
+        ExecExpr::Lit(_)
+        | ExecExpr::Var(_)
+        | ExecExpr::ConstRef(_)
+        | ExecExpr::TableLit { .. }
+        | ExecExpr::CheckPromise { .. } => {}
+    }
+}
+
+fn cmd_explain(args: &[String]) -> i32 {
+    let mut policy_path: Option<PathBuf> = None;
+    let mut script_path: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--policy" => {
+                i += 1;
+                let Some(p) = args.get(i) else {
+                    eprintln!("dana explain: `--policy` requires a file path");
+                    return 2;
+                };
+                policy_path = Some(PathBuf::from(p));
+            }
+            flag if flag.starts_with('-') => {
+                eprintln!("dana explain: unknown flag `{flag}`");
+                return 2;
+            }
+            p if script_path.is_none() => script_path = Some(PathBuf::from(p)),
+            other => {
+                eprintln!("dana explain: unexpected argument `{other}`");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    let Some(path) = script_path else {
+        eprintln!("dana explain: missing `.dana` file path");
+        return 2;
+    };
+    let mut sm = SourceMap::new();
+    let policy = match load_policy_for(&path, policy_path.as_deref(), &mut sm) {
+        Ok(p) => p,
+        Err(d) => {
+            eprint!("{}", render_diagnostic(&d, &sm));
+            return 1;
+        }
+    };
+    let resolved = match resolve_path(&path, policy, &mut sm) {
+        Ok(r) => r,
+        Err(ds) => {
+            for d in &ds {
+                eprint!("{}", render_diagnostic(d, &sm));
+            }
+            return 1;
+        }
+    };
+    let checked = match check_resolved(&resolved, &sm) {
+        Ok(c) => c,
+        Err(ds) => {
+            for d in &ds {
+                eprint!("{}", render_diagnostic(d, &sm));
+            }
+            return 1;
+        }
+    };
+    let lowered = match lower_program(checked) {
+        Ok(l) => l,
+        Err(d) => {
+            eprint!("{}", render_diagnostic(&d, &sm));
+            return 1;
+        }
+    };
+
+    let mut found_any = false;
+    for f in &lowered.exec.funs {
+        let mut plans = Vec::new();
+        collect_exec_plans(&f.body, &mut plans);
+        if plans.is_empty() {
+            continue;
+        }
+        found_any = true;
+        println!("== fn {} ==", f.name);
+        for (idx, p) in plans.iter().enumerate() {
+            let (opt, stats) = optimize_exec_plan(p, &lowered.exec);
+            println!("-- plan #{idx} (logical) --");
+            print!("{}", explain_exec_plan(p));
+            println!(
+                "-- plan #{idx} (optimized: fused={}, pushed={}, pruned={}, dead={}, limits={}) --",
+                stats.filters_fused,
+                stats.predicates_pushed,
+                stats.derive_items_pruned,
+                stats.dead_ops_eliminated,
+                stats.limits_folded
+            );
+            print!("{}", explain_exec_plan(&opt));
+        }
+    }
+    if !found_any {
+        println!("no relational plans in {}", path.display());
+    }
+    0
 }
 
 fn cmd_infer_schema(args: &[String]) -> i32 {

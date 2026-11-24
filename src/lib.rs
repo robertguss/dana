@@ -5,6 +5,8 @@
 //! - `lower`: surface-to-execution IR & Core IR v0.1 verifier bridge
 //! - `ffi`: audited RAII FFI wrappers around allowlisted system `zlib` and `libzstd`
 //! - `formats`: built-in calendar/TZif temporal math, HMAC-SHA256, streaming CSV/TSV, JSON/JSONL, schema inference & fake data generation
+//! - `plan`: relational query optimizer (filter fusion, predicate pushdown, dead-derive pruning) & plan explainer
+//! - `vm`: 2,048-row vectorized columnar batch VM, compiled row bytecode (inlined pure UDFs), & deterministic parallel runner
 //! - `runtime`: Phase 2 execution IR and reference runtime evaluator
 //! - `cli`: `dana` CLI subcommand dispatcher
 //! - `core`: Dana Core IR v0.1 AST, canonical wire codec, and decidable static verifier
@@ -26,6 +28,10 @@ pub mod lower;
 #[forbid(unsafe_code)]
 pub mod oracle;
 #[forbid(unsafe_code)]
+pub mod plan;
+#[forbid(unsafe_code)]
 pub mod runtime;
 #[forbid(unsafe_code)]
 pub mod syntax;
+#[forbid(unsafe_code)]
+pub mod vm;
