@@ -49,12 +49,10 @@ impl Hasher for FastHasher {
 
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks {
-            let v = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
-            self.mix_u64(v);
+        let (chunks, rem) = bytes.as_chunks::<8>();
+        for &c in chunks {
+            self.mix_u64(u64::from_le_bytes(c));
         }
-        let rem = chunks.remainder();
         if !rem.is_empty() {
             let mut tail = [0u8; 8];
             tail[..rem.len()].copy_from_slice(rem);

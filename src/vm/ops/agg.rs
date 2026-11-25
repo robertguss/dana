@@ -1416,11 +1416,9 @@ fn aggregate_partition(
                 .collect();
             if let Some(&idx) = sorted_map.get(&KeyTuple::new(kv)) {
                 let g = &mut groups[idx];
-                for ai in 0..aggs.len() {
+                for (ai, fallback) in g.fallback_vals.iter_mut().enumerate().take(aggs.len()) {
                     if let Some(col) = eb.arg_col(ai) {
-                        g.fallback_vals[ai]
-                            .get_or_insert_with(Vec::new)
-                            .push(col.get_val(ri));
+                        fallback.get_or_insert_with(Vec::new).push(col.get_val(ri));
                     }
                 }
             }

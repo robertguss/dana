@@ -1436,10 +1436,7 @@ fn decode_plain_values(
             if need > data.len() {
                 return Err("truncated Parquet INT32 PLAIN payload".to_string());
             }
-            for chunk in data[..need].chunks_exact(4) {
-                let arr: [u8; 4] = chunk
-                    .try_into()
-                    .map_err(|_| "INT32 chunk error".to_string())?;
+            for &arr in data[..need].as_chunks::<4>().0 {
                 vals.push(RawParquetVal::Int32(i32::from_le_bytes(arr)));
             }
             pos = need;
@@ -1451,10 +1448,7 @@ fn decode_plain_values(
             if need > data.len() {
                 return Err("truncated Parquet INT64 PLAIN payload".to_string());
             }
-            for chunk in data[..need].chunks_exact(8) {
-                let arr: [u8; 8] = chunk
-                    .try_into()
-                    .map_err(|_| "INT64 chunk error".to_string())?;
+            for &arr in data[..need].as_chunks::<8>().0 {
                 vals.push(RawParquetVal::Int64(i64::from_le_bytes(arr)));
             }
             pos = need;
@@ -1466,10 +1460,7 @@ fn decode_plain_values(
             if need > data.len() {
                 return Err("truncated Parquet FLOAT PLAIN payload".to_string());
             }
-            for chunk in data[..need].chunks_exact(4) {
-                let arr: [u8; 4] = chunk
-                    .try_into()
-                    .map_err(|_| "FLOAT chunk error".to_string())?;
+            for &arr in data[..need].as_chunks::<4>().0 {
                 vals.push(RawParquetVal::Float(f32::from_le_bytes(arr)));
             }
             pos = need;
@@ -1481,10 +1472,7 @@ fn decode_plain_values(
             if need > data.len() {
                 return Err("truncated Parquet DOUBLE PLAIN payload".to_string());
             }
-            for chunk in data[..need].chunks_exact(8) {
-                let arr: [u8; 8] = chunk
-                    .try_into()
-                    .map_err(|_| "DOUBLE chunk error".to_string())?;
+            for &arr in data[..need].as_chunks::<8>().0 {
                 vals.push(RawParquetVal::Double(f64::from_le_bytes(arr)));
             }
             pos = need;
@@ -3221,10 +3209,8 @@ impl TypedColChunk {
                     return Err("truncated Parquet INT64 PLAIN payload".to_string());
                 }
                 out.reserve(count);
-                for ch in payload[..need].chunks_exact(8) {
-                    out.push(i64::from_le_bytes([
-                        ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7],
-                    ]));
+                for &ch in payload[..need].as_chunks::<8>().0 {
+                    out.push(i64::from_le_bytes(ch));
                 }
             }
             (ColumnData::Int(out), PT_INT32) | (ColumnData::Date(out), PT_INT32) => {
@@ -3235,8 +3221,8 @@ impl TypedColChunk {
                     return Err("truncated Parquet INT32 PLAIN payload".to_string());
                 }
                 out.reserve(count);
-                for ch in payload[..need].chunks_exact(4) {
-                    out.push(i64::from(i32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]])));
+                for &ch in payload[..need].as_chunks::<4>().0 {
+                    out.push(i64::from(i32::from_le_bytes(ch)));
                 }
             }
             (ColumnData::Timestamp(out), PT_INT64) => {
@@ -3253,10 +3239,8 @@ impl TypedColChunk {
                     return Err("truncated Parquet INT64 PLAIN payload".to_string());
                 }
                 out.reserve(count);
-                for ch in payload[..need].chunks_exact(8) {
-                    let raw = i64::from_le_bytes([
-                        ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7],
-                    ]);
+                for &ch in payload[..need].as_chunks::<8>().0 {
+                    let raw = i64::from_le_bytes(ch);
                     out.push(convert_timestamp_unit(raw, unit)?);
                 }
             }
@@ -3268,10 +3252,8 @@ impl TypedColChunk {
                     return Err("truncated Parquet DOUBLE PLAIN payload".to_string());
                 }
                 out.reserve(count);
-                for ch in payload[..need].chunks_exact(8) {
-                    let f = f64::from_le_bytes([
-                        ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7],
-                    ]);
+                for &ch in payload[..need].as_chunks::<8>().0 {
+                    let f = f64::from_le_bytes(ch);
                     out.push(Float64::from_f64(f).bits);
                 }
             }
@@ -3283,8 +3265,8 @@ impl TypedColChunk {
                     return Err("truncated Parquet FLOAT PLAIN payload".to_string());
                 }
                 out.reserve(count);
-                for ch in payload[..need].chunks_exact(4) {
-                    let f = f32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]);
+                for &ch in payload[..need].as_chunks::<4>().0 {
+                    let f = f32::from_le_bytes(ch);
                     out.push(Float64::from_f64(f64::from(f)).bits);
                 }
             }
@@ -3304,8 +3286,8 @@ impl TypedColChunk {
                         if need > payload.len() {
                             return Err("truncated Parquet INT32 PLAIN payload".to_string());
                         }
-                        for ch in payload[..need].chunks_exact(4) {
-                            let n = i32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]);
+                        for &ch in payload[..need].as_chunks::<4>().0 {
+                            let n = i32::from_le_bytes(ch);
                             out.push(rescale_decimal_i128_fast(i128::from(n), src_scale)?);
                         }
                     }
@@ -3316,10 +3298,8 @@ impl TypedColChunk {
                         if need > payload.len() {
                             return Err("truncated Parquet INT64 PLAIN payload".to_string());
                         }
-                        for ch in payload[..need].chunks_exact(8) {
-                            let n = i64::from_le_bytes([
-                                ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7],
-                            ]);
+                        for &ch in payload[..need].as_chunks::<8>().0 {
+                            let n = i64::from_le_bytes(ch);
                             out.push(rescale_decimal_i128_fast(i128::from(n), src_scale)?);
                         }
                     }

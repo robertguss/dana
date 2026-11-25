@@ -1007,10 +1007,11 @@ pub fn check_prim_op(
             }
         }
         (PrimOp::MapLit { key_lty, val_lty }, kv_args) => {
-            let pairs_ok = kv_args.len().is_multiple_of(2)
-                && kv_args
-                    .chunks_exact(2)
-                    .all(|pair| lty_subtype(&pair[0], key_lty) && lty_subtype(&pair[1], val_lty));
+            let pairs_ok =
+                kv_args.len().is_multiple_of(2)
+                    && kv_args.as_chunks::<2>().0.iter().all(|pair| {
+                        lty_subtype(&pair[0], key_lty) && lty_subtype(&pair[1], val_lty)
+                    });
             if valid_lty(prog, key_lty)
                 && valid_lty(prog, val_lty)
                 && is_equatable_ty(&key_lty.ty)

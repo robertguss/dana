@@ -1945,15 +1945,10 @@ pub fn md5_digest(data: &[u8]) -> [u8; 16] {
     let mut c0: u32 = 0x98ba_dcfe;
     let mut d0: u32 = 0x1032_5476;
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
-        for i in 0..16 {
-            m[i] = u32::from_le_bytes([
-                chunk[i * 4],
-                chunk[i * 4 + 1],
-                chunk[i * 4 + 2],
-                chunk[i * 4 + 3],
-            ]);
+        for (slot, &word) in m.iter_mut().zip(chunk.as_chunks::<4>().0) {
+            *slot = u32::from_le_bytes(word);
         }
         let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
         for i in 0..64 {
@@ -2159,19 +2154,18 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, DbError> {
         )));
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0 {
         let mut vals = [0u32; 4];
         let mut pad = 0usize;
-        for i in 0..4 {
-            let b = chunk[i];
+        for (val, &b) in vals.iter_mut().zip(chunk) {
             if b == b'=' {
                 pad += 1;
-                vals[i] = 0;
+                *val = 0;
             } else {
                 if pad > 0 {
                     return Err(DbError::Auth("invalid base64 padding".to_string()));
                 }
-                vals[i] = match b {
+                *val = match b {
                     b'A'..=b'Z' => u32::from(b - b'A'),
                     b'a'..=b'z' => u32::from(b - b'a' + 26),
                     b'0'..=b'9' => u32::from(b - b'0' + 52),

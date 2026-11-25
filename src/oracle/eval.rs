@@ -485,7 +485,9 @@ pub fn eval_prim_op(op: &PrimOp, args: &[Val]) -> PrimResult {
                 return PrimResult::Wrong;
             }
             let pairs = kv_args
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| (c[0].clone(), c[1].clone()))
                 .collect();
             PrimResult::Ok(Val::Map(pairs))
