@@ -24,7 +24,7 @@ use super::schema_lock::{LockedCol, LockedDb, LockedTable};
 use super::{
     ColumnarBatchBuilder, DbConnection, DbError, SqlDialect, SqlParam, SqliteUri, UpsertDiff,
     compute_upsert_diff, decimal_from_i64, format_decimal_canonical, make_table_row,
-    parse_decimal_from_f64, parse_iso_timestamp_flexible, quote_sql_ident,
+    parse_decimal_from_f64, parse_iso_timestamp_flexible, quote_sql_ident, quote_sql_table_ref,
 };
 
 /// Safe SQLite driver implementing [`DbConnection`].
@@ -394,7 +394,7 @@ impl DbConnection for SqliteDriver {
                 ))
             })?;
 
-        let quoted_table = quote_sql_ident(table);
+        let quoted_table = quote_sql_table_ref(table);
         let quoted_cols: Vec<String> = data.cols.iter().map(|c| quote_sql_ident(&c.name)).collect();
         let quoted_key = quote_sql_ident(key_col);
 

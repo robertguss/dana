@@ -44,8 +44,8 @@ use dana::oracle::value::{ChartVal, ReportVal, TableRow, TableVal, Val, val_eq};
 use dana::plan::{SplitPlan, split_exec_plan_pushdown};
 use dana::repl::{ReplConfig, ReplOutput, ReplSession};
 use dana::runtime::ir::{
-    ExecAggItem, ExecDeriveItem, ExecExpr, ExecFun, ExecPlan, ExecPrimOp, ExecProgram, ExecRowExpr,
-    PseudonymizeMode,
+    ExecAggItem, ExecAggOp, ExecDeriveItem, ExecExpr, ExecFun, ExecPlan, ExecPrimOp, ExecProgram,
+    ExecRowExpr, PseudonymizeMode,
 };
 use dana::runtime::{
     EvalProgramResult, RunConfig, RunResult, eval_exec_entry, run_exec_program, run_program_tests,
@@ -752,11 +752,11 @@ fn soak_extended_differential_exec_and_sqlite_pushdown() -> TestResult {
                 let aggs = vec![
                     ExecAggItem {
                         name: "n".to_string(),
-                        op: if use_distinct {
+                        op: ExecAggOp::Core(if use_distinct {
                             AggOp::CountDistinct
                         } else {
                             AggOp::Count
-                        },
+                        }),
                         arg: if use_distinct {
                             Some(ExecRowExpr::Col("uid".to_string()))
                         } else {
@@ -765,17 +765,17 @@ fn soak_extended_differential_exec_and_sqlite_pushdown() -> TestResult {
                     },
                     ExecAggItem {
                         name: "total_amt".to_string(),
-                        op: AggOp::Sum,
+                        op: ExecAggOp::Core(AggOp::Sum),
                         arg: Some(ExecRowExpr::Col("amt".to_string())),
                     },
                     ExecAggItem {
                         name: "avg_score".to_string(),
-                        op: AggOp::Mean,
+                        op: ExecAggOp::Core(AggOp::Mean),
                         arg: Some(ExecRowExpr::Col("score".to_string())),
                     },
                     ExecAggItem {
                         name: "med_score".to_string(),
-                        op: AggOp::Median,
+                        op: ExecAggOp::Core(AggOp::Median),
                         arg: Some(ExecRowExpr::Col("score".to_string())),
                     },
                 ];
@@ -1096,12 +1096,12 @@ fn soak_extended_differential_exec_and_sqlite_pushdown() -> TestResult {
                         aggs: vec![
                             ExecAggItem {
                                 name: "cnt".to_string(),
-                                op: AggOp::Count,
+                                op: ExecAggOp::Core(AggOp::Count),
                                 arg: None,
                             },
                             ExecAggItem {
                                 name: "tot".to_string(),
-                                op: AggOp::Sum,
+                                op: ExecAggOp::Core(AggOp::Sum),
                                 arg: Some(ExecRowExpr::Col("val".to_string())),
                             },
                         ],
@@ -1229,12 +1229,12 @@ fn soak_extended_differential_exec_and_sqlite_pushdown() -> TestResult {
                                 aggs: vec![
                                     ExecAggItem {
                                         name: "n".to_string(),
-                                        op: AggOp::Count,
+                                        op: ExecAggOp::Core(AggOp::Count),
                                         arg: None,
                                     },
                                     ExecAggItem {
                                         name: "sum_v".to_string(),
-                                        op: AggOp::Sum,
+                                        op: ExecAggOp::Core(AggOp::Sum),
                                         arg: Some(ExecRowExpr::Col("val".to_string())),
                                     },
                                 ],

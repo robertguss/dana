@@ -14,6 +14,7 @@ pub use exec::{
     run_program_tests,
 };
 pub use ir::{
-    CompiledSchema, ExecCaseArm, ExecDeriveItem, ExecExpr, ExecFun, ExecHostOp, ExecPlan,
-    ExecPrimOp, ExecProgram, ExecPromise, ExecRowExpr, PseudonymizeMode, StructLayout,
+    CompiledSchema, ExecAggItem, ExecAggOp, ExecCaseArm, ExecDeriveItem, ExecExpr, ExecFun,
+    ExecHostOp, ExecPlan, ExecPrimOp, ExecProgram, ExecPromise, ExecRowExpr, PseudonymizeMode,
+    StructLayout,
 };

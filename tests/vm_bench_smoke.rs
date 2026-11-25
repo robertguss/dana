@@ -378,7 +378,7 @@ fn bench_100k_rows_hash_join_agg_seq_vs_parallel() -> Result<(), String> {
     let compiled_aggs = vec![
         CompiledAgg {
             name: "total_amount".into(),
-            op: AggOp::Sum,
+            op: dana::runtime::ir::ExecAggOp::Core(AggOp::Sum),
             out_spec: ColSpec {
                 name: "total_amount".into(),
                 ty: ScalarTy::Decimal,
@@ -390,7 +390,7 @@ fn bench_100k_rows_hash_join_agg_seq_vs_parallel() -> Result<(), String> {
         },
         CompiledAgg {
             name: "row_count".into(),
-            op: AggOp::Count,
+            op: dana::runtime::ir::ExecAggOp::Core(AggOp::Count),
             out_spec: ColSpec {
                 name: "row_count".into(),
                 ty: ScalarTy::Int,

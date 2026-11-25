@@ -1381,7 +1381,11 @@ fn trace_exec_provenance(
                 };
                 let col_tags = arg_tags.union(&tt.row_tags).union(&ord_tags);
                 if !col_tags.is_empty() {
-                    agg_notes.push(format!("{name}({op:?},{kind:?})={}", fmt_tags(&col_tags)));
+                    agg_notes.push(format!(
+                        "{name}({},{kind:?})={}",
+                        op.display_name(),
+                        fmt_tags(&col_tags)
+                    ));
                 }
                 out_cols.push(ColSpec {
                     name: name.clone(),
@@ -1906,7 +1910,7 @@ fn fmt_exec_plan(plan: &ExecPlan, depth: usize, out: &mut String) {
         ExecPlan::Summarize { input, aggs, .. } => {
             let names: Vec<String> = aggs
                 .iter()
-                .map(|a| format!("{}:{:?}", a.name, a.op))
+                .map(|a| format!("{}:{}", a.name, a.op.display_name()))
                 .collect();
             let _ = writeln!(out, "HashAggregate([{}])", names.join(", "));
             fmt_exec_plan(input, depth + 1, out);

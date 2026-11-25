@@ -20,8 +20,8 @@ use std::thread;
 use dana::core::bigint::BigInt;
 use dana::core::syntax::{AggKind, ColSpec, Float64, ScalarTy, TableTy, TagSet};
 use dana::db::postgres::{
-    PostgresDriver, base64_decode, base64_encode, md5_digest, oid, pg_md5_password,
-    scram_pbkdf2_hmac_sha256,
+    PostgresDriver, base64_decode, base64_encode, map_pg_type_name, md5_digest, oid,
+    pg_md5_password, scram_pbkdf2_hmac_sha256,
 };
 use dana::db::schema_lock::{
     LockedCol, LockedDb, LockedTable, SchemaLock, format_schema_lock, merge_schema_lock,
@@ -30,7 +30,7 @@ use dana::db::schema_lock::{
 use dana::db::sqlite::SqliteDriver;
 use dana::db::{
     DbConnection, DbError, DbRegistry, DbUri, RowDiffKind, SqlDialect, SqlParam, SslMode,
-    open_connection,
+    open_connection, quote_sql_table_ref,
 };
 use dana::ffi::sqlite::{SqliteConn, SqliteValueType, StepResult};
 use dana::ffi::tls::{TlsClientConfig, TlsServerAcceptor, TlsStream};
@@ -1164,37 +1164,78 @@ fn execute_pg_on_sqlite(
     params: &[(i16, Option<Vec<u8>>)],
 ) -> Result<(), String> {
     let trimmed = pg_sql.trim();
+    let requested_schemas: Vec<String> = params
+        .iter()
+        .filter_map(|(_, bytes_opt)| {
+            bytes_opt
+                .as_ref()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+        })
+        .collect();
+    let collect_sqlite_schemas = || -> Result<Vec<(String, String)>, String> {
+        let mut db_stmt = sqlite
+            .prepare("PRAGMA database_list")
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        while db_stmt.step().map_err(|e| e.to_string())? == StepResult::Row {
+            let sqlite_db = db_stmt.column_text(1).map_err(|e| e.to_string())?;
+            if sqlite_db == "temp" {
+                continue;
+            }
+            let pg_schema = if sqlite_db == "main" {
+                "public".to_string()
+            } else {
+                sqlite_db.clone()
+            };
+            if requested_schemas.is_empty() || requested_schemas.iter().any(|s| s == &pg_schema) {
+                out.push((sqlite_db, pg_schema));
+            }
+        }
+        out.sort_by(|a, b| a.1.cmp(&b.1));
+        Ok(out)
+    };
+
     // Handle `information_schema` introspection queries against real SQLite catalog metadata!
     if trimmed.contains("information_schema.table_constraints") {
         srv_send_row_desc(
             stream,
-            &[("table_name", oid::TEXT), ("column_name", oid::TEXT)],
+            &[
+                ("table_schema", oid::TEXT),
+                ("table_name", oid::TEXT),
+                ("column_name", oid::TEXT),
+            ],
         )
         .map_err(|e| e.to_string())?;
-        let mut t_stmt = sqlite
-            .prepare(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-            )
-            .map_err(|e| e.to_string())?;
-        let mut tables = Vec::new();
-        while t_stmt.step().map_err(|e| e.to_string())? == StepResult::Row {
-            tables.push(t_stmt.column_text(0).map_err(|e| e.to_string())?);
-        }
         let mut count = 0usize;
-        for t in tables {
-            let mut p_stmt = sqlite
-                .prepare(&format!("PRAGMA table_info(\"{t}\")"))
-                .map_err(|e| e.to_string())?;
-            while p_stmt.step().map_err(|e| e.to_string())? == StepResult::Row {
-                let cname = p_stmt.column_text(1).map_err(|e| e.to_string())?;
-                let pk = p_stmt.column_int64(5) > 0;
-                if pk {
-                    srv_send_data_row(
-                        stream,
-                        &[Some(t.as_bytes().to_vec()), Some(cname.into_bytes())],
-                    )
+        for (sqlite_db, pg_schema) in collect_sqlite_schemas()? {
+            let master_sql = format!(
+                "SELECT name FROM \"{sqlite_db}\".sqlite_master \
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            );
+            let mut t_stmt = sqlite.prepare(&master_sql).map_err(|e| e.to_string())?;
+            let mut tables = Vec::new();
+            while t_stmt.step().map_err(|e| e.to_string())? == StepResult::Row {
+                tables.push(t_stmt.column_text(0).map_err(|e| e.to_string())?);
+            }
+            for t in tables {
+                let mut p_stmt = sqlite
+                    .prepare(&format!("PRAGMA \"{sqlite_db}\".table_info(\"{t}\")"))
                     .map_err(|e| e.to_string())?;
-                    count += 1;
+                while p_stmt.step().map_err(|e| e.to_string())? == StepResult::Row {
+                    let cname = p_stmt.column_text(1).map_err(|e| e.to_string())?;
+                    let pk = p_stmt.column_int64(5) > 0;
+                    if pk {
+                        srv_send_data_row(
+                            stream,
+                            &[
+                                Some(pg_schema.as_bytes().to_vec()),
+                                Some(t.as_bytes().to_vec()),
+                                Some(cname.into_bytes()),
+                            ],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        count += 1;
+                    }
                 }
             }
         }
@@ -1207,6 +1248,7 @@ fn execute_pg_on_sqlite(
         srv_send_row_desc(
             stream,
             &[
+                ("table_schema", oid::TEXT),
                 ("table_name", oid::TEXT),
                 ("column_name", oid::TEXT),
                 ("data_type", oid::TEXT),
@@ -1215,39 +1257,42 @@ fn execute_pg_on_sqlite(
             ],
         )
         .map_err(|e| e.to_string())?;
-        let mut t_stmt = sqlite
-            .prepare(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-            )
-            .map_err(|e| e.to_string())?;
-        let mut tables = Vec::new();
-        while t_stmt.step().map_err(|e| e.to_string())? == StepResult::Row {
-            tables.push(t_stmt.column_text(0).map_err(|e| e.to_string())?);
-        }
         let mut count = 0usize;
-        for t in tables {
-            let mut p_stmt = sqlite
-                .prepare(&format!("PRAGMA table_info(\"{t}\")"))
-                .map_err(|e| e.to_string())?;
-            while p_stmt.step().map_err(|e| e.to_string())? == StepResult::Row {
-                let cname = p_stmt.column_text(1).map_err(|e| e.to_string())?;
-                let decl = p_stmt.column_text(2).map_err(|e| e.to_string())?;
-                let notnull = p_stmt.column_int64(3) != 0;
-                let pk = p_stmt.column_int64(5) > 0;
-                let (dt, udt, _) = sqlite_decl_to_pg_meta(&decl);
-                let nullable = if !notnull && !pk { "YES" } else { "NO" };
-                srv_send_data_row(
-                    stream,
-                    &[
-                        Some(t.as_bytes().to_vec()),
-                        Some(cname.into_bytes()),
-                        Some(dt.as_bytes().to_vec()),
-                        Some(udt.as_bytes().to_vec()),
-                        Some(nullable.as_bytes().to_vec()),
-                    ],
-                )
-                .map_err(|e| e.to_string())?;
-                count += 1;
+        for (sqlite_db, pg_schema) in collect_sqlite_schemas()? {
+            let master_sql = format!(
+                "SELECT name FROM \"{sqlite_db}\".sqlite_master \
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            );
+            let mut t_stmt = sqlite.prepare(&master_sql).map_err(|e| e.to_string())?;
+            let mut tables = Vec::new();
+            while t_stmt.step().map_err(|e| e.to_string())? == StepResult::Row {
+                tables.push(t_stmt.column_text(0).map_err(|e| e.to_string())?);
+            }
+            for t in tables {
+                let mut p_stmt = sqlite
+                    .prepare(&format!("PRAGMA \"{sqlite_db}\".table_info(\"{t}\")"))
+                    .map_err(|e| e.to_string())?;
+                while p_stmt.step().map_err(|e| e.to_string())? == StepResult::Row {
+                    let cname = p_stmt.column_text(1).map_err(|e| e.to_string())?;
+                    let decl = p_stmt.column_text(2).map_err(|e| e.to_string())?;
+                    let notnull = p_stmt.column_int64(3) != 0;
+                    let pk = p_stmt.column_int64(5) > 0;
+                    let (dt, udt, _) = sqlite_decl_to_pg_meta(&decl);
+                    let nullable = if !notnull && !pk { "YES" } else { "NO" };
+                    srv_send_data_row(
+                        stream,
+                        &[
+                            Some(pg_schema.as_bytes().to_vec()),
+                            Some(t.as_bytes().to_vec()),
+                            Some(cname.into_bytes()),
+                            Some(dt.as_bytes().to_vec()),
+                            Some(udt.as_bytes().to_vec()),
+                            Some(nullable.as_bytes().to_vec()),
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    count += 1;
+                }
             }
         }
         srv_write_msg(stream, b'C', format!("SELECT {count}\0").as_bytes())
@@ -1966,6 +2011,205 @@ fn schema_lock_roundtrip_merge_and_drift_verification() -> TestResult {
         verify_table_against_lock(&merged, "Analytics", "orders", &missing_col),
         Err(DbError::SchemaDrift(_))
     ));
+
+    Ok(())
+}
+
+#[test]
+fn quote_sql_table_ref_and_multi_schema_lock_roundtrip() -> TestResult {
+    assert_eq!(quote_sql_table_ref("enrollments"), r#""enrollments""#);
+    assert_eq!(
+        quote_sql_table_ref("populi.enrollments"),
+        r#""populi"."enrollments""#
+    );
+    assert_eq!(
+        quote_sql_table_ref(r#"my"schema.my"tbl"#),
+        r#""my""schema"."my""tbl""#
+    );
+    assert_eq!(quote_sql_table_ref("a.b.c"), r#""a.b.c""#);
+    assert_eq!(quote_sql_table_ref(".leading"), r#"".leading""#);
+    assert_eq!(quote_sql_table_ref("trailing."), r#""trailing.""#);
+
+    let lock = SchemaLock {
+        version: 1,
+        dbs: vec![LockedDb {
+            name: "Wts".to_string(),
+            dialect: SqlDialect::Postgres,
+            tables: vec![
+                LockedTable {
+                    name: "populi.course_enrollments".to_string(),
+                    cols: vec![
+                        LockedCol {
+                            name: "id".to_string(),
+                            ty: ScalarTy::Int,
+                            nullable: false,
+                            pk: true,
+                            tags: TagSet::empty(),
+                        },
+                        LockedCol {
+                            name: "student_email".to_string(),
+                            ty: ScalarTy::Text,
+                            nullable: false,
+                            pk: false,
+                            tags: TagSet::singleton("pii"),
+                        },
+                    ],
+                },
+                LockedTable {
+                    name: "public_only".to_string(),
+                    cols: vec![],
+                },
+            ],
+        }],
+    };
+    let rendered = format_schema_lock(&lock);
+    let reparsed = parse_schema_lock(&rendered)?;
+    assert_eq!(reparsed, lock);
+
+    let db = &reparsed.dbs[0];
+    assert_eq!(
+        db.resolve_table("populi.course_enrollments")?.name,
+        "populi.course_enrollments"
+    );
+    assert_eq!(
+        db.resolve_table("POPULI.COURSE_ENROLLMENTS")?.name,
+        "populi.course_enrollments"
+    );
+    assert_eq!(
+        db.resolve_table("populi.CourseEnrollments")?.name,
+        "populi.course_enrollments"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn pg_type_mapping_and_extended_oid_decoding() -> TestResult {
+    assert_eq!(map_pg_type_name("json", "json"), ScalarTy::Text);
+    assert_eq!(map_pg_type_name("jsonb", "jsonb"), ScalarTy::Text);
+    assert_eq!(map_pg_type_name("uuid", "uuid"), ScalarTy::Text);
+    assert_eq!(
+        map_pg_type_name("character varying", "varchar"),
+        ScalarTy::Text
+    );
+    assert_eq!(map_pg_type_name("character", "bpchar"), ScalarTy::Text);
+    assert_eq!(map_pg_type_name("USER-DEFINED", "citext"), ScalarTy::Text);
+    assert_eq!(map_pg_type_name("name", "name"), ScalarTy::Text);
+    assert_eq!(map_pg_type_name("date", "date"), ScalarTy::Date);
+    assert_eq!(
+        map_pg_type_name("timestamp without time zone", "timestamp"),
+        ScalarTy::Timestamp
+    );
+    assert_eq!(
+        map_pg_type_name("timestamp with time zone", "timestamptz"),
+        ScalarTy::Timestamp
+    );
+    assert_eq!(map_pg_type_name("numeric", "numeric"), ScalarTy::Decimal);
+    assert_eq!(map_pg_type_name("decimal", "numeric"), ScalarTy::Decimal);
+
+    // Wire test with custom PostgreSQL RowDescriptions covering JSON, JSONB, UUID, CHAR/NAME, and citext (>= 16384)
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let srv_thread = thread::spawn(move || -> Result<(), String> {
+        let (mut tcp, _) = listener.accept().map_err(|e| e.to_string())?;
+        let mut len_buf = [0u8; 4];
+        tcp.read_exact(&mut len_buf).map_err(|e| e.to_string())?;
+        let startup_len = i32::from_be_bytes(len_buf) as usize;
+        let rest_len = startup_len.saturating_sub(4);
+        let mut rest = vec![0u8; rest_len];
+        tcp.read_exact(&mut rest).map_err(|e| e.to_string())?;
+        let mut stream = ServerStream::Plain(tcp);
+        srv_write_msg(&mut stream, b'R', &0i32.to_be_bytes()).map_err(|e| e.to_string())?;
+        srv_write_msg(&mut stream, b'Z', b"I").map_err(|e| e.to_string())?;
+
+        while let Ok(Some((tag, _payload))) = srv_read_msg(&mut stream) {
+            match tag {
+                b'P' => {
+                    srv_write_msg(&mut stream, b'1', &[]).map_err(|e| e.to_string())?;
+                }
+                b'B' => {
+                    srv_write_msg(&mut stream, b'2', &[]).map_err(|e| e.to_string())?;
+                }
+                b'D' => {}
+                b'Q' | b'E' => {
+                    srv_send_row_desc(
+                        &mut stream,
+                        &[
+                            ("j", oid::JSON),
+                            ("jb", oid::JSONB),
+                            ("u", oid::UUID),
+                            ("c", oid::CHAR),
+                            ("nm", oid::NAME),
+                            ("ci", 16_450),
+                            ("opt_u", oid::UUID),
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    srv_send_data_row(
+                        &mut stream,
+                        &[
+                            Some(br#"{"ok":true}"#.to_vec()),
+                            Some(br#"{"k":1}"#.to_vec()),
+                            Some(b"550e8400-e29b-41d4-a716-446655440000".to_vec()),
+                            Some(b"A".to_vec()),
+                            Some(b"pg_class".to_vec()),
+                            Some(b"CaseText".to_vec()),
+                            None,
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    srv_write_msg(&mut stream, b'C', b"SELECT 1\0").map_err(|e| e.to_string())?;
+                    if tag == b'Q' {
+                        srv_write_msg(&mut stream, b'Z', b"I").map_err(|e| e.to_string())?;
+                    }
+                }
+                b'S' => {
+                    srv_write_msg(&mut stream, b'Z', b"I").map_err(|e| e.to_string())?;
+                }
+                b'X' => break,
+                _ => {}
+            }
+        }
+        Ok(())
+    });
+
+    let uri = format!("postgres://u@127.0.0.1:{port}/app?sslmode=disable");
+    let mut conn = open_connection(&uri)?;
+    let schema = table_ty(vec![
+        col("j", ScalarTy::Text, &[]),
+        col("jb", ScalarTy::Text, &[]),
+        col("u", ScalarTy::Text, &[]),
+        col("c", ScalarTy::Text, &[]),
+        col("nm", ScalarTy::Text, &[]),
+        col("ci", ScalarTy::Text, &[]),
+        col("opt_u", opt(ScalarTy::Text), &[]),
+    ]);
+    let tv = conn.query_rows("SELECT j, jb, u, c, nm, ci, opt_u FROM t", &[], &schema)?;
+    assert_eq!(tv.rows.len(), 1);
+    assert!(val_eq(
+        &tv.rows[0].cells[0],
+        &Val::Text(r#"{"ok":true}"#.to_string())
+    ));
+    assert!(val_eq(
+        &tv.rows[0].cells[1],
+        &Val::Text(r#"{"k":1}"#.to_string())
+    ));
+    assert!(val_eq(
+        &tv.rows[0].cells[2],
+        &Val::Text("550e8400-e29b-41d4-a716-446655440000".to_string())
+    ));
+    assert!(val_eq(&tv.rows[0].cells[3], &Val::Text("A".to_string())));
+    assert!(val_eq(
+        &tv.rows[0].cells[4],
+        &Val::Text("pg_class".to_string())
+    ));
+    assert!(val_eq(
+        &tv.rows[0].cells[5],
+        &Val::Text("CaseText".to_string())
+    ));
+    assert!(val_eq(&tv.rows[0].cells[6], &Val::OptNone));
+    drop(conn);
+    let _ = srv_thread.join();
 
     Ok(())
 }

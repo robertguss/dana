@@ -594,6 +594,22 @@ pub trait DbConnection {
     /// Returns [`DbError`] on query or schema decoding failure.
     fn introspect_schema(&mut self, db_name: &str) -> Result<LockedDb, DbError>;
 
+    /// Introspect tables across an explicit list of schemas (PostgreSQL `table_schema IN (...)`).
+    ///
+    /// Drivers without schema namespaces (e.g. SQLite) ignore `schemas` and fall back to
+    /// [`DbConnection::introspect_schema`].
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on query, schema-name validation, or schema decoding failure.
+    fn introspect_schema_with_schemas(
+        &mut self,
+        db_name: &str,
+        schemas: &[String],
+    ) -> Result<LockedDb, DbError> {
+        let _ = schemas;
+        self.introspect_schema(db_name)
+    }
+
     /// Compute an [`UpsertDiff`] against `table` keyed by `key_col`.
     ///
     /// When `dry_run` is `true`, **zero write SQL statements** are executed.
@@ -720,6 +736,23 @@ pub fn quote_sql_ident(ident: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Strictly quote a SQL table reference, splitting a single schema prefix (`schema.table`)
+/// into `"schema"."table"` while delegating unqualified or malformed names to [`quote_sql_ident`].
+///
+/// **CRITICAL:** Use ONLY on table references (`FROM` / `JOIN` / `INSERT INTO` / `UPDATE`),
+/// never on column names or aliases.
+#[must_use]
+pub fn quote_sql_table_ref(table: &str) -> String {
+    if let Some((schema, rel)) = table.split_once('.')
+        && !schema.is_empty()
+        && !rel.is_empty()
+        && !rel.contains('.')
+    {
+        return format!("{}.{}", quote_sql_ident(schema), quote_sql_ident(rel));
+    }
+    quote_sql_ident(table)
 }
 
 /// Format a `10^-18`-scaled [`BigInt`] `Decimal` into its lossless canonical ASCII string.

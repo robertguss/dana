@@ -33,7 +33,7 @@ use super::schema_lock::{LockedCol, LockedDb, LockedTable};
 use super::{
     ColumnarBatchBuilder, DbConnection, DbError, PostgresUri, SqlDialect, SqlParam, SslMode,
     UpsertDiff, compute_upsert_diff, format_decimal_canonical, hex_nibble, make_table_row,
-    parse_iso_timestamp_flexible, quote_sql_ident,
+    parse_iso_timestamp_flexible, quote_sql_ident, quote_sql_table_ref,
 };
 
 const PG_PROTOCOL_V3: i32 = 196_608; // 3 << 16
@@ -42,15 +42,19 @@ const PG_SSL_REQUEST_CODE: i32 = 80_877_103;
 const PG_EPOCH_DAYS: i64 = 10_957;
 const PG_EPOCH_MICROS: i64 = PG_EPOCH_DAYS * MICROS_PER_DAY;
 const MAX_WIRE_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const PG_FIRST_NORMAL_OBJECT_ID: u32 = 16_384;
 
 /// Standard PostgreSQL type OIDs.
 pub mod oid {
     pub const BOOL: u32 = 16;
     pub const BYTEA: u32 = 17;
+    pub const CHAR: u32 = 18;
+    pub const NAME: u32 = 19;
     pub const INT8: u32 = 20;
     pub const INT2: u32 = 21;
     pub const INT4: u32 = 23;
     pub const TEXT: u32 = 25;
+    pub const JSON: u32 = 114;
     pub const FLOAT4: u32 = 700;
     pub const FLOAT8: u32 = 701;
     pub const BPCHAR: u32 = 1042;
@@ -60,6 +64,8 @@ pub mod oid {
     pub const TIMESTAMPTZ: u32 = 1184;
     pub const INTERVAL: u32 = 1186;
     pub const NUMERIC: u32 = 1700;
+    pub const UUID: u32 = 2950;
+    pub const JSONB: u32 = 3802;
 }
 
 enum PgTransport {
@@ -152,6 +158,128 @@ impl PostgresDriver {
     #[must_use]
     pub fn server_param(&self, key: &str) -> Option<&str> {
         self.server_params.get(key).map(String::as_str)
+    }
+
+    /// Introspect tables across one or more PostgreSQL schemas using parameterized
+    /// `information_schema` queries.
+    ///
+    /// Tables in `"public"` keep unqualified names (`"orders"`), while tables in any
+    /// other schema are named `"<schema>.<table>"` (e.g. `"populi.enrollments"`).
+    ///
+    /// # Errors
+    /// Returns [`DbError`] if `schemas` contains invalid identifiers or the catalog query fails.
+    pub fn introspect_schema_with_schemas(
+        &mut self,
+        db_name: &str,
+        schemas: &[String],
+    ) -> Result<LockedDb, DbError> {
+        let mut normalized: Vec<String> = Vec::new();
+        if schemas.is_empty() {
+            normalized.push("public".to_string());
+        } else {
+            for raw in schemas {
+                let s = raw.trim();
+                if s.is_empty()
+                    || s.contains(char::is_whitespace)
+                    || s.as_bytes().contains(&0)
+                    || s.chars().any(char::is_control)
+                {
+                    return Err(DbError::Query(format!(
+                        "invalid PostgreSQL schema name `{raw}`"
+                    )));
+                }
+                if !normalized.iter().any(|existing| existing == s) {
+                    normalized.push(s.to_string());
+                }
+            }
+        }
+
+        let placeholders: Vec<String> = (1..=normalized.len()).map(|i| format!("${i}")).collect();
+        let in_list = placeholders.join(", ");
+        let schema_params: Vec<SqlParam> = normalized.into_iter().map(SqlParam::Text).collect();
+
+        let mut pk_set: HashSet<(String, String, String)> = HashSet::new();
+        let pk_sql = format!(
+            "SELECT tc.table_schema, tc.table_name, kcu.column_name \
+             FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu \
+               ON tc.constraint_name = kcu.constraint_name \
+              AND tc.table_schema = kcu.table_schema \
+              AND tc.table_name = kcu.table_name \
+             WHERE tc.constraint_type = 'PRIMARY KEY' \
+               AND tc.table_schema IN ({in_list})"
+        );
+        self.run_extended_query(&pk_sql, &schema_params, |_fields, cells| {
+            if cells.len() >= 3
+                && let (Some(s), Some(t), Some(c)) = (cells[0], cells[1], cells[2])
+            {
+                let sn = String::from_utf8_lossy(s).into_owned();
+                let tn = String::from_utf8_lossy(t).into_owned();
+                let cn = String::from_utf8_lossy(c).into_owned();
+                pk_set.insert((sn, tn, cn));
+            }
+            Ok(())
+        })?;
+
+        let mut table_order: Vec<String> = Vec::new();
+        let mut table_cols: HashMap<String, Vec<LockedCol>> = HashMap::new();
+
+        let cols_sql = format!(
+            "SELECT table_schema, table_name, column_name, data_type, udt_name, is_nullable \
+             FROM information_schema.columns \
+             WHERE table_schema IN ({in_list}) \
+             ORDER BY table_schema, table_name, ordinal_position"
+        );
+        self.run_extended_query(&cols_sql, &schema_params, |_fields, cells| {
+            if cells.len() < 6 {
+                return Err(DbError::SchemaDrift(
+                    "information_schema.columns returned fewer than 6 columns".to_string(),
+                ));
+            }
+            let table_schema = decode_utf8_cell(cells[0], "table_schema")?;
+            let table_name = decode_utf8_cell(cells[1], "table_name")?;
+            let col_name = decode_utf8_cell(cells[2], "column_name")?;
+            let data_type = decode_utf8_cell(cells[3], "data_type")?;
+            let udt_name = decode_utf8_cell(cells[4], "udt_name")?;
+            let is_nullable_str = decode_utf8_cell(cells[5], "is_nullable")?;
+            let pk = pk_set.contains(&(table_schema.clone(), table_name.clone(), col_name.clone()));
+            let nullable = is_nullable_str.eq_ignore_ascii_case("YES") && !pk;
+
+            let qualified_name = if table_schema == "public" {
+                table_name
+            } else {
+                format!("{table_schema}.{table_name}")
+            };
+
+            if !table_cols.contains_key(&qualified_name) {
+                table_order.push(qualified_name.clone());
+            }
+            table_cols
+                .entry(qualified_name)
+                .or_default()
+                .push(LockedCol {
+                    name: col_name,
+                    ty: map_pg_type_name(&data_type, &udt_name),
+                    nullable,
+                    pk,
+                    tags: TagSet::empty(),
+                });
+            Ok(())
+        })?;
+
+        let tables = table_order
+            .into_iter()
+            .map(|name| LockedTable {
+                cols: table_cols.remove(&name).unwrap_or_default(),
+                name,
+            })
+            .collect();
+
+        Ok(LockedDb {
+            name: db_name.to_string(),
+            dialect: SqlDialect::Postgres,
+            tables,
+        })
     }
 
     fn read_exact_buffered(&mut self, mut dst: &mut [u8]) -> Result<(), DbError> {
@@ -602,72 +730,15 @@ impl DbConnection for PostgresDriver {
     }
 
     fn introspect_schema(&mut self, db_name: &str) -> Result<LockedDb, DbError> {
-        let mut pk_set: HashSet<(String, String)> = HashSet::new();
-        let pk_sql = "SELECT tc.table_name, kcu.column_name \
-                      FROM information_schema.table_constraints tc \
-                      JOIN information_schema.key_column_usage kcu \
-                        ON tc.constraint_name = kcu.constraint_name \
-                       AND tc.table_schema = kcu.table_schema \
-                      WHERE tc.constraint_type = 'PRIMARY KEY' \
-                        AND tc.table_schema = 'public'";
-        self.run_extended_query(pk_sql, &[], |_fields, cells| {
-            if cells.len() >= 2
-                && let (Some(t), Some(c)) = (cells[0], cells[1])
-            {
-                let tn = String::from_utf8_lossy(t).into_owned();
-                let cn = String::from_utf8_lossy(c).into_owned();
-                pk_set.insert((tn, cn));
-            }
-            Ok(())
-        })?;
+        self.introspect_schema_with_schemas(db_name, &[String::from("public")])
+    }
 
-        let mut table_order: Vec<String> = Vec::new();
-        let mut table_cols: HashMap<String, Vec<LockedCol>> = HashMap::new();
-
-        let cols_sql = "SELECT table_name, column_name, data_type, udt_name, is_nullable \
-                        FROM information_schema.columns \
-                        WHERE table_schema = 'public' \
-                        ORDER BY table_name, ordinal_position";
-        self.run_extended_query(cols_sql, &[], |_fields, cells| {
-            if cells.len() < 5 {
-                return Err(DbError::SchemaDrift(
-                    "information_schema.columns returned fewer than 5 columns".to_string(),
-                ));
-            }
-            let table_name = decode_utf8_cell(cells[0], "table_name")?;
-            let col_name = decode_utf8_cell(cells[1], "column_name")?;
-            let data_type = decode_utf8_cell(cells[2], "data_type")?;
-            let udt_name = decode_utf8_cell(cells[3], "udt_name")?;
-            let is_nullable_str = decode_utf8_cell(cells[4], "is_nullable")?;
-            let pk = pk_set.contains(&(table_name.clone(), col_name.clone()));
-            let nullable = is_nullable_str.eq_ignore_ascii_case("YES") && !pk;
-
-            if !table_cols.contains_key(&table_name) {
-                table_order.push(table_name.clone());
-            }
-            table_cols.entry(table_name).or_default().push(LockedCol {
-                name: col_name,
-                ty: map_pg_type_name(&data_type, &udt_name),
-                nullable,
-                pk,
-                tags: TagSet::empty(),
-            });
-            Ok(())
-        })?;
-
-        let tables = table_order
-            .into_iter()
-            .map(|name| LockedTable {
-                cols: table_cols.remove(&name).unwrap_or_default(),
-                name,
-            })
-            .collect();
-
-        Ok(LockedDb {
-            name: db_name.to_string(),
-            dialect: SqlDialect::Postgres,
-            tables,
-        })
+    fn introspect_schema_with_schemas(
+        &mut self,
+        db_name: &str,
+        schemas: &[String],
+    ) -> Result<LockedDb, DbError> {
+        Self::introspect_schema_with_schemas(self, db_name, schemas)
     }
 
     fn upsert_table(
@@ -692,7 +763,7 @@ impl DbConnection for PostgresDriver {
                 ))
             })?;
 
-        let quoted_table = quote_sql_ident(table);
+        let quoted_table = quote_sql_table_ref(table);
         let quoted_cols: Vec<String> = data.cols.iter().map(|c| quote_sql_ident(&c.name)).collect();
         let quoted_key = quote_sql_ident(key_col);
 
@@ -924,12 +995,15 @@ pub fn fuzz_decode_pg_payload(tag: u8, payload: &[u8]) {
         0,
         oid::BOOL,
         oid::BYTEA,
+        oid::CHAR,
+        oid::NAME,
         oid::INT2,
         oid::INT4,
         oid::INT8,
         oid::FLOAT4,
         oid::FLOAT8,
         oid::TEXT,
+        oid::JSON,
         oid::VARCHAR,
         oid::BPCHAR,
         oid::DATE,
@@ -937,6 +1011,8 @@ pub fn fuzz_decode_pg_payload(tag: u8, payload: &[u8]) {
         oid::TIMESTAMPTZ,
         oid::INTERVAL,
         oid::NUMERIC,
+        oid::UUID,
+        oid::JSONB,
         999_999,
     ];
     let all_tys = [
@@ -1305,7 +1381,19 @@ fn oid_compatible_with_scalar(type_oid: u32, base: &ScalarTy) -> bool {
             type_oid,
             oid::FLOAT4 | oid::FLOAT8 | oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC
         ),
-        ScalarTy::Text => matches!(type_oid, oid::TEXT | oid::VARCHAR | oid::BPCHAR),
+        ScalarTy::Text => {
+            matches!(
+                type_oid,
+                oid::TEXT
+                    | oid::VARCHAR
+                    | oid::BPCHAR
+                    | oid::CHAR
+                    | oid::NAME
+                    | oid::JSON
+                    | oid::JSONB
+                    | oid::UUID
+            ) || type_oid >= PG_FIRST_NORMAL_OBJECT_ID
+        }
         ScalarTy::Bytes => type_oid == oid::BYTEA,
         ScalarTy::Date => matches!(type_oid, oid::DATE | oid::TEXT | oid::VARCHAR),
         ScalarTy::Timestamp => matches!(
@@ -1414,6 +1502,33 @@ fn decode_pg_binary(
         }
         ScalarTy::Bytes => Ok(Val::Bytes(bytes.to_vec())),
         ScalarTy::Text => {
+            if type_oid == oid::JSONB && bytes.first() == Some(&1) {
+                let s = std::str::from_utf8(&bytes[1..]).map_err(|e| {
+                    DbError::TypeConversion(format!("column `{col_name}` JSONB UTF-8: {e}"))
+                })?;
+                return Ok(Val::Text(s.to_string()));
+            }
+            if type_oid == oid::UUID && bytes.len() == 16 {
+                return Ok(Val::Text(format!(
+                    "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    bytes[0],
+                    bytes[1],
+                    bytes[2],
+                    bytes[3],
+                    bytes[4],
+                    bytes[5],
+                    bytes[6],
+                    bytes[7],
+                    bytes[8],
+                    bytes[9],
+                    bytes[10],
+                    bytes[11],
+                    bytes[12],
+                    bytes[13],
+                    bytes[14],
+                    bytes[15]
+                )));
+            }
             let s = std::str::from_utf8(bytes)
                 .map_err(|e| DbError::TypeConversion(format!("column `{col_name}` UTF-8: {e}")))?;
             Ok(Val::Text(s.to_string()))
@@ -1710,7 +1825,9 @@ fn decode_utf8_cell(cell: Option<&[u8]>, name: &str) -> Result<String, DbError> 
         .map_err(|e| DbError::SchemaDrift(format!("invalid UTF-8 in {name}: {e}")))
 }
 
-fn map_pg_type_name(data_type: &str, udt_name: &str) -> ScalarTy {
+/// Map PostgreSQL `information_schema.columns` (`data_type`, `udt_name`) pairs to Dana [`ScalarTy`].
+#[must_use]
+pub fn map_pg_type_name(data_type: &str, udt_name: &str) -> ScalarTy {
     let dt = data_type.trim().to_ascii_lowercase();
     let udt = udt_name.trim().to_ascii_lowercase();
     match (dt.as_str(), udt.as_str()) {
@@ -1723,6 +1840,15 @@ fn map_pg_type_name(data_type: &str, udt_name: &str) -> ScalarTy {
         (_, "timestamp" | "timestamptz") => ScalarTy::Timestamp,
         ("interval", _) | (_, "interval") => ScalarTy::Duration,
         (s, _) if s.starts_with("timestamp") => ScalarTy::Timestamp,
+        (
+            "text" | "character varying" | "character" | "varchar" | "bpchar" | "char" | "citext"
+            | "name" | "uuid" | "json" | "jsonb",
+            _,
+        )
+        | (
+            _,
+            "text" | "varchar" | "bpchar" | "char" | "citext" | "name" | "uuid" | "json" | "jsonb",
+        ) => ScalarTy::Text,
         _ => ScalarTy::Text,
     }
 }

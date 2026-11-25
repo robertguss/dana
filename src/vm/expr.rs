@@ -17,6 +17,11 @@ use crate::formats::time::{
 };
 use crate::oracle::eval::{PrimResult, eval_literal, eval_prim_op};
 use crate::oracle::value::{Bug, Val, float_order_key, render_decimal};
+use crate::runtime::exec::{
+    bigint_to_slice_bound, clamp_decimal_val, clamp_float_val, clamp_int_bigint, eval_in_list,
+    round_to_float_val, slice_text, try_parse_date_text, try_parse_decimal_text,
+    try_parse_float_text, try_parse_int_text,
+};
 use crate::runtime::ir::{ExecExpr, ExecPrimOp, ExecProgram, ExecRowExpr};
 use crate::vm::batch::{Batch, Column, ColumnData, NullBitmap};
 use crate::vm::decimal::{
@@ -1926,6 +1931,202 @@ fn eval_vec_prim(
                 }));
             }
         }
+        (ExecPrimOp::LowerText, &[ra]) => {
+            if let RegVal::Text { offsets, data } = &regs[ra] {
+                let mut is_active = vec![false; batch_len];
+                for &l in active {
+                    is_active[usize::from(l)] = true;
+                }
+                let mut out_offsets = Vec::with_capacity(batch_len + 1);
+                let mut out_data = Vec::with_capacity(data.len());
+                out_offsets.push(0);
+                for (i, &active_lane) in is_active.iter().enumerate() {
+                    if active_lane
+                        && let Ok(s) = std::str::from_utf8(&data[offsets[i]..offsets[i + 1]])
+                    {
+                        out_data.extend_from_slice(s.to_lowercase().as_bytes());
+                    }
+                    out_offsets.push(out_data.len());
+                }
+                return Ok(RegVal::Text {
+                    offsets: out_offsets,
+                    data: out_data,
+                });
+            }
+        }
+        (ExecPrimOp::UpperText, &[ra]) => {
+            if let RegVal::Text { offsets, data } = &regs[ra] {
+                let mut is_active = vec![false; batch_len];
+                for &l in active {
+                    is_active[usize::from(l)] = true;
+                }
+                let mut out_offsets = Vec::with_capacity(batch_len + 1);
+                let mut out_data = Vec::with_capacity(data.len());
+                out_offsets.push(0);
+                for (i, &active_lane) in is_active.iter().enumerate() {
+                    if active_lane
+                        && let Ok(s) = std::str::from_utf8(&data[offsets[i]..offsets[i + 1]])
+                    {
+                        out_data.extend_from_slice(s.to_uppercase().as_bytes());
+                    }
+                    out_offsets.push(out_data.len());
+                }
+                return Ok(RegVal::Text {
+                    offsets: out_offsets,
+                    data: out_data,
+                });
+            }
+        }
+        (op_sw @ (ExecPrimOp::StartsWithText | ExecPrimOp::EndsWithText), &[ra, rb]) => {
+            let is_starts = matches!(op_sw, ExecPrimOp::StartsWithText);
+            match (&regs[ra], &regs[rb]) {
+                (RegVal::Text { offsets, data }, RegVal::Broadcast(Val::Text(pat))) => {
+                    let pb = pat.as_bytes();
+                    let mut out = vec![0u8; batch_len];
+                    for &l in active {
+                        let i = usize::from(l);
+                        let sb = &data[offsets[i]..offsets[i + 1]];
+                        let m = if is_starts {
+                            sb.starts_with(pb)
+                        } else {
+                            sb.ends_with(pb)
+                        };
+                        out[i] = u8::from(m);
+                    }
+                    return Ok(RegVal::Bool(out));
+                }
+                (
+                    RegVal::Text {
+                        offsets: oa,
+                        data: da,
+                    },
+                    RegVal::Text {
+                        offsets: ob,
+                        data: db,
+                    },
+                ) => {
+                    let mut out = vec![0u8; batch_len];
+                    for &l in active {
+                        let i = usize::from(l);
+                        let sb = &da[oa[i]..oa[i + 1]];
+                        let pb = &db[ob[i]..ob[i + 1]];
+                        let m = if is_starts {
+                            sb.starts_with(pb)
+                        } else {
+                            sb.ends_with(pb)
+                        };
+                        out[i] = u8::from(m);
+                    }
+                    return Ok(RegVal::Bool(out));
+                }
+                _ => {}
+            }
+        }
+        (ExecPrimOp::ClampInt, &[ra, rb, rc]) => {
+            if let (
+                RegVal::Int(xs),
+                RegVal::Broadcast(Val::Int(lo_b)),
+                RegVal::Broadcast(Val::Int(hi_b)),
+            ) = (&regs[ra], &regs[rb], &regs[rc])
+            {
+                if lo_b > hi_b {
+                    if let Some(&l) = active.first() {
+                        return Err(RowEvalErr::Stopped {
+                            lane: usize::from(l),
+                            bug: Bug {
+                                kind: BugKind::OutsideBoundary,
+                                message: format!(
+                                    "DomainError: clamp bounds invalid ({lo_b} > {hi_b})"
+                                ),
+                            },
+                        });
+                    }
+                    return Ok(RegVal::Int(vec![0i64; batch_len]));
+                }
+                if let (Some(lo), Some(hi)) = (lo_b.to_i64(), hi_b.to_i64()) {
+                    let mut out = vec![0i64; batch_len];
+                    for &l in active {
+                        let i = usize::from(l);
+                        out[i] = xs[i].clamp(lo, hi);
+                    }
+                    return Ok(RegVal::Int(out));
+                }
+            }
+        }
+        (ExecPrimOp::ClampFloat, &[ra, rb, rc]) => {
+            if let (
+                RegVal::Float(xs),
+                RegVal::Broadcast(Val::Float(lo_v)),
+                RegVal::Broadcast(Val::Float(hi_v)),
+            ) = (&regs[ra], &regs[rb], &regs[rc])
+            {
+                let mut out = vec![0u64; batch_len];
+                for &l in active {
+                    let i = usize::from(l);
+                    let res = clamp_float_val(Float64::from_bits(xs[i]), *lo_v, *hi_v)
+                        .map_err(|bug| RowEvalErr::Stopped { lane: i, bug })?;
+                    out[i] = res.bits;
+                }
+                return Ok(RegVal::Float(out));
+            }
+        }
+        (ExecPrimOp::ClampDecimal, &[ra, rb, rc]) => {
+            if let (
+                RegVal::Decimal(xs),
+                RegVal::Broadcast(Val::Decimal(lo_b)),
+                RegVal::Broadcast(Val::Decimal(hi_b)),
+            ) = (&regs[ra], &regs[rb], &regs[rc])
+            {
+                if lo_b > hi_b {
+                    if let Some(&l) = active.first() {
+                        return Err(RowEvalErr::Stopped {
+                            lane: usize::from(l),
+                            bug: Bug {
+                                kind: BugKind::OutsideBoundary,
+                                message: format!(
+                                    "DomainError: clamp bounds invalid ({} > {})",
+                                    render_decimal(lo_b),
+                                    render_decimal(hi_b)
+                                ),
+                            },
+                        });
+                    }
+                    return Ok(RegVal::Decimal(vec![0i128; batch_len]));
+                }
+                if let (Some(lo), Some(hi)) = (lo_b.to_i128(), hi_b.to_i128()) {
+                    let mut out = vec![0i128; batch_len];
+                    for &l in active {
+                        let i = usize::from(l);
+                        out[i] = xs[i].clamp(lo, hi);
+                    }
+                    return Ok(RegVal::Decimal(out));
+                }
+            }
+        }
+        (ExecPrimOp::RoundToFloat, &[ra, rb]) => {
+            if let (RegVal::Float(xs), RegVal::Broadcast(Val::Float(step_v))) =
+                (&regs[ra], &regs[rb])
+            {
+                let mut out = vec![0u64; batch_len];
+                for &l in active {
+                    let i = usize::from(l);
+                    let res = round_to_float_val(Float64::from_bits(xs[i]), *step_v)
+                        .map_err(|bug| RowEvalErr::Stopped { lane: i, bug })?;
+                    out[i] = res.bits;
+                }
+                return Ok(RegVal::Float(out));
+            }
+        }
+        (ExecPrimOp::InList, &[ra, rb]) => {
+            if let RegVal::Broadcast(Val::List(elems)) = &regs[rb] {
+                if elems.is_empty() {
+                    return Ok(RegVal::Bool(vec![0u8; batch_len]));
+                }
+                if let Some(res) = try_in_list_vec(&regs[ra], elems, batch_len, active) {
+                    return Ok(RegVal::Bool(res));
+                }
+            }
+        }
         _ => {}
     }
 
@@ -1941,6 +2142,119 @@ fn eval_vec_prim(
         out[lane] = eval_scalar_exec_prim(op, &vals, lane)?;
     }
     Ok(RegVal::Generic(out))
+}
+
+fn try_in_list_vec(
+    ra: &RegVal,
+    elems: &[Val],
+    batch_len: usize,
+    active: &[u16],
+) -> Option<Vec<u8>> {
+    match ra {
+        RegVal::Int(xs) => {
+            let targets: Option<Vec<i64>> = elems
+                .iter()
+                .map(|v| match v {
+                    Val::Int(n) => n.to_i64(),
+                    _ => None,
+                })
+                .collect();
+            let targets = targets?;
+            let mut out = vec![0u8; batch_len];
+            for &l in active {
+                let i = usize::from(l);
+                out[i] = u8::from(targets.contains(&xs[i]));
+            }
+            Some(out)
+        }
+        RegVal::Date(xs) => {
+            let targets: Option<Vec<i64>> = elems
+                .iter()
+                .map(|v| match v {
+                    Val::Date(d) => d.to_i64(),
+                    _ => None,
+                })
+                .collect();
+            let targets = targets?;
+            let mut out = vec![0u8; batch_len];
+            for &l in active {
+                let i = usize::from(l);
+                out[i] = u8::from(targets.contains(&xs[i]));
+            }
+            Some(out)
+        }
+        RegVal::Bool(xs) => {
+            let targets: Option<Vec<u8>> = elems
+                .iter()
+                .map(|v| match v {
+                    Val::Bool(b) => Some(u8::from(*b)),
+                    _ => None,
+                })
+                .collect();
+            let targets = targets?;
+            let mut out = vec![0u8; batch_len];
+            for &l in active {
+                let i = usize::from(l);
+                out[i] = u8::from(targets.contains(&xs[i]));
+            }
+            Some(out)
+        }
+        RegVal::Text { offsets, data } => {
+            let targets: Option<Vec<&[u8]>> = elems
+                .iter()
+                .map(|v| match v {
+                    Val::Text(s) => Some(s.as_bytes()),
+                    _ => None,
+                })
+                .collect();
+            let targets = targets?;
+            let mut out = vec![0u8; batch_len];
+            for &l in active {
+                let i = usize::from(l);
+                let slice = &data[offsets[i]..offsets[i + 1]];
+                out[i] = u8::from(targets.contains(&slice));
+            }
+            Some(out)
+        }
+        RegVal::Nullable { data, validity } => match data.as_ref() {
+            ColumnData::Int(xs) => {
+                let targets: Option<Vec<i64>> = elems
+                    .iter()
+                    .map(|v| match v {
+                        Val::Int(n) => n.to_i64(),
+                        _ => None,
+                    })
+                    .collect();
+                let targets = targets?;
+                let mut out = vec![0u8; batch_len];
+                for &l in active {
+                    let i = usize::from(l);
+                    out[i] = u8::from(validity.is_valid(i) && targets.contains(&xs[i]));
+                }
+                Some(out)
+            }
+            ColumnData::Text { offsets, data } => {
+                let targets: Option<Vec<&[u8]>> = elems
+                    .iter()
+                    .map(|v| match v {
+                        Val::Text(s) => Some(s.as_bytes()),
+                        _ => None,
+                    })
+                    .collect();
+                let targets = targets?;
+                let mut out = vec![0u8; batch_len];
+                for &l in active {
+                    let i = usize::from(l);
+                    let hit = validity.is_valid(i)
+                        && targets.contains(&&data[offsets[i]..offsets[i + 1]]);
+                    out[i] = u8::from(hit);
+                }
+                Some(out)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn try_bin_i64<F>(
@@ -2609,6 +2923,94 @@ pub fn eval_scalar_exec_prim(
             },
             _ => Err(RowEvalErr::Failed(
                 "ListFirstBang requires List".to_string(),
+            )),
+        },
+        ExecPrimOp::LowerText => match args {
+            [Val::Text(s)] => Ok(Val::Text(s.to_lowercase())),
+            _ => Err(RowEvalErr::Failed("LowerText requires Text".to_string())),
+        },
+        ExecPrimOp::UpperText => match args {
+            [Val::Text(s)] => Ok(Val::Text(s.to_uppercase())),
+            _ => Err(RowEvalErr::Failed("UpperText requires Text".to_string())),
+        },
+        ExecPrimOp::SliceText => match args {
+            [Val::Text(s), Val::Int(start), Val::Int(len)] => {
+                let st = bigint_to_slice_bound(start);
+                let ln = bigint_to_slice_bound(len);
+                Ok(Val::Text(slice_text(s, st, ln)))
+            }
+            _ => Err(RowEvalErr::Failed(
+                "SliceText requires (Text, Int, Int)".to_string(),
+            )),
+        },
+        ExecPrimOp::StartsWithText => match args {
+            [Val::Text(s), Val::Text(prefix)] => Ok(Val::Bool(s.starts_with(prefix.as_str()))),
+            _ => Err(RowEvalErr::Failed(
+                "StartsWithText requires (Text, Text)".to_string(),
+            )),
+        },
+        ExecPrimOp::EndsWithText => match args {
+            [Val::Text(s), Val::Text(suffix)] => Ok(Val::Bool(s.ends_with(suffix.as_str()))),
+            _ => Err(RowEvalErr::Failed(
+                "EndsWithText requires (Text, Text)".to_string(),
+            )),
+        },
+        ExecPrimOp::TryParseDate => match args {
+            [Val::Text(s)] => Ok(try_parse_date_text(s)),
+            _ => Err(RowEvalErr::Failed("TryParseDate requires Text".to_string())),
+        },
+        ExecPrimOp::TryParseInt => match args {
+            [Val::Text(s)] => Ok(try_parse_int_text(s)),
+            _ => Err(RowEvalErr::Failed("TryParseInt requires Text".to_string())),
+        },
+        ExecPrimOp::TryParseDecimal => match args {
+            [Val::Text(s)] => Ok(try_parse_decimal_text(s)),
+            _ => Err(RowEvalErr::Failed(
+                "TryParseDecimal requires Text".to_string(),
+            )),
+        },
+        ExecPrimOp::TryParseFloat => match args {
+            [Val::Text(s)] => Ok(try_parse_float_text(s)),
+            _ => Err(RowEvalErr::Failed(
+                "TryParseFloat requires Text".to_string(),
+            )),
+        },
+        ExecPrimOp::InList => match args {
+            [v, Val::List(xs)] => Ok(Val::Bool(eval_in_list(v, xs))),
+            _ => Err(RowEvalErr::Failed(
+                "InList requires (Val, List)".to_string(),
+            )),
+        },
+        ExecPrimOp::ClampInt => match args {
+            [Val::Int(x), Val::Int(lo), Val::Int(hi)] => clamp_int_bigint(x, lo, hi)
+                .map(Val::Int)
+                .map_err(|bug| RowEvalErr::Stopped { lane, bug }),
+            _ => Err(RowEvalErr::Failed(
+                "ClampInt requires (Int, Int, Int)".to_string(),
+            )),
+        },
+        ExecPrimOp::ClampFloat => match args {
+            [Val::Float(x), Val::Float(lo), Val::Float(hi)] => clamp_float_val(*x, *lo, *hi)
+                .map(Val::Float)
+                .map_err(|bug| RowEvalErr::Stopped { lane, bug }),
+            _ => Err(RowEvalErr::Failed(
+                "ClampFloat requires (Float, Float, Float)".to_string(),
+            )),
+        },
+        ExecPrimOp::ClampDecimal => match args {
+            [Val::Decimal(x), Val::Decimal(lo), Val::Decimal(hi)] => clamp_decimal_val(x, lo, hi)
+                .map(Val::Decimal)
+                .map_err(|bug| RowEvalErr::Stopped { lane, bug }),
+            _ => Err(RowEvalErr::Failed(
+                "ClampDecimal requires (Decimal, Decimal, Decimal)".to_string(),
+            )),
+        },
+        ExecPrimOp::RoundToFloat => match args {
+            [Val::Float(x), Val::Float(step)] => round_to_float_val(*x, *step)
+                .map(Val::Float)
+                .map_err(|bug| RowEvalErr::Stopped { lane, bug }),
+            _ => Err(RowEvalErr::Failed(
+                "RoundToFloat requires (Float, Float)".to_string(),
             )),
         },
         _ => Err(RowEvalErr::Failed(format!(

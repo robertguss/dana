@@ -1182,3 +1182,191 @@ end
     );
     Ok(())
 }
+
+#[test]
+fn e2e_schema_sync_schemas_cli_validation_and_multi_schema_explain() -> TestResult {
+    let tmp = TempDir::new("v05_schemas_cli")?;
+    let db_path = tmp.path().join("app.db");
+    let uri = sqlite_uri(&db_path);
+    let mut conn = open_connection(&uri)?;
+    conn.execute(
+        r#"CREATE TABLE "users" ("id" INTEGER PRIMARY KEY NOT NULL, "email" TEXT NOT NULL)"#,
+        &[],
+    )?;
+    drop(conn);
+
+    let db_arg = format!("App={uri}");
+    let lock_path = tmp.path().join("schema.lock");
+    let lock_str = lock_path.to_string_lossy().to_string();
+
+    // Invalid empty `--schemas`
+    let (bad_empty_code, _, bad_empty_err) = run_dana_cmd(
+        &[
+            "schema-sync",
+            "--db",
+            &db_arg,
+            "--schemas",
+            "",
+            "--out",
+            &lock_str,
+        ],
+        Some(tmp.path()),
+    )?;
+    assert_ne!(bad_empty_code, 0);
+    assert!(
+        bad_empty_err.contains("--schemas"),
+        "expected `--schemas` validation error, got: {bad_empty_err}"
+    );
+
+    // Invalid whitespace schema name in `--schemas=...`
+    let (bad_ws_code, _, bad_ws_err) = run_dana_cmd(
+        &[
+            "schema-sync",
+            "--db",
+            &db_arg,
+            "--schemas=populi,bad schema",
+            "--out",
+            &lock_str,
+        ],
+        Some(tmp.path()),
+    )?;
+    assert_ne!(bad_ws_code, 0);
+    assert!(
+        bad_ws_err.contains("invalid schema name"),
+        "expected invalid schema name error, got: {bad_ws_err}"
+    );
+
+    // Valid `--schemas` succeeds on SQLite fallback and creates lock file
+    let (ok_code, _, ok_err) = run_dana_cmd(
+        &[
+            "schema-sync",
+            "--db",
+            &db_arg,
+            "--schemas",
+            "public,analytics",
+            "--out",
+            &lock_str,
+        ],
+        Some(tmp.path()),
+    )?;
+    assert_eq!(ok_code, 0, "schema-sync --schemas failed:\n{ok_err}");
+    let synced = parse_schema_lock(&fs::read_to_string(&lock_path)?)?;
+    assert_eq!(synced.dbs.len(), 1);
+
+    // Offline Postgres schema.lock with qualified `populi.enrollments` + `from:` + `count_if`
+    let pg_lock = tmp.path().join("pg_schema.lock");
+    fs::write(
+        &pg_lock,
+        r#"version 1
+
+db Wts dialect postgres
+  table "populi.enrollments"
+    col id: Int pk
+    col student_email: Text tags [pii]
+    col term: Text
+    col score: Int
+    col fee: Decimal tags [financial]
+  end
+end
+"#,
+    )?;
+    let parsed_pg = parse_schema_lock(&fs::read_to_string(&pg_lock)?)?;
+
+    let good_src = r#"module WtsExplain
+
+schema Enrollment
+  id: Int
+  student_email: Text [pii]
+  term: Text
+  score: Int
+  fee: Decimal [financial]
+end
+
+fn main(db: ReadDB(Wts), c: Console) : Int
+  res = db.table(Enrollment, from: "populi.enrollments")
+    |> where(.term.in?(["2026FA", "2027SP"]))
+    |> derive(bounded_score: .score.clamp(0, 100), clamped_fee: .fee.clamp(0.0, 5000.0))
+    |> group_by(.term)
+    |> summarize(
+         total: count(),
+         high_count: count_if(.bounded_score >= 90)
+       )
+    |> sort_by(.term)
+  c.print("ok")
+  0
+end
+"#;
+    let mut sm = SourceMap::new();
+    let fid_good = sm.add_file("wts_explain.dana", good_src.to_string());
+    let good_mod = parse_module(fid_good, good_src).map_err(|e| format!("{e:?}"))?;
+    let checked = check_module_with_lock(fid_good, good_mod, None, &sm, Some(&parsed_pg));
+    assert!(
+        checked.is_ok(),
+        "expected good multi-schema `from:` module to pass lock check: {:?}",
+        checked.err()
+    );
+
+    // Verify missing table or type drift fails against lock
+    let bad_src = r#"module WtsBad
+
+schema Enrollment
+  id: Int
+  student_email: Text
+  term: Text
+  score: Text
+  fee: Decimal [financial]
+end
+
+fn main(db: ReadDB(Wts)) : Int
+  _rows = db.table(Enrollment, from: "populi.enrollments")
+  0
+end
+"#;
+    let fid_bad = sm.add_file("wts_bad.dana", bad_src.to_string());
+    let bad_mod = parse_module(fid_bad, bad_src).map_err(|e| format!("{e:?}"))?;
+    let bad_res = check_module_with_lock(fid_bad, bad_mod, None, &sm, Some(&parsed_pg));
+    let diags = bad_res.err().ok_or("expected SchemaError on drift")?;
+    assert!(
+        diags.iter().any(|d| d.code() == DiagCode::SchemaError),
+        "expected SchemaError diagnostic, got: {diags:?}"
+    );
+
+    // Run `dana explain --dialect postgres` and inspect pushed SQL & CountIf name
+    let script_path = tmp.path().join("wts_explain.dana");
+    fs::write(&script_path, good_src)?;
+    let pg_lock_str = pg_lock.to_string_lossy().to_string();
+    let script_str = script_path.to_string_lossy().to_string();
+    let (exp_code, exp_out, exp_err) = run_dana_cmd(
+        &[
+            "explain",
+            "--dialect",
+            "postgres",
+            "--schema-lock",
+            &pg_lock_str,
+            &script_str,
+        ],
+        Some(tmp.path()),
+    )?;
+    assert_eq!(
+        exp_code, 0,
+        "dana explain failed:\nstderr={exp_err}\nstdout={exp_out}"
+    );
+    assert!(
+        exp_out.contains(r#"FROM "populi"."enrollments""#),
+        "expected qualified PG table ref in explain:\n{exp_out}"
+    );
+    assert!(
+        exp_out.contains(r#""term" IN (CAST($"#),
+        "expected parameterized IN (...) in explain:\n{exp_out}"
+    );
+    assert!(
+        exp_out.contains("COALESCE(SUM((CASE WHEN"),
+        "expected pushed count_if COALESCE(SUM((CASE WHEN ...))) in explain:\n{exp_out}"
+    );
+    assert!(
+        exp_out.contains("CountIf"),
+        "expected CountIf op label in explain:\n{exp_out}"
+    );
+
+    Ok(())
+}

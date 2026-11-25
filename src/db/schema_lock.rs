@@ -128,11 +128,11 @@ impl LockedDb {
             )));
         }
 
-        let target_snake = to_snake_case(name);
+        let target_snake = table_name_snake_key(name);
         let snake_matches: Vec<&LockedTable> = self
             .tables
             .iter()
-            .filter(|t| to_snake_case(&t.name) == target_snake)
+            .filter(|t| table_name_snake_key(&t.name) == target_snake)
             .collect();
         if snake_matches.len() == 1 {
             return Ok(snake_matches[0]);
@@ -150,6 +150,17 @@ impl LockedDb {
             self.name
         )))
     }
+}
+
+fn table_name_snake_key(name: &str) -> String {
+    if let Some((schema, rel)) = name.split_once('.')
+        && !schema.is_empty()
+        && !rel.is_empty()
+        && !rel.contains('.')
+    {
+        return format!("{}.{}", to_snake_case(schema), to_snake_case(rel));
+    }
+    to_snake_case(name)
 }
 
 /// Convert `PascalCase` / `camelCase` identifiers into canonical `snake_case`.

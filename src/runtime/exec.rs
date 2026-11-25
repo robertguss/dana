@@ -16,7 +16,7 @@ use crate::core::bigint::{BigInt, DEC_MAX, DEC_MIN, DEC_SCALE, INT64_MAX, INT64_
 use crate::core::check::{check_cap_against_policy, is_safe_relative_path, join_confined_path};
 use crate::core::syntax::*;
 use crate::db::schema_lock::{SchemaLockFile, to_snake_case};
-use crate::db::{DbError, DbRegistry, SqlDialect, SqlParam, quote_sql_ident};
+use crate::db::{DbError, DbRegistry, SqlDialect, SqlParam, quote_sql_ident, quote_sql_table_ref};
 use crate::formats::compress::{
     AutoDecodeReader, AutoEncodeWriter, CompressionKind, detect_compression_path,
     open_auto_decoded_file, strip_compression_ext,
@@ -38,7 +38,7 @@ use crate::formats::parquet::{
 use crate::formats::time::{
     date_trunc_date, date_trunc_timestamp_duration, date_trunc_timestamp_unit, format_iso_date,
     format_iso_timestamp, format_timestamp_in_tz, local_date_in_tz, months_between_days,
-    round_decimal_bigint,
+    parse_decimal_i128, parse_iso_date, round_decimal_bigint,
 };
 use crate::formats::xlsx::{read_xlsx_bytes_with_schema, write_xlsx_sheets};
 use crate::net::{HttpsClientConfig, JsonResponse, ParsedHttpsUrl, https_get_json};
@@ -1713,6 +1713,80 @@ impl<'a> Evaluator<'a> {
                 )),
                 [v] => EvalOut::Ok(Val::Text(format_display_val(v))),
                 _ => EvalOut::Failed("ValToText requires 1 arg".to_string()),
+            },
+            ExecPrimOp::LowerText => match args {
+                [Val::Text(s)] => EvalOut::Ok(Val::Text(s.to_lowercase())),
+                _ => EvalOut::Failed("LowerText requires Text".to_string()),
+            },
+            ExecPrimOp::UpperText => match args {
+                [Val::Text(s)] => EvalOut::Ok(Val::Text(s.to_uppercase())),
+                _ => EvalOut::Failed("UpperText requires Text".to_string()),
+            },
+            ExecPrimOp::SliceText => match args {
+                [Val::Text(s), Val::Int(start), Val::Int(len)] => {
+                    let st = bigint_to_slice_bound(start);
+                    let ln = bigint_to_slice_bound(len);
+                    EvalOut::Ok(Val::Text(slice_text(s, st, ln)))
+                }
+                _ => EvalOut::Failed("SliceText requires (Text, Int, Int)".to_string()),
+            },
+            ExecPrimOp::StartsWithText => match args {
+                [Val::Text(s), Val::Text(prefix)] => EvalOut::Ok(Val::Bool(s.starts_with(prefix.as_str()))),
+                _ => EvalOut::Failed("StartsWithText requires (Text, Text)".to_string()),
+            },
+            ExecPrimOp::EndsWithText => match args {
+                [Val::Text(s), Val::Text(suffix)] => EvalOut::Ok(Val::Bool(s.ends_with(suffix.as_str()))),
+                _ => EvalOut::Failed("EndsWithText requires (Text, Text)".to_string()),
+            },
+            ExecPrimOp::TryParseDate => match args {
+                [Val::Text(s)] => EvalOut::Ok(try_parse_date_text(s)),
+                _ => EvalOut::Failed("TryParseDate requires Text".to_string()),
+            },
+            ExecPrimOp::TryParseInt => match args {
+                [Val::Text(s)] => EvalOut::Ok(try_parse_int_text(s)),
+                _ => EvalOut::Failed("TryParseInt requires Text".to_string()),
+            },
+            ExecPrimOp::TryParseDecimal => match args {
+                [Val::Text(s)] => EvalOut::Ok(try_parse_decimal_text(s)),
+                _ => EvalOut::Failed("TryParseDecimal requires Text".to_string()),
+            },
+            ExecPrimOp::TryParseFloat => match args {
+                [Val::Text(s)] => EvalOut::Ok(try_parse_float_text(s)),
+                _ => EvalOut::Failed("TryParseFloat requires Text".to_string()),
+            },
+            ExecPrimOp::InList => match args {
+                [v, Val::List(xs)] => EvalOut::Ok(Val::Bool(eval_in_list(v, xs))),
+                _ => EvalOut::Failed("InList requires (Val, List)".to_string()),
+            },
+            ExecPrimOp::ClampInt => match args {
+                [Val::Int(x), Val::Int(lo), Val::Int(hi)] => match clamp_int_bigint(x, lo, hi) {
+                    Ok(v) => EvalOut::Ok(Val::Int(v)),
+                    Err(bug) => EvalOut::Stopped(bug),
+                },
+                _ => EvalOut::Failed("ClampInt requires (Int, Int, Int)".to_string()),
+            },
+            ExecPrimOp::ClampFloat => match args {
+                [Val::Float(x), Val::Float(lo), Val::Float(hi)] => match clamp_float_val(*x, *lo, *hi) {
+                    Ok(v) => EvalOut::Ok(Val::Float(v)),
+                    Err(bug) => EvalOut::Stopped(bug),
+                },
+                _ => EvalOut::Failed("ClampFloat requires (Float, Float, Float)".to_string()),
+            },
+            ExecPrimOp::ClampDecimal => match args {
+                [Val::Decimal(x), Val::Decimal(lo), Val::Decimal(hi)] => {
+                    match clamp_decimal_val(x, lo, hi) {
+                        Ok(v) => EvalOut::Ok(Val::Decimal(v)),
+                        Err(bug) => EvalOut::Stopped(bug),
+                    }
+                }
+                _ => EvalOut::Failed("ClampDecimal requires (Decimal, Decimal, Decimal)".to_string()),
+            },
+            ExecPrimOp::RoundToFloat => match args {
+                [Val::Float(x), Val::Float(step)] => match round_to_float_val(*x, *step) {
+                    Ok(v) => EvalOut::Ok(Val::Float(v)),
+                    Err(bug) => EvalOut::Stopped(bug),
+                },
+                _ => EvalOut::Failed("RoundToFloat requires (Float, Float)".to_string()),
             },
             ExecPrimOp::DateTruncUnit(unit) => match args {
                 [Val::Date(d)] => match date_trunc_date(d.to_i64().unwrap_or(0), unit) {
@@ -4116,12 +4190,12 @@ impl<'a> Evaluator<'a> {
                             .map(|c| quote_sql_ident(&c.name))
                             .collect();
                         let sql = if cols_sql.is_empty() {
-                            format!("SELECT 1 FROM {}", quote_sql_ident(&effective_table))
+                            format!("SELECT 1 FROM {}", quote_sql_table_ref(&effective_table))
                         } else {
                             format!(
                                 "SELECT {} FROM {}",
                                 cols_sql.join(", "),
-                                quote_sql_ident(&effective_table)
+                                quote_sql_table_ref(&effective_table)
                             )
                         };
                         let conn = match self.ew.db_registry.open(db) {
@@ -4728,7 +4802,17 @@ fn extract_group_keys(plan: &ExecPlan) -> Vec<Ident> {
     }
 }
 
-fn eval_agg_values(op: AggOp, vals: &[Val], row_count: usize) -> EvalOut {
+fn eval_agg_values(op: ExecAggOp, vals: &[Val], row_count: usize) -> EvalOut {
+    let op = match op {
+        ExecAggOp::CountIf => {
+            let cnt = vals
+                .iter()
+                .filter(|v| matches!(unwrap_opt_ref(v), Some(Val::Bool(true))))
+                .count();
+            return EvalOut::Ok(Val::Int(BigInt::from(cnt)));
+        }
+        ExecAggOp::Core(c) => c,
+    };
     match op {
         AggOp::Count => EvalOut::Ok(Val::Int(BigInt::from(row_count))),
         AggOp::CountDistinct => {
@@ -4898,7 +4982,7 @@ fn eval_table_col_agg(tv: &TableVal, col: &str, op: AggOp) -> EvalOut {
             _ => EvalOut::Ok(Val::Int(BigInt::ZERO)),
         };
     }
-    eval_agg_values(op, &vals, tv.rows.len())
+    eval_agg_values(ExecAggOp::Core(op), &vals, tv.rows.len())
 }
 
 fn eval_vm_table_col_agg(vm: &VmTable, col: &str, op: AggOp) -> EvalOut {
@@ -4914,7 +4998,7 @@ fn eval_vm_table_col_agg(vm: &VmTable, col: &str, op: AggOp) -> EvalOut {
                 _ => EvalOut::Ok(Val::Int(BigInt::ZERO)),
             },
             AggOp::Mean | AggOp::Stddev => EvalOut::Ok(Val::OptNone),
-            _ => eval_agg_values(op, &[], 0),
+            _ => eval_agg_values(ExecAggOp::Core(op), &[], 0),
         };
     }
 
@@ -5181,7 +5265,7 @@ fn eval_vm_table_col_agg(vm: &VmTable, col: &str, op: AggOp) -> EvalOut {
                     vals.push(c.get_val(usize::from(r_u16)));
                 }
             }
-            eval_agg_values(op, &vals, total_rows)
+            eval_agg_values(ExecAggOp::Core(op), &vals, total_rows)
         }
     }
 }
@@ -5457,7 +5541,7 @@ fn eval_window(mut tv: TableVal, items: &[WindowItem]) -> EvalOut {
                             .iter()
                             .map(|&i| tv.rows[i].cells[cidx].clone())
                             .collect();
-                        match eval_agg_values(AggOp::Sum, &slice, slice.len()) {
+                        match eval_agg_values(ExecAggOp::Core(AggOp::Sum), &slice, slice.len()) {
                             EvalOut::Ok(s) => s,
                             other => return other,
                         }
@@ -6079,6 +6163,146 @@ fn format_pretty_table(tv: &TableVal) -> String {
         }
     }
     out
+}
+
+pub(crate) fn bigint_to_slice_bound(n: &BigInt) -> i64 {
+    n.to_i64()
+        .unwrap_or_else(|| if n.is_negative() { -1 } else { i64::MAX })
+}
+
+pub(crate) fn slice_text(s: &str, start: i64, len: i64) -> String {
+    if len <= 0 {
+        return String::new();
+    }
+    let start_idx = if start <= 0 {
+        0usize
+    } else {
+        usize::try_from(start).unwrap_or(usize::MAX)
+    };
+    let take_len = usize::try_from(len).unwrap_or(usize::MAX);
+    s.chars().skip(start_idx).take(take_len).collect()
+}
+
+pub(crate) fn try_parse_date_text(s: &str) -> Val {
+    match parse_iso_date(s.trim()) {
+        Ok(days) => Val::OptSome(Box::new(Val::Date(BigInt::from(days)))),
+        Err(_) => Val::OptNone,
+    }
+}
+
+pub(crate) fn try_parse_int_text(s: &str) -> Val {
+    match s.trim().parse::<i64>() {
+        Ok(n) => Val::OptSome(Box::new(Val::Int(BigInt::from(n)))),
+        Err(_) => Val::OptNone,
+    }
+}
+
+pub(crate) fn try_parse_decimal_text(s: &str) -> Val {
+    match parse_decimal_i128(s) {
+        Some(d) => Val::OptSome(Box::new(Val::Decimal(BigInt::from(d)))),
+        None => Val::OptNone,
+    }
+}
+
+pub(crate) fn try_parse_float_text(s: &str) -> Val {
+    match s.trim().parse::<f64>() {
+        Ok(f) if f.is_finite() => {
+            Val::OptSome(Box::new(Val::Float(Float64::from_f64(if f == 0.0 {
+                0.0
+            } else {
+                f
+            }))))
+        }
+        _ => Val::OptNone,
+    }
+}
+
+pub(crate) fn eval_in_list(val: &Val, elems: &[Val]) -> bool {
+    match val {
+        Val::OptNone => false,
+        Val::OptSome(inner) => elems.iter().any(|e| val_eq(inner.as_ref(), e)),
+        other => elems.iter().any(|e| val_eq(other, e)),
+    }
+}
+
+pub(crate) fn clamp_int_bigint(x: &BigInt, lo: &BigInt, hi: &BigInt) -> Result<BigInt, Bug> {
+    if lo > hi {
+        return Err(Bug {
+            kind: BugKind::OutsideBoundary,
+            message: format!("DomainError: clamp bounds invalid ({lo} > {hi})"),
+        });
+    }
+    if x < lo {
+        Ok(lo.clone())
+    } else if x > hi {
+        Ok(hi.clone())
+    } else {
+        Ok(x.clone())
+    }
+}
+
+pub(crate) fn clamp_decimal_val(x: &BigInt, lo: &BigInt, hi: &BigInt) -> Result<BigInt, Bug> {
+    if lo > hi {
+        return Err(Bug {
+            kind: BugKind::OutsideBoundary,
+            message: format!(
+                "DomainError: clamp bounds invalid ({} > {})",
+                render_decimal(lo),
+                render_decimal(hi)
+            ),
+        });
+    }
+    if x < lo {
+        Ok(lo.clone())
+    } else if x > hi {
+        Ok(hi.clone())
+    } else {
+        Ok(x.clone())
+    }
+}
+
+pub(crate) fn clamp_float_val(x: Float64, lo: Float64, hi: Float64) -> Result<Float64, Bug> {
+    let xf = x.to_f64();
+    let lof = lo.to_f64();
+    let hif = hi.to_f64();
+    if !lof.is_finite() || !hif.is_finite() || lof > hif {
+        return Err(Bug {
+            kind: BugKind::OutsideBoundary,
+            message: format!("DomainError: clamp bounds invalid ({lof} > {hif})"),
+        });
+    }
+    if !xf.is_finite() {
+        return Err(Bug {
+            kind: BugKind::OutsideBoundary,
+            message: format!("DomainError: clamp input is non-finite ({xf})"),
+        });
+    }
+    Ok(Float64::from_f64(xf.clamp(lof, hif)))
+}
+
+pub(crate) fn round_to_float_val(x: Float64, step: Float64) -> Result<Float64, Bug> {
+    let xf = x.to_f64();
+    let sf = step.to_f64();
+    if !sf.is_finite() || sf <= 0.0 {
+        return Err(Bug {
+            kind: BugKind::OutsideBoundary,
+            message: format!("DomainError: round_to step must be positive finite, got {sf}"),
+        });
+    }
+    if !xf.is_finite() {
+        return Err(Bug {
+            kind: BugKind::OutsideBoundary,
+            message: format!("DomainError: round_to input is non-finite ({xf})"),
+        });
+    }
+    let q = (xf / sf).round() * sf;
+    if !q.is_finite() {
+        return Err(Bug {
+            kind: BugKind::OutsideBoundary,
+            message: "DomainError: round_to overflowed f64".to_string(),
+        });
+    }
+    Ok(Float64::from_f64(if q == 0.0 { 0.0 } else { q }))
 }
 
 // Keep reference constants visible for checked range consistency.

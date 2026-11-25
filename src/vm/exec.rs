@@ -16,7 +16,7 @@ use crate::core::syntax::{
     Program, ScalarTy, TableTy, TagSet, Ty,
 };
 use crate::db::schema_lock::SchemaLockFile;
-use crate::db::{SqlDialect, SqlParam, quote_sql_ident};
+use crate::db::{SqlDialect, SqlParam, quote_sql_ident, quote_sql_table_ref};
 use crate::oracle::eval::{PrimResult, RuntimeError, eval_literal, eval_prim_op};
 use crate::oracle::value::{
     Bug, CapHandle, ClosureVal, EnvEntry, EnvList, ReportVal, TableRow, TableVal, Val,
@@ -31,7 +31,7 @@ use crate::runtime::exec::{
     EvalProgramResult, RunConfig, RunResult, TestOutcome, eval_exec_entry_with_engine,
     eval_pure_exec_call, run_exec_program_with_engine, run_program_tests_with_engine,
 };
-use crate::runtime::ir::{ExecDeriveItem, ExecExpr, ExecPlan, ExecProgram};
+use crate::runtime::ir::{ExecAggOp, ExecDeriveItem, ExecExpr, ExecPlan, ExecProgram};
 use crate::vm::VmConfig;
 use crate::vm::expr::{RowEvalErr, RowEvalHost, compile_core_row_expr, compile_exec_row_expr};
 use crate::vm::ops::agg::{CompiledAgg, op_hash_aggregate, op_suppress_small_groups};
@@ -381,12 +381,12 @@ fn eval_exec_plan_to_table(
                     .map(|c| quote_sql_ident(&c.name))
                     .collect();
                 let sql = if cols_sql.is_empty() {
-                    format!("SELECT 1 FROM {}", quote_sql_ident(&effective_table))
+                    format!("SELECT 1 FROM {}", quote_sql_table_ref(&effective_table))
                 } else {
                     format!(
                         "SELECT {} FROM {}",
                         cols_sql.join(", "),
-                        quote_sql_ident(&effective_table)
+                        quote_sql_table_ref(&effective_table)
                     )
                 };
                 bridge.exec_live_sql_batches(&db_name, &sql, &[], schema, cfg.batch_size)?
@@ -904,7 +904,7 @@ fn eval_core_plan_direct(
                 out_cols.push(spec.clone());
                 compiled_aggs.push(CompiledAgg {
                     name: a.name.clone(),
-                    op: a.op,
+                    op: ExecAggOp::Core(a.op),
                     out_spec: spec,
                     arg_prog: a.arg.as_ref().map(|re| compile_core_row_expr(re, prog)),
                 });
@@ -1515,7 +1515,7 @@ fn eval_core_plan_to_table(
                 .zip(agg_specs)
                 .map(|(a, spec)| CompiledAgg {
                     name: a.name.clone(),
-                    op: a.op,
+                    op: ExecAggOp::Core(a.op),
                     out_spec: spec.clone(),
                     arg_prog: a.arg.as_ref().map(|re| compile_core_row_expr(re, prog)),
                 })

@@ -52,6 +52,24 @@ pub enum ExecPrimOp {
     DecToFloat,
     // Formatting / string interpolation conversions
     ValToText,
+    // Text transforms & predicates (v0.5)
+    LowerText,
+    UpperText,
+    SliceText,
+    StartsWithText,
+    EndsWithText,
+    // Safe text parsing (Text -> T?)
+    TryParseDate,
+    TryParseInt,
+    TryParseDecimal,
+    TryParseFloat,
+    // Membership predicate
+    InList,
+    // Numeric clamping and step rounding
+    ClampInt,
+    ClampFloat,
+    ClampDecimal,
+    RoundToFloat,
     // Temporal ops
     DateTruncUnit(String),
     DateTruncDuration,
@@ -215,10 +233,44 @@ pub enum ExecRowExpr {
     },
 }
 
+/// Aggregate operator for surface `ExecPlan::Summarize`, extending Core [`AggOp`]
+/// with conditional `count_if(cond)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExecAggOp {
+    Core(AggOp),
+    CountIf,
+}
+
+impl ExecAggOp {
+    #[must_use]
+    pub const fn is_blending(self) -> bool {
+        match self {
+            Self::Core(op) => op.is_blending(),
+            Self::CountIf => true,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_order_sensitive(self) -> bool {
+        match self {
+            Self::Core(op) => op.is_order_sensitive(),
+            Self::CountIf => false,
+        }
+    }
+
+    #[must_use]
+    pub fn display_name(self) -> String {
+        match self {
+            Self::Core(op) => format!("{op:?}"),
+            Self::CountIf => "CountIf".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecAggItem {
     pub name: Ident,
-    pub op: AggOp,
+    pub op: ExecAggOp,
     pub arg: Option<ExecRowExpr>,
 }
 
@@ -2332,6 +2384,9 @@ fn try_exec_expr_to_core(root: &ExecExpr) -> Option<Expr> {
                     let input = Box::new(plans.pop()?);
                     let mut caggs = Vec::with_capacity(aggs.len());
                     for a in aggs {
+                        let ExecAggOp::Core(cop) = a.op else {
+                            return None;
+                        };
                         let arg = if a.arg.is_some() {
                             Some(arg_vals.next()?)
                         } else {
@@ -2339,7 +2394,7 @@ fn try_exec_expr_to_core(root: &ExecExpr) -> Option<Expr> {
                         };
                         caggs.push(AggItem {
                             name: a.name.clone(),
-                            op: a.op,
+                            op: cop,
                             arg,
                         });
                     }

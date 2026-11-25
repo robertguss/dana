@@ -4,7 +4,7 @@
 //! - `dana check [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--json] <FILE...>`
 //! - `dana run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]`
 //! - `dana dry-run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]`
-//! - `dana schema-sync --db Name=URI [--db Name2=URI2 ...] [--out schema.lock]`
+//! - `dana schema-sync --db Name=URI [--db Name2=URI2 ...] [--schemas s1,s2,...] [--out schema.lock]`
 //! - `dana explain [--dialect sqlite|postgres] [--schema-lock FILE] [--policy FILE] <FILE>`
 //! - `dana repl [--policy FILE] [--db Name=URI]... [--schema-lock FILE] [--show-sensitive TAGS] [--eval EXPR]`
 //! - `dana vendor pin|verify [--dir PATH]`
@@ -60,7 +60,7 @@ COMMANDS:
       by default; pass `--oracle` for the reference row-by-row engine).
   dry-run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]
       Execute strictly read-only, printing redacted WriteTable diffs and suppressing disk/DB writes.
-  schema-sync --db Name=URI [--db Name2=URI2 ...] [--out schema.lock]
+  schema-sync --db Name=URI [--db Name2=URI2 ...] [--schemas s1,s2,...] [--out schema.lock]
       Introspect live SQLite/PostgreSQL databases and update schema.lock while preserving sensitivity tags.
   explain [--dialect sqlite|postgres] [--schema-lock FILE] [--policy FILE] <FILE>
       Show logical/optimized plans, parameterized SQL pushdown, boundary reasons, and sensitivity provenance.
@@ -826,8 +826,33 @@ fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
     }
 }
 
+fn parse_schema_list(raw: &str) -> Result<Vec<String>, String> {
+    if raw.is_empty() {
+        return Err("`--schemas` requires at least one non-empty schema name".to_string());
+    }
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let s = part.trim();
+        if s.is_empty()
+            || s.contains(char::is_whitespace)
+            || s.as_bytes().contains(&0)
+            || s.chars().any(char::is_control)
+        {
+            return Err(format!("invalid schema name `{part}` in `--schemas`"));
+        }
+        if !out.iter().any(|existing| existing == s) {
+            out.push(s.to_string());
+        }
+    }
+    if out.is_empty() {
+        return Err("`--schemas` requires at least one non-empty schema name".to_string());
+    }
+    Ok(out)
+}
+
 fn cmd_schema_sync(args: &[String]) -> i32 {
     let mut db_specs: Vec<(String, String)> = Vec::new();
+    let mut schemas: Vec<String> = Vec::new();
     let mut out_path = PathBuf::from("schema.lock");
     let mut i = 0;
 
@@ -836,6 +861,20 @@ fn cmd_schema_sync(args: &[String]) -> i32 {
         if let Some(val) = arg.strip_prefix("--db=") {
             match parse_db_binding(val) {
                 Ok(pair) => db_specs.push(pair),
+                Err(e) => {
+                    eprintln!("dana schema-sync: {e}");
+                    return 2;
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--schemas=") {
+            match parse_schema_list(val) {
+                Ok(list) => {
+                    for s in list {
+                        if !schemas.contains(&s) {
+                            schemas.push(s);
+                        }
+                    }
+                }
                 Err(e) => {
                     eprintln!("dana schema-sync: {e}");
                     return 2;
@@ -853,6 +892,28 @@ fn cmd_schema_sync(args: &[String]) -> i32 {
                     };
                     match parse_db_binding(raw) {
                         Ok(pair) => db_specs.push(pair),
+                        Err(e) => {
+                            eprintln!("dana schema-sync: {e}");
+                            return 2;
+                        }
+                    }
+                }
+                "--schemas" => {
+                    i += 1;
+                    let Some(raw) = args.get(i) else {
+                        eprintln!(
+                            "dana schema-sync: `--schemas` requires comma-separated schema names"
+                        );
+                        return 2;
+                    };
+                    match parse_schema_list(raw) {
+                        Ok(list) => {
+                            for s in list {
+                                if !schemas.contains(&s) {
+                                    schemas.push(s);
+                                }
+                            }
+                        }
                         Err(e) => {
                             eprintln!("dana schema-sync: {e}");
                             return 2;
@@ -918,7 +979,12 @@ fn cmd_schema_sync(args: &[String]) -> i32 {
                 return 1;
             }
         };
-        let fresh = match conn.introspect_schema(db_name) {
+        let fresh = if schemas.is_empty() {
+            conn.introspect_schema(db_name)
+        } else {
+            conn.introspect_schema_with_schemas(db_name, &schemas)
+        };
+        let fresh = match fresh {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("dana schema-sync: failed introspecting `{db_name}`: {e}");

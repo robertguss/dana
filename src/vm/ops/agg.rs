@@ -28,6 +28,7 @@ use crate::oracle::value::{
     Bug, GroupMeta, TableRow, Val, render_decimal, val_cmp, val_eq, val_list_cmp, val_list_eq,
     val_list_lt, val_to_float,
 };
+use crate::runtime::ir::ExecAggOp;
 use crate::vm::batch::{Batch, Column, ColumnData, rows_to_batches};
 use crate::vm::expr::{RowEvalHost, RowInstr, RowProgram, eval_row_program};
 use crate::vm::key::{FastHasher, KeyTuple, SingleKey, eq_col_cells, hash_row_key};
@@ -41,7 +42,7 @@ type FastSet<K> = HashSet<K, BuildHasherDefault<FastHasher>>;
 #[derive(Debug)]
 pub struct CompiledAgg {
     pub name: Ident,
-    pub op: AggOp,
+    pub op: ExecAggOp,
     pub out_spec: ColSpec,
     pub arg_prog: Option<RowProgram>,
 }
@@ -104,6 +105,7 @@ impl DistinctTracker {
 /// Fast per-group streaming accumulator for one aggregate column.
 enum AggAcc {
     Count(usize),
+    CountIf(usize),
     CountDistinctInt(FastSet<i64>),
     CountDistinct(FastSet<SingleKey>),
     /// `CoreV01` O(1) fast Int sum tracking `pos_sum` and `neg_sum` magnitudes separately.
@@ -163,8 +165,12 @@ enum AggAcc {
 }
 
 impl AggAcc {
-    fn new(op: AggOp, out_ty: &ScalarTy, col_kind: AggColKind, mode: VmMode) -> Self {
-        match op {
+    fn new(op: ExecAggOp, out_ty: &ScalarTy, col_kind: AggColKind, mode: VmMode) -> Self {
+        let cop = match op {
+            ExecAggOp::CountIf => return Self::CountIf(0),
+            ExecAggOp::Core(c) => c,
+        };
+        match cop {
             AggOp::Count => Self::Count(0),
             AggOp::CountDistinct => {
                 if col_kind == AggColKind::Int {
@@ -350,6 +356,11 @@ impl AggAcc {
     fn push_val(&mut self, v: Val) {
         match self {
             Self::Count(n) => *n += 1,
+            Self::CountIf(n) => {
+                if matches!(unwrap_opt_owned(v), Some(Val::Bool(true))) {
+                    *n += 1;
+                }
+            }
             Self::CountDistinctInt(set) => {
                 if let Some(Val::Int(ref n)) = unwrap_opt_owned(v)
                     && let Some(x) = n.to_i64()
@@ -439,14 +450,14 @@ impl AggAcc {
 
     fn finalize(
         self,
-        op: AggOp,
+        op: ExecAggOp,
         out_ty: &ScalarTy,
         mode: VmMode,
         group_row_count: usize,
         fallback_raw_vals: Option<&[Val]>,
     ) -> Result<Val, OpErr> {
         match self {
-            Self::Count(n) => checked_int_usize(n),
+            Self::Count(n) | Self::CountIf(n) => checked_int_usize(n),
             Self::CountDistinctInt(set) => checked_int_usize(set.len()),
             Self::CountDistinct(set) => checked_int_usize(set.len()),
             Self::SumInt {
@@ -618,13 +629,16 @@ impl AggAcc {
                 Some(v) => Val::OptSome(Box::new(v)),
                 None => Val::OptNone,
             }),
-            Self::CollectVals(mut non_null) => {
-                if mode == VmMode::CoreV01 {
-                    finalize_core_vals(op, out_ty, &mut non_null)
-                } else {
-                    finalize_exec_vals(op, &non_null, group_row_count)
+            Self::CollectVals(mut non_null) => match op {
+                ExecAggOp::Core(cop) => {
+                    if mode == VmMode::CoreV01 {
+                        finalize_core_vals(cop, out_ty, &mut non_null)
+                    } else {
+                        finalize_exec_vals(cop, &non_null, group_row_count)
+                    }
                 }
-            }
+                ExecAggOp::CountIf => Err(OpErr::Wrong),
+            },
         }
     }
 }
@@ -1450,6 +1464,14 @@ fn feed_agg_single_cell(acc: &mut AggAcc, col: &Column, row: usize) {
         AggAcc::Count(n) => {
             *n += 1;
         }
+        AggAcc::CountIf(n) => match &col.data {
+            ColumnData::Bool(vs) => {
+                if !col.validity.as_ref().is_some_and(|bm| !bm.is_valid(row)) && vs[row] != 0 {
+                    *n += 1;
+                }
+            }
+            _ => acc.push_val(col.get_val(row)),
+        },
         AggAcc::CountDistinctInt(_) | AggAcc::SumInt { .. } | AggAcc::ExecSumInt { .. } => {
             if col.validity.as_ref().is_some_and(|bm| !bm.is_valid(row)) {
                 return;
@@ -1503,6 +1525,21 @@ fn feed_agg_column_slice(acc: &mut AggAcc, col_opt: Option<&Column>, active: &[u
     };
     match (acc, &col.data, &col.validity) {
         (AggAcc::Count(n), _, _) => *n += active.len(),
+        (AggAcc::CountIf(n), ColumnData::Bool(vs), None) => {
+            for &l in active {
+                if vs[usize::from(l)] != 0 {
+                    *n += 1;
+                }
+            }
+        }
+        (AggAcc::CountIf(n), ColumnData::Bool(vs), Some(bm)) => {
+            for &l in active {
+                let r = usize::from(l);
+                if bm.is_valid(r) && vs[r] != 0 {
+                    *n += 1;
+                }
+            }
+        }
         (
             acc @ (AggAcc::SumInt { .. }
             | AggAcc::ExecSumInt { .. }

@@ -5087,7 +5087,7 @@ impl<'a> Checker<'a> {
             return Some((
                 ExecAggItem {
                     name: out_name.to_string(),
-                    op: AggOp::Count,
+                    op: ExecAggOp::Core(AggOp::Count),
                     arg: None,
                 },
                 ColSpec {
@@ -5124,10 +5124,22 @@ impl<'a> Checker<'a> {
         };
 
         let (op, out_ty) = match agg_name.as_str() {
-            "count_distinct" => (AggOp::CountDistinct, ScalarTy::Int),
+            "count_if" => {
+                if re_ty != Ty::Bool {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`count_if` expects a `Bool` condition, found `{re_ty:?}`"),
+                        )
+                        .with_span(arg0.span),
+                    );
+                }
+                (ExecAggOp::CountIf, ScalarTy::Int)
+            }
+            "count_distinct" => (ExecAggOp::Core(AggOp::CountDistinct), ScalarTy::Int),
             "sum" => {
                 let num = numeric_core_of_scalar(&s_ty).unwrap_or(ScalarTy::Int);
-                (AggOp::Sum, num)
+                (ExecAggOp::Core(AggOp::Sum), num)
             }
             "mean" | "median" => {
                 let op = if agg_name == "mean" {
@@ -5139,7 +5151,7 @@ impl<'a> Checker<'a> {
                     Some(ScalarTy::Int) | None => ScalarTy::Option(Box::new(ScalarTy::Float)),
                     Some(num) => ScalarTy::Option(Box::new(num)),
                 };
-                (op, out_t)
+                (ExecAggOp::Core(op), out_t)
             }
             "stddev" | "variance" => {
                 let op = if agg_name == "stddev" {
@@ -5147,7 +5159,10 @@ impl<'a> Checker<'a> {
                 } else {
                     AggOp::Variance
                 };
-                (op, ScalarTy::Option(Box::new(ScalarTy::Float)))
+                (
+                    ExecAggOp::Core(op),
+                    ScalarTy::Option(Box::new(ScalarTy::Float)),
+                )
             }
             "percentile" => {
                 let q = match args.get(1) {
@@ -5167,14 +5182,14 @@ impl<'a> Checker<'a> {
                     }
                 };
                 (
-                    AggOp::Percentile(Float64::from_f64(q)),
+                    ExecAggOp::Core(AggOp::Percentile(Float64::from_f64(q))),
                     ScalarTy::Option(Box::new(ScalarTy::Float)),
                 )
             }
-            "min" => (AggOp::Min, ensure_option_scalar(&s_ty)),
-            "max" => (AggOp::Max, ensure_option_scalar(&s_ty)),
-            "first" => (AggOp::First, ensure_option_scalar(&s_ty)),
-            "last" => (AggOp::Last, ensure_option_scalar(&s_ty)),
+            "min" => (ExecAggOp::Core(AggOp::Min), ensure_option_scalar(&s_ty)),
+            "max" => (ExecAggOp::Core(AggOp::Max), ensure_option_scalar(&s_ty)),
+            "first" => (ExecAggOp::Core(AggOp::First), ensure_option_scalar(&s_ty)),
+            "last" => (ExecAggOp::Core(AggOp::Last), ensure_option_scalar(&s_ty)),
             _ => {
                 self.diags.push(
                     Diagnostic::error(
@@ -6565,32 +6580,16 @@ impl<'a> Checker<'a> {
                     LTy::new(Ty::Float, rlty.tags),
                 );
             }
-            (Ty::Text, "empty?") => {
-                return (
-                    ExecExpr::Prim {
-                        op: ExecPrimOp::Core(PrimOp::EmptyText),
-                        args: vec![rex],
-                    },
-                    LTy::new(Ty::Bool, rlty.tags),
-                );
-            }
-            (Ty::Text, "trim") => {
-                return (
-                    ExecExpr::Prim {
-                        op: ExecPrimOp::Core(PrimOp::TrimText),
-                        args: vec![rex],
-                    },
-                    rlty,
-                );
-            }
-            (Ty::Text, "ascii_lowercase") => {
-                return (
-                    ExecExpr::Prim {
-                        op: ExecPrimOp::Core(PrimOp::LowerAsciiText),
-                        args: vec![rex],
-                    },
-                    rlty,
-                );
+            (Ty::Text, prop) if text_prop_op(prop).is_some() => {
+                if let Some((op, out_ty)) = text_prop_op(prop) {
+                    return (
+                        ExecExpr::Prim {
+                            op,
+                            args: vec![rex],
+                        },
+                        LTy::new(out_ty, rlty.tags),
+                    );
+                }
             }
             (Ty::Option(_), "some?") => {
                 return (
@@ -8145,6 +8144,58 @@ impl<'a> Checker<'a> {
                         return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
                     }
                 };
+                let mut from_table: Option<String> = None;
+                for extra in args.iter().skip(1) {
+                    match extra {
+                        CallArg::Named { name, value, .. } if name.name == "from" => {
+                            if from_table.is_some() {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        "duplicate `from:` argument in `db.table(...)`",
+                                    )
+                                    .with_span(name.span),
+                                );
+                                continue;
+                            }
+                            match &value.kind {
+                                ExprKind::Text { value: raw, .. } if !raw.trim().is_empty() => {
+                                    from_table = Some(raw.clone());
+                                }
+                                _ => {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::SchemaError,
+                                            "`db.table(..., from: \"...\")` requires a non-empty string literal table reference",
+                                        )
+                                        .with_span(value.span),
+                                    );
+                                }
+                            }
+                        }
+                        CallArg::Named { name, .. } => {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!(
+                                        "unknown named argument `{}` in `db.table(...)` (expected `from:`)",
+                                        name.name
+                                    ),
+                                )
+                                .with_span(name.span),
+                            );
+                        }
+                        CallArg::Positional(e) => {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    "`db.table(Schema, from: \"...\")` accepts only one positional schema argument",
+                                )
+                                .with_span(e.span),
+                            );
+                        }
+                    }
+                }
                 let Some(cs) = self.schemas.get(&sname).cloned() else {
                     self.diags.push(
                         Diagnostic::error(
@@ -8155,9 +8206,10 @@ impl<'a> Checker<'a> {
                     );
                     return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
                 };
-                let mut resolved_table_name = sname.clone();
+                let lookup_name = from_table.as_deref().unwrap_or(&sname);
+                let mut resolved_table_name = lookup_name.to_string();
                 if let Some(locked_db) = self.schema_lock.and_then(|l| l.find_db(db)) {
-                    match locked_db.resolve_table(&sname) {
+                    match locked_db.resolve_table(lookup_name) {
                         Ok(locked_tbl) => {
                             resolved_table_name = locked_tbl.name.clone();
                             for col in &cs.decl.schema.cols {
@@ -8686,17 +8738,179 @@ impl<'a> Checker<'a> {
                     LTy::new(inner.as_ref().clone(), rlty.tags),
                 );
             }
-            (Ty::Text, "contains?") => {
-                if let Some(CallArg::Positional(e)) = args.first() {
-                    let (aex, alty) = self.check_expr(e, env, Some(&Ty::Text), pc, scope, ret_ctx);
+            (Ty::Text, prop) if args.is_empty() && text_prop_op(prop).is_some() => {
+                if let Some((op, out_ty)) = text_prop_op(prop) {
                     return (
                         ExecExpr::Prim {
-                            op: ExecPrimOp::Core(PrimOp::ContainsText),
+                            op,
+                            args: vec![rex],
+                        },
+                        LTy::new(out_ty, rlty.tags),
+                    );
+                }
+            }
+            (Ty::Text, "contains?" | "starts_with?" | "ends_with?") => {
+                let (key, op) = match member.name.as_str() {
+                    "contains?" => ("sub", ExecPrimOp::Core(PrimOp::ContainsText)),
+                    "starts_with?" => ("prefix", ExecPrimOp::StartsWithText),
+                    _ => ("suffix", ExecPrimOp::EndsWithText),
+                };
+                if let Some(arg_e) = extract_one_arg(args, key) {
+                    let (aex, alty) =
+                        self.check_expr(arg_e, env, Some(&Ty::Text), pc, scope, ret_ctx);
+                    if alty.ty != Ty::Text {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!(
+                                    "`.{}` expects a `Text` argument, found `{:?}`",
+                                    member.name, alty.ty
+                                ),
+                            )
+                            .with_span(arg_e.span),
+                        );
+                    }
+                    return (
+                        ExecExpr::Prim {
+                            op,
                             args: vec![rex, aex],
                         },
                         LTy::new(Ty::Bool, rlty.tags.union(&alty.tags)),
                     );
                 }
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!(
+                            "`Text.{}` expects 1 `Text` argument (`{key}:`)",
+                            member.name
+                        ),
+                    )
+                    .with_span(span),
+                );
+                return (
+                    ExecExpr::Lit(Literal::Bool(false)),
+                    LTy::new(Ty::Bool, rlty.tags),
+                );
+            }
+            (Ty::Text, "slice") => {
+                if let Some((start_e, len_e)) = extract_two_args(args, "start", "len") {
+                    let (sex, slty) =
+                        self.check_expr(start_e, env, Some(&Ty::Int), pc, scope, ret_ctx);
+                    let (lex, llty) =
+                        self.check_expr(len_e, env, Some(&Ty::Int), pc, scope, ret_ctx);
+                    if slty.ty != Ty::Int {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!(
+                                    "`Text.slice` `start` must be `Int`, found `{:?}`",
+                                    slty.ty
+                                ),
+                            )
+                            .with_span(start_e.span),
+                        );
+                    }
+                    if llty.ty != Ty::Int {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("`Text.slice` `len` must be `Int`, found `{:?}`", llty.ty),
+                            )
+                            .with_span(len_e.span),
+                        );
+                    }
+                    return (
+                        ExecExpr::Prim {
+                            op: ExecPrimOp::SliceText,
+                            args: vec![rex, sex, lex],
+                        },
+                        LTy::new(Ty::Text, rlty.tags.union(&slty.tags).union(&llty.tags)),
+                    );
+                }
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`Text.slice` expects `(start: Int, len: Int)`",
+                    )
+                    .with_span(span),
+                );
+                return (
+                    ExecExpr::Lit(Literal::Text(String::new())),
+                    LTy::new(Ty::Text, rlty.tags),
+                );
+            }
+            (Ty::Int | Ty::Float | Ty::Decimal, "clamp") => {
+                if let Some((lo_e, hi_e)) = extract_two_args(args, "lo", "hi") {
+                    let expected_ty = rlty.ty.clone();
+                    let (lo_ex, lo_lty) =
+                        self.check_expr(lo_e, env, Some(&expected_ty), pc, scope, ret_ctx);
+                    let (hi_ex, hi_lty) =
+                        self.check_expr(hi_e, env, Some(&expected_ty), pc, scope, ret_ctx);
+                    if lo_lty.ty != expected_ty || hi_lty.ty != expected_ty {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!(
+                                    "`.clamp(lo, hi)` bounds must match receiver type `{expected_ty:?}`"
+                                ),
+                            )
+                            .with_span(span),
+                        );
+                    }
+                    let op = clamp_op_for_ty(&expected_ty).unwrap_or(ExecPrimOp::ClampInt);
+                    return (
+                        ExecExpr::Prim {
+                            op,
+                            args: vec![rex, lo_ex, hi_ex],
+                        },
+                        LTy::new(
+                            expected_ty,
+                            rlty.tags.union(&lo_lty.tags).union(&hi_lty.tags),
+                        ),
+                    );
+                }
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`.clamp` expects `(lo, hi)` bounds of the same numeric type",
+                    )
+                    .with_span(span),
+                );
+                return (rex, rlty);
+            }
+            (Ty::Float, "round_to") => {
+                if let Some(step_e) = extract_one_arg(args, "step") {
+                    let (sex, slty) =
+                        self.check_expr(step_e, env, Some(&Ty::Float), pc, scope, ret_ctx);
+                    if slty.ty != Ty::Float {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!(
+                                    "`Float.round_to` `step` must be `Float`, found `{:?}`",
+                                    slty.ty
+                                ),
+                            )
+                            .with_span(step_e.span),
+                        );
+                    }
+                    return (
+                        ExecExpr::Prim {
+                            op: ExecPrimOp::RoundToFloat,
+                            args: vec![rex, sex],
+                        },
+                        LTy::new(Ty::Float, rlty.tags.union(&slty.tags)),
+                    );
+                }
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`Float.round_to` expects 1 `Float` argument (`step:`)",
+                    )
+                    .with_span(span),
+                );
+                return (rex, rlty);
             }
             (Ty::Timestamp, "in_tz" | "date_in_tz") => {
                 if let Some(CallArg::Positional(e)) = args.first() {
@@ -8900,6 +9114,56 @@ impl<'a> Checker<'a> {
                     pc,
                     scope,
                     ret_ctx,
+                );
+            }
+            (ty, "in?") => {
+                let Some(base_ty) = in_list_base_ty(ty).cloned() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`.in?(list)` is not supported on receiver type `{ty:?}`"),
+                        )
+                        .with_span(span),
+                    );
+                    return (
+                        ExecExpr::Lit(Literal::Bool(false)),
+                        LTy::new(Ty::Bool, rlty.tags),
+                    );
+                };
+                let Some(list_e) = extract_one_arg(args, "list") else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`.in?(list)` requires 1 `List` argument",
+                        )
+                        .with_span(span),
+                    );
+                    return (
+                        ExecExpr::Lit(Literal::Bool(false)),
+                        LTy::new(Ty::Bool, rlty.tags),
+                    );
+                };
+                let exp_list_ty = Ty::List(Box::new(LTy::public(base_ty.clone())));
+                let (lex, llty) =
+                    self.check_expr(list_e, env, Some(&exp_list_ty), pc, scope, ret_ctx);
+                match &llty.ty {
+                    Ty::List(el) if el.ty == base_ty || is_unresolved_list(&llty.ty) => {}
+                    other => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("`.in?` expects `List({base_ty:?})`, found `{other:?}`"),
+                            )
+                            .with_span(list_e.span),
+                        );
+                    }
+                }
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::InList,
+                        args: vec![rex, lex],
+                    },
+                    LTy::new(Ty::Bool, rlty.tags.union(&llty.effective_tags())),
                 );
             }
             _ => {}
@@ -9938,6 +10202,363 @@ impl<'a> Checker<'a> {
     // Row Expression Checking (inside `where`, `derive`, `summarize`, `schema where`)
     // -----------------------------------------------------------------------
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "handles built-in row method calls and schema-where shorthands"
+    )]
+    fn check_row_method_call(
+        &mut self,
+        re: ExecRowExpr,
+        rty: Ty,
+        rtags: TagSet,
+        member: &str,
+        args: &[CallArg],
+        call_span: Span,
+        recv_span: Span,
+        cols: &[ColSpec],
+        outer_env: &HashMap<Ident, VarBinding>,
+        allow_dot_self: bool,
+    ) -> Option<(ExecRowExpr, Ty, TagSet)> {
+        if args.is_empty()
+            && rty == Ty::Text
+            && let Some((op, out_ty)) = text_prop_op(member)
+        {
+            return Some((ExecRowExpr::Prim { op, args: vec![re] }, out_ty, rtags));
+        }
+        match member {
+            "contains?" | "starts_with?" | "ends_with?" => {
+                if rty != Ty::Text {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`.{member}` requires a `Text` receiver, found `{rty:?}`"),
+                        )
+                        .with_span(recv_span),
+                    );
+                    return Some((ExecRowExpr::Lit(Literal::Bool(false)), Ty::Bool, rtags));
+                }
+                let (key, op) = match member {
+                    "contains?" => ("sub", ExecPrimOp::Core(PrimOp::ContainsText)),
+                    "starts_with?" => ("prefix", ExecPrimOp::StartsWithText),
+                    _ => ("suffix", ExecPrimOp::EndsWithText),
+                };
+                let Some(arg_e) = extract_one_arg(args, key) else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`Text.{member}` expects 1 `Text` argument (`{key}:`)"),
+                        )
+                        .with_span(call_span),
+                    );
+                    return Some((ExecRowExpr::Lit(Literal::Bool(false)), Ty::Bool, rtags));
+                };
+                let (are, aty, atags) =
+                    self.check_row_expr(arg_e, cols, outer_env, Some(&Ty::Text), allow_dot_self);
+                if aty != Ty::Text {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`Text.{member}` expects a `Text` argument, found `{aty:?}`"),
+                        )
+                        .with_span(arg_e.span),
+                    );
+                }
+                Some((
+                    ExecRowExpr::Prim {
+                        op,
+                        args: vec![re, are],
+                    },
+                    Ty::Bool,
+                    rtags.union(&atags),
+                ))
+            }
+            "slice" => {
+                if rty != Ty::Text {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`.slice` requires a `Text` receiver, found `{rty:?}`"),
+                        )
+                        .with_span(recv_span),
+                    );
+                    return Some((
+                        ExecRowExpr::Lit(Literal::Text(String::new())),
+                        Ty::Text,
+                        rtags,
+                    ));
+                }
+                let Some((start_e, len_e)) = extract_two_args(args, "start", "len") else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`Text.slice` expects `(start: Int, len: Int)`",
+                        )
+                        .with_span(call_span),
+                    );
+                    return Some((
+                        ExecRowExpr::Lit(Literal::Text(String::new())),
+                        Ty::Text,
+                        rtags,
+                    ));
+                };
+                let (sre, sty, stags) =
+                    self.check_row_expr(start_e, cols, outer_env, Some(&Ty::Int), allow_dot_self);
+                let (lre, lty, ltags) =
+                    self.check_row_expr(len_e, cols, outer_env, Some(&Ty::Int), allow_dot_self);
+                if sty != Ty::Int {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`Text.slice` `start` must be `Int`, found `{sty:?}`"),
+                        )
+                        .with_span(start_e.span),
+                    );
+                }
+                if lty != Ty::Int {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`Text.slice` `len` must be `Int`, found `{lty:?}`"),
+                        )
+                        .with_span(len_e.span),
+                    );
+                }
+                Some((
+                    ExecRowExpr::Prim {
+                        op: ExecPrimOp::SliceText,
+                        args: vec![re, sre, lre],
+                    },
+                    Ty::Text,
+                    rtags.union(&stags).union(&ltags),
+                ))
+            }
+            "in?" => {
+                let Some(base_ty) = in_list_base_ty(&rty).cloned() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`.in?(list)` is not supported on receiver type `{rty:?}`"),
+                        )
+                        .with_span(recv_span),
+                    );
+                    return Some((ExecRowExpr::Lit(Literal::Bool(false)), Ty::Bool, rtags));
+                };
+                let Some(list_e) = extract_one_arg(args, "list") else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`.in?(list)` requires 1 `List` argument",
+                        )
+                        .with_span(call_span),
+                    );
+                    return Some((ExecRowExpr::Lit(Literal::Bool(false)), Ty::Bool, rtags));
+                };
+                let exp_list_ty = Ty::List(Box::new(LTy::public(base_ty.clone())));
+                let (lre, lty, ltags) = self.check_row_expr(
+                    list_e,
+                    cols,
+                    outer_env,
+                    Some(&exp_list_ty),
+                    allow_dot_self,
+                );
+                match &lty {
+                    Ty::List(el) if el.ty == base_ty || is_unresolved_list(&lty) => {}
+                    other => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("`.in?` expects `List({base_ty:?})`, found `{other:?}`"),
+                            )
+                            .with_span(list_e.span),
+                        );
+                    }
+                }
+                Some((
+                    ExecRowExpr::Prim {
+                        op: ExecPrimOp::InList,
+                        args: vec![re, lre],
+                    },
+                    Ty::Bool,
+                    rtags.union(&ltags),
+                ))
+            }
+            "clamp" => {
+                let Some(op) = clamp_op_for_ty(&rty) else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!(
+                                "`.clamp` requires `Int`, `Float`, or `Decimal`, found `{rty:?}`"
+                            ),
+                        )
+                        .with_span(recv_span),
+                    );
+                    return Some((re, rty, rtags));
+                };
+                let Some((lo_e, hi_e)) = extract_two_args(args, "lo", "hi") else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`.clamp` expects `(lo, hi)` bounds of the same numeric type",
+                        )
+                        .with_span(call_span),
+                    );
+                    return Some((re, rty, rtags));
+                };
+                let (lo_re, lo_ty, lo_tags) =
+                    self.check_row_expr(lo_e, cols, outer_env, Some(&rty), allow_dot_self);
+                let (hi_re, hi_ty, hi_tags) =
+                    self.check_row_expr(hi_e, cols, outer_env, Some(&rty), allow_dot_self);
+                if lo_ty != rty || hi_ty != rty {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`.clamp(lo, hi)` bounds must match receiver type `{rty:?}`"),
+                        )
+                        .with_span(call_span),
+                    );
+                }
+                Some((
+                    ExecRowExpr::Prim {
+                        op,
+                        args: vec![re, lo_re, hi_re],
+                    },
+                    rty,
+                    rtags.union(&lo_tags).union(&hi_tags),
+                ))
+            }
+            "round_to" => {
+                if rty != Ty::Float {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`.round_to` requires a `Float` receiver, found `{rty:?}`"),
+                        )
+                        .with_span(recv_span),
+                    );
+                    return Some((re, rty, rtags));
+                }
+                let Some(step_e) = extract_one_arg(args, "step") else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`Float.round_to` expects 1 `Float` argument (`step:`)",
+                        )
+                        .with_span(call_span),
+                    );
+                    return Some((re, Ty::Float, rtags));
+                };
+                let (sre, sty, stags) =
+                    self.check_row_expr(step_e, cols, outer_env, Some(&Ty::Float), allow_dot_self);
+                if sty != Ty::Float {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`Float.round_to` `step` must be `Float`, found `{sty:?}`"),
+                        )
+                        .with_span(step_e.span),
+                    );
+                }
+                Some((
+                    ExecRowExpr::Prim {
+                        op: ExecPrimOp::RoundToFloat,
+                        args: vec![re, sre],
+                    },
+                    Ty::Float,
+                    rtags.union(&stags),
+                ))
+            }
+            "round" => {
+                let (are, _, atags) = match args.first() {
+                    Some(CallArg::Positional(a0)) => {
+                        self.check_row_expr(a0, cols, outer_env, Some(&Ty::Int), allow_dot_self)
+                    }
+                    _ => (
+                        ExecRowExpr::Lit(Literal::int(0i64)),
+                        Ty::Int,
+                        TagSet::empty(),
+                    ),
+                };
+                let pop = if rty == Ty::Decimal {
+                    ExecPrimOp::RoundDecimal
+                } else {
+                    ExecPrimOp::RoundFloat
+                };
+                Some((
+                    ExecRowExpr::Prim {
+                        op: pop,
+                        args: vec![re, are],
+                    },
+                    rty,
+                    rtags.union(&atags),
+                ))
+            }
+            "in_tz" | "date_in_tz" => {
+                let Some(CallArg::Positional(a0)) = args.first() else {
+                    return None;
+                };
+                if rty != Ty::Timestamp {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`.{member}` requires a `Timestamp` receiver"),
+                        )
+                        .with_span(recv_span),
+                    );
+                }
+                let (are, aty, atags) =
+                    self.check_row_expr(a0, cols, outer_env, Some(&Ty::Text), allow_dot_self);
+                if aty != Ty::Text {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`.{member}` expects a `Text` IANA timezone name"),
+                        )
+                        .with_span(a0.span),
+                    );
+                }
+                let (op, out_ty) = if member == "in_tz" {
+                    (ExecPrimOp::InTz, Ty::Text)
+                } else {
+                    (ExecPrimOp::DateInTz, Ty::Date)
+                };
+                Some((
+                    ExecRowExpr::Prim {
+                        op,
+                        args: vec![re, are],
+                    },
+                    out_ty,
+                    rtags.union(&atags),
+                ))
+            }
+            "predict" if rty == Ty::LinearModel => {
+                let Some(CallArg::Positional(a0)) = args.first() else {
+                    return None;
+                };
+                let (are, aty, atags) =
+                    self.check_row_expr(a0, cols, outer_env, Some(&Ty::Float), allow_dot_self);
+                if !matches!(aty, Ty::Int | Ty::Float | Ty::Decimal) {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`LinearModel.predict` argument must be `Int`, `Float`, or `Decimal`",
+                        )
+                        .with_span(a0.span),
+                    );
+                }
+                Some((
+                    ExecRowExpr::Prim {
+                        op: ExecPrimOp::LinearModelPredict,
+                        args: vec![re, are],
+                    },
+                    Ty::Float,
+                    rtags.union(&atags),
+                ))
+            }
+            _ => None,
+        }
+    }
+
     fn check_row_expr(
         &mut self,
         expr: &Expr,
@@ -10038,6 +10659,62 @@ impl<'a> Checker<'a> {
                     TagSet::empty(),
                 )
             }
+            ExprKind::List(elems) => {
+                let exp_elem = match expected {
+                    Some(Ty::List(el)) => Some(el.as_ref().clone()),
+                    _ => None,
+                };
+                if elems.is_empty() {
+                    let elem_lty = exp_elem.unwrap_or_else(|| {
+                        LTy::public(Ty::Data(TY_UNRESOLVED_LIST_ELEM.to_string()))
+                    });
+                    return (
+                        ExecRowExpr::Prim {
+                            op: ExecPrimOp::Core(PrimOp::ListLit(elem_lty.clone())),
+                            args: Vec::new(),
+                        },
+                        Ty::List(Box::new(elem_lty)),
+                        TagSet::empty(),
+                    );
+                }
+                let mut res = Vec::with_capacity(elems.len());
+                let mut inferred_elem: Option<LTy> = exp_elem;
+                let mut tags = TagSet::empty();
+                for e in elems {
+                    let hint = inferred_elem.as_ref().map(|l| &l.ty);
+                    let (ere, ety, etags) =
+                        self.check_row_expr(e, cols, outer_env, hint, allow_dot_self);
+                    tags = tags.union(&etags);
+                    inferred_elem = Some(match inferred_elem {
+                        None => LTy::new(ety, etags),
+                        Some(prev) => {
+                            if prev.ty != ety {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        format!(
+                                            "list elements must share type `{:?}`, found `{:?}`",
+                                            prev.ty, ety
+                                        ),
+                                    )
+                                    .with_span(e.span),
+                                );
+                            }
+                            LTy::new(prev.ty, prev.tags.union(&etags))
+                        }
+                    });
+                    res.push(ere);
+                }
+                let el = inferred_elem.unwrap_or_else(|| LTy::public(Ty::Unit));
+                (
+                    ExecRowExpr::Prim {
+                        op: ExecPrimOp::Core(PrimOp::ListLit(el.clone())),
+                        args: res,
+                    },
+                    Ty::List(Box::new(el)),
+                    tags,
+                )
+            }
             ExprKind::DotSelf => {
                 if allow_dot_self && let Some(sc) = cols.iter().find(|c| c.name == "__self") {
                     return (
@@ -10089,13 +10766,13 @@ impl<'a> Checker<'a> {
                     (
                         ExecRowExpr::OuterVar(name.clone()),
                         b.lty.ty.clone(),
-                        b.lty.tags.clone(),
+                        b.lty.effective_tags(),
                     )
                 } else if let Some(c) = self.consts.get(name) {
                     (
                         ExecRowExpr::ConstRef(name.clone()),
                         c.lty.ty.clone(),
-                        c.lty.tags.clone(),
+                        c.lty.effective_tags(),
                     )
                 } else {
                     self.diags.push(
@@ -10312,154 +10989,42 @@ impl<'a> Checker<'a> {
                 }
             }
             ExprKind::Call { callee, args } => {
-                // Shorthand `.contains?("@")` in `schema where`!
+                // Shorthand `.contains?("@")`, `.starts_with?(...)`, `.in?(...)`, etc. in `schema where`!
                 if allow_dot_self
                     && let ExprKind::DotField(m) = &callee.kind
                     && let Some(sc) = cols.iter().find(|c| c.name == "__self")
-                    && m.name == "contains?"
-                    && let Some(CallArg::Positional(a0)) = args.first()
+                    && let Some(out) = self.check_row_method_call(
+                        ExecRowExpr::Col("__self".to_string()),
+                        sc.ty.to_ty(),
+                        sc.tags.clone(),
+                        &m.name,
+                        args,
+                        expr.span,
+                        callee.span,
+                        cols,
+                        outer_env,
+                        allow_dot_self,
+                    )
                 {
-                    let (a_re, _, a_tags) =
-                        self.check_row_expr(a0, cols, outer_env, Some(&Ty::Text), allow_dot_self);
-                    return (
-                        ExecRowExpr::Prim {
-                            op: ExecPrimOp::Core(PrimOp::ContainsText),
-                            args: vec![ExecRowExpr::Col("__self".to_string()), a_re],
-                        },
-                        Ty::Bool,
-                        sc.tags.union(&a_tags),
-                    );
+                    return out;
                 }
-                // Method calls inside row expressions (`.contains?`, `.round(n)`).
+                // Method calls inside row expressions (`.lower`, `.slice`, `.starts_with?`, `.in?`, `.clamp`, etc.).
                 if let ExprKind::Field { receiver, member } = &callee.kind {
                     let (re, rty, rtags) =
                         self.check_row_expr(receiver, cols, outer_env, None, allow_dot_self);
-                    match member.name.as_str() {
-                        "contains?" => {
-                            if let Some(CallArg::Positional(a0)) = args.first() {
-                                let (are, _, atags) = self.check_row_expr(
-                                    a0,
-                                    cols,
-                                    outer_env,
-                                    Some(&Ty::Text),
-                                    allow_dot_self,
-                                );
-                                return (
-                                    ExecRowExpr::Prim {
-                                        op: ExecPrimOp::Core(PrimOp::ContainsText),
-                                        args: vec![re, are],
-                                    },
-                                    Ty::Bool,
-                                    rtags.union(&atags),
-                                );
-                            }
-                        }
-                        "round" => {
-                            let (are, _, atags) = match args.first() {
-                                Some(CallArg::Positional(a0)) => self.check_row_expr(
-                                    a0,
-                                    cols,
-                                    outer_env,
-                                    Some(&Ty::Int),
-                                    allow_dot_self,
-                                ),
-                                _ => (
-                                    ExecRowExpr::Lit(Literal::int(0i64)),
-                                    Ty::Int,
-                                    TagSet::empty(),
-                                ),
-                            };
-                            let pop = if rty == Ty::Decimal {
-                                ExecPrimOp::RoundDecimal
-                            } else {
-                                ExecPrimOp::RoundFloat
-                            };
-                            return (
-                                ExecRowExpr::Prim {
-                                    op: pop,
-                                    args: vec![re, are],
-                                },
-                                rty,
-                                rtags.union(&atags),
-                            );
-                        }
-                        "in_tz" | "date_in_tz" => {
-                            if let Some(CallArg::Positional(a0)) = args.first() {
-                                if rty != Ty::Timestamp {
-                                    self.diags.push(
-                                        Diagnostic::error(
-                                            DiagCode::TypeError,
-                                            format!(
-                                                "`.{}` requires a `Timestamp` receiver",
-                                                member.name
-                                            ),
-                                        )
-                                        .with_span(receiver.span),
-                                    );
-                                }
-                                let (are, aty, atags) = self.check_row_expr(
-                                    a0,
-                                    cols,
-                                    outer_env,
-                                    Some(&Ty::Text),
-                                    allow_dot_self,
-                                );
-                                if aty != Ty::Text {
-                                    self.diags.push(
-                                        Diagnostic::error(
-                                            DiagCode::TypeError,
-                                            format!(
-                                                "`.{}` expects a `Text` IANA timezone name",
-                                                member.name
-                                            ),
-                                        )
-                                        .with_span(a0.span),
-                                    );
-                                }
-                                let (op, out_ty) = if member.name == "in_tz" {
-                                    (ExecPrimOp::InTz, Ty::Text)
-                                } else {
-                                    (ExecPrimOp::DateInTz, Ty::Date)
-                                };
-                                return (
-                                    ExecRowExpr::Prim {
-                                        op,
-                                        args: vec![re, are],
-                                    },
-                                    out_ty,
-                                    rtags.union(&atags),
-                                );
-                            }
-                        }
-                        "predict" if rty == Ty::LinearModel => {
-                            if let Some(CallArg::Positional(a0)) = args.first() {
-                                let (are, aty, atags) = self.check_row_expr(
-                                    a0,
-                                    cols,
-                                    outer_env,
-                                    Some(&Ty::Float),
-                                    allow_dot_self,
-                                );
-                                if !matches!(aty, Ty::Int | Ty::Float | Ty::Decimal) {
-                                    self.diags.push(
-                                        Diagnostic::error(
-                                            DiagCode::TypeError,
-                                            "`LinearModel.predict` argument must be `Int`, `Float`, or `Decimal`",
-                                        )
-                                        .with_span(a0.span),
-                                    );
-                                }
-                                return (
-                                    ExecRowExpr::Prim {
-                                        op: ExecPrimOp::LinearModelPredict,
-                                        args: vec![re, are],
-                                    },
-                                    Ty::Float,
-                                    rtags.union(&atags),
-                                );
-                            }
-                        }
-                        _ => {}
+                    if let Some(out) = self.check_row_method_call(
+                        re,
+                        rty,
+                        rtags,
+                        &member.name,
+                        args,
+                        expr.span,
+                        receiver.span,
+                        cols,
+                        outer_env,
+                        allow_dot_self,
+                    ) {
+                        return out;
                     }
                 }
                 // Free row functions (`date_trunc`, `months_between`, or pure user `fn`).
@@ -11533,6 +12098,9 @@ fn eval_const_duration_micros(expr: &Expr) -> Option<i64> {
 }
 
 fn row_property(re: ExecRowExpr, ty: &Ty, prop: &str) -> Option<(ExecRowExpr, Ty)> {
+    if let (Ty::Text, Some((op, out_ty))) = (ty, text_prop_op(prop)) {
+        return Some((ExecRowExpr::Prim { op, args: vec![re] }, out_ty));
+    }
     match (ty, prop) {
         (Ty::Option(_), "some?") => Some((
             ExecRowExpr::Prim {
@@ -11547,27 +12115,6 @@ fn row_property(re: ExecRowExpr, ty: &Ty, prop: &str) -> Option<(ExecRowExpr, Ty
                 args: vec![re],
             },
             Ty::Bool,
-        )),
-        (Ty::Text, "empty?") => Some((
-            ExecRowExpr::Prim {
-                op: ExecPrimOp::Core(PrimOp::EmptyText),
-                args: vec![re],
-            },
-            Ty::Bool,
-        )),
-        (Ty::Text, "trim") => Some((
-            ExecRowExpr::Prim {
-                op: ExecPrimOp::Core(PrimOp::TrimText),
-                args: vec![re],
-            },
-            Ty::Text,
-        )),
-        (Ty::Text, "ascii_lowercase") => Some((
-            ExecRowExpr::Prim {
-                op: ExecPrimOp::Core(PrimOp::LowerAsciiText),
-                args: vec![re],
-            },
-            Ty::Text,
         )),
         (Ty::Int, "to_decimal") => Some((
             ExecRowExpr::Prim {
@@ -11781,5 +12328,91 @@ fn rewrite_promise_self(expr: &Expr, self_var: &str, is_table: bool) -> Expr {
             span: sp,
         },
         _ => expr.clone(),
+    }
+}
+
+fn text_prop_op(prop: &str) -> Option<(ExecPrimOp, Ty)> {
+    match prop {
+        "empty?" => Some((ExecPrimOp::Core(PrimOp::EmptyText), Ty::Bool)),
+        "trim" => Some((ExecPrimOp::Core(PrimOp::TrimText), Ty::Text)),
+        "ascii_lowercase" => Some((ExecPrimOp::Core(PrimOp::LowerAsciiText), Ty::Text)),
+        "lower" => Some((ExecPrimOp::LowerText, Ty::Text)),
+        "upper" => Some((ExecPrimOp::UpperText, Ty::Text)),
+        "try_parse_date" => Some((ExecPrimOp::TryParseDate, Ty::Option(Box::new(Ty::Date)))),
+        "try_parse_int" => Some((ExecPrimOp::TryParseInt, Ty::Option(Box::new(Ty::Int)))),
+        "try_parse_decimal" => Some((
+            ExecPrimOp::TryParseDecimal,
+            Ty::Option(Box::new(Ty::Decimal)),
+        )),
+        "try_parse_float" => Some((ExecPrimOp::TryParseFloat, Ty::Option(Box::new(Ty::Float)))),
+        _ => None,
+    }
+}
+
+fn extract_one_arg<'a>(args: &'a [CallArg], key: &str) -> Option<&'a Expr> {
+    if args.len() != 1 {
+        return None;
+    }
+    match &args[0] {
+        CallArg::Positional(e) => Some(e),
+        CallArg::Named { name, value, .. } if name.name == key => Some(value),
+        _ => None,
+    }
+}
+
+fn extract_two_args<'a>(args: &'a [CallArg], k0: &str, k1: &str) -> Option<(&'a Expr, &'a Expr)> {
+    if args.len() != 2 {
+        return None;
+    }
+    match (&args[0], &args[1]) {
+        (CallArg::Positional(a), CallArg::Positional(b)) => Some((a, b)),
+        (
+            CallArg::Named {
+                name: n0,
+                value: v0,
+                ..
+            },
+            CallArg::Named {
+                name: n1,
+                value: v1,
+                ..
+            },
+        ) => {
+            if n0.name == k0 && n1.name == k1 {
+                Some((v0, v1))
+            } else if n0.name == k1 && n1.name == k0 {
+                Some((v1, v0))
+            } else {
+                None
+            }
+        }
+        (
+            CallArg::Positional(a),
+            CallArg::Named {
+                name: n1, value: b, ..
+            },
+        ) if n1.name == k1 => Some((a, b)),
+        _ => None,
+    }
+}
+
+fn in_list_base_ty(ty: &Ty) -> Option<&Ty> {
+    let base = match ty {
+        Ty::Option(inner) => inner.as_ref(),
+        other => other,
+    };
+    matches!(
+        base,
+        Ty::Text | Ty::Int | Ty::Decimal | Ty::Float | Ty::Date | Ty::Bool
+    )
+    .then_some(base)
+}
+
+fn clamp_op_for_ty(ty: &Ty) -> Option<ExecPrimOp> {
+    match ty {
+        Ty::Int => Some(ExecPrimOp::ClampInt),
+        Ty::Float => Some(ExecPrimOp::ClampFloat),
+        Ty::Decimal => Some(ExecPrimOp::ClampDecimal),
+        _ => None,
     }
 }

@@ -34,16 +34,18 @@ use std::fmt::Write as _;
 use crate::core::bigint::BigInt;
 use crate::core::check::{base_of_scalar, build_joined_cols, merge_union_cols, resolve_join_pairs};
 use crate::core::syntax::{
-    AggItem, AggKind, AggOp, ColSpec, DeriveItem, Expr, HostOp, Ident, JoinKind, JoinOn, Literal,
-    Plan, PrimOp, Program, RowExpr, ScalarTy, SortDir, Suffixes, TableTy, TagSet, Ty,
+    AggItem, AggKind, AggOp, ColSpec, DeriveItem, Expr, Float64, HostOp, Ident, JoinKind, JoinOn,
+    Literal, Plan, PrimOp, Program, RowExpr, ScalarTy, SortDir, Suffixes, TableTy, TagSet, Ty,
 };
 use crate::db::schema_lock::SchemaLockFile;
-use crate::db::{SqlDialect, SqlParam, format_decimal_canonical, quote_sql_ident};
+use crate::db::{
+    SqlDialect, SqlParam, format_decimal_canonical, quote_sql_ident, quote_sql_table_ref,
+};
 use crate::formats::time::{format_iso_date, format_iso_timestamp};
 use crate::oracle::value::Val;
 use crate::runtime::ir::{
-    ExecAggItem, ExecDeriveItem, ExecExpr, ExecHostOp, ExecPlan, ExecPrimOp, ExecProgram,
-    ExecRowExpr,
+    ExecAggItem, ExecAggOp, ExecDeriveItem, ExecExpr, ExecHostOp, ExecPlan, ExecPrimOp,
+    ExecProgram, ExecRowExpr,
 };
 
 // ===========================================================================
@@ -538,6 +540,17 @@ enum SqlExpr {
         distinct: bool,
         arg: Box<SqlExpr>,
     },
+    BoolLit(bool),
+    IntLit(i64),
+    Substring {
+        str_expr: Box<SqlExpr>,
+        start: Box<SqlExpr>,
+        len: Box<SqlExpr>,
+    },
+    InList {
+        expr: Box<SqlExpr>,
+        items: Vec<SqlExpr>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -712,7 +725,7 @@ impl SqlRenderState {
     fn render_from(&mut self, from: &SqlFrom) {
         match from {
             SqlFrom::Table { name } => {
-                self.sql.push_str(&quote_sql_ident(name));
+                self.sql.push_str(&quote_sql_table_ref(name));
             }
             SqlFrom::Subquery { query, alias } => {
                 self.sql.push('(');
@@ -854,6 +867,51 @@ impl SqlRenderState {
                 }
                 self.render_expr(arg);
                 self.sql.push(')');
+            }
+            SqlExpr::BoolLit(b) => match (self.dialect, *b) {
+                (SqlDialect::Sqlite, true) => self.sql.push('1'),
+                (SqlDialect::Sqlite, false) => self.sql.push('0'),
+                (SqlDialect::Postgres, true) => self.sql.push_str("TRUE"),
+                (SqlDialect::Postgres, false) => self.sql.push_str("FALSE"),
+            },
+            SqlExpr::IntLit(n) => {
+                let _ = write!(self.sql, "{n}");
+            }
+            SqlExpr::Substring {
+                str_expr,
+                start,
+                len,
+            } => match self.dialect {
+                SqlDialect::Sqlite => {
+                    self.sql.push_str("SUBSTR(");
+                    self.render_expr(str_expr);
+                    self.sql.push_str(", ");
+                    self.render_expr(start);
+                    self.sql.push_str(", ");
+                    self.render_expr(len);
+                    self.sql.push(')');
+                }
+                SqlDialect::Postgres => {
+                    self.sql.push_str("SUBSTRING(");
+                    self.render_expr(str_expr);
+                    self.sql.push_str(" FROM ");
+                    self.render_expr(start);
+                    self.sql.push_str(" FOR ");
+                    self.render_expr(len);
+                    self.sql.push(')');
+                }
+            },
+            SqlExpr::InList { expr, items } => {
+                self.sql.push('(');
+                self.render_expr(expr);
+                self.sql.push_str(" IN (");
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        self.sql.push_str(", ");
+                    }
+                    self.render_expr(item);
+                }
+                self.sql.push_str("))");
             }
         }
     }
@@ -1039,7 +1097,7 @@ struct PushedNode {
     next_alias_id: usize,
 }
 
-type TranslatedAggSpec = (Ident, AggOp, Option<(SqlExpr, ScalarTy, TagSet)>);
+type TranslatedAggSpec = (Ident, ExecAggOp, Option<(SqlExpr, ScalarTy, TagSet)>);
 
 impl PushedNode {
     fn fresh_alias(&mut self, prefix: &str) -> String {
@@ -1130,7 +1188,7 @@ impl PushedNode {
         let mut unique_keys = Vec::new();
         if let Some(pk_cols) = lock
             .and_then(|l| l.find_db(db_name))
-            .and_then(|d| d.find_table(table_name))
+            .and_then(|d| d.resolve_table(table_name).ok())
             .map(|t| {
                 t.cols
                     .iter()
@@ -1932,8 +1990,26 @@ impl PushedNode {
                 AggKind::NonBlending
             };
             let (sql_e, out_ty, arg_tags) = match (op, arg_opt) {
-                (AggOp::Count, None) => (SqlExpr::CountStar, ScalarTy::Int, TagSet::empty()),
-                (AggOp::CountDistinct, Some((arg_e, arg_ty, arg_ts))) => {
+                (ExecAggOp::Core(AggOp::Count), None) => {
+                    (SqlExpr::CountStar, ScalarTy::Int, TagSet::empty())
+                }
+                (ExecAggOp::CountIf, Some((cond_e, ScalarTy::Bool, cond_tags))) => {
+                    let case_e = SqlExpr::Case {
+                        whens: vec![(cond_e.clone(), SqlExpr::IntLit(1))],
+                        else_br: Box::new(SqlExpr::IntLit(0)),
+                    };
+                    let sum_e = SqlExpr::Agg {
+                        func: "SUM",
+                        distinct: false,
+                        arg: Box::new(case_e),
+                    };
+                    (
+                        SqlExpr::Coalesce(Box::new(sum_e), Box::new(SqlExpr::IntLit(0))),
+                        ScalarTy::Int,
+                        cond_tags.clone(),
+                    )
+                }
+                (ExecAggOp::Core(AggOp::CountDistinct), Some((arg_e, arg_ty, arg_ts))) => {
                     if !is_dialect_exact_eq(dialect, arg_ty) {
                         return Err(non_exact_type_reason(dialect, arg_ty, "CountDistinct"));
                     }
@@ -1947,7 +2023,10 @@ impl PushedNode {
                         arg_ts.clone(),
                     )
                 }
-                (AggOp::Min | AggOp::Max, Some((arg_e, arg_ty, arg_ts))) => {
+                (
+                    ExecAggOp::Core(cop @ (AggOp::Min | AggOp::Max)),
+                    Some((arg_e, arg_ty, arg_ts)),
+                ) => {
                     let b_ty = base_of_scalar(arg_ty);
                     if !is_dialect_exact_ord(dialect, b_ty) {
                         return Err(non_exact_type_reason(dialect, b_ty, "Min/Max"));
@@ -1963,7 +2042,7 @@ impl PushedNode {
                         } else {
                             arg_e.clone()
                         };
-                    let func = if matches!(op, AggOp::Min) {
+                    let func = if matches!(cop, AggOp::Min) {
                         "MIN"
                     } else {
                         "MAX"
@@ -1979,7 +2058,10 @@ impl PushedNode {
                     )
                 }
                 (other_op, _) => {
-                    return Err(format!("aggregate `{other_op:?}` requires local VM"));
+                    return Err(format!(
+                        "aggregate `{}` requires local VM",
+                        other_op.display_name()
+                    ));
                 }
             };
             select_items.push(SqlSelectItem {
@@ -2027,7 +2109,7 @@ impl PushedNode {
         }
         let agg_desc: Vec<String> = agg_items
             .iter()
-            .map(|(n, op, _)| format!("{n}:{op:?}"))
+            .map(|(n, op, _)| format!("{n}:{}", op.display_name()))
             .collect();
         self.pushed_ops
             .push(format!("Summarize([{}])", agg_desc.join(", ")));
@@ -2574,7 +2656,7 @@ fn core_plan_cols_and_uqs_hint(
                 && let Some(pk) = ctx
                     .lock
                     .and_then(|l| l.find_db(&db))
-                    .and_then(|d| d.find_table(table_name))
+                    .and_then(|d| d.resolve_table(table_name).ok())
                     .map(|t| {
                         t.cols
                             .iter()
@@ -3385,7 +3467,7 @@ fn split_core_node(
                                 }
                             },
                         };
-                        translated_aggs.push((name.clone(), *op, t_arg));
+                        translated_aggs.push((name.clone(), ExecAggOp::Core(*op), t_arg));
                     }
                     match node.apply_summarize(
                         group_keys,
@@ -4336,18 +4418,372 @@ fn translate_exec_row_expr(
                 _ => Err("Coalesce type mismatch".to_string()),
             }
         }
-        ExecRowExpr::Prim { op, args } => match op {
-            ExecPrimOp::Core(core_op) => {
+        ExecRowExpr::Prim { op, args } => match (op, args.as_slice()) {
+            (ExecPrimOp::Core(core_op), _) => {
                 let mut translated = Vec::with_capacity(args.len());
                 for a in args {
                     translated.push(translate_exec_row_expr(a, schema, ctx)?);
                 }
                 translate_core_prim_sql(core_op, translated, ctx.dialect)
             }
-            other => Err(format!(
+            (ExecPrimOp::LowerText, [arg]) => {
+                let (e, ty, tags) = translate_exec_row_expr(arg, schema, ctx)?;
+                if ty != ScalarTy::Text {
+                    return Err("LowerText expects Text".to_string());
+                }
+                Ok((
+                    SqlExpr::Func {
+                        name: "LOWER",
+                        args: vec![e],
+                    },
+                    ScalarTy::Text,
+                    tags,
+                ))
+            }
+            (ExecPrimOp::UpperText, [arg]) => {
+                let (e, ty, tags) = translate_exec_row_expr(arg, schema, ctx)?;
+                if ty != ScalarTy::Text {
+                    return Err("UpperText expects Text".to_string());
+                }
+                Ok((
+                    SqlExpr::Func {
+                        name: "UPPER",
+                        args: vec![e],
+                    },
+                    ScalarTy::Text,
+                    tags,
+                ))
+            }
+            (ExecPrimOp::SliceText, [s_re, start_re, len_re]) => {
+                let (s_e, s_ty, s_tags) = translate_exec_row_expr(s_re, schema, ctx)?;
+                if s_ty != ScalarTy::Text {
+                    return Err("SliceText expects Text".to_string());
+                }
+                let Some(start) = extract_static_int_literal(start_re, ctx.prog) else {
+                    return Err("slice with dynamic start requires local VM".to_string());
+                };
+                let Some(len) = extract_static_int_literal(len_re, ctx.prog) else {
+                    return Err("slice with dynamic len requires local VM".to_string());
+                };
+                if start < 0 || len < 0 {
+                    return Err("slice with negative start or len requires local VM".to_string());
+                }
+                let Some(start_plus_1) = start.checked_add(1) else {
+                    return Err("slice start overflow requires local VM".to_string());
+                };
+                if ctx.dialect == SqlDialect::Postgres
+                    && (i32::try_from(start_plus_1).is_err() || i32::try_from(len).is_err())
+                {
+                    return Err("slice bounds outside 32-bit INTEGER require local VM".to_string());
+                }
+                Ok((
+                    SqlExpr::Substring {
+                        str_expr: Box::new(s_e),
+                        start: Box::new(SqlExpr::Param {
+                            slot: SqlParamSlot::Literal(SqlParam::Int(start_plus_1)),
+                            pg_cast: Some("INTEGER"),
+                        }),
+                        len: Box::new(SqlExpr::Param {
+                            slot: SqlParamSlot::Literal(SqlParam::Int(len)),
+                            pg_cast: Some("INTEGER"),
+                        }),
+                    },
+                    ScalarTy::Text,
+                    s_tags,
+                ))
+            }
+            (ExecPrimOp::StartsWithText, [s_re, pfx_re]) => {
+                let (s_e, s_ty, s_tags) = translate_exec_row_expr(s_re, schema, ctx)?;
+                let (p_e, p_ty, p_tags) = translate_exec_row_expr(pfx_re, schema, ctx)?;
+                if s_ty != ScalarTy::Text || p_ty != ScalarTy::Text {
+                    return Err("StartsWithText expects (Text, Text)".to_string());
+                }
+                let sub = SqlExpr::Substring {
+                    str_expr: Box::new(s_e),
+                    start: Box::new(SqlExpr::Param {
+                        slot: SqlParamSlot::Literal(SqlParam::Int(1)),
+                        pg_cast: Some("INTEGER"),
+                    }),
+                    len: Box::new(SqlExpr::Func {
+                        name: "LENGTH",
+                        args: vec![p_e.clone()],
+                    }),
+                };
+                Ok((
+                    SqlExpr::Binary {
+                        op: "=",
+                        left: Box::new(sub),
+                        right: Box::new(p_e),
+                    },
+                    ScalarTy::Bool,
+                    s_tags.union(&p_tags),
+                ))
+            }
+            (ExecPrimOp::EndsWithText, [s_re, sfx_re]) => {
+                let (s_e, s_ty, s_tags) = translate_exec_row_expr(s_re, schema, ctx)?;
+                let (sfx_e, sfx_ty, sfx_tags) = translate_exec_row_expr(sfx_re, schema, ctx)?;
+                if s_ty != ScalarTy::Text || sfx_ty != ScalarTy::Text {
+                    return Err("EndsWithText expects (Text, Text)".to_string());
+                }
+                let len_s = SqlExpr::Func {
+                    name: "LENGTH",
+                    args: vec![s_e.clone()],
+                };
+                let len_sfx = SqlExpr::Func {
+                    name: "LENGTH",
+                    args: vec![sfx_e.clone()],
+                };
+                let zero = SqlExpr::Param {
+                    slot: SqlParamSlot::Literal(SqlParam::Int(0)),
+                    pg_cast: Some("INTEGER"),
+                };
+                let one = SqlExpr::Param {
+                    slot: SqlParamSlot::Literal(SqlParam::Int(1)),
+                    pg_cast: Some("INTEGER"),
+                };
+                let is_empty_sfx = SqlExpr::Binary {
+                    op: "=",
+                    left: Box::new(len_sfx.clone()),
+                    right: Box::new(zero),
+                };
+                let too_short = SqlExpr::Binary {
+                    op: "<",
+                    left: Box::new(len_s.clone()),
+                    right: Box::new(len_sfx.clone()),
+                };
+                let start_idx = SqlExpr::Binary {
+                    op: "+",
+                    left: Box::new(SqlExpr::Binary {
+                        op: "-",
+                        left: Box::new(len_s),
+                        right: Box::new(len_sfx.clone()),
+                    }),
+                    right: Box::new(one),
+                };
+                let tail_match = SqlExpr::Binary {
+                    op: "=",
+                    left: Box::new(SqlExpr::Substring {
+                        str_expr: Box::new(s_e),
+                        start: Box::new(start_idx),
+                        len: Box::new(len_sfx),
+                    }),
+                    right: Box::new(sfx_e),
+                };
+                Ok((
+                    SqlExpr::Case {
+                        whens: vec![
+                            (is_empty_sfx, SqlExpr::BoolLit(true)),
+                            (too_short, SqlExpr::BoolLit(false)),
+                        ],
+                        else_br: Box::new(tail_match),
+                    },
+                    ScalarTy::Bool,
+                    s_tags.union(&sfx_tags),
+                ))
+            }
+            (ExecPrimOp::InList, [val_re, list_re]) => {
+                let (val_e, val_ty, val_tags) = translate_exec_row_expr(val_re, schema, ctx)?;
+                let base_ty = base_of_scalar(&val_ty);
+                if !is_dialect_exact_eq(ctx.dialect, base_ty) {
+                    return Err(non_exact_type_reason(ctx.dialect, base_ty, "in?"));
+                }
+                let ExecRowExpr::Prim {
+                    op: ExecPrimOp::Core(PrimOp::ListLit(_)),
+                    args: elems,
+                } = list_re
+                else {
+                    return Err("in? with dynamic/non-literal list requires local VM".to_string());
+                };
+                if elems.is_empty() {
+                    return Ok((SqlExpr::BoolLit(false), ScalarTy::Bool, val_tags));
+                }
+                let mut item_exprs = Vec::with_capacity(elems.len());
+                let mut all_tags = val_tags;
+                for elem in elems {
+                    let Some((lit, elem_tags)) = extract_static_scalar_lit(elem, ctx.prog) else {
+                        return Err(
+                            "in? list contains non-literal element; requires local VM".to_string()
+                        );
+                    };
+                    let (param, elem_ty, pg_cast) = literal_to_sql_param(&lit, ctx.dialect)?;
+                    if elem_ty != *base_ty {
+                        return Err("in? list element type mismatch with receiver".to_string());
+                    }
+                    all_tags = all_tags.union(&elem_tags);
+                    item_exprs.push(SqlExpr::Param {
+                        slot: SqlParamSlot::Literal(param),
+                        pg_cast,
+                    });
+                }
+                let in_expr = SqlExpr::InList {
+                    expr: Box::new(val_e),
+                    items: item_exprs,
+                };
+                let final_expr = if val_ty.is_option() {
+                    SqlExpr::Coalesce(Box::new(in_expr), Box::new(SqlExpr::BoolLit(false)))
+                } else {
+                    in_expr
+                };
+                Ok((final_expr, ScalarTy::Bool, all_tags))
+            }
+            (ExecPrimOp::ClampInt, [x_re, lo_re, hi_re]) => {
+                let (x_e, x_ty, x_tags) = translate_exec_row_expr(x_re, schema, ctx)?;
+                if x_ty != ScalarTy::Int {
+                    return Err("ClampInt expects Int".to_string());
+                }
+                let (Some(lo), Some(hi)) = (
+                    extract_static_int_literal(lo_re, ctx.prog),
+                    extract_static_int_literal(hi_re, ctx.prog),
+                ) else {
+                    return Err("clamp with dynamic bounds requires local VM".to_string());
+                };
+                if lo > hi {
+                    return Err("invalid clamp bounds (lo > hi) require local VM trap".to_string());
+                }
+                let lo_param = || SqlExpr::Param {
+                    slot: SqlParamSlot::Literal(SqlParam::Int(lo)),
+                    pg_cast: Some("BIGINT"),
+                };
+                let hi_param = || SqlExpr::Param {
+                    slot: SqlParamSlot::Literal(SqlParam::Int(hi)),
+                    pg_cast: Some("BIGINT"),
+                };
+                let lt_lo = SqlExpr::Binary {
+                    op: "<",
+                    left: Box::new(x_e.clone()),
+                    right: Box::new(lo_param()),
+                };
+                let gt_hi = SqlExpr::Binary {
+                    op: ">",
+                    left: Box::new(x_e.clone()),
+                    right: Box::new(hi_param()),
+                };
+                Ok((
+                    SqlExpr::Case {
+                        whens: vec![(lt_lo, lo_param()), (gt_hi, hi_param())],
+                        else_br: Box::new(x_e),
+                    },
+                    ScalarTy::Int,
+                    x_tags,
+                ))
+            }
+            (ExecPrimOp::ClampDecimal, [x_re, lo_re, hi_re]) => {
+                if ctx.dialect != SqlDialect::Postgres {
+                    return Err("SQLite Decimal clamp requires local VM".to_string());
+                }
+                let (x_e, x_ty, x_tags) = translate_exec_row_expr(x_re, schema, ctx)?;
+                if x_ty != ScalarTy::Decimal {
+                    return Err("ClampDecimal expects Decimal".to_string());
+                }
+                let (Some((Literal::Decimal(lo), _)), Some((Literal::Decimal(hi), _))) = (
+                    extract_static_scalar_lit(lo_re, ctx.prog),
+                    extract_static_scalar_lit(hi_re, ctx.prog),
+                ) else {
+                    return Err("Decimal clamp with dynamic bounds requires local VM".to_string());
+                };
+                if !lo.in_decimal_range() || !hi.in_decimal_range() || lo > hi {
+                    return Err("invalid Decimal clamp bounds require local VM trap".to_string());
+                }
+                let lo_param = || SqlExpr::Param {
+                    slot: SqlParamSlot::Literal(SqlParam::Decimal(lo.clone())),
+                    pg_cast: Some("NUMERIC"),
+                };
+                let hi_param = || SqlExpr::Param {
+                    slot: SqlParamSlot::Literal(SqlParam::Decimal(hi.clone())),
+                    pg_cast: Some("NUMERIC"),
+                };
+                let lt_lo = SqlExpr::Binary {
+                    op: "<",
+                    left: Box::new(x_e.clone()),
+                    right: Box::new(lo_param()),
+                };
+                let gt_hi = SqlExpr::Binary {
+                    op: ">",
+                    left: Box::new(x_e.clone()),
+                    right: Box::new(hi_param()),
+                };
+                Ok((
+                    SqlExpr::Case {
+                        whens: vec![(lt_lo, lo_param()), (gt_hi, hi_param())],
+                        else_br: Box::new(x_e),
+                    },
+                    ScalarTy::Decimal,
+                    x_tags,
+                ))
+            }
+            (
+                ExecPrimOp::TryParseDate
+                | ExecPrimOp::TryParseInt
+                | ExecPrimOp::TryParseDecimal
+                | ExecPrimOp::TryParseFloat
+                | ExecPrimOp::ClampFloat
+                | ExecPrimOp::RoundToFloat,
+                _,
+            ) => Err(format!("op `{op:?}` requires local VM")),
+            (other, _) => Err(format!(
                 "runtime extension op `{other:?}` requires local VM"
             )),
         },
+    }
+}
+
+fn extract_static_int_literal(re: &ExecRowExpr, prog: &ExecProgram) -> Option<i64> {
+    match re {
+        ExecRowExpr::Lit(Literal::Int(n)) => n.to_i64(),
+        ExecRowExpr::ConstRef(name) => match prog.find_const(name).map(|c| &c.value) {
+            Some(Literal::Int(n)) => n.to_i64(),
+            _ => None,
+        },
+        ExecRowExpr::Prim {
+            op: ExecPrimOp::Core(PrimOp::NegInt),
+            args,
+        } => match args.as_slice() {
+            [inner] => extract_static_int_literal(inner, prog).and_then(i64::checked_neg),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn extract_static_scalar_lit(re: &ExecRowExpr, prog: &ExecProgram) -> Option<(Literal, TagSet)> {
+    match re {
+        ExecRowExpr::Lit(lit) => Some((lit.clone(), TagSet::empty())),
+        ExecRowExpr::ConstRef(name) => prog
+            .find_const(name)
+            .map(|c| (c.value.clone(), c.lty.effective_tags())),
+        ExecRowExpr::Prim {
+            op: ExecPrimOp::Core(PrimOp::NegInt),
+            args,
+        } => match args.as_slice() {
+            [inner] => match extract_static_scalar_lit(inner, prog) {
+                Some((Literal::Int(n), tags)) => Some((Literal::Int(-n), tags)),
+                _ => None,
+            },
+            _ => None,
+        },
+        ExecRowExpr::Prim {
+            op: ExecPrimOp::Core(PrimOp::NegDec),
+            args,
+        } => match args.as_slice() {
+            [inner] => match extract_static_scalar_lit(inner, prog) {
+                Some((Literal::Decimal(d), tags)) => Some((Literal::Decimal(-d), tags)),
+                _ => None,
+            },
+            _ => None,
+        },
+        ExecRowExpr::Prim {
+            op: ExecPrimOp::NegFloat,
+            args,
+        } => match args.as_slice() {
+            [inner] => match extract_static_scalar_lit(inner, prog) {
+                Some((Literal::Float(f), tags)) => {
+                    Some((Literal::Float(Float64::from_f64(-f.to_f64())), tags))
+                }
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -4390,7 +4826,7 @@ fn exec_plan_cols_and_uqs_hint(
                 && let Some(pk) = ctx
                     .lock
                     .and_then(|l| l.find_db(&db))
-                    .and_then(|d| d.find_table(table_name))
+                    .and_then(|d| d.resolve_table(table_name).ok())
                     .map(|t| {
                         t.cols
                             .iter()

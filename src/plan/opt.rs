@@ -1357,7 +1357,11 @@ const fn exec_prim_op_may_stop(op: &ExecPrimOp) -> bool {
         | ExecPrimOp::OptSubDec
         | ExecPrimOp::TableColSum(_)
         | ExecPrimOp::DateTruncUnit(_)
-        | ExecPrimOp::DateTruncDuration => true,
+        | ExecPrimOp::DateTruncDuration
+        | ExecPrimOp::ClampInt
+        | ExecPrimOp::ClampFloat
+        | ExecPrimOp::ClampDecimal
+        | ExecPrimOp::RoundToFloat => true,
         _ => false,
     }
 }
