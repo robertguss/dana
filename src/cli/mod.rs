@@ -1,27 +1,36 @@
 //! Zero-crate CLI entry point for the `dana` toolchain binary.
 //!
 //! Subcommands:
-//! - `dana check [--policy PATH] [--json] <FILE...>`
-//! - `dana run [--oracle] [--policy PATH] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]`
-//! - `dana test [--oracle] [--policy PATH] [--filter SUBSTR] [PATH...]`
+//! - `dana check [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--json] <FILE...>`
+//! - `dana run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]`
+//! - `dana dry-run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]`
+//! - `dana schema-sync --db Name=URI [--db Name2=URI2 ...] [--out schema.lock]`
+//! - `dana explain [--dialect sqlite|postgres] [--schema-lock FILE] [--policy FILE] <FILE>`
+//! - `dana test [--oracle] [--policy FILE] [--filter SUBSTR] [PATH...]`
 //! - `dana format [--check] <PATH...>`
 //! - `dana guide [SECTION]`
-//! - `dana infer-schema` / `dana fake` (Slice 2B)
+//! - `dana infer-schema` / `dana fake`
 
+use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
 
 use crate::base::{DiagCode, Diagnostic, SourceMap, render_diagnostic, render_diagnostics_json};
-use crate::check::{check_resolved, parse_policy, resolve_path};
+use crate::check::{check_resolved, check_resolved_with_lock, parse_policy, resolve_path};
 use crate::core::syntax::{Policy, TagSet};
 use crate::core::text::print_program;
+use crate::db::schema_lock::{
+    SchemaLock, SchemaLockFile, format_schema_lock, merge_schema_lock, parse_schema_lock,
+};
+use crate::db::{SqlDialect, open_connection};
 use crate::formats::compress::{AutoEncodeWriter, detect_compression_path};
 use crate::formats::fake::{FakeFormat, write_fake_rows};
 use crate::formats::infer::{InferFormat, infer_schema_from_file};
 use crate::lower::lower_program;
 use crate::oracle::cli::parse_comma_tags;
-use crate::plan::{explain_exec_plan, optimize_exec_plan};
+use crate::plan::{bind_exec_plan_sources, exec_plan_db_names, explain_exec_plan_with_pushdown};
 use crate::runtime::{RunConfig, RunResult, run_exec_program, run_program_tests};
 use crate::syntax::{format_module, parse_module};
 use crate::vm::{VmConfig, run_exec_program_vm, run_program_tests_vm};
@@ -30,21 +39,25 @@ use crate::vm::{VmConfig, run_exec_program_vm, run_program_tests_vm};
 pub const EMBEDDED_GUIDE: &str = include_str!("../../docs/reference/README.md");
 
 const USAGE: &str = "\
-dana — fast, private, database-native data language toolchain (Phase 2)
+dana — fast, private, database-native data language toolchain (v0.1)
 
 USAGE:
   dana <COMMAND> [OPTIONS]
 
 COMMANDS:
-  check [--policy FILE] [--json] <FILE...>
-      Parse, type-check, privacy-check, and verify Dana source file(s).
-  run [--oracle] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]
-      Compile and execute a Dana program's `main` function (vectorized columnar VM by default;
-      pass `--oracle` for the reference row-by-row engine).
+  check [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--json] <FILE...>
+      Parse, type-check, privacy-check, and verify Dana source file(s) (with offline schema.lock).
+  run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]
+      Compile and execute a Dana program's `main` function (vectorized columnar VM + SQL pushdown
+      by default; pass `--oracle` for the reference row-by-row engine).
+  dry-run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]
+      Execute strictly read-only, printing redacted WriteTable diffs and suppressing disk/DB writes.
+  schema-sync --db Name=URI [--db Name2=URI2 ...] [--out schema.lock]
+      Introspect live SQLite/PostgreSQL databases and update schema.lock while preserving sensitivity tags.
+  explain [--dialect sqlite|postgres] [--schema-lock FILE] [--policy FILE] <FILE>
+      Show logical/optimized plans, parameterized SQL pushdown, boundary reasons, and sensitivity provenance.
   test [--oracle] [--policy FILE] [--filter SUBSTR] [PATH...]
       Run all inline `examples` and `test` blocks across file(s) or directory.
-  explain [--policy FILE] <FILE>
-      Show logical vs. optimized relational plans for every function in a `.dana` module.
   format [--check] <PATH...>
       Format Dana source file(s) canonically with 2-space indentation.
   guide [SECTION]
@@ -74,7 +87,9 @@ pub fn run_cli(args: &[String]) -> i32 {
         "format" => cmd_format(rest),
         "check" => cmd_check(rest),
         "test" => cmd_test(rest),
-        "run" => cmd_run(rest),
+        "run" => cmd_run_impl(rest, false),
+        "dry-run" => cmd_run_impl(rest, true),
+        "schema-sync" => cmd_schema_sync(rest),
         "explain" => cmd_explain(rest),
         "infer-schema" => cmd_infer_schema(rest),
         "fake" => cmd_fake(rest),
@@ -173,25 +188,57 @@ fn cmd_format(args: &[String]) -> i32 {
 
 fn cmd_check(args: &[String]) -> i32 {
     let mut policy_path: Option<PathBuf> = None;
+    let mut lock_path: Option<PathBuf> = None;
     let mut json_out = false;
     let mut files = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--policy" => {
-                i += 1;
-                let Some(p) = args.get(i) else {
-                    eprintln!("dana check: `--policy` requires a file path");
-                    return 2;
-                };
-                policy_path = Some(PathBuf::from(p));
-            }
-            "--json" => json_out = true,
-            flag if flag.starts_with('-') => {
-                eprintln!("dana check: unknown flag `{flag}`");
+        let arg = args[i].as_str();
+        if let Some(val) = arg.strip_prefix("--policy=") {
+            policy_path = Some(PathBuf::from(val));
+        } else if let Some(val) = arg.strip_prefix("--schema-lock=") {
+            lock_path = Some(PathBuf::from(val));
+        } else if let Some(val) = arg.strip_prefix("--db=") {
+            if let Err(e) = parse_db_binding(val) {
+                eprintln!("dana check: {e}");
                 return 2;
             }
-            path => files.push(PathBuf::from(path)),
+        } else {
+            match arg {
+                "--policy" => {
+                    i += 1;
+                    let Some(p) = args.get(i) else {
+                        eprintln!("dana check: `--policy` requires a file path");
+                        return 2;
+                    };
+                    policy_path = Some(PathBuf::from(p));
+                }
+                "--schema-lock" => {
+                    i += 1;
+                    let Some(p) = args.get(i) else {
+                        eprintln!("dana check: `--schema-lock` requires a file path");
+                        return 2;
+                    };
+                    lock_path = Some(PathBuf::from(p));
+                }
+                "--db" => {
+                    i += 1;
+                    let Some(raw) = args.get(i) else {
+                        eprintln!("dana check: `--db` requires `Name=URI`");
+                        return 2;
+                    };
+                    if let Err(e) = parse_db_binding(raw) {
+                        eprintln!("dana check: {e}");
+                        return 2;
+                    }
+                }
+                "--json" => json_out = true,
+                flag if flag.starts_with('-') => {
+                    eprintln!("dana check: unknown flag `{flag}`");
+                    return 2;
+                }
+                path => files.push(PathBuf::from(path)),
+            }
         }
         i += 1;
     }
@@ -217,8 +264,15 @@ fn cmd_check(args: &[String]) -> i32 {
                 continue;
             }
         };
+        let schema_lock = match load_schema_lock_for(&path, lock_path.as_deref()) {
+            Ok(l) => l,
+            Err(d) => {
+                all_diags.push(d);
+                continue;
+            }
+        };
         match resolve_path(&path, policy, &mut sm) {
-            Ok(resolved) => match check_resolved(&resolved, &sm) {
+            Ok(resolved) => match check_resolved_with_lock(&resolved, &sm, schema_lock.as_ref()) {
                 Ok(checked) => {
                     if let Err(d) = lower_program(checked) {
                         all_diags.push(d);
@@ -353,9 +407,12 @@ fn cmd_test(args: &[String]) -> i32 {
     if failed == 0 { 0 } else { 1 }
 }
 
-fn cmd_run(args: &[String]) -> i32 {
+fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
+    let cmd_name = if dry_run { "dana dry-run" } else { "dana run" };
     let mut use_oracle = false;
     let mut policy_path: Option<PathBuf> = None;
+    let mut lock_path: Option<PathBuf> = None;
+    let mut db_bindings: HashMap<String, String> = HashMap::new();
     let mut allow_export = TagSet::empty();
     let mut emit_core = false;
     let mut script_path: Option<PathBuf> = None;
@@ -363,53 +420,109 @@ fn cmd_run(args: &[String]) -> i32 {
     let mut i = 0;
 
     while i < args.len() {
-        match args[i].as_str() {
-            "--" => {
-                prog_args.extend(args[i + 1..].iter().cloned());
-                break;
-            }
-            "--oracle" => use_oracle = true,
-            "--emit-core" => emit_core = true,
-            "--policy" => {
-                i += 1;
-                let Some(p) = args.get(i) else {
-                    eprintln!("dana run: `--policy` requires a file path");
+        let arg = args[i].as_str();
+        if let Some(val) = arg.strip_prefix("--policy=") {
+            policy_path = Some(PathBuf::from(val));
+        } else if let Some(val) = arg.strip_prefix("--schema-lock=") {
+            lock_path = Some(PathBuf::from(val));
+        } else if let Some(val) = arg.strip_prefix("--db=") {
+            match parse_db_binding(val) {
+                Ok((name, uri)) => {
+                    db_bindings.insert(name, uri);
+                }
+                Err(e) => {
+                    eprintln!("{cmd_name}: {e}");
                     return 2;
-                };
-                policy_path = Some(PathBuf::from(p));
-            }
-            "--allow-export" => {
-                i += 1;
-                let Some(ts) = args.get(i) else {
-                    eprintln!("dana run: `--allow-export` requires comma-separated tags");
-                    return 2;
-                };
-                match parse_comma_tags(ts) {
-                    Ok(tags) => allow_export = allow_export.union(&tags),
-                    Err(e) => {
-                        eprintln!("dana run: invalid `--allow-export`: {e}");
-                        return 2;
-                    }
                 }
             }
-            flag if flag.starts_with('-') => {
-                eprintln!("dana run: unknown flag `{flag}`");
-                return 2;
+        } else if let Some(val) = arg.strip_prefix("--allow-export=") {
+            match parse_comma_tags(val) {
+                Ok(tags) => allow_export = allow_export.union(&tags),
+                Err(e) => {
+                    eprintln!("{cmd_name}: invalid `--allow-export`: {e}");
+                    return 2;
+                }
             }
-            p if script_path.is_none() => script_path = Some(PathBuf::from(p)),
-            other => prog_args.push(other.to_string()),
+        } else {
+            match arg {
+                "--" => {
+                    prog_args.extend(args[i + 1..].iter().cloned());
+                    break;
+                }
+                "--oracle" => use_oracle = true,
+                "--emit-core" if !dry_run => emit_core = true,
+                "--policy" => {
+                    i += 1;
+                    let Some(p) = args.get(i) else {
+                        eprintln!("{cmd_name}: `--policy` requires a file path");
+                        return 2;
+                    };
+                    policy_path = Some(PathBuf::from(p));
+                }
+                "--schema-lock" => {
+                    i += 1;
+                    let Some(p) = args.get(i) else {
+                        eprintln!("{cmd_name}: `--schema-lock` requires a file path");
+                        return 2;
+                    };
+                    lock_path = Some(PathBuf::from(p));
+                }
+                "--db" => {
+                    i += 1;
+                    let Some(raw) = args.get(i) else {
+                        eprintln!("{cmd_name}: `--db` requires `Name=URI`");
+                        return 2;
+                    };
+                    match parse_db_binding(raw) {
+                        Ok((name, uri)) => {
+                            db_bindings.insert(name, uri);
+                        }
+                        Err(e) => {
+                            eprintln!("{cmd_name}: {e}");
+                            return 2;
+                        }
+                    }
+                }
+                "--allow-export" => {
+                    i += 1;
+                    let Some(ts) = args.get(i) else {
+                        eprintln!("{cmd_name}: `--allow-export` requires comma-separated tags");
+                        return 2;
+                    };
+                    match parse_comma_tags(ts) {
+                        Ok(tags) => allow_export = allow_export.union(&tags),
+                        Err(e) => {
+                            eprintln!("{cmd_name}: invalid `--allow-export`: {e}");
+                            return 2;
+                        }
+                    }
+                }
+                flag if flag.starts_with('-') => {
+                    eprintln!("{cmd_name}: unknown flag `{flag}`");
+                    return 2;
+                }
+                p if script_path.is_none() => script_path = Some(PathBuf::from(p)),
+                other => prog_args.push(other.to_string()),
+            }
         }
         i += 1;
     }
 
     let Some(path) = script_path else {
-        eprintln!("dana run: missing `.dana` file path");
+        eprintln!("{cmd_name}: missing `.dana` file path");
         return 2;
     };
 
     let mut sm = SourceMap::new();
     let policy = match load_policy_for(&path, policy_path.as_deref(), &mut sm) {
         Ok(p) => p,
+        Err(d) => {
+            eprint!("{}", render_diagnostic(&d, &sm));
+            return 1;
+        }
+    };
+    let schema_lock = match load_schema_lock_for(&path, lock_path.as_deref()) {
+        Ok(l) => l,
         Err(d) => {
             eprint!("{}", render_diagnostic(&d, &sm));
             return 1;
@@ -424,7 +537,7 @@ fn cmd_run(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let checked = match check_resolved(&resolved, &sm) {
+    let checked = match check_resolved_with_lock(&resolved, &sm, schema_lock.as_ref()) {
         Ok(c) => c,
         Err(ds) => {
             for d in &ds {
@@ -449,7 +562,7 @@ fn cmd_run(args: &[String]) -> i32 {
             }
             None => {
                 eprintln!(
-                    "dana run --emit-core: program uses Phase 2 runtime extensions outside Core IR v0.1"
+                    "dana run --emit-core: program uses Phase 2/3 runtime extensions outside Core IR v0.1"
                 );
                 return 1;
             }
@@ -461,6 +574,9 @@ fn cmd_run(args: &[String]) -> i32 {
         allow_export,
         work_dir: None,
         live_io: true,
+        db_bindings,
+        schema_lock,
+        dry_run,
         ..RunConfig::default()
     };
     let res = if use_oracle {
@@ -511,6 +627,132 @@ fn cmd_run(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+fn cmd_schema_sync(args: &[String]) -> i32 {
+    let mut db_specs: Vec<(String, String)> = Vec::new();
+    let mut out_path = PathBuf::from("schema.lock");
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(val) = arg.strip_prefix("--db=") {
+            match parse_db_binding(val) {
+                Ok(pair) => db_specs.push(pair),
+                Err(e) => {
+                    eprintln!("dana schema-sync: {e}");
+                    return 2;
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--out=") {
+            out_path = PathBuf::from(val);
+        } else {
+            match arg {
+                "--db" => {
+                    i += 1;
+                    let Some(raw) = args.get(i) else {
+                        eprintln!("dana schema-sync: `--db` requires `Name=URI`");
+                        return 2;
+                    };
+                    match parse_db_binding(raw) {
+                        Ok(pair) => db_specs.push(pair),
+                        Err(e) => {
+                            eprintln!("dana schema-sync: {e}");
+                            return 2;
+                        }
+                    }
+                }
+                "--out" => {
+                    i += 1;
+                    let Some(p) = args.get(i) else {
+                        eprintln!("dana schema-sync: `--out` requires a file path");
+                        return 2;
+                    };
+                    out_path = PathBuf::from(p);
+                }
+                flag if flag.starts_with('-') => {
+                    eprintln!("dana schema-sync: unknown flag `{flag}`");
+                    return 2;
+                }
+                other => {
+                    eprintln!("dana schema-sync: unexpected argument `{other}`");
+                    return 2;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if db_specs.is_empty() {
+        eprintln!("dana schema-sync: provide at least one `--db Name=URI`");
+        return 2;
+    }
+
+    let mut lock = if out_path.is_file() {
+        let src = match fs::read_to_string(&out_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "dana schema-sync: cannot read existing `{}`: {e}",
+                    out_path.display()
+                );
+                return 1;
+            }
+        };
+        match parse_schema_lock(&src) {
+            Ok(existing) => existing,
+            Err(e) => {
+                eprintln!(
+                    "dana schema-sync: failed to parse `{}`: {e}",
+                    out_path.display()
+                );
+                return 1;
+            }
+        }
+    } else {
+        SchemaLock::default()
+    };
+
+    for (db_name, uri) in &db_specs {
+        let mut conn = match open_connection(uri) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("dana schema-sync: failed connecting to `{db_name}`: {e}");
+                return 1;
+            }
+        };
+        let fresh = match conn.introspect_schema(db_name) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("dana schema-sync: failed introspecting `{db_name}`: {e}");
+                return 1;
+            }
+        };
+        let (merged, report) = merge_schema_lock(&lock, &fresh);
+        lock = merged;
+        print!("{report}");
+    }
+
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "dana schema-sync: cannot create directory `{}`: {e}",
+            parent.display()
+        );
+        return 1;
+    }
+    let rendered = format_schema_lock(&lock);
+    if let Err(e) = fs::write(&out_path, rendered) {
+        eprintln!(
+            "dana schema-sync: cannot write `{}`: {e}",
+            out_path.display()
+        );
+        return 1;
+    }
+    println!("wrote {}", out_path.display());
+    0
 }
 
 fn collect_exec_plans<'a>(
@@ -592,28 +834,288 @@ fn collect_exec_plans<'a>(
     }
 }
 
+fn collect_call_db_bindings(
+    prog: &crate::runtime::ExecProgram,
+) -> HashMap<String, HashMap<String, crate::runtime::ExecPlan>> {
+    use crate::runtime::ExecExpr;
+
+    let mut fn_bindings: HashMap<String, HashMap<String, crate::runtime::ExecPlan>> =
+        HashMap::new();
+
+    for f in &prog.funs {
+        if f.kind.is_spec() {
+            continue;
+        }
+        let mut local_plans: HashMap<String, crate::runtime::ExecPlan> = HashMap::new();
+        let mut stack = vec![&f.body];
+        while let Some(cur) = stack.pop() {
+            match cur {
+                ExecExpr::LetE {
+                    name, bound, body, ..
+                } => {
+                    if let ExecExpr::Rel(plan) = bound.as_ref() {
+                        let resolved = bind_exec_plan_sources(plan, &local_plans);
+                        if !exec_plan_db_names(&resolved, prog).is_empty() {
+                            local_plans.insert(name.clone(), resolved);
+                        }
+                    }
+                    stack.push(body);
+                    stack.push(bound);
+                }
+                ExecExpr::Call { fn_name, args } => {
+                    if let Some(callee) = prog.find_fun(fn_name)
+                        && !callee.kind.is_spec()
+                    {
+                        for (arg, (pname, _)) in args.iter().zip(&callee.params) {
+                            let resolved = match arg {
+                                ExecExpr::Rel(plan) => {
+                                    let b = bind_exec_plan_sources(plan, &local_plans);
+                                    if exec_plan_db_names(&b, prog).is_empty() {
+                                        None
+                                    } else {
+                                        Some(b)
+                                    }
+                                }
+                                ExecExpr::Var(v) => local_plans.get(v).cloned(),
+                                _ => None,
+                            };
+                            if let Some(plan) = resolved {
+                                fn_bindings
+                                    .entry(callee.name.clone())
+                                    .or_default()
+                                    .entry(pname.clone())
+                                    .or_insert(plan);
+                            }
+                        }
+                    }
+                    for a in args {
+                        stack.push(a);
+                    }
+                }
+                ExecExpr::Join { rhs, body, .. } => {
+                    stack.push(body);
+                    stack.push(rhs);
+                }
+                ExecExpr::IfE {
+                    cond,
+                    then_br,
+                    else_br,
+                } => {
+                    stack.push(else_br);
+                    stack.push(then_br);
+                    stack.push(cond);
+                }
+                ExecExpr::CaseE { scrut, arms } => {
+                    for a in arms {
+                        stack.push(&a.body);
+                    }
+                    stack.push(scrut);
+                }
+                ExecExpr::ForLoop {
+                    iter_expr,
+                    body,
+                    after,
+                    ..
+                } => {
+                    stack.push(after);
+                    stack.push(body);
+                    stack.push(iter_expr);
+                }
+                ExecExpr::WhileLoop {
+                    cond, body, after, ..
+                } => {
+                    stack.push(after);
+                    stack.push(body);
+                    stack.push(cond);
+                }
+                ExecExpr::App { fn_expr, args } => {
+                    for a in args {
+                        stack.push(a);
+                    }
+                    stack.push(fn_expr);
+                }
+                ExecExpr::Jump { args, .. }
+                | ExecExpr::Tuple(args)
+                | ExecExpr::Ctor { args, .. }
+                | ExecExpr::Prim { args, .. }
+                | ExecExpr::Host { args, .. } => {
+                    for a in args {
+                        stack.push(a);
+                    }
+                }
+                ExecExpr::Proj { tup: e, .. }
+                | ExecExpr::Assert { cond: e, .. }
+                | ExecExpr::Fail(e) => stack.push(e),
+                ExecExpr::Lam { body, .. } => stack.push(body),
+                ExecExpr::Stop {
+                    detail: Some(d), ..
+                } => stack.push(d),
+                ExecExpr::Lit(_)
+                | ExecExpr::Var(_)
+                | ExecExpr::ConstRef(_)
+                | ExecExpr::TableLit { .. }
+                | ExecExpr::Rel(_)
+                | ExecExpr::CheckPromise { .. }
+                | ExecExpr::Stop { detail: None, .. } => {}
+            }
+        }
+    }
+    fn_bindings
+}
+
+fn collect_local_db_plans(
+    expr: &crate::runtime::ExecExpr,
+    prog: &crate::runtime::ExecProgram,
+    initial: &HashMap<String, crate::runtime::ExecPlan>,
+) -> HashMap<String, crate::runtime::ExecPlan> {
+    use crate::runtime::ExecExpr;
+    let mut map = initial.clone();
+    let mut stack = vec![expr];
+    while let Some(cur) = stack.pop() {
+        if let ExecExpr::LetE {
+            name, bound, body, ..
+        } = cur
+        {
+            if let ExecExpr::Rel(plan) = bound.as_ref() {
+                let resolved = bind_exec_plan_sources(plan, &map);
+                if !exec_plan_db_names(&resolved, prog).is_empty() {
+                    map.insert(name.clone(), resolved);
+                }
+            }
+            stack.push(body);
+            stack.push(bound);
+        }
+    }
+    map
+}
+
+/// Render a complete `dana explain` report (logical plan, optimized plan, parameterized SQL
+/// pushdown, boundary reasons, local VM suffix, and sensitivity provenance) for `prog`.
+#[must_use]
+pub fn render_explain_report(
+    prog: &crate::runtime::ExecProgram,
+    explicit_dialect: Option<SqlDialect>,
+    schema_lock: Option<&SchemaLockFile>,
+    display_path: &Path,
+) -> String {
+    let fn_bindings = collect_call_db_bindings(prog);
+    let mut out = String::new();
+    let mut found_any = false;
+
+    for include_spec in [false, true] {
+        if include_spec && found_any {
+            break;
+        }
+        for f in &prog.funs {
+            if f.kind.is_spec() != include_spec {
+                continue;
+            }
+            let mut plans = Vec::new();
+            collect_exec_plans(&f.body, &mut plans);
+            if plans.is_empty() {
+                continue;
+            }
+            found_any = true;
+            let base_bindings = fn_bindings.get(&f.name).cloned().unwrap_or_default();
+            let combined = collect_local_db_plans(&f.body, prog, &base_bindings);
+            let _ = writeln!(out, "== fn {} ==", f.name);
+            for (idx, p) in plans.iter().enumerate() {
+                let bound = if combined.is_empty() {
+                    (*p).clone()
+                } else {
+                    bind_exec_plan_sources(p, &combined)
+                };
+                let db_names = exec_plan_db_names(&bound, prog);
+                let db_name = db_names.first().cloned().unwrap_or_default();
+                let dialect = explicit_dialect
+                    .or_else(|| {
+                        schema_lock
+                            .and_then(|l| {
+                                if !db_name.is_empty() {
+                                    l.find_db(&db_name)
+                                } else {
+                                    None
+                                }
+                                .or_else(|| l.dbs.first())
+                            })
+                            .map(|d| d.dialect)
+                    })
+                    .unwrap_or(SqlDialect::Postgres);
+                let _ = writeln!(out, "-- plan #{idx} (dialect: {dialect}) --");
+                let explained =
+                    explain_exec_plan_with_pushdown(&bound, prog, &db_name, dialect, schema_lock);
+                out.push_str(&explained);
+            }
+        }
+    }
+
+    if !found_any {
+        let _ = writeln!(out, "no relational plans in {}", display_path.display());
+    }
+    out
+}
+
 fn cmd_explain(args: &[String]) -> i32 {
     let mut policy_path: Option<PathBuf> = None;
+    let mut lock_path: Option<PathBuf> = None;
+    let mut explicit_dialect: Option<SqlDialect> = None;
     let mut script_path: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--policy" => {
-                i += 1;
-                let Some(p) = args.get(i) else {
-                    eprintln!("dana explain: `--policy` requires a file path");
+        let arg = args[i].as_str();
+        if let Some(val) = arg.strip_prefix("--policy=") {
+            policy_path = Some(PathBuf::from(val));
+        } else if let Some(val) = arg.strip_prefix("--schema-lock=") {
+            lock_path = Some(PathBuf::from(val));
+        } else if let Some(val) = arg.strip_prefix("--dialect=") {
+            match parse_dialect(val) {
+                Ok(d) => explicit_dialect = Some(d),
+                Err(e) => {
+                    eprintln!("dana explain: {e}");
                     return 2;
-                };
-                policy_path = Some(PathBuf::from(p));
+                }
             }
-            flag if flag.starts_with('-') => {
-                eprintln!("dana explain: unknown flag `{flag}`");
-                return 2;
-            }
-            p if script_path.is_none() => script_path = Some(PathBuf::from(p)),
-            other => {
-                eprintln!("dana explain: unexpected argument `{other}`");
-                return 2;
+        } else {
+            match arg {
+                "--policy" => {
+                    i += 1;
+                    let Some(p) = args.get(i) else {
+                        eprintln!("dana explain: `--policy` requires a file path");
+                        return 2;
+                    };
+                    policy_path = Some(PathBuf::from(p));
+                }
+                "--schema-lock" => {
+                    i += 1;
+                    let Some(p) = args.get(i) else {
+                        eprintln!("dana explain: `--schema-lock` requires a file path");
+                        return 2;
+                    };
+                    lock_path = Some(PathBuf::from(p));
+                }
+                "--dialect" => {
+                    i += 1;
+                    let Some(raw) = args.get(i) else {
+                        eprintln!("dana explain: `--dialect` requires `sqlite` or `postgres`");
+                        return 2;
+                    };
+                    match parse_dialect(raw) {
+                        Ok(d) => explicit_dialect = Some(d),
+                        Err(e) => {
+                            eprintln!("dana explain: {e}");
+                            return 2;
+                        }
+                    }
+                }
+                flag if flag.starts_with('-') => {
+                    eprintln!("dana explain: unknown flag `{flag}`");
+                    return 2;
+                }
+                p if script_path.is_none() => script_path = Some(PathBuf::from(p)),
+                other => {
+                    eprintln!("dana explain: unexpected argument `{other}`");
+                    return 2;
+                }
             }
         }
         i += 1;
@@ -630,6 +1132,13 @@ fn cmd_explain(args: &[String]) -> i32 {
             return 1;
         }
     };
+    let schema_lock = match load_schema_lock_for(&path, lock_path.as_deref()) {
+        Ok(l) => l,
+        Err(d) => {
+            eprint!("{}", render_diagnostic(&d, &sm));
+            return 1;
+        }
+    };
     let resolved = match resolve_path(&path, policy, &mut sm) {
         Ok(r) => r,
         Err(ds) => {
@@ -639,7 +1148,7 @@ fn cmd_explain(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let checked = match check_resolved(&resolved, &sm) {
+    let checked = match check_resolved_with_lock(&resolved, &sm, schema_lock.as_ref()) {
         Ok(c) => c,
         Err(ds) => {
             for d in &ds {
@@ -656,33 +1165,9 @@ fn cmd_explain(args: &[String]) -> i32 {
         }
     };
 
-    let mut found_any = false;
-    for f in &lowered.exec.funs {
-        let mut plans = Vec::new();
-        collect_exec_plans(&f.body, &mut plans);
-        if plans.is_empty() {
-            continue;
-        }
-        found_any = true;
-        println!("== fn {} ==", f.name);
-        for (idx, p) in plans.iter().enumerate() {
-            let (opt, stats) = optimize_exec_plan(p, &lowered.exec);
-            println!("-- plan #{idx} (logical) --");
-            print!("{}", explain_exec_plan(p));
-            println!(
-                "-- plan #{idx} (optimized: fused={}, pushed={}, pruned={}, dead={}, limits={}) --",
-                stats.filters_fused,
-                stats.predicates_pushed,
-                stats.derive_items_pruned,
-                stats.dead_ops_eliminated,
-                stats.limits_folded
-            );
-            print!("{}", explain_exec_plan(&opt));
-        }
-    }
-    if !found_any {
-        println!("no relational plans in {}", path.display());
-    }
+    let report =
+        render_explain_report(&lowered.exec, explicit_dialect, schema_lock.as_ref(), &path);
+    print!("{report}");
     0
 }
 
@@ -991,6 +1476,81 @@ fn cmd_fake(args: &[String]) -> i32 {
         }
         0
     }
+}
+
+fn parse_db_binding(raw: &str) -> Result<(String, String), String> {
+    let Some((name, uri)) = raw.split_once('=') else {
+        return Err(format!(
+            "invalid `--db` argument `{raw}` (expected `Name=URI`)"
+        ));
+    };
+    let name = name.trim();
+    let uri = uri.trim();
+    if name.is_empty() || uri.is_empty() {
+        return Err(format!(
+            "invalid `--db` argument `{raw}` (both database name and URI must be non-empty)"
+        ));
+    }
+    Ok((name.to_string(), uri.to_string()))
+}
+
+fn parse_dialect(raw: &str) -> Result<SqlDialect, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "sqlite" => Ok(SqlDialect::Sqlite),
+        "postgres" | "postgresql" | "pg" => Ok(SqlDialect::Postgres),
+        other => Err(format!(
+            "unsupported dialect `{other}` (expected `sqlite` or `postgres`)"
+        )),
+    }
+}
+
+/// Load explicit `--schema-lock` file, or auto-discover `schema.lock` beside `script_path`
+/// or in an ancestor directory (stopping at a `.git` root).
+fn load_schema_lock_for(
+    script_path: &Path,
+    explicit: Option<&Path>,
+) -> Result<Option<SchemaLockFile>, Diagnostic> {
+    let chosen = match explicit {
+        Some(p) => Some(p.to_path_buf()),
+        None => {
+            let mut found = None;
+            let start_dir = script_path.parent().and_then(|d| {
+                if d.as_os_str().is_empty() {
+                    std::env::current_dir().ok()
+                } else {
+                    Some(d.to_path_buf())
+                }
+            });
+            if let Some(dir) = start_dir {
+                for anc in dir.ancestors() {
+                    let candidate = anc.join("schema.lock");
+                    if candidate.is_file() {
+                        found = Some(candidate);
+                        break;
+                    }
+                    if anc.join(".git").exists() {
+                        break;
+                    }
+                }
+            }
+            found
+        }
+    };
+    let Some(p) = chosen else {
+        return Ok(None);
+    };
+    let src = fs::read_to_string(&p).map_err(|e| {
+        Diagnostic::error(
+            DiagCode::IoError,
+            format!("cannot read schema.lock `{}`: {e}", p.display()),
+        )
+    })?;
+    parse_schema_lock(&src).map(Some).map_err(|e| {
+        Diagnostic::error(
+            DiagCode::SchemaError,
+            format!("invalid schema.lock `{}`: {e}", p.display()),
+        )
+    })
 }
 
 /// Load explicit `--policy` file, or auto-discover a sibling `dana.policy` beside `script_path`.

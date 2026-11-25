@@ -13,9 +13,9 @@ when its declared checks pass.
 | 4. Formats, Analytics, Charts & REPL | Native Parquet & `.xlsx`, HTTPS allowlist, windows/pivots/stats, SVG/HTML reports, `dana repl` | **v0.2** |
 | 5. Hardening & Learnability Gate | Full parser fuzzing, differential soak tests, real-world pipelines, multi-model AI learnability gate | **v1.0** |
 
-## Now: Phase 2 Complete — Ready for Phase 3 (Databases & SQL Pushdown)
+## Now: Phase 3 Complete (**v0.1**) — Ready for Phase 4 (Formats, Analytics, Charts & Safe REPL)
 
-Phases 0, 1, and 2 established, formally proved, implemented, and differentially verified the language specification, Core IR, Lean 4 proofs, naive Rust reference oracle, Zero-Crate Rust compiler/CLI, streaming formats/FFI codecs, and 2,048-row vectorized columnar VM:
+Phases 0, 1, 2, and 3 established, formally proved, implemented, and differentially verified the language specification, Core IR, Lean 4 proofs, naive Rust reference oracle, Zero-Crate Rust compiler/CLI, streaming formats/FFI codecs, 2,048-row vectorized columnar VM, and embedded SQLite + native PostgreSQL v3.0 database pushdown runtime (**v0.1**):
 
 - [x] **Design Charter & Architecture Overview** (`docs/CHARTER.md`, `docs/design/architecture.md`, `docs/ROADMAP.md`)
 - [x] **Privacy & Declassification Model** (`docs/design/privacy.md`): sensitivity tag algebra, direct and implicit flows (filters/group-bys/counts), audited declassifiers (`redact`, `pseudonymize`, `bucket`, `suppress_small_groups`), capability sink rules, optional `dana.policy`, and runtime redaction rules.
@@ -27,18 +27,11 @@ Phases 0, 1, and 2 established, formally proved, implemented, and differentially
 - [x] **Phase 2A — Zero-Crate Compiler Front End & Core IR Bridge** (`src/base/`, `src/syntax/`, `src/check/`, `src/lower/`, `src/runtime/`, `src/cli/`): 100% Bison IELR(1) parity parser and canonical formatter, module & `dana.policy` resolver, structural table/privacy/capability/implicit-flow checker, iterative stack-safe lowering with `verified_core` extraction, and `dana` CLI (`check`, `run`, `test`, `format`, `guide`).
 - [x] **Phase 2B — Audited FFI Codecs & Streaming Formats** (`src/ffi/`, `src/formats/`): minimal audited RAII FFI wrappers for system `zlib` and `libzstd` (only `unsafe` in the repo), IANA TZif timezone calendar math, HMAC-SHA256 pseudonymization, streaming CSV/TSV quarantine parser & JSON/JSONL codecs, `dana infer-schema`, and deterministic constraint-satisfying `dana fake`.
 - [x] **Phase 2C — Relational Query Optimizer & 2,048-Row Vectorized Columnar VM** (`src/plan/`, `src/vm/`): stop-, tag-, and cardinality-preserving relational optimizer (filter fusion, predicate pushdown, dead-derive pruning, limit folding) with `dana explain`, 2,048-row contiguous columnar batch engine with bit-packed null bitmaps, compiled register-based row bytecode with automatic pure UDF inlining (zero UDF cliff), vectorized physical operators (`HashJoin`, radix-partitioned `HashAggregate`, `SuppressSmallGroups`, `Window`, `Sort`, `Distinct`, `FillGaps`, `PivotWider`, `Crosstab`, `Redact`, `Pseudonymize`), deterministic `std::thread::scope` multi-core execution, 1M-row throughput smoke benchmark, and 5,000+ generated-pipeline differential verification (`Lean danacore == naive oracle == vectorized VM`).
+- [x] **Phase 3 — Databases & SQL Pushdown (**v0.1**)** (`src/ffi/{sqlite,tls}.rs`, `src/db/`, `src/plan/{pushdown,explain}.rs`, `src/check/`, `src/runtime/`, `src/vm/`, `src/cli/`): minimal audited SQLite 3 & OpenSSL 3 TLS FFI shims, embedded SQLite driver & native PostgreSQL v3.0 wire-protocol client (TLS + SCRAM-SHA-256 auth, parameterized queries only, direct 2,048-row columnar batch streaming), deterministic tag-preserving `dana schema-sync` & offline `schema.lock` verification (including column-by-column `WriteTable` sensitivity compatibility), 100% parameterized SQL pushdown splitter (SQLite & Postgres dialects) verified across 1,125+ differential cases (`Oracle == VM == SQLite Pushdown == Postgres Pushdown`), live `ReadDB`/`WriteTable.upsert`/`RawReadDB.raw_sql` execution, strictly read-only redacted `dana dry-run`, and sensitivity-provenance `dana explain`.
 
 ## Upcoming Phases
 
-### Phase 3 — Databases & SQL Pushdown (**v0.1**, Next)
-- Minimal audited `extern "C"` shims for embedded SQLite amalgamation and system TLS.
-- Native PostgreSQL wire-protocol client (TLS, SCRAM-SHA-256 auth, typed binary/text decoding, parameterized queries only).
-- `dana schema-sync` / `schema.lock` offline database schema snapshots.
-- Query planner pushdown splitter: lowers pushable pipeline stages into parameterized SQL (SQLite & Postgres dialects) and seamlessly streams results into local vectorized stages for cross-source joins and custom functions.
-- `dana dry-run` (redacted insert/update/delete diffs), `dana explain` (SQL pushdown + PII flow map), and capability-gated `raw_sql`.
-- Gate: differential testing asserts `naive oracle == vectorized VM == SQLite pushdown == Postgres pushdown`.
-
-### Phase 4 — Formats, Analytics, Charts & Safe REPL (**v0.2**)
+### Phase 4 — Formats, Analytics, Charts & Safe REPL (**v0.2**, Next)
 - Native in-tree Parquet reader/writer and Excel (`.xlsx`) reader/writer (reusing the audited zlib/zstd shim).
 - Capability-gated HTTPS client with explicit domain allowlists and PII-egress blocking.
 - Full analytics stdlib: window functions (`lag`/`lead`, `rank`, `row_number`, rolling windows), `pivot_wider`/`pivot_longer`, `fill_gaps`, redacted `profile()`, practical stats (`median`, `percentile`, `stddev`, `corr`, t-test, chi-square, linear regression, outlier flags).

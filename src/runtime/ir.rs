@@ -121,9 +121,16 @@ pub enum ExecHostOp {
     /// `out.write_csv(path, table)` / `out.write_jsonl(path, table)`.
     WriteCsv,
     WriteJsonl,
-    /// `db_write.upsert(table, key: .k)` (Phase 3 boundary on real handle).
+    /// `db_write.upsert(table, key: .k)` (Phase 3 live transactional upsert / read-only dry-run).
     WriteTableUpsert {
         key_col: Ident,
+        allows: TagSet,
+    },
+    /// `raw_db.raw_sql("SELECT ...", params: [...], as: Schema)` (Phase 3 parameterized raw SQL).
+    RawSqlQuery {
+        db: Ident,
+        sql: String,
+        out_schema: TableTy,
     },
     /// `response.parse_table(field, as: S)` / `response.bool_at(field)` (Phase 4 HTTPS JSON).
     JsonParseTable(Ident),

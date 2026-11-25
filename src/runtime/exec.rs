@@ -11,8 +11,10 @@ use std::io::{self, BufWriter, Cursor, Write};
 use std::path::Path;
 
 use crate::core::bigint::{BigInt, DEC_MAX, DEC_MIN, DEC_SCALE, INT64_MAX, INT64_MIN};
-use crate::core::check::{is_safe_relative_path, join_confined_path};
+use crate::core::check::{check_cap_against_policy, is_safe_relative_path, join_confined_path};
 use crate::core::syntax::*;
+use crate::db::schema_lock::{SchemaLockFile, to_snake_case};
+use crate::db::{DbError, DbRegistry, SqlDialect, SqlParam, quote_sql_ident};
 use crate::formats::compress::{
     AutoDecodeReader, AutoEncodeWriter, CompressionKind, detect_compression_path,
     open_auto_decoded_file, strip_compression_ext,
@@ -44,6 +46,12 @@ pub struct RunConfig {
     pub live_io: bool,
     pub fuel: usize,
     pub pseudonymize_mode: PseudonymizeMode,
+    /// Logical Dana DB name -> connection URI bindings (e.g. `"Seminary" -> "sqlite:///..."`).
+    pub db_bindings: HashMap<String, String>,
+    /// Optional offline `schema.lock` snapshot for table-name resolution and pushdown PK proofs.
+    pub schema_lock: Option<SchemaLockFile>,
+    /// When `true`, suppresses all live DB/filesystem mutations and prints redacted dry-run diffs.
+    pub dry_run: bool,
 }
 
 impl Default for RunConfig {
@@ -55,6 +63,9 @@ impl Default for RunConfig {
             live_io: true,
             fuel: DEFAULT_FUEL,
             pseudonymize_mode: PseudonymizeMode::HmacSha256,
+            db_bindings: HashMap::new(),
+            schema_lock: None,
+            dry_run: false,
         }
     }
 }
@@ -88,7 +99,7 @@ pub struct TestOutcome {
     pub message: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ExecWorld {
     world: World,
     fake_args: Vec<Vec<String>>,
@@ -96,6 +107,9 @@ struct ExecWorld {
     work_dir: Option<std::path::PathBuf>,
     live_io: bool,
     pseudonymize_mode: PseudonymizeMode,
+    db_registry: DbRegistry,
+    schema_lock: Option<SchemaLockFile>,
+    dry_run: bool,
 }
 
 impl ExecWorld {
@@ -105,6 +119,10 @@ impl ExecWorld {
             runtime_allow_export: cfg.allow_export.clone(),
             ..World::default()
         };
+        let mut db_registry = DbRegistry::new();
+        for (name, uri) in &cfg.db_bindings {
+            db_registry.register(name.clone(), uri.clone());
+        }
         Self {
             world,
             fake_args: Vec::new(),
@@ -112,6 +130,9 @@ impl ExecWorld {
             work_dir: cfg.work_dir.clone(),
             live_io: cfg.live_io,
             pseudonymize_mode: cfg.pseudonymize_mode,
+            db_registry,
+            schema_lock: cfg.schema_lock.clone(),
+            dry_run: cfg.dry_run,
         }
     }
 }
@@ -357,6 +378,36 @@ struct Evaluator<'a> {
     vm_cfg: Option<crate::vm::VmConfig>,
 }
 
+fn map_db_err_to_bug(err: DbError) -> Bug {
+    match err {
+        DbError::SchemaDrift(m) | DbError::TypeConversion(m) => Bug {
+            kind: BugKind::SchemaConstraint,
+            message: m,
+        },
+        other => Bug {
+            kind: BugKind::OutsideBoundary,
+            message: other.to_string(),
+        },
+    }
+}
+
+fn find_fake_db_table<'a>(db: &'a FakeDBState, table_name: &str) -> Option<&'a StoredTable> {
+    if let Some(exact) = db.tables.iter().find(|t| t.table_name == table_name) {
+        return Some(exact);
+    }
+    if let Some(ci) = db
+        .tables
+        .iter()
+        .find(|t| t.table_name.eq_ignore_ascii_case(table_name))
+    {
+        return Some(ci);
+    }
+    let target_snake = to_snake_case(table_name);
+    db.tables
+        .iter()
+        .find(|t| to_snake_case(&t.table_name) == target_snake)
+}
+
 impl crate::vm::exec::ExecPlanBridge for Evaluator<'_> {
     fn eval_outer_expr(
         &mut self,
@@ -389,7 +440,7 @@ impl crate::vm::exec::ExecPlanBridge for Evaluator<'_> {
                     .world
                     .fake_dbs
                     .get(idx)
-                    .and_then(|db| db.tables.iter().find(|t| t.table_name == table_name));
+                    .and_then(|db| find_fake_db_table(db, table_name));
                 match stored {
                     Some(st) => {
                         let rows = st
@@ -413,7 +464,8 @@ impl crate::vm::exec::ExecPlanBridge for Evaluator<'_> {
             }
             _ => Err(crate::vm::OpErr::Stopped(Bug {
                 kind: BugKind::OutsideBoundary,
-                message: "live ReadDB queries require Phase 3 database driver".to_string(),
+                message: "live ReadDB queries require a bound database URI (--db Name=URI or DANA_DB_<NAME>)"
+                    .to_string(),
             })),
         }
     }
@@ -444,6 +496,47 @@ impl crate::vm::exec::ExecPlanBridge for Evaluator<'_> {
                 .unwrap_or_else(|| format!("env:{name}")),
             _ => String::new(),
         }
+    }
+
+    fn live_db_info(
+        &mut self,
+        cap_val: &Val,
+    ) -> Result<Option<(Ident, SqlDialect)>, crate::vm::OpErr> {
+        match cap_val {
+            Val::CapReadDB {
+                handle: CapHandle::Real,
+                db,
+            } => {
+                let conn = self
+                    .ew
+                    .db_registry
+                    .open(db)
+                    .map_err(|e| crate::vm::OpErr::Stopped(map_db_err_to_bug(e)))?;
+                Ok(Some((db.clone(), conn.dialect())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn schema_lock(&self) -> Option<&SchemaLockFile> {
+        self.ew.schema_lock.as_ref()
+    }
+
+    fn exec_live_sql_batches(
+        &mut self,
+        db_name: &str,
+        sql: &str,
+        params: &[SqlParam],
+        expected_schema: &TableTy,
+        batch_size: usize,
+    ) -> Result<crate::vm::ops::VmTable, crate::vm::OpErr> {
+        let conn = self
+            .ew
+            .db_registry
+            .open(db_name)
+            .map_err(|e| crate::vm::OpErr::Stopped(map_db_err_to_bug(e)))?;
+        conn.query_batches(sql, params, expected_schema, batch_size)
+            .map_err(|e| crate::vm::OpErr::Stopped(map_db_err_to_bug(e)))
     }
 }
 
@@ -1517,7 +1610,9 @@ impl<'a> Evaluator<'a> {
                     Val::Table(tv),
                 ] = args
                 {
-                    if let Some(bug) = self.check_export_gate(*handle, allows) {
+                    if !self.ew.dry_run
+                        && let Some(bug) = self.check_export_gate(*handle, allows)
+                    {
                         return EvalOut::Stopped(bug);
                     }
                     if !is_safe_relative_path(rel) {
@@ -1542,7 +1637,9 @@ impl<'a> Evaluator<'a> {
                     Val::Table(tv),
                 ] = args
                 {
-                    if let Some(bug) = self.check_export_gate(*handle, allows) {
+                    if !self.ew.dry_run
+                        && let Some(bug) = self.check_export_gate(*handle, allows)
+                    {
                         return EvalOut::Stopped(bug);
                     }
                     if !is_safe_relative_path(rel) {
@@ -1561,13 +1658,142 @@ impl<'a> Evaluator<'a> {
                     EvalOut::Failed("write_csv expects (WriteFiles, path, table)".to_string())
                 }
             }
-            ExecHostOp::ReadXlsx(_)
-            | ExecHostOp::WriteTableUpsert { .. }
-            | ExecHostOp::JsonParseTable(_)
-            | ExecHostOp::JsonBoolAt => EvalOut::Stopped(Bug {
-                kind: BugKind::OutsideBoundary,
-                message: "operation requires Phase 3/4 database/XLSX/HTTPS drivers".to_string(),
-            }),
+            ExecHostOp::WriteTableUpsert { key_col, allows } => {
+                if let [
+                    Val::CapWriteTable {
+                        handle,
+                        db,
+                        table_name,
+                    },
+                    Val::Table(tv),
+                ] = args
+                {
+                    let cap_ty = Ty::WriteTable {
+                        db: db.clone(),
+                        table_name: table_name.clone(),
+                        dest_cols: Vec::new(),
+                        dest_row_tags: TagSet::empty(),
+                        allows: allows.clone(),
+                    };
+                    if let Err(err) = check_cap_against_policy(self.prog.policy.as_ref(), &cap_ty) {
+                        return EvalOut::Stopped(Bug {
+                            kind: BugKind::ExportGateDenied,
+                            message: err.message,
+                        });
+                    }
+                    let mut required_tags = allows.clone();
+                    for col in &tv.cols {
+                        required_tags = required_tags.union(&col.tags);
+                    }
+                    if !self.ew.dry_run
+                        && let Some(bug) = self.check_export_gate(*handle, &required_tags)
+                    {
+                        return EvalOut::Stopped(bug);
+                    }
+                    let effective_table = self
+                        .ew
+                        .schema_lock
+                        .as_ref()
+                        .and_then(|l| l.find_db(db))
+                        .and_then(|d| d.resolve_table(table_name).ok())
+                        .map_or_else(|| table_name.clone(), |t| t.name.clone());
+                    let dry_run = self.ew.dry_run;
+                    let conn = match self.ew.db_registry.open(db) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
+                        }
+                    };
+                    match conn.upsert_table(&effective_table, key_col, tv, dry_run) {
+                        Ok(diff) => {
+                            if dry_run {
+                                let display_allow = match &self.prog.policy {
+                                    Some(pol) => {
+                                        let permitted: Vec<String> = self
+                                            .ew
+                                            .world
+                                            .runtime_allow_export
+                                            .elems()
+                                            .iter()
+                                            .filter(|t| pol.allow_console.contains(t))
+                                            .cloned()
+                                            .collect();
+                                        TagSet::of_list(permitted)
+                                    }
+                                    None => self.ew.world.runtime_allow_export.clone(),
+                                };
+                                let rendered = diff.render_redacted(&display_allow);
+                                let mut preview = format!(
+                                    "[DRY-RUN] WriteTable({db}, \"{effective_table}\"):\n{rendered}"
+                                );
+                                if preview.ends_with('\n') {
+                                    preview.pop();
+                                }
+                                self.ew.world.stdout.push(preview);
+                            }
+                            EvalOut::Ok(Val::ResOk(Box::new(Val::Ctor {
+                                type_name: "__UpsertStats".to_string(),
+                                ctor_name: "__UpsertStats".to_string(),
+                                fields: vec![
+                                    Val::Int(BigInt::from(diff.inserted as i64)),
+                                    Val::Int(BigInt::from(diff.updated as i64)),
+                                    Val::Int(BigInt::from(diff.unchanged as i64)),
+                                ],
+                            })))
+                        }
+                        Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string())))),
+                    }
+                } else {
+                    EvalOut::Failed("WriteTable.upsert expects (WriteTable, table)".to_string())
+                }
+            }
+            ExecHostOp::RawSqlQuery {
+                db,
+                sql,
+                out_schema,
+            } => {
+                if let [Val::CapRawReadDB(cap_db), params_val] = args {
+                    let raw_params: &[Val] = match params_val {
+                        Val::Tuple(xs) | Val::List(xs) => xs.as_slice(),
+                        _ => {
+                            return EvalOut::Failed(
+                                "RawReadDB.raw_sql expects a tuple or list of scalar parameters"
+                                    .to_string(),
+                            );
+                        }
+                    };
+                    let mut sql_params = Vec::with_capacity(raw_params.len());
+                    for p in raw_params {
+                        match SqlParam::from_val(p) {
+                            Ok(sp) => sql_params.push(sp),
+                            Err(e) => {
+                                return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(
+                                    e.to_string(),
+                                ))));
+                            }
+                        }
+                    }
+                    let target_db = if cap_db.is_empty() { db } else { cap_db };
+                    let conn = match self.ew.db_registry.open(target_db) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
+                        }
+                    };
+                    match conn.query_rows(sql, &sql_params, out_schema) {
+                        Ok(tv) => EvalOut::Ok(Val::ResOk(Box::new(Val::Table(tv)))),
+                        Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string())))),
+                    }
+                } else {
+                    EvalOut::Failed("RawReadDB.raw_sql expects (RawReadDB, params)".to_string())
+                }
+            }
+            ExecHostOp::ReadXlsx(_) | ExecHostOp::JsonParseTable(_) | ExecHostOp::JsonBoolAt => {
+                EvalOut::Stopped(Bug {
+                    kind: BugKind::OutsideBoundary,
+                    message: "operation requires Phase 4 XLSX/HTTPS drivers".to_string(),
+                })
+            }
             ExecHostOp::Core(cop) => self.eval_core_host(cop, args),
         }
     }
@@ -1651,7 +1877,9 @@ impl<'a> Evaluator<'a> {
                     Val::Text(content),
                 ],
             ) => {
-                if let Some(bug) = self.check_export_gate(*handle, allows) {
+                if !self.ew.dry_run
+                    && let Some(bug) = self.check_export_gate(*handle, allows)
+                {
                     return EvalOut::Stopped(bug);
                 }
                 if !is_safe_relative_path(rel) {
@@ -1674,7 +1902,9 @@ impl<'a> Evaluator<'a> {
                     Val::Report(rep),
                 ],
             ) => {
-                if let Some(bug) = self.check_export_gate(*handle, allows) {
+                if !self.ew.dry_run
+                    && let Some(bug) = self.check_export_gate(*handle, allows)
+                {
                     return EvalOut::Stopped(bug);
                 }
                 if !is_safe_relative_path(rel) {
@@ -1919,6 +2149,14 @@ impl<'a> Evaluator<'a> {
                 EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)))
             }
             CapHandle::Real => {
+                if self.ew.dry_run {
+                    self.ew.world.stdout.push(format!(
+                        "[DRY-RUN] would write table \"{full_rel}\" ({} rows, {} cols)",
+                        tv.rows.len(),
+                        tv.cols.len()
+                    ));
+                    return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
+                }
                 if self.ew.live_io {
                     let out_path = match &self.ew.work_dir {
                         Some(base) => base.join(full_rel),
@@ -1969,6 +2207,13 @@ impl<'a> Evaluator<'a> {
                 EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)))
             }
             CapHandle::Real => {
+                if self.ew.dry_run {
+                    self.ew.world.stdout.push(format!(
+                        "[DRY-RUN] would write file \"{full_rel}\" ({} bytes)",
+                        content.len()
+                    ));
+                    return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
+                }
                 if self.ew.live_io {
                     let out_path = match &self.ew.work_dir {
                         Some(base) => base.join(full_rel),
@@ -2219,10 +2464,12 @@ impl<'a> Evaluator<'a> {
                         handle: CapHandle::Fake(idx),
                         ..
                     } => {
-                        let stored =
-                            self.ew.world.fake_dbs.get(idx).and_then(|db| {
-                                db.tables.iter().find(|t| t.table_name == *table_name)
-                            });
+                        let stored = self
+                            .ew
+                            .world
+                            .fake_dbs
+                            .get(idx)
+                            .and_then(|db| find_fake_db_table(db, table_name));
                         match stored {
                             Some(st) => {
                                 let rows = st
@@ -2244,9 +2491,43 @@ impl<'a> Evaluator<'a> {
                             })),
                         }
                     }
+                    Val::CapReadDB {
+                        handle: CapHandle::Real,
+                        ref db,
+                    } => {
+                        let effective_table = self
+                            .ew
+                            .schema_lock
+                            .as_ref()
+                            .and_then(|l| l.find_db(db))
+                            .and_then(|d| d.resolve_table(table_name).ok())
+                            .map_or_else(|| table_name.clone(), |t| t.name.clone());
+                        let cols_sql: Vec<String> = schema
+                            .cols
+                            .iter()
+                            .map(|c| quote_sql_ident(&c.name))
+                            .collect();
+                        let sql = if cols_sql.is_empty() {
+                            format!("SELECT 1 FROM {}", quote_sql_ident(&effective_table))
+                        } else {
+                            format!(
+                                "SELECT {} FROM {}",
+                                cols_sql.join(", "),
+                                quote_sql_ident(&effective_table)
+                            )
+                        };
+                        let conn = match self.ew.db_registry.open(db) {
+                            Ok(c) => c,
+                            Err(e) => return EvalOut::Stopped(map_db_err_to_bug(e)),
+                        };
+                        match conn.query_rows(&sql, &[], schema) {
+                            Ok(tv) => EvalOut::Ok(Val::Table(tv)),
+                            Err(e) => EvalOut::Stopped(map_db_err_to_bug(e)),
+                        }
+                    }
                     _ => EvalOut::Stopped(Bug {
                         kind: BugKind::OutsideBoundary,
-                        message: "live ReadDB queries require Phase 3 database driver".to_string(),
+                        message: "expected ReadDB capability handle".to_string(),
                     }),
                 }
             }

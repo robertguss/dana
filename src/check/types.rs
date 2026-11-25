@@ -12,6 +12,7 @@ use crate::core::check::{
     ensure_option_scalar, numeric_core_of_scalar, quarantine_bad_row_table_ty,
 };
 use crate::core::syntax::*;
+use crate::db::schema_lock::{LockedCol, SchemaLockFile};
 use crate::formats::time::{
     MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MINUTE, MICROS_PER_SECOND, parse_decimal_bigint,
     parse_iso_date, parse_iso_timestamp,
@@ -37,7 +38,21 @@ pub fn check_resolved(
     resolved: &ResolvedProgram,
     sm: &SourceMap,
 ) -> Result<CheckedProgram, Vec<Diagnostic>> {
-    let mut checker = Checker::new(resolved, sm);
+    check_resolved_with_lock(resolved, sm, None)
+}
+
+/// Check an already-resolved multi-module program, optionally verifying all `ReadDB` and
+/// `WriteTable` references offline against a [`SchemaLockFile`].
+///
+/// # Errors
+/// Returns one or more privacy-safe [`Diagnostic`]s on type, schema, privacy, policy, or
+/// capability violations.
+pub fn check_resolved_with_lock(
+    resolved: &ResolvedProgram,
+    sm: &SourceMap,
+    schema_lock: Option<&SchemaLockFile>,
+) -> Result<CheckedProgram, Vec<Diagnostic>> {
+    let mut checker = Checker::new(resolved, sm, schema_lock);
     checker.check_all()?;
     Ok(checker.finish())
 }
@@ -52,8 +67,23 @@ pub fn check_module(
     policy: Option<Policy>,
     sm: &SourceMap,
 ) -> Result<CheckedProgram, Vec<Diagnostic>> {
+    check_module_with_lock(file_id, module, policy, sm, None)
+}
+
+/// Convenience helper: resolve and check a single in-memory parsed module with an optional
+/// offline [`SchemaLockFile`].
+///
+/// # Errors
+/// Returns diagnostics on resolution, type, schema-lock drift, privacy, or policy errors.
+pub fn check_module_with_lock(
+    file_id: crate::base::FileId,
+    module: ast::Module,
+    policy: Option<Policy>,
+    sm: &SourceMap,
+    schema_lock: Option<&SchemaLockFile>,
+) -> Result<CheckedProgram, Vec<Diagnostic>> {
     let resolved = crate::check::resolve::resolve_module(file_id, module, policy)?;
-    check_resolved(&resolved, sm)
+    check_resolved_with_lock(&resolved, sm, schema_lock)
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +143,7 @@ const TY_UNRESOLVED_LIST_ELEM: &str = "__UnresolvedElem";
 struct Checker<'a> {
     resolved: &'a ResolvedProgram,
     sm: &'a SourceMap,
+    schema_lock: Option<&'a SchemaLockFile>,
     diags: Vec<Diagnostic>,
     committed_diags: Vec<Diagnostic>,
     schemas: HashMap<Ident, CompiledSchema>,
@@ -135,19 +166,32 @@ struct Checker<'a> {
 }
 
 impl<'a> Checker<'a> {
-    fn new(resolved: &'a ResolvedProgram, sm: &'a SourceMap) -> Self {
+    fn new(
+        resolved: &'a ResolvedProgram,
+        sm: &'a SourceMap,
+        schema_lock: Option<&'a SchemaLockFile>,
+    ) -> Self {
         let mut structs = HashMap::new();
         structs.insert(
             TY_UPSERT_STATS.to_string(),
             StructLayout {
                 name: TY_UPSERT_STATS.to_string(),
-                field_names: vec!["inserted".to_string(), "updated".to_string()],
-                field_ltys: vec![LTy::public(Ty::Int), LTy::public(Ty::Int)],
+                field_names: vec![
+                    "inserted".to_string(),
+                    "updated".to_string(),
+                    "unchanged".to_string(),
+                ],
+                field_ltys: vec![
+                    LTy::public(Ty::Int),
+                    LTy::public(Ty::Int),
+                    LTy::public(Ty::Int),
+                ],
             },
         );
         Self {
             resolved,
             sm,
+            schema_lock,
             diags: Vec::new(),
             committed_diags: Vec::new(),
             schemas: HashMap::new(),
@@ -535,10 +579,26 @@ impl<'a> Checker<'a> {
                     }
                 };
                 let allows = self.extract_allows_arg(&args[2.min(args.len())..], span);
+                let mut resolved_table = table_name;
+                let mut dest_cols = Vec::new();
+                if let Some(locked_db) = self.schema_lock.and_then(|l| l.find_db(&db)) {
+                    match locked_db.resolve_table(&resolved_table) {
+                        Ok(tbl) => {
+                            resolved_table = tbl.name.clone();
+                            dest_cols = tbl.cols.iter().map(LockedCol::to_col_spec).collect();
+                        }
+                        Err(err) => {
+                            self.diags.push(
+                                Diagnostic::error(DiagCode::SchemaError, err.to_string())
+                                    .with_span(span),
+                            );
+                        }
+                    }
+                }
                 Ty::WriteTable {
                     db,
-                    table_name,
-                    dest_cols: Vec::new(),
+                    table_name: resolved_table,
+                    dest_cols,
                     dest_row_tags: TagSet::empty(),
                     allows,
                 }
@@ -7140,7 +7200,7 @@ impl<'a> Checker<'a> {
                     LTy::public(res_ty),
                 );
             }
-            (Ty::ReadDB(_), "table") => {
+            (Ty::ReadDB(db), "table") => {
                 let sname = match args.first() {
                     Some(CallArg::Positional(Expr {
                         kind: ExprKind::CapName(s),
@@ -7167,10 +7227,68 @@ impl<'a> Checker<'a> {
                     );
                     return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
                 };
+                let mut resolved_table_name = sname.clone();
+                if let Some(locked_db) = self.schema_lock.and_then(|l| l.find_db(db)) {
+                    match locked_db.resolve_table(&sname) {
+                        Ok(locked_tbl) => {
+                            resolved_table_name = locked_tbl.name.clone();
+                            for col in &cs.decl.schema.cols {
+                                let Some(locked_col) = locked_tbl.find_col(&col.name) else {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::SchemaError,
+                                            format!(
+                                                "column `{}.{}` declared in schema `{sname}` is missing from schema.lock for db `{db}`",
+                                                locked_tbl.name, col.name
+                                            ),
+                                        )
+                                        .with_span(span),
+                                    );
+                                    continue;
+                                };
+                                let locked_ty = locked_col.effective_scalar_ty();
+                                if locked_ty != col.ty {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::SchemaError,
+                                            format!(
+                                                "column `{}.{}` type drift: schema.lock has `{locked_ty:?}`, schema `{sname}` declares `{:?}`",
+                                                locked_tbl.name, col.name, col.ty
+                                            ),
+                                        )
+                                        .with_span(span),
+                                    );
+                                }
+                                if !locked_col.tags.is_subset(&col.tags) {
+                                    let missing = locked_col.tags.diff(&col.tags);
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::PrivacyError,
+                                            format!(
+                                                "column `{}.{}` requires sensitivity tags {:?} from schema.lock, but schema `{sname}` omits {:?}",
+                                                locked_tbl.name,
+                                                col.name,
+                                                locked_col.tags.elems(),
+                                                missing.elems()
+                                            ),
+                                        )
+                                        .with_span(span),
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            self.diags.push(
+                                Diagnostic::error(DiagCode::SchemaError, err.to_string())
+                                    .with_span(span),
+                            );
+                        }
+                    }
+                }
                 return (
                     ExecExpr::Rel(Box::new(ExecPlan::SourceDB {
                         cap: Box::new(rex),
-                        table_name: sname,
+                        table_name: resolved_table_name,
                         schema: cs.decl.schema.clone(),
                     })),
                     LTy::public(Ty::Table(cs.decl.schema)),
@@ -7186,6 +7304,13 @@ impl<'a> Checker<'a> {
                 "upsert",
             ) => {
                 let Some(CallArg::Positional(tbl_e)) = args.first() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`WriteTable.upsert` requires a table argument",
+                        )
+                        .with_span(span),
+                    );
                     return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
                 };
                 let (tex, tlty) = self.check_expr(tbl_e, env, None, pc, scope, ret_ctx);
@@ -7203,17 +7328,245 @@ impl<'a> Checker<'a> {
                         .with_span(span),
                     );
                 }
-                let key_col = named_dot_col(args, "key").unwrap_or_default();
+                let key_col = match named_dot_col(args, "key") {
+                    Some(k) => k,
+                    None => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`WriteTable.upsert` requires `key: .column`",
+                            )
+                            .with_span(span),
+                        );
+                        String::new()
+                    }
+                };
+                match &tlty.ty {
+                    Ty::Table(src_tt) => {
+                        if !key_col.is_empty() && src_tt.find_col(&key_col).is_none() {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!(
+                                        "upsert key column `.{key_col}` does not exist on input table"
+                                    ),
+                                )
+                                .with_span(span),
+                            );
+                        }
+                        if let Some(locked_db) = self.schema_lock.and_then(|l| l.find_db(db)) {
+                            match locked_db.resolve_table(table_name) {
+                                Ok(locked_tbl) => {
+                                    if !key_col.is_empty()
+                                        && locked_tbl.find_col(&key_col).is_none()
+                                    {
+                                        self.diags.push(
+                                            Diagnostic::error(
+                                                DiagCode::SchemaError,
+                                                format!(
+                                                    "upsert key column `{}.{key_col}` missing from schema.lock for db `{db}`",
+                                                    locked_tbl.name
+                                                ),
+                                            )
+                                            .with_span(span),
+                                        );
+                                    }
+                                    for src_col in &src_tt.cols {
+                                        let Some(dest_col) = locked_tbl.find_col(&src_col.name)
+                                        else {
+                                            self.diags.push(
+                                                Diagnostic::error(
+                                                    DiagCode::SchemaError,
+                                                    format!(
+                                                        "column `{}.{}` missing from destination table in schema.lock for db `{db}`",
+                                                        locked_tbl.name, src_col.name
+                                                    ),
+                                                )
+                                                .with_span(span),
+                                            );
+                                            continue;
+                                        };
+                                        let dest_ty = dest_col.effective_scalar_ty();
+                                        if dest_ty != src_col.ty {
+                                            self.diags.push(
+                                                Diagnostic::error(
+                                                    DiagCode::SchemaError,
+                                                    format!(
+                                                        "column `{}.{}` type drift on WriteTable.upsert: schema.lock has `{dest_ty:?}`, input table has `{:?}`",
+                                                        locked_tbl.name, src_col.name, src_col.ty
+                                                    ),
+                                                )
+                                                .with_span(span),
+                                            );
+                                        }
+                                        if !src_col.tags.is_subset(&dest_col.tags) {
+                                            let unauth = src_col.tags.diff(&dest_col.tags);
+                                            self.diags.push(
+                                                Diagnostic::error(
+                                                    DiagCode::PrivacyError,
+                                                    format!(
+                                                        "cannot upsert column `{}` tagged {:?} into destination column `{}.{}` tagged {:?} in schema.lock (unauthorized tags: {:?})",
+                                                        src_col.name,
+                                                        src_col.tags.elems(),
+                                                        locked_tbl.name,
+                                                        dest_col.name,
+                                                        dest_col.tags.elems(),
+                                                        unauth.elems()
+                                                    ),
+                                                )
+                                                .with_span(span),
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    self.diags.push(
+                                        Diagnostic::error(DiagCode::SchemaError, err.to_string())
+                                            .with_span(span),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`WriteTable.upsert` first argument must be a `Table(...)`",
+                            )
+                            .with_span(tbl_e.span),
+                        );
+                    }
+                }
                 let res_ty = Ty::Result {
                     ok_ty: Box::new(Ty::Data(TY_UPSERT_STATS.to_string())),
                     err_ty: Box::new(Ty::Text),
                 };
                 return (
                     ExecExpr::Host {
-                        op: ExecHostOp::WriteTableUpsert { key_col },
+                        op: ExecHostOp::WriteTableUpsert {
+                            key_col,
+                            allows: allows.clone(),
+                        },
                         args: vec![rex, tex],
                     },
                     LTy::public(res_ty),
+                );
+            }
+            (Ty::RawReadDB(db), "raw_sql") => {
+                let sql = match args.first() {
+                    Some(CallArg::Positional(Expr {
+                        kind: ExprKind::Text { value, .. },
+                        ..
+                    })) => value.clone(),
+                    Some(CallArg::Positional(other)) => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::CapabilityError,
+                                "`RawReadDB.raw_sql` requires a compile-time constant SQL string literal (no string interpolation or dynamic expressions; bind values via `params: [...]`)",
+                            )
+                            .with_span(other.span),
+                        );
+                        return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                    }
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`RawReadDB.raw_sql` requires a constant SQL string literal as its first argument",
+                            )
+                            .with_span(span),
+                        );
+                        return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                    }
+                };
+                let Some(schema_name) = named_cap_arg(args, "as") else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::SchemaError,
+                            "`RawReadDB.raw_sql` requires `as: SchemaName`",
+                        )
+                        .with_span(span),
+                    );
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                let Some(cs) = self.schemas.get(&schema_name).cloned() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::SchemaError,
+                            format!("unknown schema `{schema_name}`"),
+                        )
+                        .with_span(span),
+                    );
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                };
+                let mut param_tags = TagSet::empty();
+                let params_ex = if let Some(pe) = named_expr_arg(args, "params") {
+                    if let ExprKind::List(items) = &pe.kind {
+                        let mut pexprs = Vec::with_capacity(items.len());
+                        for item in items {
+                            let (iex, ilty) = self.check_expr(item, env, None, pc, scope, ret_ctx);
+                            if ilty.ty.to_scalar_ty().is_none() {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        format!(
+                                            "`raw_sql` param must be a scalar or `Option` scalar, got `{:?}`",
+                                            ilty.ty
+                                        ),
+                                    )
+                                    .with_span(item.span),
+                                );
+                            }
+                            param_tags = param_tags.union(&ilty.effective_tags());
+                            pexprs.push(iex);
+                        }
+                        ExecExpr::Tuple(pexprs)
+                    } else {
+                        let (pex, plty) = self.check_expr(pe, env, None, pc, scope, ret_ctx);
+                        let valid_list = match &plty.ty {
+                            Ty::List(elem) => {
+                                elem.ty.to_scalar_ty().is_some()
+                                    || matches!(
+                                        &elem.ty,
+                                        Ty::Data(n) if n == TY_UNRESOLVED_LIST_ELEM
+                                    )
+                            }
+                            _ => false,
+                        };
+                        if !valid_list {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    "`raw_sql` `params:` argument must be a list of scalar values",
+                                )
+                                .with_span(pe.span),
+                            );
+                        }
+                        param_tags = param_tags.union(&plty.effective_tags());
+                        pex
+                    }
+                } else {
+                    ExecExpr::Tuple(Vec::new())
+                };
+
+                let taint = param_tags.union(pc);
+                let mut out_schema = cs.decl.schema;
+                out_schema.row_tags = out_schema.row_tags.union(&taint);
+                let res_ty = Ty::Result {
+                    ok_ty: Box::new(Ty::Table(out_schema.clone())),
+                    err_ty: Box::new(Ty::Text),
+                };
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::RawSqlQuery {
+                            db: db.clone(),
+                            sql,
+                            out_schema,
+                        },
+                        args: vec![rex, params_ex],
+                    },
+                    LTy::new(res_ty, taint),
                 );
             }
             (Ty::HttpsAllow { host, allows }, "get_json") => {

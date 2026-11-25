@@ -9,11 +9,11 @@ this repository. `CLAUDE.md` imports this file.
 fast, private, database-native data work—the data sibling to
 [Mo](https://github.com/robertguss/mo).
 
-Phases 0, 1, and 2 (Design, Executable Grammar, Lean 4 Formal Core, Naive Rust Oracle,
+Phases 0, 1, 2, and 3 (Design, Executable Grammar, Lean 4 Formal Core, Naive Rust Oracle,
 Zero-Crate Toolchain, Streaming Formats/FFI, Relational Optimizer & 2,048-Row Vectorized
-Columnar VM) are complete. Phase 3 (Databases & SQL Pushdown) is next. Run
-`make check-all` after changes to `grammar/`, `examples/`, `formal/`, `src/`, or
-`docs/reference/README.md`.
+Columnar VM, and Databases & SQL Pushdown — **v0.1**) are complete. Phase 4 (Formats,
+Analytics, Charts & Safe REPL — v0.2) is next. Run `make check-all` after changes to
+`grammar/`, `examples/`, `formal/`, `src/`, or `docs/reference/README.md`.
 
 ## Documents in Order of Authority
 
@@ -34,7 +34,8 @@ make formal                # build & verify Lean 4 formal core, proofs, and dana
 make oracle                # fmt, clippy (-D warnings), doc, unit & differential test suites
 make test-parser-parity    # run Rust parser vs. Bison IELR(1) parity suite
 make test-examples         # run end-to-end tests across all 10 examples/*.dana (VM & oracle)
-make test-diff             # run Lean/oracle/VM differential verification suites (5,000+ cases)
+make test-db               # run SQLite/Postgres driver, schema.lock, pushdown & CLI DB e2e tests
+make test-diff             # run Lean/oracle/VM/SQL-pushdown differential verification suites (6,000+ cases)
 make check-all             # run grammar, formal, and oracle checks end-to-end
 ```
 

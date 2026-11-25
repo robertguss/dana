@@ -99,6 +99,81 @@ impl LockedDb {
     pub fn find_table(&self, name: &str) -> Option<&LockedTable> {
         self.tables.iter().find(|t| t.name == name)
     }
+
+    /// Resolve a Dana schema or table name against this locked database:
+    /// 1. Exact name match
+    /// 2. Unique ASCII case-insensitive match
+    /// 3. Unique `snake_case` match (e.g. `CourseEnrollment` -> `course_enrollment`)
+    ///
+    /// # Errors
+    /// Returns [`DbError::SchemaDrift`] if no table matches or if the fuzzy match is ambiguous.
+    pub fn resolve_table(&self, name: &str) -> Result<&LockedTable, DbError> {
+        if let Some(exact) = self.find_table(name) {
+            return Ok(exact);
+        }
+
+        let ci_matches: Vec<&LockedTable> = self
+            .tables
+            .iter()
+            .filter(|t| t.name.eq_ignore_ascii_case(name))
+            .collect();
+        if ci_matches.len() == 1 {
+            return Ok(ci_matches[0]);
+        }
+        if ci_matches.len() > 1 {
+            let names: Vec<&str> = ci_matches.iter().map(|t| t.name.as_str()).collect();
+            return Err(DbError::SchemaDrift(format!(
+                "ambiguous case-insensitive table match for `{name}` in db `{}`: {:?}",
+                self.name, names
+            )));
+        }
+
+        let target_snake = to_snake_case(name);
+        let snake_matches: Vec<&LockedTable> = self
+            .tables
+            .iter()
+            .filter(|t| to_snake_case(&t.name) == target_snake)
+            .collect();
+        if snake_matches.len() == 1 {
+            return Ok(snake_matches[0]);
+        }
+        if snake_matches.len() > 1 {
+            let names: Vec<&str> = snake_matches.iter().map(|t| t.name.as_str()).collect();
+            return Err(DbError::SchemaDrift(format!(
+                "ambiguous snake_case table match for `{name}` in db `{}`: {:?}",
+                self.name, names
+            )));
+        }
+
+        Err(DbError::SchemaDrift(format!(
+            "table `{name}` not found in schema.lock for db `{}`",
+            self.name
+        )))
+    }
+}
+
+/// Convert `PascalCase` / `camelCase` identifiers into canonical `snake_case`.
+#[must_use]
+pub fn to_snake_case(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    let chars: Vec<char> = name.chars().collect();
+    for (idx, &ch) in chars.iter().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if idx > 0 {
+                let prev = chars[idx - 1];
+                let next_is_lower = chars.get(idx + 1).is_some_and(|n| n.is_ascii_lowercase());
+                if prev != '_'
+                    && (prev.is_ascii_lowercase() || prev.is_ascii_digit() || next_is_lower)
+                {
+                    out.push('_');
+                }
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch.to_ascii_lowercase());
+        }
+    }
+    out
 }
 
 /// Root offline `schema.lock` document.

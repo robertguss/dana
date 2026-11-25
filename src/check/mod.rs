@@ -8,4 +8,6 @@ pub mod types;
 
 pub use policy::parse_policy;
 pub use resolve::{ModuleOrigin, ResolvedModule, ResolvedProgram, resolve_module, resolve_path};
-pub use types::{CheckedProgram, check_module, check_resolved};
+pub use types::{
+    CheckedProgram, check_module, check_module_with_lock, check_resolved, check_resolved_with_lock,
+};

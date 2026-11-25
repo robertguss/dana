@@ -15,6 +15,8 @@ use crate::core::syntax::{
     AggKind, BugKind, CaseArm, ColSpec, DeriveItem, Expr, HostOp, Ident, LTy, Plan, PrimOp,
     Program, ScalarTy, TableTy, TagSet, Ty,
 };
+use crate::db::schema_lock::SchemaLockFile;
+use crate::db::{SqlDialect, SqlParam, quote_sql_ident};
 use crate::oracle::eval::{PrimResult, RuntimeError, eval_literal, eval_prim_op};
 use crate::oracle::value::{
     Bug, CapHandle, EnvEntry, EnvList, ReportVal, TableRow, TableVal, Val, format_diag_detail,
@@ -24,7 +26,7 @@ use crate::oracle::world::{
     ExecReport, FakeConsoleState, FakeDBState, FakeFilesState, FakeHttpsState, Outcome,
     StoredTable, World, extract_report,
 };
-use crate::plan::{optimize_exec_plan, optimize_program};
+use crate::plan::{SplitPlan, optimize_exec_plan, optimize_program, split_exec_plan_pushdown};
 use crate::runtime::exec::{
     RunConfig, RunResult, TestOutcome, eval_pure_exec_call, run_exec_program_with_engine,
     run_program_tests_with_engine,
@@ -107,10 +109,29 @@ pub trait ExecPlanBridge {
         schema: &TableTy,
     ) -> Result<TableVal, OpErr>;
     fn resolve_secret_material(&self, sec_val: &Val) -> String;
+
+    /// If `cap_val` is a live `ReadDB(db_name)`, resolve/open its connection and return
+    /// `(db_name, dialect)`. Returns `Ok(None)` for in-memory fake DB handles.
+    fn live_db_info(&mut self, cap_val: &Val) -> Result<Option<(Ident, SqlDialect)>, OpErr>;
+
+    /// Return the optional offline [`SchemaLockFile`] configured for this run.
+    fn schema_lock(&self) -> Option<&SchemaLockFile>;
+
+    /// Execute a parameterized SQL query against live logical database `db_name` and stream
+    /// results directly into `batch_size`-row columnar batches.
+    fn exec_live_sql_batches(
+        &mut self,
+        db_name: &str,
+        sql: &str,
+        params: &[SqlParam],
+        expected_schema: &TableTy,
+        batch_size: usize,
+    ) -> Result<VmTable, OpErr>;
 }
 
-/// Execute a Phase 2 [`ExecPlan`] through the optional relational optimizer and the
-/// 2,048-row vectorized columnar batch VM.
+/// Execute a Phase 2 [`ExecPlan`] through the optional relational optimizer, automatic
+/// parameterized SQL pushdown (for live `ReadDB` sources), and the 2,048-row vectorized
+/// columnar batch VM.
 pub fn eval_exec_plan_vm(
     plan: &ExecPlan,
     prog: &ExecProgram,
@@ -139,6 +160,7 @@ pub fn eval_exec_plan_vm(
         outer_env: env,
         fuel,
     };
+    let mut preloaded: Vec<(Ident, VmTable)> = Vec::new();
     if let ExecPlan::Crosstab {
         input,
         rows_col,
@@ -147,21 +169,142 @@ pub fn eval_exec_plan_vm(
         fill,
     } = effective_plan
     {
-        let in_tbl = eval_exec_plan_to_table(input, prog, env, &row_host, &op_cfg, bridge)?;
+        let in_tbl = eval_exec_plan_to_table(
+            input,
+            prog,
+            env,
+            &mut preloaded,
+            &row_host,
+            &op_cfg,
+            bridge,
+            true,
+        )?;
         return op_crosstab(in_tbl, rows_col, cols_col, values_col, fill, &op_cfg);
     }
-    let out_tbl = eval_exec_plan_to_table(effective_plan, prog, env, &row_host, &op_cfg, bridge)?;
+    let out_tbl = eval_exec_plan_to_table(
+        effective_plan,
+        prog,
+        env,
+        &mut preloaded,
+        &row_host,
+        &op_cfg,
+        bridge,
+        true,
+    )?;
     Ok(Val::Table(out_tbl.into_table_val()))
 }
 
+fn collect_exec_source_db_caps<'a>(plan: &'a ExecPlan, out: &mut Vec<&'a ExecExpr>) {
+    let mut stack = vec![plan];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            ExecPlan::SourceDB { cap, .. } => out.push(cap),
+            ExecPlan::SourceExpr(_) => {}
+            ExecPlan::Join { left, right, .. } | ExecPlan::Union { left, right } => {
+                stack.push(right);
+                stack.push(left);
+            }
+            other => {
+                if let Some(child) = exec_unary_input(other) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Vectorized ExecPlan evaluator threads preloaded SQL-pushdown batches and bridge callbacks without row marshalling"
+)]
 fn eval_exec_plan_to_table(
     plan: &ExecPlan,
     prog: &ExecProgram,
     env: &HashMap<Ident, Val>,
+    preloaded: &mut Vec<(Ident, VmTable)>,
     row_host: &ExecRowHost<'_>,
     cfg: &OpExecConfig,
     bridge: &mut dyn ExecPlanBridge,
+    allow_pushdown: bool,
 ) -> Result<VmTable, OpErr> {
+    if allow_pushdown {
+        let mut db_caps = Vec::new();
+        collect_exec_source_db_caps(plan, &mut db_caps);
+        if !db_caps.is_empty() {
+            let mut single_live: Option<(Ident, SqlDialect)> = None;
+            let mut all_same_live = true;
+            for cap in db_caps {
+                let cap_v = bridge.eval_outer_expr(cap, env)?;
+                match bridge.live_db_info(&cap_v)? {
+                    Some((db_name, dialect)) => match &single_live {
+                        None => single_live = Some((db_name, dialect)),
+                        Some((prev_db, _)) if *prev_db == db_name => {}
+                        Some(_) => {
+                            all_same_live = false;
+                            break;
+                        }
+                    },
+                    None => {
+                        all_same_live = false;
+                        break;
+                    }
+                }
+            }
+            if all_same_live && let Some((db_name, dialect)) = single_live {
+                let split =
+                    split_exec_plan_pushdown(plan, prog, &db_name, dialect, bridge.schema_lock());
+                match split {
+                    SplitPlan::FullyPushed(q) => {
+                        let params = q
+                            .resolve_params(
+                                |v| env.get(v).cloned(),
+                                |c| prog.find_const(c).map(|d| eval_literal(&d.value)),
+                            )
+                            .map_err(OpErr::Failed)?;
+                        return bridge.exec_live_sql_batches(
+                            &q.db_name,
+                            &q.sql,
+                            &params,
+                            &q.out_schema,
+                            cfg.batch_size,
+                        );
+                    }
+                    SplitPlan::Hybrid {
+                        pushdown,
+                        placeholder_var,
+                        local_suffix,
+                    } => {
+                        let params = pushdown
+                            .resolve_params(
+                                |v| env.get(v).cloned(),
+                                |c| prog.find_const(c).map(|d| eval_literal(&d.value)),
+                            )
+                            .map_err(OpErr::Failed)?;
+                        let pushed_tbl = bridge.exec_live_sql_batches(
+                            &pushdown.db_name,
+                            &pushdown.sql,
+                            &params,
+                            &pushdown.out_schema,
+                            cfg.batch_size,
+                        )?;
+                        preloaded.push((placeholder_var, pushed_tbl));
+                        return eval_exec_plan_to_table(
+                            &local_suffix,
+                            prog,
+                            env,
+                            preloaded,
+                            row_host,
+                            cfg,
+                            bridge,
+                            true,
+                        );
+                    }
+                    SplitPlan::LocalOnly { .. } => {}
+                }
+            }
+        }
+    }
+
     // Iteratively peel deep unary chains so 200,000-stage relational pipelines run in O(1) stack!
     let mut unary_stack: Vec<&ExecPlan> = Vec::new();
     let mut leaf = plan;
@@ -172,11 +315,17 @@ fn eval_exec_plan_to_table(
 
     let mut cur = match leaf {
         ExecPlan::SourceExpr(e) => {
-            let v = bridge.eval_outer_expr(e, env)?;
-            let Some(tv) = v.into_table() else {
-                return Err(OpErr::Failed("plan did not evaluate to Table".to_string()));
-            };
-            VmTable::from_table_val(&tv, cfg.batch_size)
+            if let ExecExpr::Var(name) = e.as_ref()
+                && let Some(pos) = preloaded.iter().rposition(|(k, _)| k == name)
+            {
+                preloaded.remove(pos).1
+            } else {
+                let v = bridge.eval_outer_expr(e, env)?;
+                let Some(tv) = v.into_table() else {
+                    return Err(OpErr::Failed("plan did not evaluate to Table".to_string()));
+                };
+                VmTable::from_table_val(&tv, cfg.batch_size)
+            }
         }
         ExecPlan::SourceDB {
             cap,
@@ -184,12 +333,37 @@ fn eval_exec_plan_to_table(
             schema,
         } => {
             let cap_v = bridge.eval_outer_expr(cap, env)?;
-            let tv = bridge.load_fake_db_table(cap_v, table_name, schema)?;
-            VmTable::from_table_val(&tv, cfg.batch_size)
+            if let Some((db_name, _dialect)) = bridge.live_db_info(&cap_v)? {
+                let effective_table = bridge
+                    .schema_lock()
+                    .and_then(|l| l.find_db(&db_name))
+                    .and_then(|d| d.resolve_table(table_name).ok())
+                    .map_or_else(|| table_name.clone(), |t| t.name.clone());
+                let cols_sql: Vec<String> = schema
+                    .cols
+                    .iter()
+                    .map(|c| quote_sql_ident(&c.name))
+                    .collect();
+                let sql = if cols_sql.is_empty() {
+                    format!("SELECT 1 FROM {}", quote_sql_ident(&effective_table))
+                } else {
+                    format!(
+                        "SELECT {} FROM {}",
+                        cols_sql.join(", "),
+                        quote_sql_ident(&effective_table)
+                    )
+                };
+                bridge.exec_live_sql_batches(&db_name, &sql, &[], schema, cfg.batch_size)?
+            } else {
+                let tv = bridge.load_fake_db_table(cap_v, table_name, schema)?;
+                VmTable::from_table_val(&tv, cfg.batch_size)
+            }
         }
         ExecPlan::Union { left, right } => {
-            let lt = eval_exec_plan_to_table(left, prog, env, row_host, cfg, bridge)?;
-            let rt = eval_exec_plan_to_table(right, prog, env, row_host, cfg, bridge)?;
+            let lt =
+                eval_exec_plan_to_table(left, prog, env, preloaded, row_host, cfg, bridge, true)?;
+            let rt =
+                eval_exec_plan_to_table(right, prog, env, preloaded, row_host, cfg, bridge, true)?;
             op_union(lt, rt, cfg.mode)?
         }
         ExecPlan::Join {
@@ -199,8 +373,10 @@ fn eval_exec_plan_to_table(
             on,
             suffixes,
         } => {
-            let lt = eval_exec_plan_to_table(left, prog, env, row_host, cfg, bridge)?;
-            let rt = eval_exec_plan_to_table(right, prog, env, row_host, cfg, bridge)?;
+            let lt =
+                eval_exec_plan_to_table(left, prog, env, preloaded, row_host, cfg, bridge, true)?;
+            let rt =
+                eval_exec_plan_to_table(right, prog, env, preloaded, row_host, cfg, bridge, true)?;
             op_hash_join(*kind, lt, rt, on, suffixes, &TagSet::empty(), cfg)?
         }
         _ => {
