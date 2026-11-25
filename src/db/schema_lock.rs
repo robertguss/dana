@@ -108,6 +108,9 @@ pub struct SchemaLock {
     pub dbs: Vec<LockedDb>,
 }
 
+/// Alias for [`SchemaLock`] matching the Phase 3 pushdown & lockfile API.
+pub type SchemaLockFile = SchemaLock;
+
 impl Default for SchemaLock {
     fn default() -> Self {
         Self {

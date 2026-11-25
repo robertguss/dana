@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use crate::core::bigint::BigInt;
 use crate::core::check::{
-    PlanTy, apply_derive_item_arc, check_expr_arc, check_plan_arc, check_program,
-    infer_jump_pc_arc, is_safe_relative_path, join_confined_path, quarantine_bad_row_table_ty,
+    PlanTy, apply_derive_item_arc, apply_window_item, check_expr_arc, check_plan_arc,
+    check_program, infer_jump_pc_arc, is_safe_relative_path, join_confined_path,
+    quarantine_bad_row_table_ty,
 };
 use crate::core::stack::with_large_stack;
 use crate::core::syntax::{
@@ -384,10 +385,31 @@ fn exec_unary_input(plan: &ExecPlan) -> Option<&ExecPlan> {
 // ===========================================================================
 
 /// Direct columnar batch plan evaluator over a pre-loaded [`VmTable`] source (used by
-/// benchmarks and streaming tests to run 1M+ rows end-to-end in columnar batches without
-/// row-by-row `TableVal` marshalling).
+/// benchmarks, streaming tests, and hybrid SQL pushdown local suffixes to run columnar
+/// batches without row-by-row `TableVal` marshalling).
 pub fn eval_core_plan_batches(
     prog: &Program,
+    source_var_name: &str,
+    source_table: VmTable,
+    plan: &Plan,
+    vm_cfg: &VmConfig,
+) -> Result<VmTable, OpErr> {
+    let empty_env = EnvList::empty();
+    eval_core_plan_batches_with_env(
+        prog,
+        &empty_env,
+        source_var_name,
+        source_table,
+        plan,
+        vm_cfg,
+    )
+}
+
+/// Direct columnar batch plan evaluator over a pre-loaded [`VmTable`] source with an explicit
+/// outer lexical environment [`EnvList`] (supporting `RowExpr::OuterVar` inside hybrid local suffixes).
+pub fn eval_core_plan_batches_with_env(
+    prog: &Program,
+    env: &EnvList,
     source_var_name: &str,
     source_table: VmTable,
     plan: &Plan,
@@ -409,12 +431,11 @@ pub fn eval_core_plan_batches(
         pseudonymize_mode: crate::runtime::ir::PseudonymizeMode::CoreV01Fnv1a,
     };
     let mut world = World::default();
-    let empty_env = EnvList::empty();
     let mut source_slot = Some(source_table);
     eval_core_plan_direct(
         100_000,
         prog,
-        &empty_env,
+        env,
         &TagSet::empty(),
         &mut world,
         effective_plan,
@@ -527,6 +548,15 @@ fn eval_core_plan_direct(
                 source_var,
                 source_slot,
             )?;
+            for c in &mut t.cols {
+                c.agg_kind = AggKind::Raw;
+            }
+            for b in &mut t.batches {
+                b.group_meta = None;
+                for c in &mut b.cols {
+                    c.spec.agg_kind = AggKind::Raw;
+                }
+            }
             for item in items {
                 let next_cols = apply_derive_item_arc(prog, env.as_arc_ty_env(), &t.cols, item)
                     .map_err(|_| OpErr::Wrong)?;
@@ -653,6 +683,146 @@ fn eval_core_plan_direct(
                 source_slot,
             )?;
             Ok(op_limit(t, n.to_usize_saturating(), cfg.mode))
+        }
+        Plan::Distinct { input, cols } => {
+            let t = eval_core_plan_direct(
+                fuel,
+                prog,
+                env,
+                pc,
+                world,
+                input,
+                cfg,
+                source_var,
+                source_slot,
+            )?;
+            op_distinct(t, cols, cfg)
+        }
+        Plan::SuppressSmallGroups {
+            input,
+            min_k,
+            distinct_by,
+            mode,
+        } => {
+            let t = eval_core_plan_direct(
+                fuel,
+                prog,
+                env,
+                pc,
+                world,
+                input,
+                cfg,
+                source_var,
+                source_slot,
+            )?;
+            Ok(op_suppress_small_groups(
+                t,
+                min_k,
+                distinct_by,
+                *mode,
+                pc,
+                cfg,
+            ))
+        }
+        Plan::Window { input, items } => {
+            let t = eval_core_plan_direct(
+                fuel,
+                prog,
+                env,
+                pc,
+                world,
+                input,
+                cfg,
+                source_var,
+                source_slot,
+            )?;
+            let mut out_cols: Vec<ColSpec> = t
+                .cols
+                .iter()
+                .map(|c| ColSpec {
+                    agg_kind: AggKind::Raw,
+                    ..c.clone()
+                })
+                .collect();
+            for item in items {
+                out_cols = apply_window_item(&out_cols, &TagSet::empty(), item)
+                    .map_err(|_| OpErr::Wrong)?;
+            }
+            op_window(t, items, Some(out_cols), cfg)
+        }
+        Plan::Redact {
+            input,
+            col,
+            replacement,
+        } => {
+            let t = eval_core_plan_direct(
+                fuel,
+                prog,
+                env,
+                pc,
+                world,
+                input,
+                cfg,
+                source_var,
+                source_slot,
+            )?;
+            op_redact(t, col, replacement, pc, cfg)
+        }
+        Plan::Join {
+            kind,
+            left,
+            right,
+            on,
+            suffixes,
+        } => {
+            let lt = eval_core_plan_direct(
+                fuel,
+                prog,
+                env,
+                pc,
+                world,
+                left,
+                cfg,
+                source_var,
+                source_slot,
+            )?;
+            let rt = eval_core_plan_direct(
+                fuel,
+                prog,
+                env,
+                pc,
+                world,
+                right,
+                cfg,
+                source_var,
+                source_slot,
+            )?;
+            op_hash_join(*kind, lt, rt, on, suffixes, pc, cfg)
+        }
+        Plan::Union { left, right } => {
+            let lt = eval_core_plan_direct(
+                fuel,
+                prog,
+                env,
+                pc,
+                world,
+                left,
+                cfg,
+                source_var,
+                source_slot,
+            )?;
+            let rt = eval_core_plan_direct(
+                fuel,
+                prog,
+                env,
+                pc,
+                world,
+                right,
+                cfg,
+                source_var,
+                source_slot,
+            )?;
+            op_union(lt, rt, cfg.mode)
         }
         other => match eval_core_plan_vm(fuel, prog, env, pc, world, other, cfg) {
             VmStep::Ok(v) => {
