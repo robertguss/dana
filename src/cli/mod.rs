@@ -6,6 +6,8 @@
 //! - `dana dry-run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]`
 //! - `dana schema-sync --db Name=URI [--db Name2=URI2 ...] [--out schema.lock]`
 //! - `dana explain [--dialect sqlite|postgres] [--schema-lock FILE] [--policy FILE] <FILE>`
+//! - `dana repl [--policy FILE] [--db Name=URI]... [--schema-lock FILE] [--show-sensitive TAGS] [--eval EXPR]`
+//! - `dana vendor pin|verify [--dir PATH]`
 //! - `dana test [--oracle] [--policy FILE] [--filter SUBSTR] [PATH...]`
 //! - `dana format [--check] <PATH...>`
 //! - `dana guide [SECTION]`
@@ -14,23 +16,29 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{self, BufWriter};
+use std::io::{self, BufWriter, Cursor, IsTerminal};
 use std::path::{Path, PathBuf};
 
 use crate::base::{DiagCode, Diagnostic, SourceMap, render_diagnostic, render_diagnostics_json};
-use crate::check::{check_resolved, check_resolved_with_lock, parse_policy, resolve_path};
+use crate::check::{
+    check_resolved, check_resolved_with_lock, parse_policy, pin_vendor_dir, resolve_path,
+    verify_vendor_dir,
+};
 use crate::core::syntax::{Policy, TagSet};
 use crate::core::text::print_program;
 use crate::db::schema_lock::{
     SchemaLock, SchemaLockFile, format_schema_lock, merge_schema_lock, parse_schema_lock,
 };
 use crate::db::{SqlDialect, open_connection};
-use crate::formats::compress::{AutoEncodeWriter, detect_compression_path};
+use crate::formats::compress::{AutoEncodeWriter, detect_compression_path, strip_compression_ext};
 use crate::formats::fake::{FakeFormat, write_fake_rows};
-use crate::formats::infer::{InferFormat, infer_schema_from_file};
+use crate::formats::infer::{InferFormat, default_schema_name_from_path, infer_schema_from_file};
+use crate::formats::parquet::infer_parquet_schema_from_file;
+use crate::formats::xlsx::infer_xlsx_schema_from_file;
 use crate::lower::lower_program;
 use crate::oracle::cli::parse_comma_tags;
 use crate::plan::{bind_exec_plan_sources, exec_plan_db_names, explain_exec_plan_with_pushdown};
+use crate::repl::{ReplConfig, ReplSession, run_repl_reader, run_repl_stdio};
 use crate::runtime::{RunConfig, RunResult, run_exec_program, run_program_tests};
 use crate::syntax::{format_module, parse_module};
 use crate::vm::{VmConfig, run_exec_program_vm, run_program_tests_vm};
@@ -39,7 +47,7 @@ use crate::vm::{VmConfig, run_exec_program_vm, run_program_tests_vm};
 pub const EMBEDDED_GUIDE: &str = include_str!("../../docs/reference/README.md");
 
 const USAGE: &str = "\
-dana — fast, private, database-native data language toolchain (v0.1)
+dana — fast, private, database-native data language toolchain (v0.2)
 
 USAGE:
   dana <COMMAND> [OPTIONS]
@@ -56,14 +64,18 @@ COMMANDS:
       Introspect live SQLite/PostgreSQL databases and update schema.lock while preserving sensitivity tags.
   explain [--dialect sqlite|postgres] [--schema-lock FILE] [--policy FILE] <FILE>
       Show logical/optimized plans, parameterized SQL pushdown, boundary reasons, and sensitivity provenance.
+  repl [--policy FILE] [--db Name=URI]... [--schema-lock FILE] [--show-sensitive TAGS] [--eval EXPR]
+      Start a safe read-only, privacy-redacted interactive REPL (or run a one-liner via `--eval`).
+  vendor pin|verify [--dir PATH]
+      Pin or verify SHA-256 hashes of pure-by-default vendored modules in `vendor/vendor.lock`.
   test [--oracle] [--policy FILE] [--filter SUBSTR] [PATH...]
       Run all inline `examples` and `test` blocks across file(s) or directory.
   format [--check] <PATH...>
       Format Dana source file(s) canonically with 2-space indentation.
   guide [SECTION]
-      Print the embedded Dana Language Reference v0.1 (optionally filtered by section).
-  infer-schema <DATA_FILE> [--name Schema] [--sample-rows N] [--format csv|tsv|jsonl]
-      Infer a typed Dana schema from CSV/TSV/JSONL (supports .gz and .zst transparently).
+      Print the embedded Dana Language Reference (optionally filtered by section).
+  infer-schema <DATA_FILE> [--name Schema] [--sample-rows N] [--format csv|tsv|jsonl|parquet|xlsx]
+      Infer a typed Dana schema from CSV/TSV/JSONL/Parquet/XLSX (supports .gz and .zst transparently).
   fake <FILE.dana> [--schema Name] [--rows N] [--seed S] [--format csv|tsv|jsonl] [--out PATH]
       Generate deterministic synthetic constraint-satisfying test data.
   help, --help, -h
@@ -91,6 +103,8 @@ pub fn run_cli(args: &[String]) -> i32 {
         "dry-run" => cmd_run_impl(rest, true),
         "schema-sync" => cmd_schema_sync(rest),
         "explain" => cmd_explain(rest),
+        "repl" => cmd_repl(rest),
+        "vendor" => cmd_vendor(rest),
         "infer-schema" => cmd_infer_schema(rest),
         "fake" => cmd_fake(rest),
         other => {
@@ -1171,11 +1185,251 @@ fn cmd_explain(args: &[String]) -> i32 {
     0
 }
 
+fn cmd_vendor(args: &[String]) -> i32 {
+    let Some(sub) = args.first().map(String::as_str) else {
+        eprintln!(
+            "dana vendor: expected subcommand `pin` or `verify` (`dana vendor pin|verify [--dir PATH]`)"
+        );
+        return 2;
+    };
+    if matches!(sub, "--help" | "-h" | "help") {
+        println!("usage: dana vendor pin|verify [--dir PATH]");
+        return 0;
+    }
+    if !matches!(sub, "pin" | "verify") {
+        eprintln!("dana vendor: unknown subcommand `{sub}` (expected `pin` or `verify`)");
+        return 2;
+    }
+
+    let mut vendor_dir = PathBuf::from("vendor");
+    let mut i = 1usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(val) = arg.strip_prefix("--dir=") {
+            vendor_dir = PathBuf::from(val);
+        } else if arg == "--dir" {
+            i += 1;
+            let Some(p) = args.get(i) else {
+                eprintln!("dana vendor {sub}: `--dir` requires a directory path");
+                return 2;
+            };
+            vendor_dir = PathBuf::from(p);
+        } else if arg.starts_with('-') {
+            eprintln!("dana vendor {sub}: unknown flag `{arg}`");
+            return 2;
+        } else {
+            eprintln!("dana vendor {sub}: unexpected argument `{arg}`");
+            return 2;
+        }
+        i += 1;
+    }
+
+    match sub {
+        "pin" => match pin_vendor_dir(&vendor_dir) {
+            Ok((lock, paths)) => {
+                for p in &paths {
+                    println!("pinned {p}");
+                }
+                println!(
+                    "wrote {} ({} module(s))",
+                    vendor_dir.join("vendor.lock").display(),
+                    lock.entries.len()
+                );
+                0
+            }
+            Err(msg) => {
+                eprintln!("dana vendor pin: {msg}");
+                1
+            }
+        },
+        "verify" => match verify_vendor_dir(&vendor_dir) {
+            Ok(paths) => {
+                println!(
+                    "ok: verified {} vendored module(s) in {}",
+                    paths.len(),
+                    vendor_dir.join("vendor.lock").display()
+                );
+                0
+            }
+            Err(errs) => {
+                for err in errs {
+                    eprintln!("dana vendor verify: {err}");
+                }
+                1
+            }
+        },
+        _ => 2,
+    }
+}
+
+fn cmd_repl(args: &[String]) -> i32 {
+    let mut policy_path: Option<PathBuf> = None;
+    let mut lock_path: Option<PathBuf> = None;
+    let mut db_bindings: Vec<(String, String)> = Vec::new();
+    let mut allowed_show_tags = TagSet::empty();
+    let mut eval_expr: Option<String> = None;
+    let mut i = 0usize;
+
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(val) = arg.strip_prefix("--policy=") {
+            policy_path = Some(PathBuf::from(val));
+        } else if let Some(val) = arg.strip_prefix("--schema-lock=") {
+            lock_path = Some(PathBuf::from(val));
+        } else if let Some(val) = arg.strip_prefix("--db=") {
+            match parse_db_binding(val) {
+                Ok(pair) => db_bindings.push(pair),
+                Err(e) => {
+                    eprintln!("dana repl: {e}");
+                    return 2;
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--show-sensitive=") {
+            match parse_comma_tags(val) {
+                Ok(tags) => allowed_show_tags = allowed_show_tags.union(&tags),
+                Err(e) => {
+                    eprintln!("dana repl: invalid `--show-sensitive`: {e}");
+                    return 2;
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--eval=") {
+            eval_expr = Some(val.to_string());
+        } else {
+            match arg {
+                "--policy" => {
+                    i += 1;
+                    let Some(p) = args.get(i) else {
+                        eprintln!("dana repl: `--policy` requires a file path");
+                        return 2;
+                    };
+                    policy_path = Some(PathBuf::from(p));
+                }
+                "--schema-lock" => {
+                    i += 1;
+                    let Some(p) = args.get(i) else {
+                        eprintln!("dana repl: `--schema-lock` requires a file path");
+                        return 2;
+                    };
+                    lock_path = Some(PathBuf::from(p));
+                }
+                "--db" => {
+                    i += 1;
+                    let Some(raw) = args.get(i) else {
+                        eprintln!("dana repl: `--db` requires `Name=URI`");
+                        return 2;
+                    };
+                    match parse_db_binding(raw) {
+                        Ok(pair) => db_bindings.push(pair),
+                        Err(e) => {
+                            eprintln!("dana repl: {e}");
+                            return 2;
+                        }
+                    }
+                }
+                "--show-sensitive" => {
+                    i += 1;
+                    let Some(ts) = args.get(i) else {
+                        eprintln!("dana repl: `--show-sensitive` requires comma-separated tags");
+                        return 2;
+                    };
+                    match parse_comma_tags(ts) {
+                        Ok(tags) => allowed_show_tags = allowed_show_tags.union(&tags),
+                        Err(e) => {
+                            eprintln!("dana repl: invalid `--show-sensitive`: {e}");
+                            return 2;
+                        }
+                    }
+                }
+                "--eval" => {
+                    i += 1;
+                    let Some(expr) = args.get(i) else {
+                        eprintln!("dana repl: `--eval` requires an expression");
+                        return 2;
+                    };
+                    eval_expr = Some(expr.clone());
+                }
+                "--help" | "-h" => {
+                    println!(
+                        "usage: dana repl [--policy FILE] [--db Name=URI]... [--schema-lock FILE] [--show-sensitive TAGS] [--eval EXPR]"
+                    );
+                    return 0;
+                }
+                flag if flag.starts_with('-') => {
+                    eprintln!("dana repl: unknown flag `{flag}`");
+                    return 2;
+                }
+                other => {
+                    eprintln!("dana repl: unexpected argument `{other}`");
+                    return 2;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut sm = SourceMap::new();
+    let policy = match load_policy_from_dir_or_ancestors(&cwd, policy_path.as_deref(), &mut sm) {
+        Ok(p) => p,
+        Err(d) => {
+            eprint!("{}", render_diagnostic(&d, &sm));
+            return 1;
+        }
+    };
+    let schema_lock = match load_schema_lock_for(&cwd.join("repl.dana"), lock_path.as_deref()) {
+        Ok(l) => l,
+        Err(d) => {
+            eprint!("{}", render_diagnostic(&d, &sm));
+            return 1;
+        }
+    };
+
+    let cfg = ReplConfig {
+        policy,
+        db_bindings,
+        schema_lock,
+        allowed_show_tags,
+        work_dir: cwd,
+        vm_cfg: VmConfig::default(),
+    };
+    let mut session = match ReplSession::new(cfg) {
+        Ok(s) => s,
+        Err(d) => {
+            eprint!("{}", render_diagnostic(&d, &sm));
+            return 1;
+        }
+    };
+
+    if let Some(expr) = eval_expr {
+        let stdout = io::stdout();
+        let stderr = io::stderr();
+        let mut out = stdout.lock();
+        let mut err = stderr.lock();
+        run_repl_reader(
+            &mut session,
+            Cursor::new(format!("{expr}\n").into_bytes()),
+            &mut out,
+            &mut err,
+            false,
+            true,
+        )
+    } else {
+        let interactive = io::stdin().is_terminal();
+        run_repl_stdio(&mut session, interactive)
+    }
+}
+
 fn cmd_infer_schema(args: &[String]) -> i32 {
+    enum CliInferFormat {
+        Text(InferFormat),
+        Parquet,
+        Xlsx,
+    }
+
     let mut data_path: Option<PathBuf> = None;
     let mut schema_name: Option<String> = None;
     let mut sample_rows: usize = 10_000;
-    let mut format_override: Option<InferFormat> = None;
+    let mut format_override: Option<CliInferFormat> = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -1205,13 +1459,17 @@ fn cmd_infer_schema(args: &[String]) -> i32 {
             "--format" => {
                 i += 1;
                 let Some(raw) = args.get(i) else {
-                    eprintln!("dana infer-schema: `--format` requires csv, tsv, or jsonl");
+                    eprintln!(
+                        "dana infer-schema: `--format` requires csv, tsv, jsonl, parquet, or xlsx"
+                    );
                     return 2;
                 };
                 format_override = match raw.to_ascii_lowercase().as_str() {
-                    "csv" => Some(InferFormat::Csv),
-                    "tsv" => Some(InferFormat::Tsv),
-                    "jsonl" | "ndjson" => Some(InferFormat::Jsonl),
+                    "csv" => Some(CliInferFormat::Text(InferFormat::Csv)),
+                    "tsv" => Some(CliInferFormat::Text(InferFormat::Tsv)),
+                    "jsonl" | "ndjson" => Some(CliInferFormat::Text(InferFormat::Jsonl)),
+                    "parquet" => Some(CliInferFormat::Parquet),
+                    "xlsx" => Some(CliInferFormat::Xlsx),
                     other => {
                         eprintln!("dana infer-schema: unsupported format `{other}`");
                         return 2;
@@ -1247,7 +1505,18 @@ fn cmd_infer_schema(args: &[String]) -> i32 {
         }
         None => default_schema_name_from_path(&path),
     };
-    match infer_schema_from_file(&path, &name, format_override, sample_rows) {
+    let lower_inner = strip_compression_ext(&path.to_string_lossy()).to_ascii_lowercase();
+    let res = match format_override {
+        Some(CliInferFormat::Parquet) => infer_parquet_schema_from_file(&path, &name),
+        Some(CliInferFormat::Xlsx) => infer_xlsx_schema_from_file(&path, None, &name),
+        Some(CliInferFormat::Text(fmt)) => {
+            infer_schema_from_file(&path, &name, Some(fmt), sample_rows)
+        }
+        None if lower_inner.ends_with(".parquet") => infer_parquet_schema_from_file(&path, &name),
+        None if lower_inner.ends_with(".xlsx") => infer_xlsx_schema_from_file(&path, None, &name),
+        None => infer_schema_from_file(&path, &name, None, sample_rows),
+    };
+    match res {
         Ok(schema) => {
             print!("{}", schema.render_dana());
             0
@@ -1265,30 +1534,6 @@ fn is_valid_schema_cap_name(name: &str) -> bool {
         return false;
     };
     first.is_ascii_uppercase() && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-fn default_schema_name_from_path(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    let stripped = crate::formats::compress::strip_compression_ext(&raw);
-    let stem = Path::new(stripped)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("Record");
-    let mut out = String::new();
-    for part in stem.split(|c: char| !c.is_ascii_alphanumeric()) {
-        let mut chars = part.chars();
-        if let Some(first) = chars.next() {
-            out.push(first.to_ascii_uppercase());
-            for ch in chars {
-                out.push(ch.to_ascii_lowercase());
-            }
-        }
-    }
-    if out.is_empty() || !out.as_bytes()[0].is_ascii_uppercase() {
-        "Record".to_string()
-    } else {
-        out
-    }
 }
 
 fn cmd_fake(args: &[String]) -> i32 {
@@ -1565,6 +1810,43 @@ fn load_policy_for(
             .parent()
             .map(|dir| dir.join("dana.policy"))
             .filter(|p| p.is_file()),
+    };
+    let Some(p) = chosen else {
+        return Ok(None);
+    };
+    let src = fs::read_to_string(&p).map_err(|e| {
+        Diagnostic::error(
+            DiagCode::IoError,
+            format!("cannot read policy `{}`: {e}", p.display()),
+        )
+    })?;
+    let fid = sm.add_file(p.display().to_string(), src.clone());
+    parse_policy(fid, &src).map(Some)
+}
+
+/// Load explicit `--policy` file, or auto-discover `dana.policy` in `start_dir` or an ancestor
+/// directory (stopping at a `.git` root).
+fn load_policy_from_dir_or_ancestors(
+    start_dir: &Path,
+    explicit: Option<&Path>,
+    sm: &mut SourceMap,
+) -> Result<Option<Policy>, Diagnostic> {
+    let chosen = match explicit {
+        Some(p) => Some(p.to_path_buf()),
+        None => {
+            let mut found = None;
+            for anc in start_dir.ancestors() {
+                let candidate = anc.join("dana.policy");
+                if candidate.is_file() {
+                    found = Some(candidate);
+                    break;
+                }
+                if anc.join(".git").exists() {
+                    break;
+                }
+            }
+            found
+        }
     };
     let Some(p) = chosen else {
         return Ok(None);

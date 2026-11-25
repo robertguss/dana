@@ -4,7 +4,7 @@
 //!
 //! Compiles under `#[forbid(unsafe_code)]` via `src/lib.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -13,6 +13,10 @@ use crate::core::bigint::{BigInt, DEC_MAX, DEC_MIN};
 use crate::core::check::quarantine_bad_row_table_ty;
 use crate::core::syntax::{Float64, ScalarTy, TableTy};
 use crate::formats::crypto::to_hex_lower;
+use crate::formats::infer::{
+    InferredColumn, InferredSchema, InferredTy, classify_text_cell, looks_like_pii_column,
+    sanitize_col_name,
+};
 use crate::formats::time::{
     MICROS_PER_DAY, format_iso_date, format_iso_timestamp, parse_decimal_bigint_strict,
     parse_iso_date, parse_iso_timestamp,
@@ -1244,6 +1248,232 @@ where
 {
     let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     read_xlsx_bytes_with_schema(&bytes, sheet, schema, check_constraint)
+}
+
+fn classify_xlsx_cell(cell: &XlsxCell) -> Option<InferredTy> {
+    match cell {
+        XlsxCell::Empty => None,
+        XlsxCell::Bool(_) => Some(InferredTy::Bool),
+        XlsxCell::DateSerial { serial, .. } => {
+            if (*serial - serial.floor()).abs() > 1e-6 {
+                Some(InferredTy::Timestamp)
+            } else {
+                Some(InferredTy::Date)
+            }
+        }
+        XlsxCell::Num(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.parse::<i64>().is_ok() {
+                Some(InferredTy::Int)
+            } else if parse_decimal_bigint_strict(trimmed).is_ok() {
+                Some(InferredTy::Decimal)
+            } else {
+                Some(InferredTy::Float)
+            }
+        }
+        XlsxCell::Str(s) => classify_text_cell(s),
+        XlsxCell::Error(_) => Some(InferredTy::Text),
+    }
+}
+
+fn decode_xlsx_untyped_bytes(
+    bytes: &[u8],
+    sheet: Option<&str>,
+    schema_name: &str,
+) -> Result<(InferredSchema, TableVal), String> {
+    let archive = ZipArchive::from_bytes(bytes).map_err(|e| e.to_string())?;
+    let wb_bytes = archive
+        .get_case_insensitive("xl/workbook.xml")
+        .ok_or_else(|| "missing `xl/workbook.xml` in XLSX archive".to_string())?;
+    let wb_xml = std::str::from_utf8(wb_bytes)
+        .map_err(|_| "`xl/workbook.xml` is not valid UTF-8".to_string())?;
+    let wb = parse_workbook_xml(wb_xml)?;
+
+    let target_sheet = match sheet {
+        Some(req) => wb
+            .sheets
+            .iter()
+            .find(|s| s.name == req)
+            .ok_or_else(|| format!("worksheet `{req}` not found in workbook"))?,
+        None => wb
+            .sheets
+            .first()
+            .ok_or_else(|| "XLSX workbook contains no worksheets".to_string())?,
+    };
+
+    let rels_bytes = archive
+        .get_case_insensitive("xl/_rels/workbook.xml.rels")
+        .ok_or_else(|| "missing `xl/_rels/workbook.xml.rels` in XLSX archive".to_string())?;
+    let rels_xml = std::str::from_utf8(rels_bytes)
+        .map_err(|_| "`xl/_rels/workbook.xml.rels` is not valid UTF-8".to_string())?;
+    let rels = parse_workbook_rels(rels_xml)?;
+    let rel_target = rels.get(&target_sheet.rel_id).ok_or_else(|| {
+        format!(
+            "missing relationship `{}` for worksheet `{}`",
+            target_sheet.rel_id, target_sheet.name
+        )
+    })?;
+    let sheet_path = resolve_xl_target(rel_target)?;
+    let sheet_bytes = archive.get_case_insensitive(&sheet_path).ok_or_else(|| {
+        format!(
+            "worksheet XML `{sheet_path}` for `{}` not found in archive",
+            target_sheet.name
+        )
+    })?;
+    let sheet_xml = std::str::from_utf8(sheet_bytes)
+        .map_err(|_| format!("`{sheet_path}` is not valid UTF-8"))?;
+
+    let shared_strings =
+        if let Some(ss_bytes) = archive.get_case_insensitive("xl/sharedStrings.xml") {
+            let ss_xml = std::str::from_utf8(ss_bytes)
+                .map_err(|_| "`xl/sharedStrings.xml` is not valid UTF-8".to_string())?;
+            parse_shared_strings(ss_xml)?
+        } else {
+            Vec::new()
+        };
+
+    let date_styles = if let Some(st_bytes) = archive.get_case_insensitive("xl/styles.xml") {
+        let st_xml = std::str::from_utf8(st_bytes)
+            .map_err(|_| "`xl/styles.xml` is not valid UTF-8".to_string())?;
+        parse_date_style_flags(st_xml)?
+    } else {
+        Vec::new()
+    };
+
+    let parsed_rows = parse_worksheet_rows(sheet_xml, &shared_strings, &date_styles)?;
+    let Some((header_row, data_rows)) = parsed_rows.split_first() else {
+        return Err(format!(
+            "cannot infer schema from empty worksheet `{}`",
+            target_sheet.name
+        ));
+    };
+
+    let mut header_cols: Vec<(usize, String)> = header_row
+        .cells
+        .iter()
+        .map(|(&idx, c)| (idx, c.raw_text().trim().to_string()))
+        .filter(|(_, name)| !name.is_empty())
+        .collect();
+    header_cols.sort_by_key(|(idx, _)| *idx);
+    if header_cols.is_empty() {
+        return Err(format!(
+            "worksheet `{}` has an empty header row",
+            target_sheet.name
+        ));
+    }
+
+    let mut seen_names = HashSet::new();
+    let mut cols: Vec<InferredColumn> = header_cols
+        .iter()
+        .enumerate()
+        .map(|(i, (_, raw))| {
+            let mut name = sanitize_col_name(raw, i);
+            while !seen_names.insert(name.clone()) {
+                name.push('_');
+            }
+            InferredColumn {
+                pii_hint: looks_like_pii_column(&name),
+                name,
+                ty: InferredTy::Empty,
+                nullable: false,
+                non_null_count: 0,
+            }
+        })
+        .collect();
+
+    for row in data_rows {
+        for (ci, (xlsx_col, _)) in header_cols.iter().enumerate() {
+            let cell = row.cells.get(xlsx_col).unwrap_or(&XlsxCell::Empty);
+            match classify_xlsx_cell(cell) {
+                None => cols[ci].nullable = true,
+                Some(t) => {
+                    cols[ci].ty = cols[ci].ty.join(t);
+                    cols[ci].non_null_count += 1;
+                }
+            }
+        }
+    }
+
+    let inferred = InferredSchema {
+        name: schema_name.to_string(),
+        rows_sampled: data_rows.len(),
+        cols,
+    };
+    let table_ty = inferred.to_public_table_ty();
+
+    let mut rows = Vec::with_capacity(data_rows.len());
+    for row in data_rows {
+        let mut cells = Vec::with_capacity(table_ty.cols.len());
+        for (ci, col) in table_ty.cols.iter().enumerate() {
+            let xlsx_col = header_cols[ci].0;
+            let raw_cell = row.cells.get(&xlsx_col).unwrap_or(&XlsxCell::Empty);
+            let val = parse_xlsx_cell(raw_cell, &col.ty, wb.date1904).unwrap_or_else(|_| {
+                if col.ty.is_option() {
+                    if raw_cell.is_empty() {
+                        Val::OptNone
+                    } else {
+                        Val::OptSome(Box::new(Val::Text(raw_cell.raw_text())))
+                    }
+                } else {
+                    Val::Text(raw_cell.raw_text())
+                }
+            });
+            cells.push(val);
+        }
+        rows.push(TableRow {
+            cells,
+            group_meta: None,
+        });
+    }
+
+    Ok((
+        inferred,
+        TableVal {
+            cols: table_ty.cols,
+            rows,
+        },
+    ))
+}
+
+/// Infer a Dana [`InferredSchema`] from raw `.xlsx` workbook bytes.
+///
+/// # Errors
+/// Returns an error string on ZIP/XML validation, missing worksheet, or empty sheet errors.
+pub fn infer_xlsx_schema_from_bytes(
+    bytes: &[u8],
+    sheet: Option<&str>,
+    schema_name: &str,
+) -> Result<InferredSchema, String> {
+    let (inferred, _) = decode_xlsx_untyped_bytes(bytes, sheet, schema_name)?;
+    Ok(inferred)
+}
+
+/// Infer a Dana [`InferredSchema`] from an `.xlsx` file on disk.
+///
+/// # Errors
+/// Returns an error string on filesystem I/O, ZIP/XML validation, or missing worksheet errors.
+pub fn infer_xlsx_schema_from_file(
+    path: &Path,
+    sheet: Option<&str>,
+    schema_name: &str,
+) -> Result<InferredSchema, String> {
+    let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    infer_xlsx_schema_from_bytes(&bytes, sheet, schema_name)
+}
+
+/// Read an OOXML `.xlsx` worksheet without a pre-declared schema (used by REPL `untyped.read_xlsx`).
+///
+/// # Errors
+/// Returns an error string on filesystem I/O, ZIP/XML validation, missing worksheet, or empty sheet errors.
+pub fn read_xlsx_file_untyped(
+    path: &Path,
+    sheet: Option<&str>,
+    schema_name: &str,
+) -> Result<(InferredSchema, TableVal), String> {
+    let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    decode_xlsx_untyped_bytes(&bytes, sheet, schema_name)
 }
 
 // ---------------------------------------------------------------------------

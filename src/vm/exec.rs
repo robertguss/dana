@@ -28,8 +28,8 @@ use crate::oracle::world::{
 };
 use crate::plan::{SplitPlan, optimize_exec_plan, optimize_program, split_exec_plan_pushdown};
 use crate::runtime::exec::{
-    RunConfig, RunResult, TestOutcome, eval_pure_exec_call, run_exec_program_with_engine,
-    run_program_tests_with_engine,
+    EvalProgramResult, RunConfig, RunResult, TestOutcome, eval_exec_entry_with_engine,
+    eval_pure_exec_call, run_exec_program_with_engine, run_program_tests_with_engine,
 };
 use crate::runtime::ir::{ExecDeriveItem, ExecExpr, ExecPlan, ExecProgram};
 use crate::vm::VmConfig;
@@ -58,6 +58,21 @@ pub fn run_exec_program_vm(
     let mut cfg = *vm_cfg;
     cfg.pseudonymize_mode = run_cfg.pseudonymize_mode;
     run_exec_program_with_engine(prog, run_cfg, Some(cfg))
+}
+
+/// Evaluate a named entry function of a lowered [`ExecProgram`] on the vectorized columnar VM,
+/// returning its typed runtime [`Val`] and static [`LTy`] (used by `dana repl`).
+#[must_use]
+pub fn eval_exec_entry_vm(
+    prog: &ExecProgram,
+    entry_name: &str,
+    prebound: &[(Ident, Val)],
+    run_cfg: &RunConfig,
+    vm_cfg: &VmConfig,
+) -> EvalProgramResult {
+    let mut cfg = *vm_cfg;
+    cfg.pseudonymize_mode = run_cfg.pseudonymize_mode;
+    eval_exec_entry_with_engine(prog, entry_name, prebound, run_cfg, Some(cfg))
 }
 
 /// Run all `examples` and `test` spec blocks in a lowered [`ExecProgram`] using the

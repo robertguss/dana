@@ -9,7 +9,9 @@
 pub mod exec;
 pub mod ir;
 
-pub use exec::{RunConfig, RunResult, TestOutcome, run_exec_program, run_program_tests};
+pub use exec::{
+    EvalProgramResult, RunConfig, RunResult, TestOutcome, run_exec_program, run_program_tests,
+};
 pub use ir::{
     CompiledSchema, ExecCaseArm, ExecDeriveItem, ExecExpr, ExecFun, ExecHostOp, ExecPlan,
     ExecPrimOp, ExecProgram, ExecPromise, ExecRowExpr, PseudonymizeMode, StructLayout,

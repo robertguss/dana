@@ -10,14 +10,17 @@
 //!   `Decimal` (`FIXED_LEN_BYTE_ARRAY(16)` with arbitrary-scale rescaling on read) and schema
 //!   `where` constraint enforcement.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
 use crate::core::bigint::{BigInt, DEC_MAX, DEC_MIN};
-use crate::core::syntax::{ColSpec, Float64, ScalarTy, TableTy};
+use crate::core::syntax::{AggKind, ColSpec, Float64, ScalarTy, TableTy, TagSet};
 use crate::ffi::{GzipReader, GzipWriter, ZstdReader, ZstdWriter};
+use crate::formats::infer::{
+    InferredColumn, InferredSchema, InferredTy, looks_like_pii_column, sanitize_col_name,
+};
 use crate::oracle::value::{TableRow, TableVal, Val};
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
@@ -2361,6 +2364,195 @@ where
 {
     let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     read_parquet_bytes_with_schema(&bytes, schema, check_constraint)
+}
+
+fn infer_parquet_inferred_ty(se: &SchemaElement) -> Result<InferredTy, String> {
+    if se.repetition_type == Some(REP_REPEATED) {
+        return Err(format!(
+            "Parquet column `{}` has unsupported REPEATED repetition",
+            se.name
+        ));
+    }
+    let Some(pt) = se.phys_type else {
+        return Err(format!(
+            "Parquet column `{}` is a nested group, expected scalar column",
+            se.name
+        ));
+    };
+    if parquet_decimal_scale(se).is_some() {
+        return Ok(InferredTy::Decimal);
+    }
+    match pt {
+        PT_BOOLEAN => Ok(InferredTy::Bool),
+        PT_INT32 => {
+            if is_parquet_date(se) {
+                Ok(InferredTy::Date)
+            } else {
+                Ok(InferredTy::Int)
+            }
+        }
+        PT_INT64 => {
+            if parquet_timestamp_unit(se).is_some() {
+                Ok(InferredTy::Timestamp)
+            } else {
+                Ok(InferredTy::Int)
+            }
+        }
+        PT_FLOAT | PT_DOUBLE => Ok(InferredTy::Float),
+        PT_BYTE_ARRAY => {
+            if se.converted_type == Some(CONV_UTF8)
+                || matches!(se.logical_type, Some(LogicalType::String))
+            {
+                Ok(InferredTy::Text)
+            } else {
+                Ok(InferredTy::Bytes)
+            }
+        }
+        PT_FIXED_LEN_BYTE_ARRAY => Ok(InferredTy::Bytes),
+        other => Err(format!(
+            "unsupported Parquet physical type {other} for column `{}`",
+            se.name
+        )),
+    }
+}
+
+fn read_parquet_footer(bytes: &[u8]) -> Result<FileMetaData, String> {
+    if bytes.len() < 12 {
+        return Err("Parquet file too short (minimum 12 bytes)".to_string());
+    }
+    if &bytes[..4] != PARQUET_MAGIC || &bytes[bytes.len() - 4..] != PARQUET_MAGIC {
+        return Err("invalid Parquet header/footer magic (expected `PAR1`)".to_string());
+    }
+    let footer_len_slice: [u8; 4] = bytes[bytes.len() - 8..bytes.len() - 4]
+        .try_into()
+        .map_err(|_| "failed to read Parquet footer length".to_string())?;
+    let footer_len = u32::from_le_bytes(footer_len_slice) as usize;
+    if footer_len > MAX_PARQUET_FOOTER_BYTES || footer_len + 12 > bytes.len() {
+        return Err(format!("invalid Parquet footer length ({footer_len})"));
+    }
+    let footer_start = bytes.len() - 8 - footer_len;
+    let footer_bytes = &bytes[footer_start..bytes.len() - 8];
+    let mut fm_reader = ThriftReader::new(footer_bytes);
+    read_file_metadata(&mut fm_reader)
+}
+
+/// Infer a Dana [`InferredSchema`] directly from Parquet `FileMetaData` footer bytes.
+///
+/// # Errors
+/// Returns an error string on malformed Parquet headers/footers or unsupported column types.
+pub fn infer_parquet_schema_from_bytes(
+    bytes: &[u8],
+    schema_name: &str,
+) -> Result<InferredSchema, String> {
+    let fm = read_parquet_footer(bytes)?;
+    if fm.schema.is_empty() {
+        return Err("Parquet file has empty schema".to_string());
+    }
+    let rows_sampled = usize::try_from(fm.num_rows).unwrap_or(0);
+    let mut seen_names = HashSet::new();
+    let mut cols = Vec::new();
+    for se in fm.schema.iter().skip(1) {
+        if se.phys_type.is_none() {
+            continue;
+        }
+        let ty = infer_parquet_inferred_ty(se)?;
+        let nullable = se.repetition_type == Some(REP_OPTIONAL);
+        let mut name = sanitize_col_name(&se.name, cols.len());
+        while !seen_names.insert(name.clone()) {
+            name.push('_');
+        }
+        cols.push(InferredColumn {
+            pii_hint: looks_like_pii_column(&name),
+            name,
+            ty,
+            nullable,
+            non_null_count: rows_sampled,
+        });
+    }
+    if cols.is_empty() {
+        return Err("Parquet file contains no scalar columns".to_string());
+    }
+    Ok(InferredSchema {
+        name: schema_name.to_string(),
+        rows_sampled,
+        cols,
+    })
+}
+
+/// Infer a Dana [`InferredSchema`] from a Parquet file on disk.
+///
+/// # Errors
+/// Returns an error string on I/O or Parquet metadata decode errors.
+pub fn infer_parquet_schema_from_file(
+    path: &Path,
+    schema_name: &str,
+) -> Result<InferredSchema, String> {
+    let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    infer_parquet_schema_from_bytes(&bytes, schema_name)
+}
+
+/// Read an Apache Parquet file without a pre-declared schema (used by REPL `untyped.read_parquet`).
+///
+/// Uses the exact Parquet `FileMetaData` column names to decode every column, then exposes
+/// Dana-sanitized column identifiers on the returned [`InferredSchema`] and [`TableVal`].
+///
+/// # Errors
+/// Returns an error string on I/O, Parquet decode, or unsupported column type errors.
+pub fn read_parquet_file_untyped(
+    path: &Path,
+    schema_name: &str,
+) -> Result<(InferredSchema, TableVal), String> {
+    let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let fm = read_parquet_footer(&bytes)?;
+    if fm.schema.is_empty() {
+        return Err("Parquet file has empty schema".to_string());
+    }
+    let rows_sampled = usize::try_from(fm.num_rows).unwrap_or(0);
+    let mut seen_names = HashSet::new();
+    let mut inferred_cols = Vec::new();
+    let mut raw_cols = Vec::new();
+    for se in fm.schema.iter().skip(1) {
+        if se.phys_type.is_none() {
+            continue;
+        }
+        let ty = infer_parquet_inferred_ty(se)?;
+        let nullable = se.repetition_type == Some(REP_OPTIONAL);
+        let mut dana_name = sanitize_col_name(&se.name, inferred_cols.len());
+        while !seen_names.insert(dana_name.clone()) {
+            dana_name.push('_');
+        }
+        raw_cols.push(ColSpec {
+            name: se.name.clone(),
+            ty: ty.to_scalar_ty(nullable),
+            tags: TagSet::empty(),
+            bucketed: false,
+            agg_kind: AggKind::Raw,
+        });
+        inferred_cols.push(InferredColumn {
+            pii_hint: looks_like_pii_column(&dana_name),
+            name: dana_name,
+            ty,
+            nullable,
+            non_null_count: rows_sampled,
+        });
+    }
+    if raw_cols.is_empty() {
+        return Err("Parquet file contains no scalar columns".to_string());
+    }
+    let raw_schema = TableTy {
+        cols: raw_cols,
+        ..TableTy::default()
+    };
+    let mut tv = read_parquet_bytes_with_schema(&bytes, &raw_schema, |_, _| true)?;
+    let inferred = InferredSchema {
+        name: schema_name.to_string(),
+        rows_sampled: tv.rows.len(),
+        cols: inferred_cols,
+    };
+    for (col_spec, inf_col) in tv.cols.iter_mut().zip(&inferred.cols) {
+        col_spec.name.clone_from(&inf_col.name);
+    }
+    Ok((inferred, tv))
 }
 
 fn decode_column_chunk(

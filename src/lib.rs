@@ -11,6 +11,7 @@
 //! - `viz`: zero-dependency standalone SVG & Unicode terminal charts, plus self-contained HTML5 & Markdown reports
 //! - `plan`: relational query optimizer (filter fusion, predicate pushdown, dead-derive pruning) & plan explainer
 //! - `vm`: 2,048-row vectorized columnar batch VM, compiled row bytecode (inlined pure UDFs), & deterministic parallel runner
+//! - `repl`: safe read-only interactive REPL, privacy-redacted output, and `untyped` data explorer
 //! - `runtime`: Phase 2 execution IR and reference runtime evaluator
 //! - `cli`: `dana` CLI subcommand dispatcher
 //! - `core`: Dana Core IR v0.1 AST, canonical wire codec, and decidable static verifier
@@ -37,6 +38,8 @@ pub mod net;
 pub mod oracle;
 #[forbid(unsafe_code)]
 pub mod plan;
+#[forbid(unsafe_code)]
+pub mod repl;
 #[forbid(unsafe_code)]
 pub mod runtime;
 #[forbid(unsafe_code)]

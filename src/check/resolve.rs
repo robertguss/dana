@@ -127,6 +127,22 @@ pub fn resolve_module(
     resolve_with_loader(file_id, module, None, policy, &mut sm)
 }
 
+/// Resolve an already-parsed in-memory root module using an optional base directory for
+/// local and SHA-256 hash-pinned `vendor/` module imports.
+///
+/// # Errors
+/// Returns diagnostics on duplicate declarations, cyclic/missing imports, unpinned/tampered
+/// vendored modules, or invalid tags.
+pub fn resolve_module_in_dir(
+    file_id: FileId,
+    module: Module,
+    root_dir: Option<&Path>,
+    policy: Option<Policy>,
+    sm: &mut SourceMap,
+) -> Result<ResolvedProgram, Vec<Diagnostic>> {
+    resolve_with_loader(file_id, module, root_dir, policy, sm)
+}
+
 /// Parse and resolve a `.dana` file from disk along with any local or `vendor/` module imports.
 ///
 /// # Errors
@@ -351,8 +367,40 @@ fn load_recursive(
             );
             continue;
         };
-        match fs::read_to_string(&chosen_path) {
-            Ok(dep_src) => {
+        match fs::read(&chosen_path) {
+            Ok(bytes) => {
+                if dep_origin == ModuleOrigin::Vendor {
+                    let rel_posix = crate::check::vendor::rel_path_to_posix(&rel);
+                    if let Err(msg) = crate::check::vendor::verify_vendor_module(
+                        &base_dir.join("vendor"),
+                        &dep_name,
+                        &rel_posix,
+                        &bytes,
+                    ) {
+                        diags.push(
+                            Diagnostic::error(DiagCode::ResolveError, msg)
+                                .with_span(u.span)
+                                .with_hint("run `dana vendor pin` to update vendor/vendor.lock"),
+                        );
+                        continue;
+                    }
+                }
+                let dep_src = match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        diags.push(
+                            Diagnostic::error(
+                                DiagCode::IoError,
+                                format!(
+                                    "module `{}` is not valid UTF-8: {e}",
+                                    chosen_path.display()
+                                ),
+                            )
+                            .with_span(u.span),
+                        );
+                        continue;
+                    }
+                };
                 let dep_fid = sm.add_file(chosen_path.display().to_string(), dep_src.clone());
                 match parse_module(dep_fid, &dep_src) {
                     Ok(dep_mod) => {

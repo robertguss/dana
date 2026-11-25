@@ -100,6 +100,27 @@ pub enum RunResult {
     },
 }
 
+/// Typed value result returned by evaluating a named entry function (used by `dana repl`).
+#[derive(Clone, Debug)]
+pub enum EvalProgramResult {
+    Ok {
+        val: Box<Val>,
+        ret_lty: Box<LTy>,
+        stdout: Vec<String>,
+        stderr: Vec<String>,
+    },
+    Stopped {
+        bug: Bug,
+        stdout: Vec<String>,
+        stderr: Vec<String>,
+    },
+    Failed {
+        message: String,
+        stdout: Vec<String>,
+        stderr: Vec<String>,
+    },
+}
+
 /// Result of executing one `test` or `examples` spec block.
 #[derive(Clone, Debug)]
 pub struct TestOutcome {
@@ -235,6 +256,66 @@ pub(crate) fn run_exec_program_with_engine(
             stderr: ew.world.stderr,
         },
         EvalOut::Jumped(lbl, _) => RunResult::Failed {
+            message: format!("uncaught jump `{lbl}`"),
+            stdout: ew.world.stdout,
+            stderr: ew.world.stderr,
+        },
+    }
+}
+
+/// Evaluate a named entry function on an [`ExecProgram`] with optional pre-bound runtime values
+/// (e.g. `untyped` exploration tables in `dana repl`), returning the resulting [`Val`] and static [`LTy`].
+#[must_use]
+pub(crate) fn eval_exec_entry_with_engine(
+    prog: &ExecProgram,
+    entry_name: &str,
+    prebound: &[(Ident, Val)],
+    cfg: &RunConfig,
+    vm_cfg: Option<crate::vm::VmConfig>,
+) -> EvalProgramResult {
+    let Some(entry_fn) = prog.find_fun(entry_name) else {
+        return EvalProgramResult::Failed {
+            message: format!("missing entry function `{entry_name}`"),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+    };
+
+    let mut ew = ExecWorld::from_config(cfg);
+    let mut env = RTEnv::new();
+    for (pname, plty) in &entry_fn.params {
+        if let Some((_, v)) = prebound.iter().find(|(n, _)| n == pname) {
+            env.insert(pname.clone(), v.clone());
+        } else {
+            let cap_val = real_cap_for_ty(&plty.ty);
+            env.insert(pname.clone(), cap_val);
+        }
+    }
+
+    let mut ev = Evaluator {
+        prog,
+        ew: &mut ew,
+        fuel: cfg.fuel,
+        vm_cfg,
+    };
+    match ev.eval_expr(&entry_fn.body, &env) {
+        EvalOut::Ok(val) => EvalProgramResult::Ok {
+            val: Box::new(val),
+            ret_lty: Box::new(entry_fn.ret.clone()),
+            stdout: ew.world.stdout,
+            stderr: ew.world.stderr,
+        },
+        EvalOut::Stopped(bug) => EvalProgramResult::Stopped {
+            bug,
+            stdout: ew.world.stdout,
+            stderr: ew.world.stderr,
+        },
+        EvalOut::Failed(message) => EvalProgramResult::Failed {
+            message,
+            stdout: ew.world.stdout,
+            stderr: ew.world.stderr,
+        },
+        EvalOut::Jumped(lbl, _) => EvalProgramResult::Failed {
             message: format!("uncaught jump `{lbl}`"),
             stdout: ew.world.stdout,
             stderr: ew.world.stderr,

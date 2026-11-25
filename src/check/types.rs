@@ -1131,10 +1131,16 @@ impl<'a> Checker<'a> {
                     op: ExecPrimOp::TableCoerce(_),
                     ..
                 }
-            ) && matches!(
-                (&inferred_ret.ty, &declared.ty),
-                (Ty::Table(_), Ty::Table(_))
-            ) {
+            ) && let (Ty::Table(inf_tt), Ty::Table(decl_tt)) = (&inferred_ret.ty, &declared.ty)
+                && inf_tt.row_tags == decl_tt.row_tags
+                && inf_tt.cols.len() == decl_tt.cols.len()
+                && inf_tt
+                    .cols
+                    .iter()
+                    .zip(&decl_tt.cols)
+                    .all(|(a, b)| a.name == b.name && a.tags == b.tags)
+                && inferred_ret.tags == declared.tags
+            {
                 inferred_ret
             } else {
                 declared.clone()
@@ -6328,11 +6334,10 @@ impl<'a> Checker<'a> {
                     cur = target.as_ref();
                 }
                 ExprKind::Call { callee, args } => match &callee.kind {
-                    // Static namespace calls (`Stats.corr(...)`, `Report.new(...)`), constructors
-                    // (`Ok(...)`), and direct free-function calls (`foo(...)`) terminate the spine.
-                    ExprKind::Field { receiver, .. }
-                        if matches!(receiver.kind, ExprKind::CapName(_)) =>
-                    {
+                    // Static namespace calls (`Stats.corr(...)`, `Report.new(...)`,
+                    // `Math.Extra.triple(...)`), constructors (`Ok(...)`), and direct
+                    // free-function calls (`foo(...)`) terminate the spine.
+                    ExprKind::Field { receiver, .. } if extract_cap_path(receiver).is_some() => {
                         break;
                     }
                     ExprKind::CapName(_) | ExprKind::Ident(_) => break,
@@ -6757,12 +6762,13 @@ impl<'a> Checker<'a> {
         scope: LocalScopeKind,
         ret_ctx: Option<(&str, Option<&Ty>)>,
     ) -> (ExecExpr, LTy) {
-        // 1. Namespace/module static calls: `Stats.corr(...)`, `Report.new(...)`, `Files.in_memory(...)`, etc.
+        // 1. Namespace/module static calls: `Stats.corr(...)`, `Report.new(...)`, `Files.in_memory(...)`,
+        //    and imported local/vendored module calls (`Helpers.double(...)`, `Acme.Helpers.double(...)`).
         if let ExprKind::Field { receiver, member } = &callee.kind
-            && let ExprKind::CapName(ns) = &receiver.kind
+            && let Some(ns) = extract_cap_path(receiver)
         {
             return self.check_namespace_call(
-                ns,
+                &ns,
                 &member.name,
                 args,
                 span,
@@ -7663,6 +7669,95 @@ impl<'a> Checker<'a> {
                 )
             }
             _ => {
+                // Qualified call to an imported local or vendored module (`Helpers.double(...)`
+                // or `Acme.Helpers.double(...)`).
+                if let Some((mod_idx, rm)) =
+                    self.resolved.modules.iter().enumerate().find(|(_, m)| {
+                        m.full_name == ns || m.full_name.rsplit('.').next() == Some(ns)
+                    })
+                {
+                    if !crate::check::resolve::is_symbol_exposed(rm, method) {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::ResolveError,
+                                format!(
+                                    "function `{method}` is not exposed by module `{}`",
+                                    rm.full_name
+                                ),
+                            )
+                            .with_span(span),
+                        );
+                        return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                    }
+                    if let Some(sig) = self.fn_sigs.get(method).cloned()
+                        && sig.module_idx == mod_idx
+                    {
+                        if !sig.is_pure && !pc.is_empty() {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::PrivacyError,
+                                    format!(
+                                        "cannot call impure function `{ns}.{method}` under sensitive control flow {:?}",
+                                        pc.elems()
+                                    ),
+                                )
+                                .with_span(span),
+                            );
+                        }
+                        let ret_lty = self
+                            .ensure_fn_checked(method)
+                            .or(sig.ret)
+                            .unwrap_or_else(|| LTy::public(Ty::Unit));
+                        if args.len() != sig.params.len() {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!(
+                                        "function `{ns}.{method}` expects {} argument(s), got {}",
+                                        sig.params.len(),
+                                        args.len()
+                                    ),
+                                )
+                                .with_span(span),
+                            );
+                        }
+                        let mut lowered_args = Vec::with_capacity(args.len());
+                        let mut arg_tags = TagSet::empty();
+                        for (i, arg) in args.iter().enumerate() {
+                            let expr_arg = match arg {
+                                CallArg::Positional(e) | CallArg::Named { value: e, .. } => e,
+                            };
+                            let param_lty = sig.params.get(i).map(|(_, l)| l);
+                            let (mut aex, alty) = self.check_expr(
+                                expr_arg,
+                                env,
+                                param_lty.map(|l| &l.ty),
+                                pc,
+                                scope,
+                                ret_ctx,
+                            );
+                            if let Some(plty) = param_lty {
+                                aex = self.coerce_expr(
+                                    aex,
+                                    &alty,
+                                    plty,
+                                    expr_arg.span,
+                                    &format!("argument {} of `{ns}.{method}`", i + 1),
+                                );
+                            }
+                            arg_tags = arg_tags.union(&alty.tags);
+                            lowered_args.push(aex);
+                        }
+                        let out_ret = taint_return_with_pc(ret_lty, &arg_tags, pc);
+                        return (
+                            ExecExpr::Call {
+                                fn_name: method.to_string(),
+                                args: lowered_args,
+                            },
+                            out_ret,
+                        );
+                    }
+                }
                 self.diags.push(
                     Diagnostic::error(
                         DiagCode::ResolveError,
@@ -9630,11 +9725,14 @@ impl<'a> Checker<'a> {
         let mut col_tys: Vec<Option<ScalarTy>> = vec![None; ncols];
         let mut col_has_none: Vec<bool> = vec![false; ncols];
         let mut col_tags: Vec<TagSet> = vec![TagSet::empty(); ncols];
+        let mut init_row_tags = TagSet::empty();
 
         if let Some(ett) = exp_tt {
+            init_row_tags = ett.row_tags.clone();
             for (ci, h) in headers.iter().enumerate() {
                 if let Some(cs) = ett.find_col(&h.name) {
                     col_tys[ci] = Some(cs.ty.clone());
+                    col_tags[ci] = col_tags[ci].union(&cs.tags);
                 }
             }
         }
@@ -9704,7 +9802,7 @@ impl<'a> Checker<'a> {
 
         let tt = TableTy {
             cols: cols.clone(),
-            row_tags: TagSet::empty(),
+            row_tags: init_row_tags,
             order_tags: TagSet::empty(),
             grouped_by: None,
             summarized: false,
@@ -11446,6 +11544,26 @@ fn named_expr_arg<'a>(args: &'a [CallArg], key: &str) -> Option<&'a Expr> {
         CallArg::Named { name, value, .. } if name.name == key => Some(value),
         _ => None,
     })
+}
+
+fn extract_cap_path(expr: &Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::CapName(name) => Some(name.clone()),
+        ExprKind::Field { receiver, member } => {
+            if member
+                .name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
+            {
+                let prefix = extract_cap_path(receiver)?;
+                Some(format!("{prefix}.{}", member.name))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 fn stats_col_tags(tlty: &LTy, cols: &[&str]) -> TagSet {

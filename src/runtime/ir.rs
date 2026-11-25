@@ -1856,9 +1856,33 @@ impl ExecProgram {
                 body,
             });
         }
+        // Include any custom tags referenced by a repository-wide `dana.policy` so Core IR v0.1's
+        // closed-world policy tag validation accepts programs that don't use every repo-wide tag.
+        let mut tags = self.tags.clone();
+        if let Some(p) = &self.policy {
+            let mut push_custom = |ts: &TagSet| {
+                for t in ts.elems() {
+                    if !BUILT_IN_TAGS.contains(&t.as_str()) {
+                        tags.push(t.clone());
+                    }
+                }
+            };
+            push_custom(&p.allow_console);
+            for (_, ts) in &p.allow_export {
+                push_custom(ts);
+            }
+            for (_, ts) in &p.allow_https {
+                push_custom(ts);
+            }
+            for rule in &p.allow_write {
+                push_custom(&rule.tags);
+            }
+            tags.sort();
+            tags.dedup();
+        }
         Some(Program {
             version: self.version,
-            tags: self.tags.clone(),
+            tags,
             policy: self.policy.clone(),
             datas: self.datas.clone(),
             schemas: self.schemas.iter().map(|s| s.decl.clone()).collect(),
@@ -2499,6 +2523,11 @@ fn try_exec_expr_to_core(root: &ExecExpr) -> Option<Expr> {
                     let ExecPrimOp::Core(cop) = op else {
                         return None;
                     };
+                    // Phase 4B surface `Stats.corr` returns `Float`, whereas Core IR v0.1
+                    // `PrimOp::StatsCorr` checks as `Option(Float)`.
+                    if matches!(cop, PrimOp::StatsCorr { .. }) {
+                        return None;
+                    }
                     tasks.push(ConvTask::BuildExpr(BuildExprOp::Prim(cop, args.len())));
                     for a in args.iter().rev() {
                         tasks.push(ConvTask::Expr(a));

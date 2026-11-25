@@ -28,8 +28,8 @@ pub use batch::{
     table_to_batches,
 };
 pub use exec::{
-    eval_core_plan_batches, eval_core_plan_batches_with_env, run_core_program_vm,
-    run_exec_program_vm, run_program_tests_vm,
+    eval_core_plan_batches, eval_core_plan_batches_with_env, eval_exec_entry_vm,
+    run_core_program_vm, run_exec_program_vm, run_program_tests_vm,
 };
 pub use ops::{OpErr, OpExecConfig, VmMode, VmTable};
 
