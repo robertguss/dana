@@ -22,17 +22,24 @@ use crate::formats::compress::{
 use crate::formats::crypto::hmac_sha256_pseudonym;
 use crate::formats::csv::{format_csv_table, read_csv_stream_with_schema, write_csv_table};
 use crate::formats::json::{format_jsonl_table, read_jsonl_stream_with_schema, write_jsonl_table};
+use crate::formats::parquet::{
+    ParquetCompression, read_parquet_bytes_with_schema, write_parquet_bytes,
+};
 use crate::formats::time::{
     date_trunc_date, date_trunc_timestamp_duration, date_trunc_timestamp_unit, format_iso_date,
     format_iso_timestamp, format_timestamp_in_tz, local_date_in_tz, months_between_days,
     round_decimal_bigint,
 };
+use crate::formats::xlsx::{read_xlsx_bytes_with_schema, write_xlsx_sheets};
+use crate::net::{HttpsClientConfig, JsonResponse, ParsedHttpsUrl, https_get_json};
 use crate::oracle::eval::{PrimResult, eval_literal, eval_prim_op, pseudonymize_token};
 use crate::oracle::value::{
     Bug, CapHandle, GroupMeta, TableRow, TableVal, Val, render_decimal, render_public_val, val_cmp,
     val_eq, val_list_eq, val_list_lt, val_lt,
 };
-use crate::oracle::world::{FakeConsoleState, FakeDBState, FakeFilesState, StoredTable, World};
+use crate::oracle::world::{
+    FakeConsoleState, FakeDBState, FakeFilesState, FakeHttpsState, StoredTable, World,
+};
 use crate::runtime::ir::*;
 
 const DEFAULT_FUEL: usize = 500_000;
@@ -52,6 +59,8 @@ pub struct RunConfig {
     pub schema_lock: Option<SchemaLockFile>,
     /// When `true`, suppresses all live DB/filesystem mutations and prints redacted dry-run diffs.
     pub dry_run: bool,
+    /// Optional PEM CA certificate file used by `HttpsAllow` (falls back to `DANA_HTTPS_CA_CERT`).
+    pub https_ca_cert: Option<std::path::PathBuf>,
 }
 
 impl Default for RunConfig {
@@ -66,6 +75,7 @@ impl Default for RunConfig {
             db_bindings: HashMap::new(),
             schema_lock: None,
             dry_run: false,
+            https_ca_cert: None,
         }
     }
 }
@@ -104,12 +114,16 @@ struct ExecWorld {
     world: World,
     fake_args: Vec<Vec<String>>,
     fake_console_tables: Vec<Vec<TableVal>>,
+    fake_binary_files: HashMap<usize, Vec<(String, Vec<u8>)>>,
+    written_binary_files: Vec<(String, Vec<u8>)>,
+    json_responses: Vec<JsonResponse>,
     work_dir: Option<std::path::PathBuf>,
     live_io: bool,
     pseudonymize_mode: PseudonymizeMode,
     db_registry: DbRegistry,
     schema_lock: Option<SchemaLockFile>,
     dry_run: bool,
+    https_ca_cert: Option<std::path::PathBuf>,
 }
 
 impl ExecWorld {
@@ -123,16 +137,24 @@ impl ExecWorld {
         for (name, uri) in &cfg.db_bindings {
             db_registry.register(name.clone(), uri.clone());
         }
+        let https_ca_cert = cfg
+            .https_ca_cert
+            .clone()
+            .or_else(|| std::env::var_os("DANA_HTTPS_CA_CERT").map(std::path::PathBuf::from));
         Self {
             world,
             fake_args: Vec::new(),
             fake_console_tables: Vec::new(),
+            fake_binary_files: HashMap::new(),
+            written_binary_files: Vec::new(),
+            json_responses: Vec::new(),
             work_dir: cfg.work_dir.clone(),
             live_io: cfg.live_io,
             pseudonymize_mode: cfg.pseudonymize_mode,
             db_registry,
             schema_lock: cfg.schema_lock.clone(),
             dry_run: cfg.dry_run,
+            https_ca_cert,
         }
     }
 }
@@ -1178,6 +1200,9 @@ impl<'a> Evaluator<'a> {
                 _ => EvalOut::Failed("DecToFloat requires Decimal".to_string()),
             },
             ExecPrimOp::ValToText => match args {
+                [v @ Val::CapSecret { .. }] => EvalOut::Ok(Val::Text(
+                    <Self as crate::vm::exec::ExecPlanBridge>::resolve_secret_material(self, v),
+                )),
                 [v] => EvalOut::Ok(Val::Text(format_display_val(v))),
                 _ => EvalOut::Failed("ValToText requires 1 arg".to_string()),
             },
@@ -1483,15 +1508,28 @@ impl<'a> Evaluator<'a> {
             }
             ExecHostOp::FakeFilesInMemory => match args {
                 [Val::Map(pairs)] => {
-                    let files: Vec<(String, String)> = pairs
-                        .iter()
-                        .map(|(k, v)| (format_display_val(k), format_display_val(v)))
-                        .collect();
+                    let mut text_files = Vec::new();
+                    let mut bin_files = Vec::new();
+                    for (k, v) in pairs {
+                        let path = format_display_val(k);
+                        match v {
+                            Val::Bytes(bs) => bin_files.push((path, bs.clone())),
+                            other => {
+                                let text = format_display_val(other);
+                                bin_files.push((path.clone(), text.as_bytes().to_vec()));
+                                text_files.push((path, text));
+                            }
+                        }
+                    }
                     let idx = self.ew.world.fake_files.len();
-                    self.ew.world.fake_files.push(FakeFilesState { files });
+                    self.ew
+                        .world
+                        .fake_files
+                        .push(FakeFilesState { files: text_files });
+                    self.ew.fake_binary_files.insert(idx, bin_files);
                     EvalOut::Ok(Val::CapReadFiles(CapHandle::Fake(idx)))
                 }
-                _ => EvalOut::Failed("Files.in_memory requires Map(Text, Text)".to_string()),
+                _ => EvalOut::Failed("Files.in_memory requires Map(Text, Text|Bytes)".to_string()),
             },
             ExecHostOp::FakeDbInMemory { db, table_names } => {
                 let mut tables = Vec::with_capacity(table_names.len());
@@ -1788,11 +1826,87 @@ impl<'a> Evaluator<'a> {
                     EvalOut::Failed("RawReadDB.raw_sql expects (RawReadDB, params)".to_string())
                 }
             }
-            ExecHostOp::ReadXlsx(_) | ExecHostOp::JsonParseTable(_) | ExecHostOp::JsonBoolAt => {
-                EvalOut::Stopped(Bug {
-                    kind: BugKind::OutsideBoundary,
-                    message: "operation requires Phase 4 XLSX/HTTPS drivers".to_string(),
+            ExecHostOp::ReadXlsx { schema, sheet } => match args {
+                [Val::CapReadFiles(handle), Val::Text(path)] => {
+                    self.eval_read_xlsx(schema, *handle, path, sheet.as_deref())
+                }
+                [
+                    Val::CapReadFiles(handle),
+                    Val::Text(path),
+                    Val::Text(dyn_sheet),
+                ] => self.eval_read_xlsx(schema, *handle, path, Some(dyn_sheet.as_str())),
+                _ => EvalOut::Failed("read_xlsx expects (ReadFiles, path[, sheet])".to_string()),
+            },
+            ExecHostOp::FakeHttps { host } => {
+                let responses: Vec<(String, String)> = match args {
+                    [Val::Map(pairs)] => pairs
+                        .iter()
+                        .map(|(k, v)| (format_display_val(k), format_display_val(v)))
+                        .collect(),
+                    [Val::Unit] | [] => Vec::new(),
+                    _ => {
+                        return EvalOut::Failed(
+                            "Https.fake requires `responses: Map(Text, Text)`".to_string(),
+                        );
+                    }
+                };
+                let idx = self.ew.world.fake_https.len();
+                self.ew.world.fake_https.push(FakeHttpsState {
+                    host: host.clone(),
+                    responses,
+                    requests: Vec::new(),
+                });
+                EvalOut::Ok(Val::CapHttpsAllow {
+                    handle: CapHandle::Fake(idx),
+                    host: host.clone(),
+                    allows: TagSet::empty(),
                 })
+            }
+            ExecHostOp::JsonParseTable(schema_name) => {
+                if let [resp_val, Val::Text(field)] = args {
+                    self.eval_json_parse_table(resp_val, field, schema_name)
+                } else {
+                    EvalOut::Failed("parse_table expects (JsonResponse, field)".to_string())
+                }
+            }
+            ExecHostOp::JsonBoolAt => {
+                if let [resp_val, Val::Text(field)] = args {
+                    let Some(jresp) = self.extract_json_response(resp_val) else {
+                        return EvalOut::Failed("invalid JsonResponse handle".to_string());
+                    };
+                    match jresp.bool_at(field) {
+                        Ok(b) => EvalOut::Ok(Val::Bool(b)),
+                        Err(e) => EvalOut::Failed(e),
+                    }
+                } else {
+                    EvalOut::Failed("bool_at expects (JsonResponse, field)".to_string())
+                }
+            }
+            ExecHostOp::JsonTextAt => {
+                if let [resp_val, Val::Text(field)] = args {
+                    let Some(jresp) = self.extract_json_response(resp_val) else {
+                        return EvalOut::Failed("invalid JsonResponse handle".to_string());
+                    };
+                    match jresp.text_at(field) {
+                        Ok(s) => EvalOut::Ok(Val::Text(s)),
+                        Err(e) => EvalOut::Failed(e),
+                    }
+                } else {
+                    EvalOut::Failed("text_at expects (JsonResponse, field)".to_string())
+                }
+            }
+            ExecHostOp::JsonIntAt => {
+                if let [resp_val, Val::Text(field)] = args {
+                    let Some(jresp) = self.extract_json_response(resp_val) else {
+                        return EvalOut::Failed("invalid JsonResponse handle".to_string());
+                    };
+                    match jresp.int_at(field) {
+                        Ok(n) => EvalOut::Ok(Val::Int(BigInt::from(n))),
+                        Err(e) => EvalOut::Failed(e),
+                    }
+                } else {
+                    EvalOut::Failed("int_at expects (JsonResponse, field)".to_string())
+                }
             }
             ExecHostOp::Core(cop) => self.eval_core_host(cop, args),
         }
@@ -1936,15 +2050,113 @@ impl<'a> Evaluator<'a> {
                     name: name.clone(),
                 })
             }
+            (HostOp::ReadParquet(schema_tt), [Val::CapReadFiles(handle), Val::Text(path)]) => {
+                self.eval_read_parquet(schema_tt, *handle, path)
+            }
             (
-                HostOp::ReadParquet(_)
-                | HostOp::WriteParquet
-                | HostOp::WriteXlsx
-                | HostOp::WriteTable
-                | HostOp::RawSqlQuery { .. }
-                | HostOp::HttpsGetJson,
-                _,
-            ) => EvalOut::Stopped(Bug {
+                HostOp::WriteParquet,
+                [
+                    Val::CapWriteFiles {
+                        handle,
+                        root,
+                        allows,
+                    },
+                    Val::Text(rel),
+                    Val::Table(tv),
+                ],
+            ) => {
+                if !self.ew.dry_run
+                    && let Some(bug) = self.check_export_gate(*handle, allows)
+                {
+                    return EvalOut::Stopped(bug);
+                }
+                if !is_safe_relative_path(rel) {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                        "unsafe write path `{rel}`"
+                    )))));
+                }
+                let full_rel = join_confined_path(root, rel);
+                if matches!(handle, CapHandle::Real) && self.ew.dry_run {
+                    self.ew.world.stdout.push(format!(
+                        "[DRY-RUN] would write parquet \"{full_rel}\" ({} rows, {} cols)",
+                        tv.rows.len(),
+                        tv.cols.len()
+                    ));
+                    return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
+                }
+                match write_parquet_bytes(tv, ParquetCompression::Zstd) {
+                    Ok(bytes) => self.write_confined_bytes(*handle, &full_rel, bytes),
+                    Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e)))),
+                }
+            }
+            (
+                HostOp::WriteXlsx,
+                [
+                    Val::CapWriteFiles {
+                        handle,
+                        root,
+                        allows,
+                    },
+                    Val::Text(rel),
+                    payload,
+                ],
+            ) => {
+                if !self.ew.dry_run
+                    && let Some(bug) = self.check_export_gate(*handle, allows)
+                {
+                    return EvalOut::Stopped(bug);
+                }
+                if !is_safe_relative_path(rel) {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                        "unsafe write path `{rel}`"
+                    )))));
+                }
+                let full_rel = join_confined_path(root, rel);
+                let sheets: Vec<(String, TableVal)> = match payload {
+                    Val::Table(tv) => vec![("Sheet1".to_string(), tv.clone())],
+                    Val::Map(pairs) => {
+                        let mut out = Vec::with_capacity(pairs.len());
+                        for (k, v) in pairs {
+                            let Val::Table(tv) = v else {
+                                return EvalOut::Failed(
+                                    "write_xlsx `sheets:` map values must be Tables".to_string(),
+                                );
+                            };
+                            out.push((format_display_val(k), tv.clone()));
+                        }
+                        out
+                    }
+                    _ => {
+                        return EvalOut::Failed(
+                            "write_xlsx expects a Table or `sheets: Map(Text, Table)`".to_string(),
+                        );
+                    }
+                };
+                if matches!(handle, CapHandle::Real) && self.ew.dry_run {
+                    self.ew.world.stdout.push(format!(
+                        "[DRY-RUN] would write xlsx \"{full_rel}\" ({} sheet(s))",
+                        sheets.len()
+                    ));
+                    return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
+                }
+                match write_xlsx_sheets(&sheets) {
+                    Ok(bytes) => self.write_confined_bytes(*handle, &full_rel, bytes),
+                    Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e)))),
+                }
+            }
+            (
+                HostOp::HttpsGetJson,
+                [
+                    Val::CapHttpsAllow {
+                        handle,
+                        host,
+                        allows,
+                    },
+                    Val::Text(url),
+                    hdr_val,
+                ],
+            ) => self.eval_https_get_json(*handle, host, allows, url, hdr_val),
+            (HostOp::WriteTable | HostOp::RawSqlQuery { .. }, _) => EvalOut::Stopped(Bug {
                 kind: BugKind::OutsideBoundary,
                 message: format!("host operation `{op:?}` requires Phase 3/4 runtime drivers"),
             }),
@@ -2245,6 +2457,264 @@ impl<'a> Evaluator<'a> {
                     .push((full_rel.to_string(), content));
                 EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)))
             }
+        }
+    }
+
+    fn read_file_bytes(&self, handle: CapHandle, path: &str) -> Result<Vec<u8>, String> {
+        match handle {
+            CapHandle::Fake(idx) => {
+                if let Some(files) = self.ew.fake_binary_files.get(&idx)
+                    && let Some((_, bs)) = files.iter().find(|(p, _)| p == path)
+                {
+                    return Ok(bs.clone());
+                }
+                if let Some(ff) = self.ew.world.fake_files.get(idx)
+                    && let Some((_, content)) = ff.files.iter().find(|(p, _)| p == path)
+                {
+                    return Ok(content.as_bytes().to_vec());
+                }
+                Err(format!("file not found: {path}"))
+            }
+            CapHandle::Real => {
+                if !self.ew.live_io {
+                    return Err(format!("file I/O disabled in spec mode: {path}"));
+                }
+                let resolved = match &self.ew.work_dir {
+                    Some(base) if !Path::new(path).is_absolute() => base.join(path),
+                    _ => std::path::PathBuf::from(path),
+                };
+                fs::read(&resolved).map_err(|e| format!("{path}: {e}"))
+            }
+        }
+    }
+
+    fn write_confined_bytes(
+        &mut self,
+        handle: CapHandle,
+        full_rel: &str,
+        bytes: Vec<u8>,
+    ) -> EvalOut {
+        match handle {
+            CapHandle::Fake(idx) => {
+                self.ew
+                    .fake_binary_files
+                    .entry(idx)
+                    .or_default()
+                    .push((full_rel.to_string(), bytes));
+                EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)))
+            }
+            CapHandle::Real => {
+                if self.ew.dry_run {
+                    self.ew.world.stdout.push(format!(
+                        "[DRY-RUN] would write binary file \"{full_rel}\" ({} bytes)",
+                        bytes.len()
+                    ));
+                    return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
+                }
+                if self.ew.live_io {
+                    let out_path = match &self.ew.work_dir {
+                        Some(base) => base.join(full_rel),
+                        None => std::path::PathBuf::from(full_rel),
+                    };
+                    if let Some(parent) = out_path.parent()
+                        && let Err(e) = fs::create_dir_all(parent)
+                    {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
+                    }
+                    if let Err(e) = fs::write(&out_path, &bytes) {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
+                    }
+                }
+                self.ew
+                    .written_binary_files
+                    .push((full_rel.to_string(), bytes));
+                EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)))
+            }
+        }
+    }
+
+    fn eval_read_parquet(&mut self, schema_tt: &TableTy, handle: CapHandle, path: &str) -> EvalOut {
+        let bytes = match self.read_file_bytes(handle, path) {
+            Ok(b) => b,
+            Err(e) => return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e)))),
+        };
+        let constraints: Vec<Option<ExecRowExpr>> = self
+            .prog
+            .schemas
+            .iter()
+            .find(|cs| cs.decl.schema == *schema_tt)
+            .or_else(|| {
+                self.prog.schemas.iter().find(|cs| {
+                    cs.decl.schema.cols.len() == schema_tt.cols.len()
+                        && cs
+                            .decl
+                            .schema
+                            .cols
+                            .iter()
+                            .zip(&schema_tt.cols)
+                            .all(|(a, b)| a.name == b.name && a.ty == b.ty)
+                })
+            })
+            .map_or_else(
+                || vec![None; schema_tt.cols.len()],
+                |cs| cs.constraints.clone(),
+            );
+        let empty_env = RTEnv::new();
+        match read_parquet_bytes_with_schema(&bytes, schema_tt, |ci, val| {
+            self.eval_schema_constraint(schema_tt, &constraints, ci, val, &empty_env)
+        }) {
+            Ok(tv) => EvalOut::Ok(Val::ResOk(Box::new(Val::Table(tv)))),
+            Err(msg) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(msg)))),
+        }
+    }
+
+    fn eval_read_xlsx(
+        &mut self,
+        schema_name: &str,
+        handle: CapHandle,
+        path: &str,
+        sheet: Option<&str>,
+    ) -> EvalOut {
+        let Some(cs) = self.prog.find_schema(schema_name) else {
+            return EvalOut::Failed(format!("unknown schema `{schema_name}`"));
+        };
+        let constraints = cs.constraints.clone();
+        let schema_tt = cs.decl.schema.clone();
+        let bytes = match self.read_file_bytes(handle, path) {
+            Ok(b) => b,
+            Err(e) => return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e)))),
+        };
+        let empty_env = RTEnv::new();
+        match read_xlsx_bytes_with_schema(&bytes, sheet, &schema_tt, |ci, val| {
+            self.eval_schema_constraint(&schema_tt, &constraints, ci, val, &empty_env)
+        }) {
+            Ok((good, bad)) => EvalOut::Ok(Val::ResOk(Box::new(Val::Tuple(vec![
+                Val::Table(good),
+                Val::Table(bad),
+            ])))),
+            Err(msg) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(msg)))),
+        }
+    }
+
+    fn eval_https_get_json(
+        &mut self,
+        handle: CapHandle,
+        host: &str,
+        allows: &TagSet,
+        url: &str,
+        hdr_val: &Val,
+    ) -> EvalOut {
+        let req_headers: Vec<(String, String)> = match hdr_val {
+            Val::Unit => Vec::new(),
+            Val::Map(pairs) => pairs
+                .iter()
+                .map(|(k, v)| (format_display_val(k), format_display_val(v)))
+                .collect(),
+            _ => {
+                return EvalOut::Failed(
+                    "HttpsAllow.get_json `headers:` must be a Map(Text, Text)".to_string(),
+                );
+            }
+        };
+
+        match handle {
+            CapHandle::Fake(idx) => {
+                let parsed = match ParsedHttpsUrl::parse_and_check_host(url, host) {
+                    Ok(p) => p,
+                    Err(e) => return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string())))),
+                };
+                let Some(fh) = self.ew.world.fake_https.get_mut(idx) else {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(
+                        "invalid fake HTTPS handle".to_string(),
+                    ))));
+                };
+                fh.requests.push(url.to_string());
+                let body_opt = fh
+                    .responses
+                    .iter()
+                    .find(|(k, _)| k == url || k == &parsed.path_and_query)
+                    .map(|(_, v)| v.clone());
+                let Some(body) = body_opt else {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                        "no fake HTTPS response registered for `{url}`"
+                    )))));
+                };
+                match JsonResponse::from_json_str(&body) {
+                    Ok(jresp) => {
+                        let resp_idx = self.ew.json_responses.len();
+                        self.ew.json_responses.push(jresp);
+                        EvalOut::Ok(Val::ResOk(Box::new(make_json_response_val(resp_idx))))
+                    }
+                    Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string())))),
+                }
+            }
+            CapHandle::Real => {
+                let cap_ty = Ty::HttpsAllow {
+                    host: host.to_string(),
+                    allows: allows.clone(),
+                };
+                if let Err(err) = check_cap_against_policy(self.prog.policy.as_ref(), &cap_ty) {
+                    return EvalOut::Stopped(Bug {
+                        kind: BugKind::ExportGateDenied,
+                        message: err.message,
+                    });
+                }
+                if let Some(bug) = self.check_export_gate(handle, allows) {
+                    return EvalOut::Stopped(bug);
+                }
+                if !self.ew.live_io {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                        "HTTPS I/O disabled in spec mode: {url}"
+                    )))));
+                }
+                let https_cfg = HttpsClientConfig {
+                    ca_cert_path: self
+                        .ew
+                        .https_ca_cert
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    ..HttpsClientConfig::default()
+                };
+                match https_get_json(url, host, &req_headers, &https_cfg) {
+                    Ok(jresp) => {
+                        let resp_idx = self.ew.json_responses.len();
+                        self.ew.json_responses.push(jresp);
+                        EvalOut::Ok(Val::ResOk(Box::new(make_json_response_val(resp_idx))))
+                    }
+                    Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string())))),
+                }
+            }
+        }
+    }
+
+    fn extract_json_response(&self, val: &Val) -> Option<&JsonResponse> {
+        if let Val::Ctor {
+            type_name, fields, ..
+        } = val
+            && type_name == "__JsonResponse"
+            && let Some(Val::Int(n)) = fields.first()
+            && let Some(idx) = n.to_usize()
+        {
+            return self.ew.json_responses.get(idx);
+        }
+        None
+    }
+
+    fn eval_json_parse_table(&mut self, resp_val: &Val, field: &str, schema_name: &str) -> EvalOut {
+        let Some(cs) = self.prog.find_schema(schema_name) else {
+            return EvalOut::Failed(format!("unknown schema `{schema_name}`"));
+        };
+        let constraints = cs.constraints.clone();
+        let schema_tt = cs.decl.schema.clone();
+        let Some(jresp) = self.extract_json_response(resp_val).cloned() else {
+            return EvalOut::Failed("invalid JsonResponse handle".to_string());
+        };
+        let empty_env = RTEnv::new();
+        match jresp.parse_table(field, &schema_tt, |ci, val| {
+            self.eval_schema_constraint(&schema_tt, &constraints, ci, val, &empty_env)
+        }) {
+            Ok((good, bad)) => EvalOut::Ok(Val::Tuple(vec![Val::Table(good), Val::Table(bad)])),
+            Err(e) => EvalOut::Failed(e),
         }
     }
 
@@ -4026,6 +4496,14 @@ fn coerce_cell_to_scalar(val: Val, target: &ScalarTy) -> Val {
             render_decimal(d).parse::<f64>().unwrap_or(0.0),
         )),
         _ => val,
+    }
+}
+
+fn make_json_response_val(idx: usize) -> Val {
+    Val::Ctor {
+        type_name: "__JsonResponse".to_string(),
+        ctor_name: "__JsonResponse".to_string(),
+        fields: vec![Val::Int(BigInt::from(idx))],
     }
 }
 

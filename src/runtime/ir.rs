@@ -116,8 +116,11 @@ pub enum ExecHostOp {
     ConsolePrintProfile,
     /// `files.read_jsonl(path, as: Schema)` -> `Result((Table(S), Table(BadRow(S))), Text)`.
     ReadJsonl(Ident),
-    /// `files.read_xlsx(path, sheet: ..., as: Schema)` (Phase 4 boundary).
-    ReadXlsx(Ident),
+    /// `files.read_xlsx(path, sheet: ..., as: Schema)` -> `Result((Table(S), Table(BadRow(S))), Text)`.
+    ReadXlsx {
+        schema: Ident,
+        sheet: Option<String>,
+    },
     /// `out.write_csv(path, table)` / `out.write_jsonl(path, table)`.
     WriteCsv,
     WriteJsonl,
@@ -132,9 +135,15 @@ pub enum ExecHostOp {
         sql: String,
         out_schema: TableTy,
     },
-    /// `response.parse_table(field, as: S)` / `response.bool_at(field)` (Phase 4 HTTPS JSON).
+    /// `Https.fake("host", responses: {...})` (spec-only offline HTTPS capability).
+    FakeHttps {
+        host: String,
+    },
+    /// `response.parse_table(field, as: S)` / `bool_at` / `text_at` / `int_at` (Phase 4 HTTPS JSON).
     JsonParseTable(Ident),
     JsonBoolAt,
+    JsonTextAt,
+    JsonIntAt,
 }
 
 /// Row-level pure expression inside `where`, `derive`, `summarize`, and `schema where`.

@@ -44,6 +44,11 @@ struct Ssl {
     _opaque: [u8; 0],
 }
 
+#[repr(C)]
+struct X509VerifyParam {
+    _opaque: [u8; 0],
+}
+
 unsafe extern "C" {
     fn TLS_client_method() -> *const SslMethod;
     fn TLS_server_method() -> *const SslMethod;
@@ -65,6 +70,8 @@ unsafe extern "C" {
     fn SSL_set_fd(ssl: *mut Ssl, fd: c_int) -> c_int;
     fn SSL_ctrl(ssl: *mut Ssl, cmd: c_int, larg: c_long, parg: *mut c_void) -> c_long;
     fn SSL_set1_host(ssl: *mut Ssl, hostname: *const c_char) -> c_int;
+    fn SSL_get0_param(ssl: *mut Ssl) -> *mut X509VerifyParam;
+    fn X509_VERIFY_PARAM_set1_ip_asc(param: *mut X509VerifyParam, ipasc: *const c_char) -> c_int;
 
     fn SSL_connect(ssl: *mut Ssl) -> c_int;
     fn SSL_accept(ssl: *mut Ssl) -> c_int;
@@ -249,7 +256,8 @@ impl TlsStream {
                 })?;
 
                 // RFC 6066 SNI applies to DNS hostnames (not literal IP addresses).
-                if server_name.parse::<IpAddr>().is_err() {
+                let is_ip = server_name.parse::<IpAddr>().is_ok();
+                if !is_ip {
                     // SAFETY: `ssl` is live and `c_host` is a valid NUL-terminated hostname;
                     // OpenSSL copies the hostname string inside `SSL_ctrl`.
                     let sni_ok = unsafe {
@@ -271,16 +279,37 @@ impl TlsStream {
                 }
 
                 if config.verify_peer && config.verify_hostname {
-                    // SAFETY: `ssl` is live and `c_host` is a valid NUL-terminated string;
-                    // `SSL_set1_host` copies the hostname for post-handshake verification.
-                    let host_ok = unsafe { SSL_set1_host(ssl, c_host.as_ptr()) };
-                    if host_ok != 1 {
-                        // SAFETY: free `ssl` before returning error.
-                        unsafe { SSL_free(ssl) };
-                        return Err(io::Error::other(format!(
-                            "SSL_set1_host failed: {}",
-                            drain_openssl_errors()
-                        )));
+                    if is_ip {
+                        // SAFETY: `ssl` is live; `SSL_get0_param` returns OpenSSL's internal
+                        // `X509_VERIFY_PARAM*` owned by `ssl`.
+                        let param = unsafe { SSL_get0_param(ssl) };
+                        let ip_ok = if param.is_null() {
+                            0
+                        } else {
+                            // SAFETY: `param` is non-null and owned by `ssl`; `c_host` is a valid
+                            // NUL-terminated IP literal string copied by OpenSSL.
+                            unsafe { X509_VERIFY_PARAM_set1_ip_asc(param, c_host.as_ptr()) }
+                        };
+                        if ip_ok != 1 {
+                            // SAFETY: free `ssl` before returning error.
+                            unsafe { SSL_free(ssl) };
+                            return Err(io::Error::other(format!(
+                                "X509_VERIFY_PARAM_set1_ip_asc failed: {}",
+                                drain_openssl_errors()
+                            )));
+                        }
+                    } else {
+                        // SAFETY: `ssl` is live and `c_host` is a valid NUL-terminated string;
+                        // `SSL_set1_host` copies the hostname for post-handshake verification.
+                        let host_ok = unsafe { SSL_set1_host(ssl, c_host.as_ptr()) };
+                        if host_ok != 1 {
+                            // SAFETY: free `ssl` before returning error.
+                            unsafe { SSL_free(ssl) };
+                            return Err(io::Error::other(format!(
+                                "SSL_set1_host failed: {}",
+                                drain_openssl_errors()
+                            )));
+                        }
                     }
                 }
             }

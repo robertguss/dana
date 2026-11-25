@@ -26,6 +26,9 @@ const Z_DEFAULT_STRATEGY: c_int = 0;
 const INFLATE_WINDOW_BITS_AUTO: c_int = 15 + 32;
 /// Window bits: 15 + 16 writes a standard RFC 1952 gzip header and CRC-32 trailer.
 const DEFLATE_WINDOW_BITS_GZIP: c_int = 15 + 16;
+/// Window bits: -15 enables raw RFC 1951 DEFLATE (no zlib/gzip wrapper), used by PKZIP/XLSX.
+const INFLATE_WINDOW_BITS_RAW: c_int = -15;
+const DEFLATE_WINDOW_BITS_RAW: c_int = -15;
 const DEFAULT_MEM_LEVEL: c_int = 8;
 const DEFAULT_COMPRESSION_LEVEL: c_int = 6;
 const BUF_CAPACITY: usize = 32 * 1024;
@@ -454,5 +457,191 @@ impl<W: Write> Drop for GzipWriter<W> {
         }
         // SAFETY: `self.strm` was initialized by `deflateInit2_` and is freed exactly once here.
         let _ = unsafe { deflateEnd(ptr::from_mut(self.strm.as_mut())) };
+    }
+}
+
+struct RawDeflateGuard {
+    strm: Box<ZStream>,
+}
+
+impl Drop for RawDeflateGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.strm` was initialized by `deflateInit2_` and is freed exactly once here.
+        let _ = unsafe { deflateEnd(ptr::from_mut(self.strm.as_mut())) };
+    }
+}
+
+struct RawInflateGuard {
+    strm: Box<ZStream>,
+}
+
+impl Drop for RawInflateGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.strm` was initialized by `inflateInit2_` and is freed exactly once here.
+        let _ = unsafe { inflateEnd(ptr::from_mut(self.strm.as_mut())) };
+    }
+}
+
+/// Compress `input` into a raw RFC 1951 DEFLATE stream (`window_bits = -15`, no zlib/gzip header).
+///
+/// # Errors
+/// Returns an `io::Error` if `zlib` fails to initialize or compress the stream.
+pub fn raw_deflate(input: &[u8]) -> io::Result<Vec<u8>> {
+    let mut strm = zeroed_zstream();
+    let ver = c"1.3";
+    // SAFETY: `strm` is heap-pinned and zero-initialized; `ver` is a valid NUL-terminated string,
+    // and `size_of::<ZStream>()` verifies ABI compatibility.
+    let rc = unsafe {
+        deflateInit2_(
+            ptr::from_mut(strm.as_mut()),
+            DEFAULT_COMPRESSION_LEVEL,
+            Z_DEFLATED,
+            DEFLATE_WINDOW_BITS_RAW,
+            DEFAULT_MEM_LEVEL,
+            Z_DEFAULT_STRATEGY,
+            ver.as_ptr(),
+            size_of::<ZStream>() as c_int,
+        )
+    };
+    if rc != Z_OK {
+        return Err(zlib_err(&strm, rc, "raw deflateInit2 failed"));
+    }
+    let mut guard = RawDeflateGuard { strm };
+
+    let mut out = Vec::new();
+    let mut chunk = [0u8; BUF_CAPACITY];
+    let mut remaining = input;
+
+    loop {
+        let avail_in = remaining.len().min(c_uint::MAX as usize) as c_uint;
+        let flush = if remaining.len() <= c_uint::MAX as usize {
+            Z_FINISH
+        } else {
+            Z_NO_FLUSH
+        };
+        let avail_out = chunk.len() as c_uint;
+
+        guard.strm.next_in = if avail_in == 0 {
+            ptr::null()
+        } else {
+            remaining.as_ptr()
+        };
+        guard.strm.avail_in = avail_in;
+        guard.strm.next_out = chunk.as_mut_ptr();
+        guard.strm.avail_out = avail_out;
+
+        // SAFETY: `next_in` (when non-null) points to `avail_in` readable bytes in `remaining`,
+        // `next_out` points to `avail_out` writable bytes in `chunk`, and they do not alias.
+        let rc = unsafe { deflate(ptr::from_mut(guard.strm.as_mut()), flush) };
+
+        let consumed = (avail_in - guard.strm.avail_in) as usize;
+        let produced = (avail_out - guard.strm.avail_out) as usize;
+        remaining = &remaining[consumed..];
+
+        guard.strm.next_in = ptr::null();
+        guard.strm.avail_in = 0;
+        guard.strm.next_out = ptr::null_mut();
+        guard.strm.avail_out = 0;
+
+        if produced > 0 {
+            out.extend_from_slice(&chunk[..produced]);
+        }
+
+        match rc {
+            Z_STREAM_END => return Ok(out),
+            Z_OK => {}
+            other => return Err(zlib_err(&guard.strm, other, "raw deflate error")),
+        }
+    }
+}
+
+/// Decompress a raw RFC 1951 DEFLATE stream (`window_bits = -15`) while strictly enforcing
+/// `max_output_bytes` to prevent zip-bomb memory exhaustion.
+///
+/// # Errors
+/// Returns [`io::ErrorKind::InvalidData`] if the stream is malformed, truncated, or expands
+/// beyond `max_output_bytes`.
+pub fn raw_inflate(input: &[u8], max_output_bytes: usize) -> io::Result<Vec<u8>> {
+    let mut strm = zeroed_zstream();
+    let ver = c"1.3";
+    // SAFETY: `strm` is heap-pinned and zero-initialized; `ver` is a valid NUL-terminated string,
+    // and `size_of::<ZStream>()` verifies ABI compatibility.
+    let rc = unsafe {
+        inflateInit2_(
+            ptr::from_mut(strm.as_mut()),
+            INFLATE_WINDOW_BITS_RAW,
+            ver.as_ptr(),
+            size_of::<ZStream>() as c_int,
+        )
+    };
+    if rc != Z_OK {
+        return Err(zlib_err(&strm, rc, "raw inflateInit2 failed"));
+    }
+    let mut guard = RawInflateGuard { strm };
+
+    let mut out = Vec::new();
+    let mut chunk = [0u8; BUF_CAPACITY];
+    let mut remaining = input;
+
+    loop {
+        let avail_in = remaining.len().min(c_uint::MAX as usize) as c_uint;
+        let room = max_output_bytes - out.len();
+        // Allow up to `room + 1` bytes in `chunk` so a stream that expands past `max_output_bytes`
+        // is detected immediately while an exact-size stream can still reach `Z_STREAM_END`.
+        let step = room.saturating_add(1).min(chunk.len());
+        let avail_out = step as c_uint;
+
+        guard.strm.next_in = if avail_in == 0 {
+            ptr::null()
+        } else {
+            remaining.as_ptr()
+        };
+        guard.strm.avail_in = avail_in;
+        guard.strm.next_out = chunk.as_mut_ptr();
+        guard.strm.avail_out = avail_out;
+
+        // SAFETY: `next_in` (when non-null) points to `avail_in` readable bytes in `remaining`,
+        // `next_out` points to `avail_out` writable bytes in `chunk`, and they do not alias.
+        let rc = unsafe { inflate(ptr::from_mut(guard.strm.as_mut()), Z_NO_FLUSH) };
+
+        let consumed = (avail_in - guard.strm.avail_in) as usize;
+        let produced = (avail_out - guard.strm.avail_out) as usize;
+        remaining = &remaining[consumed..];
+
+        guard.strm.next_in = ptr::null();
+        guard.strm.avail_in = 0;
+        guard.strm.next_out = ptr::null_mut();
+        guard.strm.avail_out = 0;
+
+        if produced > room {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("raw inflate output exceeds limit of {max_output_bytes} bytes"),
+            ));
+        }
+        if produced > 0 {
+            out.extend_from_slice(&chunk[..produced]);
+        }
+
+        match rc {
+            Z_STREAM_END => return Ok(out),
+            Z_OK => {
+                if produced == 0 && consumed == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "truncated raw deflate stream",
+                    ));
+                }
+            }
+            Z_BUF_ERROR => {
+                if produced == 0 && remaining.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "truncated raw deflate stream",
+                    ));
+                }
+            }
+            other => return Err(zlib_err(&guard.strm, other, "raw inflate error")),
+        }
     }
 }

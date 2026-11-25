@@ -5,7 +5,8 @@
 //! - `lower`: surface-to-execution IR & Core IR v0.1 verifier bridge
 //! - `ffi`: audited RAII FFI wrappers around allowlisted system `zlib`, `libzstd`, `sqlite3`, and OpenSSL TLS
 //! - `db`: SQLite and native PostgreSQL v3.0 drivers, offline `schema.lock`, and privacy-redacted dry-run diffs
-//! - `formats`: built-in calendar/TZif temporal math, HMAC-SHA256, streaming CSV/TSV, JSON/JSONL, schema inference & fake data generation
+//! - `formats`: built-in calendar/TZif temporal math, HMAC-SHA256, streaming CSV/TSV, JSON/JSONL, PKZIP, XLSX, Parquet, schema inference & fake data generation
+//! - `net`: capability-gated HTTP/1.1 HTTPS client (`HttpsAllow`) & `JsonResponse` helpers
 //! - `plan`: relational query optimizer (filter fusion, predicate pushdown, dead-derive pruning) & plan explainer
 //! - `vm`: 2,048-row vectorized columnar batch VM, compiled row bytecode (inlined pure UDFs), & deterministic parallel runner
 //! - `runtime`: Phase 2 execution IR and reference runtime evaluator
@@ -28,6 +29,8 @@ pub mod ffi;
 pub mod formats;
 #[forbid(unsafe_code)]
 pub mod lower;
+#[forbid(unsafe_code)]
+pub mod net;
 #[forbid(unsafe_code)]
 pub mod oracle;
 #[forbid(unsafe_code)]

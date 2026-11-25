@@ -6854,6 +6854,56 @@ impl<'a> Checker<'a> {
                     LTy::public(Ty::Secret("fake".to_string())),
                 )
             }
+            ("Https", "fake") => {
+                self.require_spec_scope(scope, span, "`Https.fake(...)`");
+                let host = match args.first() {
+                    Some(CallArg::Positional(Expr {
+                        kind: ExprKind::Text { value, .. },
+                        ..
+                    })) => value.clone(),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::CapabilityError,
+                                "`Https.fake` requires a hostname string literal as its first argument",
+                            )
+                            .with_span(span),
+                        );
+                        String::new()
+                    }
+                };
+                let resp_expr = named_expr_arg(args, "responses").or_else(|| match args.get(1) {
+                    Some(CallArg::Positional(e)) => Some(e),
+                    _ => None,
+                });
+                let resp_ex = if let Some(re) = resp_expr {
+                    let (ex, _) = self.check_expr(re, env, None, pc, scope, ret_ctx);
+                    ex
+                } else {
+                    ExecExpr::Lit(Literal::Unit)
+                };
+                let mut allows = TagSet::empty();
+                if let Some(Expr {
+                    kind: ExprKind::List(items),
+                    ..
+                }) = named_expr_arg(args, "allows")
+                {
+                    let mut tags = Vec::new();
+                    for item in items {
+                        if let ExprKind::Ident(t) = &item.kind {
+                            tags.push(t.clone());
+                        }
+                    }
+                    allows = TagSet::of_list(tags);
+                }
+                (
+                    ExecExpr::Host {
+                        op: ExecHostOp::FakeHttps { host: host.clone() },
+                        args: vec![resp_ex],
+                    },
+                    LTy::public(Ty::HttpsAllow { host, allows }),
+                )
+            }
             ("DB", "in_memory") => {
                 self.require_spec_scope(scope, span, "`DB.in_memory(...)`");
                 let db = match args.first() {
@@ -7076,17 +7126,44 @@ impl<'a> Checker<'a> {
                     ok_ty: Box::new(ok_ty),
                     err_ty: Box::new(Ty::Text),
                 };
+                let mut call_args = vec![rex, pex];
+                let mut out_tags = plty.tags;
                 let hop = match member.name.as_str() {
                     "read_csv" => ExecHostOp::Core(HostOp::ReadCsv(schema_name)),
                     "read_jsonl" => ExecHostOp::ReadJsonl(schema_name),
-                    _ => ExecHostOp::ReadXlsx(schema_name),
+                    _ => {
+                        let sheet = match named_expr_arg(args, "sheet") {
+                            Some(Expr {
+                                kind: ExprKind::Text { value, .. },
+                                ..
+                            }) => Some(value.clone()),
+                            Some(sheet_e) => {
+                                let (sex, slty) = self.check_expr(
+                                    sheet_e,
+                                    env,
+                                    Some(&Ty::Text),
+                                    pc,
+                                    scope,
+                                    ret_ctx,
+                                );
+                                out_tags = out_tags.union(&slty.tags);
+                                call_args.push(sex);
+                                None
+                            }
+                            None => None,
+                        };
+                        ExecHostOp::ReadXlsx {
+                            schema: schema_name,
+                            sheet,
+                        }
+                    }
                 };
                 return (
                     ExecExpr::Host {
                         op: hop,
-                        args: vec![rex, pex],
+                        args: call_args,
                     },
-                    LTy::new(res_ty, plty.tags),
+                    LTy::new(res_ty, out_tags),
                 );
             }
             (Ty::ReadFiles, "read_parquet") => {
@@ -7162,7 +7239,20 @@ impl<'a> Checker<'a> {
                 };
                 let (pay_ex, pay_tags) = if let Some(pe) = payload_expr {
                     let (ex, lty) = self.check_expr(pe, env, None, pc, scope, ret_ctx);
-                    (ex, lty.effective_tags())
+                    let tags = lty.effective_tags();
+                    let coerced = if member.name == "write_parquet"
+                        && let Ty::Table(ref tt) = lty.ty
+                    {
+                        // Materialize exact static column types (including derived/summarized
+                        // columns) even when the table has 0 rows at runtime.
+                        ExecExpr::Prim {
+                            op: ExecPrimOp::TableCoerce(tt.clone()),
+                            args: vec![ex],
+                        }
+                    } else {
+                        ex
+                    };
+                    (coerced, tags)
                 } else {
                     (ExecExpr::Lit(Literal::Unit), TagSet::empty())
                 };
@@ -7673,6 +7763,42 @@ impl<'a> Checker<'a> {
                         args: vec![rex, fex],
                     },
                     LTy::public(Ty::Bool),
+                );
+            }
+            (Ty::Data(dname), "text_at") if dname == TY_JSON_RESPONSE => {
+                let (fex, _) = match args.first() {
+                    Some(CallArg::Positional(e)) => {
+                        self.check_expr(e, env, Some(&Ty::Text), pc, scope, ret_ctx)
+                    }
+                    _ => (
+                        ExecExpr::Lit(Literal::Text(String::new())),
+                        LTy::public(Ty::Text),
+                    ),
+                };
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::JsonTextAt,
+                        args: vec![rex, fex],
+                    },
+                    LTy::public(Ty::Text),
+                );
+            }
+            (Ty::Data(dname), "int_at") if dname == TY_JSON_RESPONSE => {
+                let (fex, _) = match args.first() {
+                    Some(CallArg::Positional(e)) => {
+                        self.check_expr(e, env, Some(&Ty::Text), pc, scope, ret_ctx)
+                    }
+                    _ => (
+                        ExecExpr::Lit(Literal::Text(String::new())),
+                        LTy::public(Ty::Text),
+                    ),
+                };
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::JsonIntAt,
+                        args: vec![rex, fex],
+                    },
+                    LTy::public(Ty::Int),
                 );
             }
             (Ty::Option(inner), "or_return") => {
