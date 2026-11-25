@@ -1629,6 +1629,21 @@ fn rewrite_exec_plan(plan: &ExecPlan, prog: &ExecProgram, stats: &mut OptStats) 
             static_cols: static_cols.clone(),
             fill: fill.clone(),
         },
+        ExecPlan::PivotLonger {
+            input,
+            cols,
+            names_to,
+            values_to,
+            value_ty,
+            value_tags,
+        } => ExecPlan::PivotLonger {
+            input: Box::new(rewrite_exec_plan(input, prog, stats)),
+            cols: cols.clone(),
+            names_to: names_to.clone(),
+            values_to: values_to.clone(),
+            value_ty: value_ty.clone(),
+            value_tags: value_tags.clone(),
+        },
         ExecPlan::Crosstab {
             input,
             rows_col,
@@ -2049,6 +2064,21 @@ fn prune_exec_plan_derives(
             values_from: values_from.clone(),
             static_cols: static_cols.clone(),
             fill: fill.clone(),
+        },
+        ExecPlan::PivotLonger {
+            input,
+            cols,
+            names_to,
+            values_to,
+            value_ty,
+            value_tags,
+        } => ExecPlan::PivotLonger {
+            input: Box::new(prune_exec_plan_derives(input, None, stats)),
+            cols: cols.clone(),
+            names_to: names_to.clone(),
+            values_to: values_to.clone(),
+            value_ty: value_ty.clone(),
+            value_tags: value_tags.clone(),
         },
         ExecPlan::Crosstab {
             input,

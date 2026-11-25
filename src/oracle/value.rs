@@ -35,6 +35,30 @@ pub struct ProfileColSummary {
     pub distinct_count: usize,
     pub min_display: Option<String>,
     pub max_display: Option<String>,
+    /// Percentage of null cells in `[0.0, 100.0]` (Phase 4B rich metadata; `0.0` in Core IR).
+    pub null_pct: Float64,
+    /// Public numeric summary statistics (`None` when redacted or non-numeric).
+    pub mean: Option<Float64>,
+    pub stddev: Option<Float64>,
+    pub min: Option<Float64>,
+    pub p25: Option<Float64>,
+    pub median: Option<Float64>,
+    pub p75: Option<Float64>,
+    pub max: Option<Float64>,
+    /// 8-bin Unicode sparkline (`▁▂▃▄▅▆▇█`) for public numeric columns (`None` when redacted).
+    pub sparkline: Option<String>,
+    /// Top-3 categorical values `(display, count)` for public columns (empty when redacted).
+    pub top_values: Vec<(String, usize)>,
+    /// Sorted sensitivity tags when this column was redacted (empty for public columns).
+    pub redacted_tags: Vec<String>,
+}
+
+impl ProfileColSummary {
+    /// Returns `true` when value-derived statistics for this column were redacted.
+    #[must_use]
+    pub fn is_redacted(&self) -> bool {
+        !self.redacted_tags.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -54,12 +78,21 @@ pub struct TableVal {
     pub rows: Vec<TableRow>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ChartVal {
     pub kind: ChartKind,
     pub title: String,
     pub col_names: Vec<Ident>,
     pub series: Vec<Vec<Val>>,
+    /// Explicit column role mappings (Phase 4B rich metadata; `None` in Core IR).
+    pub x_col: Option<Ident>,
+    pub y_col: Option<Ident>,
+    pub color_col: Option<Ident>,
+    pub value_col: Option<Ident>,
+    /// Explicit histogram bin count (Sturges default when `None`).
+    pub bins: Option<usize>,
+    /// Optional OLS linear trendline overlay `(slope, intercept, r_squared)`.
+    pub trendline: Option<(f64, f64, f64)>,
 }
 
 #[derive(Clone, Debug, Default)]

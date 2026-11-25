@@ -437,6 +437,21 @@ pub fn bind_exec_plan_sources(plan: &ExecPlan, bindings: &HashMap<Ident, ExecPla
             static_cols: static_cols.clone(),
             fill: fill.clone(),
         },
+        ExecPlan::PivotLonger {
+            input,
+            cols,
+            names_to,
+            values_to,
+            value_ty,
+            value_tags,
+        } => ExecPlan::PivotLonger {
+            input: Box::new(bind_exec_plan_sources(input, bindings)),
+            cols: cols.clone(),
+            names_to: names_to.clone(),
+            values_to: values_to.clone(),
+            value_ty: value_ty.clone(),
+            value_tags: value_tags.clone(),
+        },
         ExecPlan::Crosstab {
             input,
             rows_col,
@@ -4068,6 +4083,7 @@ fn exec_unary_child(plan: &ExecPlan) -> Option<&ExecPlan> {
         | ExecPlan::Window { input, .. }
         | ExecPlan::FillGaps { input, .. }
         | ExecPlan::PivotWider { input, .. }
+        | ExecPlan::PivotLonger { input, .. }
         | ExecPlan::Crosstab { input, .. }
         | ExecPlan::Redact { input, .. }
         | ExecPlan::Pseudonymize { input, .. } => Some(input),
@@ -4167,6 +4183,21 @@ fn rebuild_exec_unary(stage: &ExecPlan, new_input: ExecPlan) -> ExecPlan {
             values_from: values_from.clone(),
             static_cols: static_cols.clone(),
             fill: fill.clone(),
+        },
+        ExecPlan::PivotLonger {
+            cols,
+            names_to,
+            values_to,
+            value_ty,
+            value_tags,
+            ..
+        } => ExecPlan::PivotLonger {
+            input: Box::new(new_input),
+            cols: cols.clone(),
+            names_to: names_to.clone(),
+            values_to: values_to.clone(),
+            value_ty: value_ty.clone(),
+            value_tags: value_tags.clone(),
         },
         ExecPlan::Crosstab {
             rows_col,
@@ -5046,6 +5077,15 @@ fn split_exec_node(
             false,
             false,
             "pivot_wider operator requires local VM",
+        ),
+        ExecPlan::PivotLonger { input, .. } => split_exec_local_barrier(
+            plan,
+            input,
+            ctx,
+            false,
+            false,
+            false,
+            "pivot_longer operator requires local VM",
         ),
         ExecPlan::Crosstab { input, .. } => split_exec_local_barrier(
             plan,

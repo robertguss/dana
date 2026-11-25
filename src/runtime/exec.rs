@@ -1093,6 +1093,20 @@ impl<'a> Evaluator<'a> {
 
     fn eval_exec_prim(&self, op: &ExecPrimOp, args: &[Val]) -> EvalOut {
         match op {
+            ExecPrimOp::Core(PrimOp::StatsCorr { col_x, col_y }) => match args {
+                [Val::Table(tv)] => match crate::stats::pearson_corr_table(tv, col_x, col_y) {
+                    Ok(Some(r)) => EvalOut::Ok(Val::Float(Float64::from_f64(r))),
+                    Ok(None) => EvalOut::Ok(Val::Float(Float64::CANONICAL_NAN)),
+                    Err(e) => EvalOut::Failed(format!("Stats.corr: {e}")),
+                },
+                _ => EvalOut::Failed("Stats.corr requires a Table".to_string()),
+            },
+            ExecPrimOp::Core(PrimOp::TableProfile) => match args {
+                [Val::Table(tv)] => EvalOut::Ok(Val::Profile(
+                    crate::stats::profile::profile_table(tv, &TagSet::empty(), &[]),
+                )),
+                _ => EvalOut::Failed("table.profile() requires a Table".to_string()),
+            },
             ExecPrimOp::Core(cop) => match eval_prim_op(cop, args) {
                 PrimResult::Ok(v) => EvalOut::Ok(v),
                 PrimResult::Stopped(b) => EvalOut::Stopped(b),
@@ -1407,9 +1421,183 @@ impl<'a> Evaluator<'a> {
                 ),
             },
             ExecPrimOp::StatsWelchTTest { col } => match args {
-                [Val::Table(a), Val::Table(b)] => eval_welch_t_test(a, b, col),
+                [Val::Table(a), Val::Table(b)] => {
+                    match crate::stats::welch_t_test_tables(a, b, col) {
+                        Ok(Some(res)) => EvalOut::Ok(Val::StatTest {
+                            stat: Float64::from_f64(res.t_stat),
+                            p_value: Float64::from_f64(res.p_value),
+                        }),
+                        Ok(None) => EvalOut::Ok(Val::StatTest {
+                            stat: Float64::CANONICAL_NAN,
+                            p_value: Float64::CANONICAL_NAN,
+                        }),
+                        Err(e) => EvalOut::Failed(format!("Stats.t_test: {e}")),
+                    }
+                }
                 _ => EvalOut::Failed("StatsWelchTTest requires two Tables".to_string()),
             },
+            ExecPrimOp::StatsCorrSpearman { col_x, col_y } => match args {
+                [Val::Table(tv)] => match crate::stats::spearman_corr_table(tv, col_x, col_y) {
+                    Ok(Some(rho)) => EvalOut::Ok(Val::Float(Float64::from_f64(rho))),
+                    Ok(None) => EvalOut::Ok(Val::Float(Float64::CANONICAL_NAN)),
+                    Err(e) => EvalOut::Failed(format!("Stats.corr(:spearman): {e}")),
+                },
+                _ => EvalOut::Failed("StatsCorrSpearman requires a Table".to_string()),
+            },
+            ExecPrimOp::LinearModelPredict => match args {
+                [
+                    Val::LinearModel {
+                        slope, intercept, ..
+                    },
+                    x_val,
+                ] => match val_to_f64(x_val) {
+                    Some(x) => EvalOut::Ok(Val::Float(Float64::from_f64(
+                        slope.to_f64() * x + intercept.to_f64(),
+                    ))),
+                    None => EvalOut::Failed(
+                        "LinearModel.predict requires a numeric argument".to_string(),
+                    ),
+                },
+                _ => EvalOut::Failed(
+                    "LinearModel.predict requires (LinearModel, numeric)".to_string(),
+                ),
+            },
+            ExecPrimOp::StatsChiSquareIndependence { col_x, col_y } => match args {
+                [Val::Table(tv)] => {
+                    match crate::stats::chi_square_independence_table(tv, col_x, col_y) {
+                        Ok(Some(res)) => EvalOut::Ok(Val::StatTest {
+                            stat: Float64::from_f64(res.stat),
+                            p_value: Float64::from_f64(res.p_value),
+                        }),
+                        Ok(None) => EvalOut::Ok(Val::StatTest {
+                            stat: Float64::CANONICAL_NAN,
+                            p_value: Float64::CANONICAL_NAN,
+                        }),
+                        Err(e) => EvalOut::Failed(e),
+                    }
+                }
+                _ => EvalOut::Failed("StatsChiSquareIndependence requires a Table".to_string()),
+            },
+            ExecPrimOp::StatsChiSquareGof { observed, expected } => match args {
+                [Val::Table(tv)] => {
+                    match crate::stats::chi_square_gof_table(tv, observed, expected) {
+                        Ok(Some(res)) => EvalOut::Ok(Val::StatTest {
+                            stat: Float64::from_f64(res.stat),
+                            p_value: Float64::from_f64(res.p_value),
+                        }),
+                        Ok(None) => EvalOut::Ok(Val::StatTest {
+                            stat: Float64::CANONICAL_NAN,
+                            p_value: Float64::CANONICAL_NAN,
+                        }),
+                        Err(e) => EvalOut::Failed(e),
+                    }
+                }
+                _ => EvalOut::Failed("StatsChiSquareGof requires a Table".to_string()),
+            },
+            ExecPrimOp::StatsOutliers {
+                col,
+                method,
+                flag_col,
+                flag_tags,
+            } => match args {
+                [Val::Table(tv), thresh_val] => {
+                    let threshold = val_to_f64(thresh_val).unwrap_or(f64::NAN);
+                    match crate::stats::detect_outliers_table(
+                        tv, col, *method, threshold, flag_col, flag_tags,
+                    ) {
+                        Ok(out_tv) => EvalOut::Ok(Val::Table(out_tv)),
+                        Err(e) => EvalOut::Failed(e),
+                    }
+                }
+                _ => EvalOut::Failed("StatsOutliers requires (Table, threshold)".to_string()),
+            },
+            ExecPrimOp::TableProfileEx { row_tags, col_tags } => match args {
+                [Val::Table(tv)] => EvalOut::Ok(Val::Profile(
+                    crate::stats::profile::profile_table(tv, row_tags, col_tags),
+                )),
+                _ => EvalOut::Failed("TableProfileEx requires a Table".to_string()),
+            },
+            ExecPrimOp::ChartMakeEx {
+                kind,
+                x_col,
+                y_col,
+                color_col,
+                value_col,
+                has_title_expr,
+                has_trendline_expr,
+                has_bins_expr,
+            } => {
+                let Some(Val::Table(tv)) = args.first() else {
+                    return EvalOut::Failed(
+                        "ChartMakeEx requires a Table as first arg".to_string(),
+                    );
+                };
+                let mut cursor = 1usize;
+                let title = if *has_title_expr {
+                    let t = args.get(cursor).map(format_display_val).unwrap_or_default();
+                    cursor += 1;
+                    t
+                } else {
+                    String::new()
+                };
+                let trendline = if *has_trendline_expr {
+                    let tr = match args.get(cursor) {
+                        Some(Val::LinearModel {
+                            slope,
+                            intercept,
+                            r2,
+                        }) => Some((slope.to_f64(), intercept.to_f64(), r2.to_f64())),
+                        _ => None,
+                    };
+                    cursor += 1;
+                    tr
+                } else {
+                    None
+                };
+                let bins = if *has_bins_expr {
+                    match args.get(cursor) {
+                        Some(Val::Int(n)) => n
+                            .to_i64()
+                            .filter(|&k| k > 0)
+                            .map(|k| (k as usize).clamp(1, 200)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let mut col_names: Vec<Ident> = Vec::new();
+                for opt_c in [x_col, y_col, color_col, value_col] {
+                    if let Some(cn) = opt_c
+                        && !col_names.contains(cn)
+                    {
+                        col_names.push(cn.clone());
+                    }
+                }
+                let mut series = Vec::with_capacity(col_names.len());
+                for cn in &col_names {
+                    let Some(idx) = tv.cols.iter().position(|c| &c.name == cn) else {
+                        return EvalOut::Failed(format!("chart: missing column `{cn}`"));
+                    };
+                    let vals = tv
+                        .rows
+                        .iter()
+                        .map(|r| r.cells.get(idx).cloned().unwrap_or(Val::OptNone))
+                        .collect();
+                    series.push(vals);
+                }
+                EvalOut::Ok(Val::Chart(crate::oracle::value::ChartVal {
+                    kind: *kind,
+                    title,
+                    col_names,
+                    series,
+                    x_col: x_col.clone(),
+                    y_col: y_col.clone(),
+                    color_col: color_col.clone(),
+                    value_col: value_col.clone(),
+                    bins,
+                    trendline,
+                }))
+            }
             ExecPrimOp::OptSubInt => match args {
                 [Val::Int(_), Val::OptNone] => EvalOut::Ok(Val::OptNone),
                 [Val::Int(a), Val::OptSome(b)] => match b.as_ref() {
@@ -1614,9 +1802,12 @@ impl<'a> Evaluator<'a> {
                 }
                 _ => EvalOut::Failed("printed_tables requires fake Console".to_string()),
             },
-            ExecHostOp::ConsolePrintChart | ExecHostOp::ConsolePrintProfile => {
+            ExecHostOp::ConsolePrintChart => {
                 if let [Val::CapConsole { handle, .. }, payload] = args {
-                    let rendered = format_display_val(payload);
+                    let rendered = match payload {
+                        Val::Chart(ch) => crate::viz::terminal::render_chart_terminal(ch),
+                        other => format_display_val(other),
+                    };
                     match handle {
                         CapHandle::Real => self.ew.world.stdout.push(rendered),
                         CapHandle::Fake(idx) => {
@@ -1627,7 +1818,26 @@ impl<'a> Evaluator<'a> {
                     }
                     EvalOut::Ok(Val::Unit)
                 } else {
-                    EvalOut::Failed("console print expects (Console, value)".to_string())
+                    EvalOut::Failed("console.print_chart expects (Console, Chart)".to_string())
+                }
+            }
+            ExecHostOp::ConsolePrintProfile => {
+                if let [Val::CapConsole { handle, .. }, payload] = args {
+                    let rendered = match payload {
+                        Val::Profile(prof) => crate::stats::profile::render_profile_terminal(prof),
+                        other => format_display_val(other),
+                    };
+                    match handle {
+                        CapHandle::Real => self.ew.world.stdout.push(rendered),
+                        CapHandle::Fake(idx) => {
+                            if let Some(fc) = self.ew.world.fake_consoles.get_mut(*idx) {
+                                fc.stdout.push(rendered);
+                            }
+                        }
+                    }
+                    EvalOut::Ok(Val::Unit)
+                } else {
+                    EvalOut::Failed("console.print_profile expects (Console, Profile)".to_string())
                 }
             }
             ExecHostOp::ReadJsonl(schema_name) => {
@@ -1694,6 +1904,62 @@ impl<'a> Evaluator<'a> {
                     self.write_confined_table(*handle, &full_rel, tv, TableWriteFmt::Csv(delim))
                 } else {
                     EvalOut::Failed("write_csv expects (WriteFiles, path, table)".to_string())
+                }
+            }
+            ExecHostOp::WriteReportMarkdown => {
+                if let [
+                    Val::CapWriteFiles {
+                        handle,
+                        root,
+                        allows,
+                    },
+                    Val::Text(rel),
+                    Val::Report(rep),
+                ] = args
+                {
+                    if !self.ew.dry_run
+                        && let Some(bug) = self.check_export_gate(*handle, allows)
+                    {
+                        return EvalOut::Stopped(bug);
+                    }
+                    if !is_safe_relative_path(rel) {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                            "unsafe write path `{rel}`"
+                        )))));
+                    }
+                    let full_rel = join_confined_path(root, rel);
+                    let md = crate::viz::report::render_markdown_report(rep);
+                    self.write_confined_output(*handle, &full_rel, md)
+                } else {
+                    EvalOut::Failed("write_markdown expects (WriteFiles, path, Report)".to_string())
+                }
+            }
+            ExecHostOp::WriteChartSvg => {
+                if let [
+                    Val::CapWriteFiles {
+                        handle,
+                        root,
+                        allows,
+                    },
+                    Val::Text(rel),
+                    Val::Chart(chart),
+                ] = args
+                {
+                    if !self.ew.dry_run
+                        && let Some(bug) = self.check_export_gate(*handle, allows)
+                    {
+                        return EvalOut::Stopped(bug);
+                    }
+                    if !is_safe_relative_path(rel) {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                            "unsafe write path `{rel}`"
+                        )))));
+                    }
+                    let full_rel = join_confined_path(root, rel);
+                    let svg = crate::viz::svg::render_chart_svg(chart);
+                    self.write_confined_output(*handle, &full_rel, svg)
+                } else {
+                    EvalOut::Failed("write_svg expects (WriteFiles, path, Chart)".to_string())
                 }
             }
             ExecHostOp::WriteTableUpsert { key_col, allows } => {
@@ -2027,7 +2293,7 @@ impl<'a> Evaluator<'a> {
                     )))));
                 }
                 let full_rel = join_confined_path(root, rel);
-                let html = render_basic_html_report(rep);
+                let html = crate::viz::report::render_html_report(rep);
                 self.write_confined_output(*handle, &full_rel, html)
             }
             (HostOp::FakeConsole(allows), []) => {
@@ -3392,6 +3658,14 @@ impl<'a> Evaluator<'a> {
                 fill,
                 ..
             } => eval_pivot_wider(tv, names_from, values_from, static_cols, eval_literal(fill)),
+            ExecPlan::PivotLonger {
+                cols,
+                names_to,
+                values_to,
+                value_ty,
+                value_tags,
+                ..
+            } => eval_pivot_longer(tv, cols, names_to, values_to, value_ty, value_tags),
             ExecPlan::Crosstab {
                 rows_col,
                 cols_col,
@@ -3771,6 +4045,7 @@ fn unary_plan_input(plan: &ExecPlan) -> Option<&ExecPlan> {
         | ExecPlan::Window { input, .. }
         | ExecPlan::FillGaps { input, .. }
         | ExecPlan::PivotWider { input, .. }
+        | ExecPlan::PivotLonger { input, .. }
         | ExecPlan::Crosstab { input, .. }
         | ExecPlan::Redact { input, .. }
         | ExecPlan::Pseudonymize { input, .. } => Some(input),
@@ -4215,6 +4490,70 @@ fn eval_pivot_wider(
     }))
 }
 
+fn eval_pivot_longer(
+    tv: TableVal,
+    cols: &[Ident],
+    names_to: &str,
+    values_to: &str,
+    value_ty: &ScalarTy,
+    value_tags: &TagSet,
+) -> EvalOut {
+    let mut melt_idxs = Vec::with_capacity(cols.len());
+    let mut eff_val_tags = value_tags.clone();
+    for cn in cols {
+        let Some(idx) = tv.cols.iter().position(|c| &c.name == cn) else {
+            return EvalOut::Failed(format!("pivot_longer: missing column `{cn}`"));
+        };
+        eff_val_tags = eff_val_tags.union(&tv.cols[idx].tags);
+        melt_idxs.push(idx);
+    }
+    let id_idxs: Vec<usize> = (0..tv.cols.len())
+        .filter(|i| !melt_idxs.contains(i))
+        .collect();
+
+    let mut out_cols: Vec<ColSpec> = id_idxs
+        .iter()
+        .map(|&i| ColSpec {
+            agg_kind: AggKind::Raw,
+            ..tv.cols[i].clone()
+        })
+        .collect();
+    out_cols.push(ColSpec {
+        name: names_to.to_string(),
+        ty: ScalarTy::Text,
+        tags: TagSet::empty(),
+        bucketed: false,
+        agg_kind: AggKind::Raw,
+    });
+    out_cols.push(ColSpec {
+        name: values_to.to_string(),
+        ty: value_ty.clone(),
+        tags: eff_val_tags,
+        bucketed: false,
+        agg_kind: AggKind::Raw,
+    });
+
+    let mut out_rows = Vec::with_capacity(tv.rows.len().saturating_mul(cols.len()));
+    for r in &tv.rows {
+        let base_ids: Vec<Val> = id_idxs.iter().map(|&i| r.cells[i].clone()).collect();
+        for (cn, &mi) in cols.iter().zip(&melt_idxs) {
+            let mut cells = Vec::with_capacity(base_ids.len() + 2);
+            cells.extend(base_ids.iter().cloned());
+            cells.push(Val::Text(cn.clone()));
+            cells.push(coerce_cell_to_scalar(r.cells[mi].clone(), value_ty));
+            out_rows.push(TableRow {
+                cells,
+                group_meta: None,
+            });
+        }
+    }
+
+    EvalOut::Ok(Val::Table(TableVal {
+        cols: out_cols,
+        rows: out_rows,
+    }))
+}
+
 fn eval_crosstab(
     tv: TableVal,
     rows_col: &str,
@@ -4264,148 +4603,6 @@ fn eval_crosstab(
         headers,
         rows: out_rows,
     })
-}
-
-fn eval_welch_t_test(a: &TableVal, b: &TableVal, col: &str) -> EvalOut {
-    let (Some(ia), Some(ib)) = (
-        a.cols.iter().position(|c| c.name == col),
-        b.cols.iter().position(|c| c.name == col),
-    ) else {
-        return EvalOut::Failed(format!("Stats.t_test: missing column `{col}`"));
-    };
-    let xa: Vec<f64> = a
-        .rows
-        .iter()
-        .filter_map(|r| unwrap_opt_ref(&r.cells[ia]).and_then(val_to_f64))
-        .collect();
-    let xb: Vec<f64> = b
-        .rows
-        .iter()
-        .filter_map(|r| unwrap_opt_ref(&r.cells[ib]).and_then(val_to_f64))
-        .collect();
-    if xa.len() < 2 || xb.len() < 2 {
-        return EvalOut::Ok(Val::StatTest {
-            stat: Float64::CANONICAL_NAN,
-            p_value: Float64::CANONICAL_NAN,
-        });
-    }
-    let na = xa.len() as f64;
-    let nb = xb.len() as f64;
-    let ma = xa.iter().sum::<f64>() / na;
-    let mb = xb.iter().sum::<f64>() / nb;
-    let va = xa.iter().map(|&x| (x - ma) * (x - ma)).sum::<f64>() / (na - 1.0);
-    let vb = xb.iter().map(|&x| (x - mb) * (x - mb)).sum::<f64>() / (nb - 1.0);
-    let se2 = va / na + vb / nb;
-    if se2 == 0.0 {
-        return EvalOut::Ok(Val::StatTest {
-            stat: Float64::ZERO,
-            p_value: Float64::from_f64(1.0),
-        });
-    }
-    let t = (ma - mb) / se2.sqrt();
-    let df_num = se2 * se2;
-    let df_den = (va / na).powi(2) / (na - 1.0) + (vb / nb).powi(2) / (nb - 1.0);
-    let df = if df_den > 0.0 {
-        df_num / df_den
-    } else {
-        na + nb - 2.0
-    };
-    let p_val = student_t_two_tailed_p(t.abs(), df);
-    EvalOut::Ok(Val::StatTest {
-        stat: Float64::from_f64(t),
-        p_value: Float64::from_f64(p_val),
-    })
-}
-
-/// Two-tailed Student-t p-value via regularized incomplete beta `I_{df/(df+t^2)}(df/2, 1/2)`.
-fn student_t_two_tailed_p(t_abs: f64, df: f64) -> f64 {
-    if !t_abs.is_finite() || df <= 0.0 {
-        return f64::NAN;
-    }
-    let x = df / (df + t_abs * t_abs);
-    reg_incomplete_beta(df * 0.5, 0.5, x).clamp(0.0, 1.0)
-}
-
-fn reg_incomplete_beta(a: f64, b: f64, x: f64) -> f64 {
-    if x <= 0.0 {
-        return 0.0;
-    }
-    if x >= 1.0 {
-        return 1.0;
-    }
-    let bt = (ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln()).exp();
-    if x < (a + 1.0) / (a + b + 2.0) {
-        bt * betacf(a, b, x) / a
-    } else {
-        1.0 - bt * betacf(b, a, 1.0 - x) / b
-    }
-}
-
-fn betacf(a: f64, b: f64, x: f64) -> f64 {
-    let mut qab = a + b;
-    let mut qap = a + 1.0;
-    let mut qam = a - 1.0;
-    let mut c = 1.0f64;
-    let mut d = 1.0 - qab * x / qap;
-    if d.abs() < 1e-30 {
-        d = 1e-30;
-    }
-    d = 1.0 / d;
-    let mut h = d;
-    for m in 1..=200 {
-        let mf = f64::from(m);
-        let m2 = 2.0 * mf;
-        let aa = mf * (b - mf) * x / ((qam + m2) * (a + m2));
-        d = 1.0 + aa * d;
-        if d.abs() < 1e-30 {
-            d = 1e-30;
-        }
-        c = 1.0 + aa / c;
-        if c.abs() < 1e-30 {
-            c = 1e-30;
-        }
-        d = 1.0 / d;
-        h *= d * c;
-        let aa2 = -(a + mf) * (qab + mf) * x / ((a + m2) * (qap + m2));
-        d = 1.0 + aa2 * d;
-        if d.abs() < 1e-30 {
-            d = 1e-30;
-        }
-        c = 1.0 + aa2 / c;
-        if c.abs() < 1e-30 {
-            c = 1e-30;
-        }
-        d = 1.0 / d;
-        let del = d * c;
-        h *= del;
-        if (del - 1.0).abs() < 1e-12 {
-            break;
-        }
-    }
-    let _ = (&mut qab, &mut qap, &mut qam);
-    h
-}
-
-/// Lanczos approximation for `ln(Gamma(z))`.
-fn ln_gamma(z: f64) -> f64 {
-    const COEFFS: [f64; 9] = [
-        0.999_999_999_999_809_9,
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_1,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-    let z = z - 1.0;
-    let mut x = COEFFS[0];
-    for (i, &c) in COEFFS.iter().enumerate().skip(1) {
-        x += c / (z + i as f64);
-    }
-    let t = z + 7.5;
-    0.5 * (2.0 * std::f64::consts::PI).ln() + (z + 0.5) * t.ln() - t + x.ln()
 }
 
 fn match_pattern(pat: &ExecPattern, val: &Val) -> Option<Vec<(Ident, Val)>> {
@@ -4565,44 +4762,6 @@ fn format_pretty_table(tv: &TableVal) -> String {
         }
     }
     out
-}
-
-fn render_basic_html_report(rep: &crate::oracle::value::ReportVal) -> String {
-    let mut out = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title></head><body><h1>{}</h1>",
-        html_escape(&rep.title),
-        html_escape(&rep.title)
-    );
-    for s in &rep.summaries {
-        out.push_str(&format!("<p>{}</p>", html_escape(s)));
-    }
-    for (hdrs, rows) in &rep.tables {
-        out.push_str("<table><thead><tr>");
-        for h in hdrs {
-            out.push_str(&format!("<th>{}</th>", html_escape(h)));
-        }
-        out.push_str("</tr></thead><tbody>");
-        for r in rows {
-            out.push_str("<tr>");
-            for cell in r {
-                out.push_str(&format!(
-                    "<td>{}</td>",
-                    html_escape(&format_display_val(cell))
-                ));
-            }
-            out.push_str("</tr>");
-        }
-        out.push_str("</tbody></table>");
-    }
-    out.push_str("</body></html>\n");
-    out
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 // Keep reference constants visible for checked range consistency.

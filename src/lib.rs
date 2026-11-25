@@ -7,6 +7,8 @@
 //! - `db`: SQLite and native PostgreSQL v3.0 drivers, offline `schema.lock`, and privacy-redacted dry-run diffs
 //! - `formats`: built-in calendar/TZif temporal math, HMAC-SHA256, streaming CSV/TSV, JSON/JSONL, PKZIP, XLSX, Parquet, schema inference & fake data generation
 //! - `net`: capability-gated HTTP/1.1 HTTPS client (`HttpsAllow`) & `JsonResponse` helpers
+//! - `stats`: statistical analytics stdlib (Pearson/Spearman correlation, OLS regression, Welch t-test, chi-square, outlier detection) & privacy-safe dataset profiler
+//! - `viz`: zero-dependency standalone SVG & Unicode terminal charts, plus self-contained HTML5 & Markdown reports
 //! - `plan`: relational query optimizer (filter fusion, predicate pushdown, dead-derive pruning) & plan explainer
 //! - `vm`: 2,048-row vectorized columnar batch VM, compiled row bytecode (inlined pure UDFs), & deterministic parallel runner
 //! - `runtime`: Phase 2 execution IR and reference runtime evaluator
@@ -38,6 +40,10 @@ pub mod plan;
 #[forbid(unsafe_code)]
 pub mod runtime;
 #[forbid(unsafe_code)]
+pub mod stats;
+#[forbid(unsafe_code)]
 pub mod syntax;
+#[forbid(unsafe_code)]
+pub mod viz;
 #[forbid(unsafe_code)]
 pub mod vm;

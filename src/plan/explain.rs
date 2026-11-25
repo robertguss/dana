@@ -1573,6 +1573,54 @@ fn trace_exec_provenance(
                 ..TableTy::default()
             })
         }
+        ExecPlan::PivotLonger {
+            input,
+            cols,
+            names_to,
+            values_to,
+            value_ty,
+            value_tags,
+        } => {
+            let tt = trace_exec_provenance(input, prog, var_tags, table_vars, lines)?;
+            let mut val_tags = value_tags.clone();
+            let mut out_cols: Vec<ColSpec> = Vec::new();
+            for c in &tt.cols {
+                if cols.contains(&c.name) {
+                    val_tags = val_tags.union(&c.tags);
+                } else {
+                    out_cols.push(ColSpec {
+                        agg_kind: AggKind::Raw,
+                        ..c.clone()
+                    });
+                }
+            }
+            if !val_tags.is_empty() {
+                lines.push(format!(
+                    "PROPAGATE PivotLonger({values_to}): tags={}",
+                    fmt_tags(&val_tags)
+                ));
+            }
+            out_cols.push(ColSpec {
+                name: names_to.clone(),
+                ty: ScalarTy::Text,
+                tags: TagSet::empty(),
+                bucketed: false,
+                agg_kind: AggKind::Raw,
+            });
+            out_cols.push(ColSpec {
+                name: values_to.clone(),
+                ty: value_ty.clone(),
+                tags: val_tags,
+                bucketed: false,
+                agg_kind: AggKind::Raw,
+            });
+            Some(TableTy {
+                cols: out_cols,
+                row_tags: tt.row_tags,
+                order_tags: tt.order_tags,
+                ..TableTy::default()
+            })
+        }
         ExecPlan::FillGaps { input, .. }
         | ExecPlan::PivotWider { input, .. }
         | ExecPlan::Crosstab { input, .. } => {
@@ -1885,6 +1933,20 @@ fn fmt_exec_plan(plan: &ExecPlan, depth: usize, out: &mut String) {
             ..
         } => {
             let _ = writeln!(out, "PivotWider({names_from} -> {values_from})");
+            fmt_exec_plan(input, depth + 1, out);
+        }
+        ExecPlan::PivotLonger {
+            input,
+            cols,
+            names_to,
+            values_to,
+            ..
+        } => {
+            let _ = writeln!(
+                out,
+                "PivotLonger([{}] -> {names_to}, {values_to})",
+                cols.join(", ")
+            );
             fmt_exec_plan(input, depth + 1, out);
         }
         ExecPlan::Crosstab {

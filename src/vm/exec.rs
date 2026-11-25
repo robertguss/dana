@@ -37,7 +37,7 @@ use crate::vm::expr::{RowEvalErr, RowEvalHost, compile_core_row_expr, compile_ex
 use crate::vm::ops::agg::{CompiledAgg, op_hash_aggregate, op_suppress_small_groups};
 use crate::vm::ops::join::op_hash_join;
 use crate::vm::ops::sort_win::{
-    op_crosstab, op_distinct, op_fill_gaps, op_pivot_wider, op_sort, op_window,
+    op_crosstab, op_distinct, op_fill_gaps, op_pivot_longer, op_pivot_wider, op_sort, op_window,
 };
 use crate::vm::ops::{
     OpErr, OpExecConfig, VmMode, VmTable, op_derive_bucket, op_derive_col_expr, op_drop, op_filter,
@@ -506,6 +506,14 @@ fn eval_exec_plan_to_table(
                 fill,
                 ..
             } => op_pivot_wider(cur, names_from, values_from, static_cols, fill, None, cfg)?,
+            ExecPlan::PivotLonger {
+                cols,
+                names_to,
+                values_to,
+                value_ty,
+                value_tags,
+                ..
+            } => op_pivot_longer(cur, cols, names_to, values_to, value_ty, value_tags, cfg)?,
             ExecPlan::Redact {
                 col, replacement, ..
             } => op_redact(cur, col, replacement, &TagSet::empty(), cfg)?,
@@ -546,6 +554,7 @@ fn exec_unary_input(plan: &ExecPlan) -> Option<&ExecPlan> {
         | ExecPlan::Window { input, .. }
         | ExecPlan::FillGaps { input, .. }
         | ExecPlan::PivotWider { input, .. }
+        | ExecPlan::PivotLonger { input, .. }
         | ExecPlan::Crosstab { input, .. }
         | ExecPlan::Redact { input, .. }
         | ExecPlan::Pseudonymize { input, .. } => Some(input),

@@ -196,6 +196,7 @@ fn build_profile_col(tv: &TableVal, idx: usize, c: &ColSpec) -> Option<ProfileCo
         distinct_count: distinct_vals.len(),
         min_display,
         max_display,
+        ..ProfileColSummary::default()
     })
 }
 
@@ -582,6 +583,7 @@ pub fn eval_prim_op(op: &PrimOp, args: &[Val]) -> PrimResult {
                 title: title.clone(),
                 col_names: cols.clone(),
                 series,
+                ..ChartVal::default()
             }))
         }
         (PrimOp::ReportNew, [Val::Text(title)]) => PrimResult::Ok(Val::Report(ReportVal {

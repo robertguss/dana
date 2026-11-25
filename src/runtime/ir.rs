@@ -80,6 +80,46 @@ pub enum ExecPrimOp {
     StatsWelchTTest {
         col: Ident,
     },
+    /// Spearman rank correlation (`Stats.corr(tbl, x: .a, y: .b, method: :spearman)`).
+    StatsCorrSpearman {
+        col_x: Ident,
+        col_y: Ident,
+    },
+    /// OLS linear regression prediction (`model.predict(x)` -> `Float`).
+    LinearModelPredict,
+    /// Pearson chi-square test of independence (`Stats.chi_square(tbl, x: .a, y: .b)`).
+    StatsChiSquareIndependence {
+        col_x: Ident,
+        col_y: Ident,
+    },
+    /// Pearson chi-square goodness-of-fit test (`Stats.chi_square(tbl, observed: .o, expected: .e)`).
+    StatsChiSquareGof {
+        observed: Ident,
+        expected: Ident,
+    },
+    /// Z-score or IQR outlier detection (`Stats.outliers(tbl, column: .c, ...)`).
+    StatsOutliers {
+        col: Ident,
+        method: crate::stats::OutlierMethod,
+        flag_col: Ident,
+        flag_tags: TagSet,
+    },
+    /// Privacy-aware dataset profile carrying static table `row_tags` and sensitive `col_tags`.
+    TableProfileEx {
+        row_tags: TagSet,
+        col_tags: Vec<(Ident, TagSet)>,
+    },
+    /// Rich chart builder with dynamic title expression, explicit column roles, trendline, and bins.
+    ChartMakeEx {
+        kind: ChartKind,
+        x_col: Option<Ident>,
+        y_col: Option<Ident>,
+        color_col: Option<Ident>,
+        value_col: Option<Ident>,
+        has_title_expr: bool,
+        has_trendline_expr: bool,
+        has_bins_expr: bool,
+    },
     /// Optional binary numeric promotion (`Int - Option(Int)` -> `Option(Int)` for window diffs).
     OptSubInt,
     OptSubDec,
@@ -124,6 +164,9 @@ pub enum ExecHostOp {
     /// `out.write_csv(path, table)` / `out.write_jsonl(path, table)`.
     WriteCsv,
     WriteJsonl,
+    /// `out.write_markdown(path, report)` / `out.write_svg(path, chart)`.
+    WriteReportMarkdown,
+    WriteChartSvg,
     /// `db_write.upsert(table, key: .k)` (Phase 3 live transactional upsert / read-only dry-run).
     WriteTableUpsert {
         key_col: Ident,
@@ -276,6 +319,14 @@ pub enum ExecPlan {
         values_from: Ident,
         static_cols: Vec<Ident>,
         fill: Literal,
+    },
+    PivotLonger {
+        input: Box<ExecPlan>,
+        cols: Vec<Ident>,
+        names_to: Ident,
+        values_to: Ident,
+        value_ty: ScalarTy,
+        value_tags: TagSet,
     },
     Crosstab {
         input: Box<ExecPlan>,
@@ -475,6 +526,7 @@ enum CloneBuildPlan<'a> {
     Window(&'a [WindowItem]),
     FillGaps(&'a Ident, &'a BigInt, &'a [Ident], &'a [(Ident, Literal)]),
     PivotWider(&'a Ident, &'a Ident, &'a [Ident], &'a Literal),
+    PivotLonger(&'a [Ident], &'a Ident, &'a Ident, &'a ScalarTy, &'a TagSet),
     Crosstab(&'a Ident, &'a Ident, &'a Ident, &'a Literal),
     Redact(&'a Ident, &'a str),
     Pseudonymize(&'a Ident),
@@ -721,6 +773,19 @@ fn run_exec_clone(initial: ExecCloneTask<'_>) -> (Vec<ExecExpr>, Vec<ExecPlan>, 
                     )));
                     tasks.push(ExecCloneTask::Plan(input));
                 }
+                ExecPlan::PivotLonger {
+                    input,
+                    cols,
+                    names_to,
+                    values_to,
+                    value_ty,
+                    value_tags,
+                } => {
+                    tasks.push(ExecCloneTask::BuildPlan(CloneBuildPlan::PivotLonger(
+                        cols, names_to, values_to, value_ty, value_tags,
+                    )));
+                    tasks.push(ExecCloneTask::Plan(input));
+                }
                 ExecPlan::Crosstab {
                     input,
                     rows_col,
@@ -947,6 +1012,18 @@ fn run_exec_clone(initial: ExecCloneTask<'_>) -> (Vec<ExecExpr>, Vec<ExecPlan>, 
                             values_from: values_from.clone(),
                             static_cols: static_cols.to_vec(),
                             fill: fill.clone(),
+                        });
+                    }
+                }
+                CloneBuildPlan::PivotLonger(cols, names_to, values_to, value_ty, value_tags) => {
+                    if let Some(input) = plans.pop() {
+                        plans.push(ExecPlan::PivotLonger {
+                            input: Box::new(input),
+                            cols: cols.to_vec(),
+                            names_to: names_to.clone(),
+                            values_to: values_to.clone(),
+                            value_ty: value_ty.clone(),
+                            value_tags: value_tags.clone(),
                         });
                     }
                 }
@@ -1464,6 +1541,7 @@ fn push_exec_plan_children(plan: &mut ExecPlan, stack: &mut Vec<ExecDropNode>) {
         | ExecPlan::Window { input, .. }
         | ExecPlan::FillGaps { input, .. }
         | ExecPlan::PivotWider { input, .. }
+        | ExecPlan::PivotLonger { input, .. }
         | ExecPlan::Crosstab { input, .. }
         | ExecPlan::Redact { input, .. } => {
             stack.push(ExecDropNode::Plan(std::mem::replace(
@@ -2077,6 +2155,7 @@ fn try_exec_expr_to_core(root: &ExecExpr) -> Option<Expr> {
                     )));
                     tasks.push(ConvTask::Plan(input));
                 }
+                ExecPlan::PivotLonger { .. } => return None,
                 ExecPlan::Crosstab {
                     input,
                     rows_col,

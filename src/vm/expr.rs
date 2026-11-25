@@ -2521,6 +2521,24 @@ pub fn eval_scalar_exec_prim(
                 "RecordField requires Ctor, LinearModel, or StatTest".to_string(),
             )),
         },
+        ExecPrimOp::LinearModelPredict => match args {
+            [
+                Val::LinearModel {
+                    slope, intercept, ..
+                },
+                x_val,
+            ] => match crate::oracle::value::unwrap_numeric_float(x_val) {
+                Some(x) => Ok(Val::Float(Float64::from_f64(
+                    slope.to_f64() * x + intercept.to_f64(),
+                ))),
+                None => Err(RowEvalErr::Failed(
+                    "LinearModel.predict requires a numeric argument".to_string(),
+                )),
+            },
+            _ => Err(RowEvalErr::Failed(
+                "LinearModel.predict requires (LinearModel, numeric)".to_string(),
+            )),
+        },
         ExecPrimOp::ListFirst => match args {
             [Val::List(xs)] => match xs.first() {
                 Some(v) => Ok(Val::OptSome(Box::new(v.clone()))),

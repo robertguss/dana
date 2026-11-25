@@ -842,6 +842,96 @@ pub fn op_pivot_wider(
     })
 }
 
+fn coerce_pivot_cell(val: Val, target: &ScalarTy) -> Val {
+    match (&val, target) {
+        (Val::OptNone, ScalarTy::Option(_)) => Val::OptNone,
+        (Val::OptSome(inner), ScalarTy::Option(t)) => {
+            Val::OptSome(Box::new(coerce_pivot_cell(inner.as_ref().clone(), t)))
+        }
+        (_, ScalarTy::Option(t)) => Val::OptSome(Box::new(coerce_pivot_cell(val, t))),
+        (Val::Int(n), ScalarTy::Decimal) => {
+            Val::Decimal(n * &crate::core::bigint::BigInt::from(crate::core::bigint::DEC_SCALE))
+        }
+        (Val::Int(n), ScalarTy::Float) => Val::Float(crate::core::syntax::Float64::from_f64(
+            n.to_i64().unwrap_or(0) as f64,
+        )),
+        (Val::Decimal(d), ScalarTy::Float) => Val::Float(crate::core::syntax::Float64::from_f64(
+            render_decimal(d).parse::<f64>().unwrap_or(0.0),
+        )),
+        _ => val,
+    }
+}
+
+/// Columnar `PivotLonger` unpivoting `cols` into `(names_to, values_to)` with exact
+/// scalar type coercion and sensitivity tag propagation.
+pub fn op_pivot_longer(
+    tbl: VmTable,
+    cols: &[Ident],
+    names_to: &str,
+    values_to: &str,
+    value_ty: &ScalarTy,
+    value_tags: &crate::core::syntax::TagSet,
+    cfg: &OpExecConfig,
+) -> Result<VmTable, OpErr> {
+    let tv = tbl.into_table_val();
+    let mut melt_idxs = Vec::with_capacity(cols.len());
+    let mut eff_val_tags = value_tags.clone();
+    for cn in cols {
+        let Some(idx) = tv.cols.iter().position(|c| &c.name == cn) else {
+            return Err(OpErr::Failed(format!(
+                "pivot_longer: missing column `{cn}`"
+            )));
+        };
+        eff_val_tags = eff_val_tags.union(&tv.cols[idx].tags);
+        melt_idxs.push(idx);
+    }
+    let id_idxs: Vec<usize> = (0..tv.cols.len())
+        .filter(|i| !melt_idxs.contains(i))
+        .collect();
+
+    let mut out_cols: Vec<ColSpec> = id_idxs
+        .iter()
+        .map(|&i| ColSpec {
+            agg_kind: AggKind::Raw,
+            ..tv.cols[i].clone()
+        })
+        .collect();
+    out_cols.push(ColSpec {
+        name: names_to.to_string(),
+        ty: ScalarTy::Text,
+        tags: crate::core::syntax::TagSet::empty(),
+        bucketed: false,
+        agg_kind: AggKind::Raw,
+    });
+    out_cols.push(ColSpec {
+        name: values_to.to_string(),
+        ty: value_ty.clone(),
+        tags: eff_val_tags,
+        bucketed: false,
+        agg_kind: AggKind::Raw,
+    });
+
+    let mut out_rows = Vec::with_capacity(tv.rows.len().saturating_mul(cols.len()));
+    for r in &tv.rows {
+        let base_ids: Vec<Val> = id_idxs.iter().map(|&i| r.cells[i].clone()).collect();
+        for (cn, &mi) in cols.iter().zip(&melt_idxs) {
+            let mut cells = Vec::with_capacity(base_ids.len() + 2);
+            cells.extend(base_ids.iter().cloned());
+            cells.push(Val::Text(cn.clone()));
+            cells.push(coerce_pivot_cell(r.cells[mi].clone(), value_ty));
+            out_rows.push(TableRow {
+                cells,
+                group_meta: None,
+            });
+        }
+    }
+
+    Ok(VmTable {
+        batches: rows_to_batches(&out_cols, &out_rows, cfg.batch_size),
+        cols: out_cols,
+    })
+}
+
 /// Hash-indexed `Crosstab` returning `Val::DynTable`.
 pub fn op_crosstab(
     tbl: VmTable,

@@ -3924,17 +3924,29 @@ impl<'a> Checker<'a> {
                 ChartKind::Bar
             }
         };
-        let mut cols = Vec::new();
-        let mut title = String::new();
+        let mut x_col: Option<Ident> = None;
+        let mut y_col: Option<Ident> = None;
+        let mut color_col: Option<Ident> = None;
+        let mut value_col: Option<Ident> = None;
+        let mut title_expr: Option<ExecExpr> = None;
+        let mut trendline_expr: Option<ExecExpr> = None;
+        let mut bins_expr: Option<ExecExpr> = None;
         let mut extra_tags = TagSet::empty();
+
         for arg in args {
             match arg {
                 CallArg::Named { name, value, .. } => match name.name.as_str() {
-                    "x" | "y" | "color" | "value" => {
+                    "x" | "y" | "color" | "value" | "column" => {
                         if let ExprKind::DotField(m) = &value.kind {
                             if let Some(c) = in_tt.find_col(&m.name) {
                                 extra_tags = extra_tags.union(&c.tags);
-                                cols.push(m.name.clone());
+                                match name.name.as_str() {
+                                    "x" | "column" => x_col = Some(m.name.clone()),
+                                    "y" => y_col = Some(m.name.clone()),
+                                    "color" => color_col = Some(m.name.clone()),
+                                    "value" => value_col = Some(m.name.clone()),
+                                    _ => {}
+                                }
                             } else {
                                 self.diags.push(
                                     Diagnostic::error(
@@ -3944,25 +3956,84 @@ impl<'a> Checker<'a> {
                                     .with_span(m.span),
                                 );
                             }
+                        } else {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!(
+                                        "`{}:` in `{verb}` expects a `.column` reference",
+                                        name.name
+                                    ),
+                                )
+                                .with_span(value.span),
+                            );
                         }
                     }
                     "title" => {
-                        let (_, tlty) =
+                        let (tex, tlty) =
                             self.check_expr(value, env, Some(&Ty::Text), pc, scope, ret_ctx);
-                        extra_tags = extra_tags.union(&tlty.effective_tags());
-                        if let ExprKind::Text { value: s, .. } = &value.kind {
-                            title = s.clone();
+                        if tlty.ty != Ty::Text {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("`title:` in `{verb}` must be `Text`"),
+                                )
+                                .with_span(value.span),
+                            );
                         }
+                        extra_tags = extra_tags.union(&tlty.effective_tags());
+                        title_expr = Some(tex);
                     }
                     "trendline" => {
-                        let (_, mlty) = self.check_expr(value, env, None, pc, scope, ret_ctx);
+                        let (mex, mlty) =
+                            self.check_expr(value, env, Some(&Ty::LinearModel), pc, scope, ret_ctx);
+                        if mlty.ty != Ty::LinearModel {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("`trendline:` in `{verb}` must be a `LinearModel`"),
+                                )
+                                .with_span(value.span),
+                            );
+                        }
                         extra_tags = extra_tags.union(&mlty.effective_tags());
+                        trendline_expr = Some(mex);
+                    }
+                    "bins" => {
+                        let (bex, blty) =
+                            self.check_expr(value, env, Some(&Ty::Int), pc, scope, ret_ctx);
+                        if blty.ty != Ty::Int {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("`bins:` in `{verb}` must be `Int`"),
+                                )
+                                .with_span(value.span),
+                            );
+                        }
+                        extra_tags = extra_tags.union(&blty.effective_tags());
+                        bins_expr = Some(bex);
                     }
                     _ => {}
                 },
                 CallArg::Positional(e) => {
                     if let ExprKind::DotField(m) = &e.kind {
-                        cols.push(m.name.clone());
+                        if let Some(c) = in_tt.find_col(&m.name) {
+                            extra_tags = extra_tags.union(&c.tags);
+                            if x_col.is_none() {
+                                x_col = Some(m.name.clone());
+                            } else if y_col.is_none() {
+                                y_col = Some(m.name.clone());
+                            }
+                        } else {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("unknown column `.{}` in `{verb}`", m.name),
+                                )
+                                .with_span(m.span),
+                            );
+                        }
                     }
                 }
             }
@@ -3972,10 +4043,38 @@ impl<'a> Checker<'a> {
             .union(&in_tt.order_tags)
             .union(&extra_tags)
             .union(outer_tags);
+        let mut prim_args = vec![tbl_ex];
+        let has_title_expr = if let Some(tex) = title_expr {
+            prim_args.push(tex);
+            true
+        } else {
+            false
+        };
+        let has_trendline_expr = if let Some(mex) = trendline_expr {
+            prim_args.push(mex);
+            true
+        } else {
+            false
+        };
+        let has_bins_expr = if let Some(bex) = bins_expr {
+            prim_args.push(bex);
+            true
+        } else {
+            false
+        };
         (
             ExecExpr::Prim {
-                op: ExecPrimOp::Core(PrimOp::ChartMake { kind, cols, title }),
-                args: vec![tbl_ex],
+                op: ExecPrimOp::ChartMakeEx {
+                    kind,
+                    x_col,
+                    y_col,
+                    color_col,
+                    value_col,
+                    has_title_expr,
+                    has_trendline_expr,
+                    has_bins_expr,
+                },
+                args: prim_args,
             },
             LTy::new(Ty::Chart(chart_tags), TagSet::empty()),
         )
@@ -4407,6 +4506,7 @@ impl<'a> Checker<'a> {
             "window" => self.check_window_verb(in_plan, in_tt, outer_tags, args, span, env),
             "fill_gaps" => self.check_fill_gaps_verb(in_plan, in_tt, outer_tags, args, span),
             "pivot_wider" => self.check_pivot_wider_verb(in_plan, in_tt, outer_tags, args, span),
+            "pivot_longer" => self.check_pivot_longer_verb(in_plan, in_tt, outer_tags, args, span),
             "crosstab" => self.check_crosstab_verb(in_plan, in_tt, outer_tags, args, span),
             "union" => {
                 let Some(CallArg::Positional(other_e)) = args.first() else {
@@ -5668,6 +5768,218 @@ impl<'a> Checker<'a> {
         )
     }
 
+    fn check_pivot_longer_verb(
+        &mut self,
+        in_plan: ExecPlan,
+        in_tt: TableTy,
+        outer_tags: TagSet,
+        args: &[CallArg],
+        span: Span,
+    ) -> (ExecExpr, LTy) {
+        let mut melt_cols: Vec<Ident> = Vec::new();
+        let mut names_to = String::new();
+        let mut values_to = String::new();
+
+        for arg in args {
+            let CallArg::Named { name, value, .. } = arg else {
+                continue;
+            };
+            match name.name.as_str() {
+                "cols" => {
+                    if let ExprKind::List(items) = &value.kind {
+                        for it in items {
+                            if let ExprKind::DotField(m) = &it.kind {
+                                if melt_cols.contains(&m.name) {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::TypeError,
+                                            format!(
+                                                "duplicate column `.{}` in `pivot_longer` `cols:`",
+                                                m.name
+                                            ),
+                                        )
+                                        .with_span(m.span),
+                                    );
+                                } else {
+                                    melt_cols.push(m.name.clone());
+                                }
+                            } else {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        "`pivot_longer` `cols:` items must be `.column` references",
+                                    )
+                                    .with_span(it.span),
+                                );
+                            }
+                        }
+                    } else {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`pivot_longer` `cols:` must be a list of `.column` references",
+                            )
+                            .with_span(value.span),
+                        );
+                    }
+                }
+                "names_to" => {
+                    if let ExprKind::Text { value: s, .. } = &value.kind {
+                        names_to = s.clone();
+                    } else {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`pivot_longer` `names_to:` must be a string literal",
+                            )
+                            .with_span(value.span),
+                        );
+                    }
+                }
+                "values_to" => {
+                    if let ExprKind::Text { value: s, .. } = &value.kind {
+                        values_to = s.clone();
+                    } else {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`pivot_longer` `values_to:` must be a string literal",
+                            )
+                            .with_span(value.span),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if melt_cols.is_empty() {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    "`pivot_longer` requires a non-empty `cols: [.a, .b, ...]` list",
+                )
+                .with_span(span),
+            );
+        }
+        if names_to.is_empty() || values_to.is_empty() {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    "`pivot_longer` requires non-empty `names_to:` and `values_to:` string literals",
+                )
+                .with_span(span),
+            );
+        }
+        if !names_to.is_empty() && names_to == values_to {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!(
+                        "`pivot_longer` `names_to` and `values_to` cannot share name `{names_to}`"
+                    ),
+                )
+                .with_span(span),
+            );
+        }
+
+        let mut unified_ty: Option<ScalarTy> = None;
+        let mut val_tags = TagSet::empty();
+        for cname in &melt_cols {
+            let Some(cs) = in_tt.find_col(cname) else {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("unknown column `.{cname}` in `pivot_longer`"),
+                    )
+                    .with_span(span),
+                );
+                continue;
+            };
+            val_tags = val_tags.union(&cs.tags);
+            unified_ty = match unified_ty {
+                None => Some(cs.ty.clone()),
+                Some(prev) => match unify_pivot_scalar(&prev, &cs.ty) {
+                    Some(u) => Some(u),
+                    None => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!(
+                                    "`pivot_longer` cannot unify column `.{cname}` of type `{:?}` with `{:?}`",
+                                    cs.ty, prev
+                                ),
+                            )
+                            .with_span(span),
+                        );
+                        Some(prev)
+                    }
+                },
+            };
+        }
+
+        let value_ty = unified_ty.unwrap_or(ScalarTy::Float);
+        let mut out_cols: Vec<ColSpec> = in_tt
+            .cols
+            .iter()
+            .filter(|c| !melt_cols.contains(&c.name))
+            .map(|c| ColSpec {
+                agg_kind: AggKind::Raw,
+                ..c.clone()
+            })
+            .collect();
+
+        for kept in &out_cols {
+            if kept.name == names_to || kept.name == values_to {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!(
+                            "`pivot_longer` output column `{}` collides with retained ID column",
+                            kept.name
+                        ),
+                    )
+                    .with_span(span),
+                );
+            }
+        }
+
+        out_cols.push(ColSpec {
+            name: names_to.clone(),
+            ty: ScalarTy::Text,
+            tags: TagSet::empty(),
+            bucketed: false,
+            agg_kind: AggKind::Raw,
+        });
+        out_cols.push(ColSpec {
+            name: values_to.clone(),
+            ty: value_ty.clone(),
+            tags: val_tags.clone(),
+            bucketed: false,
+            agg_kind: AggKind::Raw,
+        });
+
+        let out_tt = TableTy {
+            cols: out_cols,
+            row_tags: in_tt.row_tags,
+            order_tags: in_tt.order_tags,
+            grouped_by: None,
+            summarized: false,
+            distinct_by: None,
+        };
+        (
+            ExecExpr::Rel(Box::new(ExecPlan::PivotLonger {
+                input: Box::new(in_plan),
+                cols: melt_cols,
+                names_to,
+                values_to,
+                value_ty,
+                value_tags: val_tags,
+            })),
+            LTy::new(Ty::Table(out_tt), outer_tags),
+        )
+    }
+
     fn check_crosstab_verb(
         &mut self,
         in_plan: ExecPlan,
@@ -6351,9 +6663,9 @@ impl<'a> Checker<'a> {
                     LTy::new(Ty::Float, rlty.tags),
                 );
             }
-            (Ty::StatTest, "t_stat" | "p_value" | "df") => {
+            (Ty::StatTest, "t_stat" | "stat" | "statistic" | "chi2" | "p_value" | "df") => {
                 let idx = match member.name.as_str() {
-                    "t_stat" => 0,
+                    "t_stat" | "stat" | "statistic" | "chi2" => 0,
                     "p_value" => 1,
                     _ => 2,
                 };
@@ -6958,6 +7270,13 @@ impl<'a> Checker<'a> {
             }
             ("Stats", "corr") => {
                 let Some(CallArg::Positional(tbl_e)) = args.first() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`Stats.corr` requires a table argument",
+                        )
+                        .with_span(span),
+                    );
                     return (
                         ExecExpr::Lit(Literal::Float(Float64::ZERO)),
                         LTy::public(Ty::Float),
@@ -6966,10 +7285,59 @@ impl<'a> Checker<'a> {
                 let (tex, tlty) = self.check_expr(tbl_e, env, None, pc, scope, ret_ctx);
                 let col_x = named_dot_col(args, "x").unwrap_or_default();
                 let col_y = named_dot_col(args, "y").unwrap_or_default();
+                if let Ty::Table(ref tt) = tlty.ty {
+                    for cname in [&col_x, &col_y] {
+                        match tt.find_col(cname) {
+                            None => self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("unknown column `.{cname}` in `Stats.corr`"),
+                                )
+                                .with_span(span),
+                            ),
+                            Some(cs) if numeric_core_of_scalar(&cs.ty).is_none() => {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        format!("`Stats.corr` requires numeric column `.{cname}`"),
+                                    )
+                                    .with_span(span),
+                                );
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
+                let is_spearman = match named_expr_arg(args, "method") {
+                    None => false,
+                    Some(Expr {
+                        kind: ExprKind::Atom(m),
+                        ..
+                    }) if m == "pearson" => false,
+                    Some(Expr {
+                        kind: ExprKind::Atom(m),
+                        ..
+                    }) if m == "spearman" => true,
+                    Some(other) => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`Stats.corr` `method:` must be `:pearson` or `:spearman`",
+                            )
+                            .with_span(other.span),
+                        );
+                        false
+                    }
+                };
                 let tags = stats_col_tags(&tlty, &[&col_x, &col_y]);
+                let op = if is_spearman {
+                    ExecPrimOp::StatsCorrSpearman { col_x, col_y }
+                } else {
+                    ExecPrimOp::Core(PrimOp::StatsCorr { col_x, col_y })
+                };
                 (
                     ExecExpr::Prim {
-                        op: ExecPrimOp::Core(PrimOp::StatsCorr { col_x, col_y }),
+                        op,
                         args: vec![tex],
                     },
                     LTy::new(Ty::Float, tags),
@@ -6977,11 +7345,45 @@ impl<'a> Checker<'a> {
             }
             ("Stats", "linear_regression") => {
                 let Some(CallArg::Positional(tbl_e)) = args.first() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`Stats.linear_regression` requires a table argument",
+                        )
+                        .with_span(span),
+                    );
                     return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::LinearModel));
                 };
                 let (tex, tlty) = self.check_expr(tbl_e, env, None, pc, scope, ret_ctx);
                 let col_x = named_dot_col(args, "x").unwrap_or_default();
                 let col_y = named_dot_col(args, "y").unwrap_or_default();
+                if let Ty::Table(ref tt) = tlty.ty {
+                    for cname in [&col_x, &col_y] {
+                        match tt.find_col(cname) {
+                            None => self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!(
+                                        "unknown column `.{cname}` in `Stats.linear_regression`"
+                                    ),
+                                )
+                                .with_span(span),
+                            ),
+                            Some(cs) if numeric_core_of_scalar(&cs.ty).is_none() => {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        format!(
+                                            "`Stats.linear_regression` requires numeric column `.{cname}`"
+                                        ),
+                                    )
+                                    .with_span(span),
+                                );
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
                 let tags = stats_col_tags(&tlty, &[&col_x, &col_y]);
                 (
                     ExecExpr::Prim {
@@ -7008,6 +7410,257 @@ impl<'a> Checker<'a> {
                     );
                 }
                 (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::StatTest))
+            }
+            ("Stats", "chi_square") => {
+                let Some(CallArg::Positional(tbl_e)) = args.first() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`Stats.chi_square` requires a table argument",
+                        )
+                        .with_span(span),
+                    );
+                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::StatTest));
+                };
+                let (tex, tlty) = self.check_expr(tbl_e, env, None, pc, scope, ret_ctx);
+                let xy = (named_dot_col(args, "x"), named_dot_col(args, "y"));
+                let oe = (
+                    named_dot_col(args, "observed"),
+                    named_dot_col(args, "expected"),
+                );
+                match (xy, oe) {
+                    ((Some(col_x), Some(col_y)), (None, None)) => {
+                        if let Ty::Table(ref tt) = tlty.ty {
+                            for cname in [&col_x, &col_y] {
+                                if tt.find_col(cname).is_none() {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::TypeError,
+                                            format!(
+                                                "unknown column `.{cname}` in `Stats.chi_square`"
+                                            ),
+                                        )
+                                        .with_span(span),
+                                    );
+                                }
+                            }
+                        }
+                        let tags = stats_col_tags(&tlty, &[&col_x, &col_y]);
+                        (
+                            ExecExpr::Prim {
+                                op: ExecPrimOp::StatsChiSquareIndependence { col_x, col_y },
+                                args: vec![tex],
+                            },
+                            LTy::new(Ty::StatTest, tags),
+                        )
+                    }
+                    ((None, None), (Some(observed), Some(expected))) => {
+                        if let Ty::Table(ref tt) = tlty.ty {
+                            for cname in [&observed, &expected] {
+                                match tt.find_col(cname) {
+                                    None => self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::TypeError,
+                                            format!(
+                                                "unknown column `.{cname}` in `Stats.chi_square`"
+                                            ),
+                                        )
+                                        .with_span(span),
+                                    ),
+                                    Some(cs) if numeric_core_of_scalar(&cs.ty).is_none() => {
+                                        self.diags.push(
+                                            Diagnostic::error(
+                                                DiagCode::TypeError,
+                                                format!(
+                                                    "`Stats.chi_square` goodness-of-fit requires numeric column `.{cname}`"
+                                                ),
+                                            )
+                                            .with_span(span),
+                                        );
+                                    }
+                                    Some(_) => {}
+                                }
+                            }
+                        }
+                        let tags = stats_col_tags(&tlty, &[&observed, &expected]);
+                        (
+                            ExecExpr::Prim {
+                                op: ExecPrimOp::StatsChiSquareGof { observed, expected },
+                                args: vec![tex],
+                            },
+                            LTy::new(Ty::StatTest, tags),
+                        )
+                    }
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`Stats.chi_square` requires either `(tbl, x: .a, y: .b)` or `(tbl, observed: .obs, expected: .exp)`",
+                            )
+                            .with_span(span),
+                        );
+                        (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::StatTest))
+                    }
+                }
+            }
+            ("Stats", "outliers") => {
+                let Some(CallArg::Positional(tbl_e)) = args.first() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`Stats.outliers` requires a table argument",
+                        )
+                        .with_span(span),
+                    );
+                    return (
+                        ExecExpr::Lit(Literal::Unit),
+                        LTy::public(Ty::Table(TableTy::default())),
+                    );
+                };
+                let (tex, tlty) = self.check_expr(tbl_e, env, None, pc, scope, ret_ctx);
+                let col = named_dot_col(args, "column").unwrap_or_default();
+                let method = match named_expr_arg(args, "method") {
+                    None => crate::stats::OutlierMethod::ZScore,
+                    Some(Expr {
+                        kind: ExprKind::Atom(m),
+                        ..
+                    }) if m == "zscore" => crate::stats::OutlierMethod::ZScore,
+                    Some(Expr {
+                        kind: ExprKind::Atom(m),
+                        ..
+                    }) if m == "iqr" => crate::stats::OutlierMethod::Iqr,
+                    Some(other) => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`Stats.outliers` `method:` must be `:zscore` or `:iqr`",
+                            )
+                            .with_span(other.span),
+                        );
+                        crate::stats::OutlierMethod::ZScore
+                    }
+                };
+                let default_thresh = match method {
+                    crate::stats::OutlierMethod::ZScore => 3.0_f64,
+                    crate::stats::OutlierMethod::Iqr => 1.5_f64,
+                };
+                let (thresh_ex, thresh_tags) = match named_expr_arg(args, "threshold") {
+                    Some(te) => {
+                        let (ex, lty) =
+                            self.check_expr(te, env, Some(&Ty::Float), pc, scope, ret_ctx);
+                        if !matches!(lty.ty, Ty::Float | Ty::Int | Ty::Decimal) {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    "`Stats.outliers` `threshold:` must be numeric (`Float`, `Decimal`, or `Int`)",
+                                )
+                                .with_span(te.span),
+                            );
+                        }
+                        (ex, lty.effective_tags())
+                    }
+                    None => (
+                        ExecExpr::Lit(Literal::Float(Float64::from_f64(default_thresh))),
+                        TagSet::empty(),
+                    ),
+                };
+                let flag_col = match named_expr_arg(args, "flag") {
+                    None => "outlier?".to_string(),
+                    Some(Expr {
+                        kind: ExprKind::Text { value: s, .. },
+                        ..
+                    }) if !s.is_empty() => s.clone(),
+                    Some(other) => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`Stats.outliers` `flag:` must be a non-empty string literal",
+                            )
+                            .with_span(other.span),
+                        );
+                        "outlier?".to_string()
+                    }
+                };
+                let Ty::Table(ref in_tt) = tlty.ty else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`Stats.outliers` first argument must be a `Table`",
+                        )
+                        .with_span(tbl_e.span),
+                    );
+                    return (
+                        ExecExpr::Lit(Literal::Unit),
+                        LTy::public(Ty::Table(TableTy::default())),
+                    );
+                };
+                let col_tags = match in_tt.find_col(&col) {
+                    Some(cs) => {
+                        if numeric_core_of_scalar(&cs.ty).is_none() {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("`Stats.outliers` requires numeric column `.{col}`"),
+                                )
+                                .with_span(span),
+                            );
+                        }
+                        cs.tags.clone()
+                    }
+                    None => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("unknown column `.{col}` in `Stats.outliers`"),
+                            )
+                            .with_span(span),
+                        );
+                        TagSet::empty()
+                    }
+                };
+                if in_tt.find_col(&flag_col).is_some() {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!(
+                                "`Stats.outliers` flag column `{flag_col}` already exists in table"
+                            ),
+                        )
+                        .with_span(span),
+                    );
+                }
+                let flag_tags = col_tags
+                    .union(&in_tt.row_tags)
+                    .union(&in_tt.order_tags)
+                    .union(&thresh_tags);
+                let mut out_cols = in_tt.cols.clone();
+                out_cols.push(ColSpec {
+                    name: flag_col.clone(),
+                    ty: ScalarTy::Bool,
+                    tags: flag_tags.clone(),
+                    bucketed: false,
+                    agg_kind: AggKind::Raw,
+                });
+                let out_tt = TableTy {
+                    cols: out_cols,
+                    row_tags: in_tt.row_tags.clone(),
+                    order_tags: in_tt.order_tags.clone(),
+                    grouped_by: None,
+                    summarized: false,
+                    distinct_by: None,
+                };
+                (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::StatsOutliers {
+                            col,
+                            method,
+                            flag_col,
+                            flag_tags,
+                        },
+                        args: vec![tex, thresh_ex],
+                    },
+                    LTy::new(Ty::Table(out_tt), tlty.tags),
+                )
             }
             _ => {
                 self.diags.push(
@@ -7205,8 +7858,8 @@ impl<'a> Checker<'a> {
             }
             (
                 Ty::WriteFiles { root, allows },
-                "write_html" | "write_parquet" | "write_xlsx" | "write_csv" | "write_jsonl"
-                | "write_text",
+                "write_html" | "write_markdown" | "write_svg" | "write_parquet" | "write_xlsx"
+                | "write_csv" | "write_jsonl" | "write_text",
             ) => {
                 let Some(CallArg::Positional(path_e)) = args.first() else {
                     self.diags.push(
@@ -7239,6 +7892,23 @@ impl<'a> Checker<'a> {
                 };
                 let (pay_ex, pay_tags) = if let Some(pe) = payload_expr {
                     let (ex, lty) = self.check_expr(pe, env, None, pc, scope, ret_ctx);
+                    if member.name == "write_markdown" && !matches!(lty.ty, Ty::Report(_)) {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`out.write_markdown` requires a `Report` payload",
+                            )
+                            .with_span(pe.span),
+                        );
+                    } else if member.name == "write_svg" && !matches!(lty.ty, Ty::Chart(_)) {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`out.write_svg` requires a `Chart` payload",
+                            )
+                            .with_span(pe.span),
+                        );
+                    }
                     let tags = lty.effective_tags();
                     let coerced = if member.name == "write_parquet"
                         && let Ty::Table(ref tt) = lty.ty
@@ -7272,6 +7942,8 @@ impl<'a> Checker<'a> {
                 }
                 let hop = match member.name.as_str() {
                     "write_html" => ExecHostOp::Core(HostOp::WriteReportHtml),
+                    "write_markdown" => ExecHostOp::WriteReportMarkdown,
+                    "write_svg" => ExecHostOp::WriteChartSvg,
                     "write_parquet" => ExecHostOp::Core(HostOp::WriteParquet),
                     "write_xlsx" => ExecHostOp::Core(HostOp::WriteXlsx),
                     "write_csv" => ExecHostOp::WriteCsv,
@@ -7938,6 +8610,38 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
+            (Ty::LinearModel, "predict") => {
+                let Some(CallArg::Positional(x_e)) = args.first() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`LinearModel.predict` requires 1 numeric argument",
+                        )
+                        .with_span(span),
+                    );
+                    return (
+                        ExecExpr::Lit(Literal::Float(Float64::ZERO)),
+                        LTy::new(Ty::Float, rlty.tags),
+                    );
+                };
+                let (xex, xlty) = self.check_expr(x_e, env, Some(&Ty::Float), pc, scope, ret_ctx);
+                if !matches!(xlty.ty, Ty::Int | Ty::Float | Ty::Decimal) {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`LinearModel.predict` argument must be `Int`, `Float`, or `Decimal`",
+                        )
+                        .with_span(x_e.span),
+                    );
+                }
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::LinearModelPredict,
+                        args: vec![rex, xex],
+                    },
+                    LTy::new(Ty::Float, rlty.tags.union(&xlty.effective_tags())),
+                );
+            }
             (Ty::Table(tt), "count") => {
                 return (
                     ExecExpr::Prim {
@@ -7948,15 +8652,28 @@ impl<'a> Checker<'a> {
                 );
             }
             (Ty::Table(tt), "profile") => {
+                let col_tags: Vec<(Ident, TagSet)> = tt
+                    .cols
+                    .iter()
+                    .filter(|c| !c.tags.is_empty())
+                    .map(|c| (c.name.clone(), c.tags.clone()))
+                    .collect();
+                let row_tags = tt.row_tags.clone();
+                // Column-tagged values are strictly redacted to `[REDACTED:...]` by `profile()`,
+                // whereas table-level `row_tags` (e.g. after filtering on a sensitive column)
+                // still taint structural row counts and remain on `Ty::Profile`.
+                let profile_tags = row_tags.union(&rlty.tags);
+                let op = if row_tags.is_empty() && col_tags.is_empty() {
+                    ExecPrimOp::Core(PrimOp::TableProfile)
+                } else {
+                    ExecPrimOp::TableProfileEx { row_tags, col_tags }
+                };
                 return (
                     ExecExpr::Prim {
-                        op: ExecPrimOp::Core(PrimOp::TableProfile),
+                        op,
                         args: vec![rex],
                     },
-                    LTy::new(
-                        Ty::Profile(tt.total_tags().union(&rlty.tags)),
-                        TagSet::empty(),
-                    ),
+                    LTy::new(Ty::Profile(profile_tags), TagSet::empty()),
                 );
             }
             (Ty::Table(tt), "sum" | "mean" | "stddev") => {
@@ -9541,6 +10258,34 @@ impl<'a> Checker<'a> {
                                 );
                             }
                         }
+                        "predict" if rty == Ty::LinearModel => {
+                            if let Some(CallArg::Positional(a0)) = args.first() {
+                                let (are, aty, atags) = self.check_row_expr(
+                                    a0,
+                                    cols,
+                                    outer_env,
+                                    Some(&Ty::Float),
+                                    allow_dot_self,
+                                );
+                                if !matches!(aty, Ty::Int | Ty::Float | Ty::Decimal) {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::TypeError,
+                                            "`LinearModel.predict` argument must be `Int`, `Float`, or `Decimal`",
+                                        )
+                                        .with_span(a0.span),
+                                    );
+                                }
+                                return (
+                                    ExecRowExpr::Prim {
+                                        op: ExecPrimOp::LinearModelPredict,
+                                        args: vec![re, are],
+                                    },
+                                    Ty::Float,
+                                    rtags.union(&atags),
+                                );
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -10706,7 +11451,7 @@ fn named_expr_arg<'a>(args: &'a [CallArg], key: &str) -> Option<&'a Expr> {
 fn stats_col_tags(tlty: &LTy, cols: &[&str]) -> TagSet {
     let mut tags = tlty.tags.clone();
     if let Ty::Table(tt) = &tlty.ty {
-        tags = tags.union(&tt.row_tags);
+        tags = tags.union(&tt.row_tags).union(&tt.order_tags);
         for c in cols {
             if let Some(cs) = tt.find_col(c) {
                 tags = tags.union(&cs.tags);
@@ -10714,6 +11459,29 @@ fn stats_col_tags(tlty: &LTy, cols: &[&str]) -> TagSet {
         }
     }
     tags
+}
+
+fn unify_pivot_scalar(a: &ScalarTy, b: &ScalarTy) -> Option<ScalarTy> {
+    if a == b {
+        return Some(a.clone());
+    }
+    match (a, b) {
+        (ScalarTy::Option(ia), ScalarTy::Option(ib)) => {
+            unify_pivot_scalar(ia, ib).map(|u| ScalarTy::Option(Box::new(u)))
+        }
+        (ScalarTy::Option(ia), other) => {
+            unify_pivot_scalar(ia, other).map(|u| ScalarTy::Option(Box::new(u)))
+        }
+        (other, ScalarTy::Option(ib)) => {
+            unify_pivot_scalar(other, ib).map(|u| ScalarTy::Option(Box::new(u)))
+        }
+        (ScalarTy::Int, ScalarTy::Decimal) | (ScalarTy::Decimal, ScalarTy::Int) => {
+            Some(ScalarTy::Decimal)
+        }
+        (ScalarTy::Int | ScalarTy::Decimal, ScalarTy::Float)
+        | (ScalarTy::Float, ScalarTy::Int | ScalarTy::Decimal) => Some(ScalarTy::Float),
+        _ => None,
+    }
 }
 
 fn sanitize_ident(s: &str) -> String {
