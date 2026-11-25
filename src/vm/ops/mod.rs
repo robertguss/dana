@@ -68,6 +68,14 @@ pub struct VmTable {
 
 impl VmTable {
     #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            cols: Vec::new(),
+            batches: Vec::new(),
+        }
+    }
+
+    #[must_use]
     pub fn from_table_val(tv: &TableVal, batch_size: usize) -> Self {
         Self {
             cols: tv.cols.clone(),
@@ -81,6 +89,11 @@ impl VmTable {
     }
 
     #[must_use]
+    pub fn to_table_val(&self) -> TableVal {
+        batches_to_table(self.cols.clone(), &self.batches)
+    }
+
+    #[must_use]
     pub fn total_rows(&self) -> usize {
         self.batches.iter().map(Batch::active_len).sum()
     }
@@ -88,6 +101,96 @@ impl VmTable {
     #[must_use]
     pub fn find_col_idx(&self, name: &str) -> Option<usize> {
         self.cols.iter().position(|c| c.name == name)
+    }
+
+    /// Decode only row `0` from the first non-empty batch (O(1) in table size).
+    #[must_use]
+    pub fn first_row_cells(&self) -> Option<Vec<Val>> {
+        for b in &self.batches {
+            if b.is_empty() {
+                continue;
+            }
+            let row_idx = match &b.selection {
+                Some(sel) => usize::from(*sel.first()?),
+                None => 0,
+            };
+            let mut cells = Vec::with_capacity(b.cols.len());
+            for c in &b.cols {
+                cells.push(c.get_val(row_idx));
+            }
+            return Some(cells);
+        }
+        None
+    }
+
+    /// Decode at most `limit` active rows across batches without materializing the full table.
+    #[must_use]
+    pub fn collect_rows_limited(&self, limit: usize) -> Vec<Vec<Val>> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(limit.min(self.total_rows()));
+        let ncols = self.cols.len();
+        for b in &self.batches {
+            if b.is_empty() {
+                continue;
+            }
+            match &b.selection {
+                Some(sel) => {
+                    for &r_u16 in sel {
+                        if out.len() >= limit {
+                            return out;
+                        }
+                        let r = usize::from(r_u16);
+                        let mut cells = Vec::with_capacity(ncols);
+                        for c in &b.cols {
+                            cells.push(c.get_val(r));
+                        }
+                        out.push(cells);
+                    }
+                }
+                None => {
+                    for r in 0..b.len {
+                        if out.len() >= limit {
+                            return out;
+                        }
+                        let mut cells = Vec::with_capacity(ncols);
+                        for c in &b.cols {
+                            cells.push(c.get_val(r));
+                        }
+                        out.push(cells);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Slice the first `limit` active rows directly from `&self` without cloning remaining batches.
+    #[must_use]
+    pub fn slice_first(&self, limit: usize) -> Self {
+        let mut rem = limit;
+        let mut out_batches = Vec::new();
+        for b in &self.batches {
+            if rem == 0 {
+                break;
+            }
+            let active = b.active_len();
+            if active == 0 {
+                continue;
+            }
+            if active <= rem {
+                out_batches.push(b.clone());
+                rem -= active;
+            } else {
+                out_batches.push(b.take_first(rem));
+                break;
+            }
+        }
+        Self {
+            cols: self.cols.clone(),
+            batches: out_batches,
+        }
     }
 }
 

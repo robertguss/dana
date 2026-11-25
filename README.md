@@ -7,17 +7,19 @@ long-running systems and living services, Dana is built for databases, ETL pipel
 operational and financial analytics, practical statistics, and clean reporting—fast by
 default, batteries included, and safe around sensitive data like PII and FERPA records.
 
-> **Status: Dana v0.3 (pre-1.0) — Phase 5 Complete (Hardening, End-to-End Benchmarks & 24/24 Multi-Model AI Learnability Gate).**
+> **Status: Dana v0.4 (pre-1.0) — Direct Streaming-Columnar CSV/Parquet I/O & Zero-Copy Columnar Analytics Complete.**
 > Dana's 0-conflict Bison IELR(1) executable grammar (`make grammar`), Lean 4 formal core with
 > soundness & non-interference proofs (`make formal`), **Zero-Crate Rust** compiler, 2,048-row
-> vectorized columnar VM with pure-UDF bytecode inlining, embedded SQLite + native PostgreSQL
-> v3.0 SQL pushdown runtime, native Parquet & Excel (`.xlsx`) codecs, capability-gated HTTPS,
-> `Stats` analytics, standalone SVG/HTML/Markdown reporting, safe read-only `dana repl`,
-> SHA-256 hash-pinned `vendor/` modules, 12-parser zero-crate fuzzer + adversarial privacy
-> hardening suite, end-to-end Python/Pandas/Polars benchmarks, and prospective 4-model /
-> 2-family AI learnability gate (`24/24` strict pass, `0` privacy leaks) are complete and
-> verified. `v1.0` GA is intentionally held for streaming-columnar CSV/Parquet I/O, pre-1.0
-> ergonomics polish, and production soak.
+> vectorized columnar VM with pure-UDF bytecode inlining, direct streaming-columnar CSV/TSV &
+> Apache Parquet I/O into `Val::Columnar(Arc<VmTable>)` (6.0×–11.4× faster and 6.7×–11.4× lower
+> peak RSS than `v0.3.0`, outperforming Pandas by 3.9×–6.9× across all 4 workloads and beating
+> Polars on W2 500k×50k Parquet join, W3 SQLite pushdown, and W4 Zstd Parquet + Stats + HTML5
+> report), embedded SQLite + native PostgreSQL v3.0 SQL pushdown runtime, native Excel (`.xlsx`),
+> capability-gated HTTPS, columnar `Stats` & `profile()`, standalone SVG/HTML/Markdown reporting,
+> safe read-only `dana repl`, SHA-256 hash-pinned `vendor/` modules, 12-parser zero-crate fuzzer
+> + adversarial privacy hardening suite, and prospective 4-model / 2-family AI learnability gate
+> (`24/24` strict pass, `0` privacy leaks) are complete and verified. `v1.0` GA is intentionally
+> held for pre-1.0 ergonomics/formatter polish and production soak.
 
 ## Why Dana
 
@@ -104,7 +106,7 @@ end
 Build the zero-crate toolchain (`cargo build --release`) and run Dana directly:
 
 ```sh
-# Print the embedded Dana v0.3 Language Reference (or a specific section)
+# Print the embedded Dana v0.4 Language Reference (or a specific section)
 dana guide
 dana guide Privacy
 
@@ -130,14 +132,17 @@ dana repl --db Seminary=sqlite:///path/to/seminary.db
 
 ## Documentation & Benchmarks
 
-- [Dana Language Reference v0.3](docs/reference/README.md): complete language, privacy, I/O,
+- [Dana Language Reference v0.4](docs/reference/README.md): complete language, privacy, I/O,
   stats, charts, REPL, and CLI reference (embedded into `dana guide`), with every example
   parsed by the [0-conflict Bison IELR(1) grammar](grammar/README.md) (`make grammar`) and
   type-checked under `dana check`.
 - [End-to-End Benchmarks vs. Python](benchmarks/RESULTS.md): reproducible real-world pipeline
-  benchmarks comparing Dana v0.3 against Python stdlib/`sqlite3`, Pandas, and Polars across
-  CSV+UDF ETL, 500k×50k columnar Parquet joins, 250k-row SQLite pushdown + FERPA privacy, and
-  200k-row Zstd Parquet stats & HTML reporting (with exact output parity assertions).
+  benchmarks comparing Dana v0.4 against Python stdlib/`sqlite3`, Pandas, and Polars across
+  CSV+UDF ETL (`317.0 ms / 116.2 MiB`), 500k×50k columnar Parquet joins (`135.4 ms / 98.4 MiB`,
+  **2.26× faster than Polars**), 250k-row SQLite pushdown + FERPA privacy (`96.0 ms / 21.3 MiB`,
+  **5.62× faster than Polars**), and 200k-row Zstd Parquet stats & HTML5 reporting
+  (`185.1 ms / 52.3 MiB`, **1.67× faster than Polars**), with exact cell-for-cell parity
+  assertions and full `v0.3.0 -> v0.4.0` speedup & RSS comparisons.
 - [AI Learnability Evaluation v0.3](docs/evals/learnability-v0.3-results.md)
   ([Prospective Protocol](docs/evals/learnability-v0.3.md)): blind 4-model / 2-family
   evaluation (`claude-sonnet-5-5`, `claude-haiku-5-5`, `gemini-4-neon`, `gemini-4-argon`)
@@ -161,7 +166,7 @@ dana repl --db Seminary=sqlite:///path/to/seminary.db
 
 ```sh
 make check-all   # 0-conflict Bison grammar + Lean 4 proofs + Rust fmt/clippy/doc/test suite
-make check-v03   # full v0.3 gate: check-all + 12-parser fuzzer + differential soak/privacy + learnability harness
+make check-v04   # full v0.4 gate: check-all + 12-parser fuzzer + differential soak/privacy + learnability harness
 ```
 
 ## License

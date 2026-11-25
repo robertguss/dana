@@ -276,10 +276,10 @@ fn call_pure_table_fn(
         &VmConfig::default(),
     );
     match res {
-        EvalProgramResult::Ok { val, ret_lty, .. } => match (val.as_ref(), &ret_lty.ty) {
-            (Val::Table(tv), Ty::Table(tt)) => Ok((tv.clone(), tt.clone())),
-            (other_v, other_ty) => Err(format!(
-                "`{fn_name}` did not return a Table (val={other_v:?}, ty={other_ty:?})"
+        EvalProgramResult::Ok { val, ret_lty, .. } => match (val.to_table_val(), &ret_lty.ty) {
+            (Some(tv), Ty::Table(tt)) => Ok((tv, tt.clone())),
+            (_, other_ty) => Err(format!(
+                "`{fn_name}` did not return a Table (val={val:?}, ty={other_ty:?})"
             )),
         },
         EvalProgramResult::Stopped { bug, .. } => {

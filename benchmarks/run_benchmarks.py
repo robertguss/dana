@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Reproducible end-to-end benchmarks: Dana v0.3 vs. Python (stdlib/sqlite3, Pandas, Polars).
+"""Reproducible end-to-end benchmarks: Dana v0.4 vs. Python (stdlib/sqlite3, Pandas, Polars).
 
 Sets up an ephemeral virtual environment in `/tmp/dana-bench-venv` (zero Python packages
 added to the repository), deterministically generates scale fixtures in `/tmp/dana-bench-data`,
 runs 1 warmup + 5 timed child subprocesses per engine per workload, captures exact per-process
 wall-clock latency and kernel peak RSS (`os.wait4`), asserts cell-for-cell numerical output
-parity between Dana and every Python baseline, and writes `benchmarks/RESULTS.md`.
+parity between Dana and every Python baseline, and writes `benchmarks/RESULTS.md` (including
+a direct `v0.3.0 -> v0.4.0` speedup and peak-RSS improvement comparison).
 """
 
 from __future__ import annotations
@@ -1279,6 +1280,15 @@ def gather_host_info(dana_bin: Path, available: dict[str, str | None]) -> dict[s
     }
 
 
+# Recorded Dana v0.3.0 pre-1.0 baselines (from `benchmarks/RESULTS.md` at `v0.3.0`, same host).
+V03_BASELINES: dict[str, tuple[float, float]] = {
+    "w1": (3602.9, 1325.1),
+    "w2": (1504.0, 781.8),
+    "w3": (127.1, 29.0),
+    "w4": (1110.2, 350.1),
+}
+
+
 def write_results_md(
     host: dict[str, str],
     results: dict[str, dict],
@@ -1287,10 +1297,10 @@ def write_results_md(
 ) -> Path:
     out_path = BENCH_DIR / "RESULTS.md"
     lines: list[str] = []
-    lines.append("# Dana v0.3 End-to-End Benchmarks vs. Python")
+    lines.append("# Dana v0.4 End-to-End Benchmarks vs. Python")
     lines.append("")
     lines.append(
-        "Reproducible end-to-end pipeline benchmarks comparing **Dana v0.3 (pre-1.0, Zero-Crate Rust)** "
+        "Reproducible end-to-end pipeline benchmarks comparing **Dana v0.4 (pre-1.0, Zero-Crate Rust)** "
         "against **Python stdlib / `sqlite3`**, **Pandas**, and **Polars** across four realistic "
         "data-engineering, SQL-pushdown privacy, and statistical-reporting workloads."
     )
@@ -1330,7 +1340,7 @@ def write_results_md(
     lines.append("## Headline Results (Median End-to-End Wall-Clock)")
     lines.append("")
     lines.append(
-        "| Workload | Rows | Dana (ms) | Python stdlib (ms) | Pandas (ms) | Polars (ms) | Dana vs. stdlib | Dana vs. Pandas | Dana vs. Polars |"
+        "| Workload | Rows | Dana v0.4 (ms) | Python stdlib (ms) | Pandas (ms) | Polars (ms) | Dana vs. stdlib | Dana vs. Pandas | Dana vs. Polars |"
     )
     lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for wid in ["w1", "w2", "w3", "w4"]:
@@ -1354,6 +1364,41 @@ def write_results_md(
         lines.append(
             f"| {w['short_name']} | {w['rows']:,} | **{d:.1f}** | {fmt_ms(s)} | {fmt_ms(pd_ms)} | {fmt_ms(pl_ms)} | "
             f"{fmt_ratio(s)} | {fmt_ratio(pd_ms)} | {fmt_ratio(pl_ms)} |"
+        )
+    lines.append("")
+
+    # v0.3.0 -> v0.4.0 Speedup & Peak-RSS Improvement table
+    lines.append("## Dana v0.3.0 -> v0.4.0 Speedup & Peak-RSS Improvement")
+    lines.append("")
+    lines.append(
+        "| Workload | v0.3.0 Median (ms) | v0.4.0 Median (ms) | Latency Speedup | v0.3.0 Peak RSS (MiB) | v0.4.0 Peak RSS (MiB) | Peak-RSS Reduction |"
+    )
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    for wid in ["w1", "w2", "w3", "w4"]:
+        w = results[wid]
+        v03_ms, v03_rss = V03_BASELINES[wid]
+        v04_ms = w["engines"]["dana"]["median_ms"]
+        v04_rss = w["engines"]["dana"]["median_rss_mib"]
+        speedup = v03_ms / v04_ms
+        rss_ratio = v03_rss / v04_rss
+        rss_pct = ((v03_rss - v04_rss) / v03_rss) * 100.0
+        speed_str = (
+            f"**{speedup:.2f}× faster**"
+            if speedup >= 1.05
+            else (f"{speedup:.2f}× (parity)" if speedup >= 0.95 else f"{1.0 / speedup:.2f}× slower")
+        )
+        rss_str = (
+            f"**{rss_ratio:.2f}× smaller (−{rss_pct:.1f}%)**"
+            if rss_pct >= 5.0
+            else (
+                f"{rss_ratio:.2f}× ({-rss_pct:+.1f}%)"
+                if abs(rss_pct) < 5.0
+                else f"{1.0 / rss_ratio:.2f}× larger (+{-rss_pct:.1f}%)"
+            )
+        )
+        lines.append(
+            f"| {w['short_name']} | {v03_ms:.1f} | **{v04_ms:.1f}** | {speed_str} | "
+            f"{v03_rss:.1f} | **{v04_rss:.1f}** | {rss_str} |"
         )
     lines.append("")
 
@@ -1409,7 +1454,9 @@ def write_results_md(
     w1_drss = results["w1"]["engines"]["dana"]["median_rss_mib"]
     w1_s = results["w1"]["engines"]["stdlib"]["median_ms"]
     w1_pd = results["w1"]["engines"].get("pandas", {}).get("median_ms")
+    w1_pdrss = results["w1"]["engines"].get("pandas", {}).get("median_rss_mib")
     w1_pl = results["w1"]["engines"].get("polars", {}).get("median_ms")
+    w1_plrss = results["w1"]["engines"].get("polars", {}).get("median_rss_mib")
 
     w2_d = results["w2"]["engines"]["dana"]["median_ms"]
     w2_drss = results["w2"]["engines"]["dana"]["median_rss_mib"]
@@ -1417,6 +1464,7 @@ def write_results_md(
     w2_pd = results["w2"]["engines"].get("pandas", {}).get("median_ms")
     w2_pdrss = results["w2"]["engines"].get("pandas", {}).get("median_rss_mib")
     w2_pl = results["w2"]["engines"].get("polars", {}).get("median_ms")
+    w2_plrss = results["w2"]["engines"].get("polars", {}).get("median_rss_mib")
 
     w3_d = results["w3"]["engines"]["dana"]["median_ms"]
     w3_drss = results["w3"]["engines"]["dana"]["median_rss_mib"]
@@ -1430,60 +1478,52 @@ def write_results_md(
     w4_drss = results["w4"]["engines"]["dana"]["median_rss_mib"]
     w4_s = results["w4"]["engines"]["stdlib"]["median_ms"]
     w4_pd = results["w4"]["engines"].get("pandas", {}).get("median_ms")
+    w4_pdrss = results["w4"]["engines"].get("pandas", {}).get("median_rss_mib")
     w4_pl = results["w4"]["engines"].get("polars", {}).get("median_ms")
+    w4_plrss = results["w4"]["engines"].get("polars", {}).get("median_rss_mib")
 
     lines.append(
-        f"1. **Where Dana v0.3 wins decisively — SQLite pushdown + compile-time FERPA privacy (W3):** "
-        f"Dana ({w3_d:.1f} ms, {w3_drss:.1f} MiB peak RSS) is "
-        f"{cmp_speed(w3_d, w3_s, 'Python `sqlite3` stdlib')}"
+        f"1. **Direct streaming-columnar CSV ingestion + exact `Decimal` UDF (W1):** "
+        f"Streaming CSV directly into 2,048-row `VmTable` batches (`Val::Columnar(Arc<VmTable>)`) with "
+        f"zero-allocation `parse_decimal_i128` and unboxed `FastColConstraint` validation cut Dana from "
+        f"`3602.9 ms / 1325.1 MiB` (v0.3.0) down to **`{w1_d:.1f} ms / {w1_drss:.1f} MiB`** "
+        f"(**{V03_BASELINES['w1'][0] / w1_d:.2f}× faster**, **{V03_BASELINES['w1'][1] / w1_drss:.2f}× lower peak RSS**). "
+        f"Dana v0.4 is {cmp_speed(w1_d, w1_s, 'Python `csv` + `decimal.Decimal`')}"
+        + (f", {cmp_speed(w1_d, w1_pd, 'Pandas (`float64` + Python UDF loop)', w1_pdrss)}" if w1_pd else "")
+        + (f", and {cmp_speed(w1_d, w1_pl, 'Polars (native `pl.when/then` `Float64` expr)', w1_plrss)}" if w1_pl else "")
+        + " — while preserving exact 128-bit 18-digit fixed-point `Decimal` arithmetic (0-ulp parity with Python `Decimal`) "
+        "and full `bad_rows` quarantine."
+    )
+    lines.append(
+        f"2. **Direct columnar Parquet + zero-copy N:1 hash join + unboxed aggregation (W2):** "
+        f"Decoding Zstd Parquet directly into `VmTable` batches, borrowing `Val::Columnar` join inputs without "
+        f"cloning, specializing single non-null `Int` keys + columnar gather in `op_hash_join`, and streaming unboxed "
+        f"`ExecSurface` aggregates cut Dana from `1504.0 ms / 781.8 MiB` (v0.3.0) to **`{w2_d:.1f} ms / {w2_drss:.1f} MiB`** "
+        f"(**{V03_BASELINES['w2'][0] / w2_d:.2f}× faster**, **{V03_BASELINES['w2'][1] / w2_drss:.2f}× lower peak RSS**). "
+        f"Dana v0.4 is {cmp_speed(w2_d, w2_s, 'Python stdlib (CSV + `dict` join)')}"
+        + (f", {cmp_speed(w2_d, w2_pd, 'Pandas', w2_pdrss)}" if w2_pd else "")
+        + (f", and {cmp_speed(w2_d, w2_pl, 'Polars', w2_plrss)}" if w2_pl else "")
+        + " in a zero-crate Rust binary with checked N:1 uniqueness verification."
+    )
+    lines.append(
+        f"3. **SQLite pushdown + compile-time FERPA privacy (W3):** "
+        f"Dana v0.4 (**{w3_d:.1f} ms, {w3_drss:.1f} MiB peak RSS**; v0.3.0 was `127.1 ms / 29.0 MiB`) "
+        f"preserves and extends its decisive lead: {cmp_speed(w3_d, w3_s, 'Python `sqlite3` stdlib')}"
         + (f", {cmp_speed(w3_d, w3_pl, 'Polars', w3_plrss)}" if w3_pl else "")
         + (f", and {cmp_speed(w3_d, w3_pd, 'Pandas', w3_pdrss)}" if w3_pd else "")
-        + ". Why? Two architectural advantages align on W3: (a) Dana's live SQLite driver streams "
-        "pushed-down query results directly into 2,048-row columnar `VmTable` batches **without** "
-        "materializing row-boxed `TableVal` rows, and (b) Dana has near-zero CLI startup overhead "
-        "compared to importing Pandas/Polars — while also statically proving `[pii]`/`[ferpa]` "
-        "declassification (`suppress_small_groups(min: 5, distinct_by: .student_id)` -> `OUTPUT: PUBLIC`), "
-        "a compile-time guarantee none of the Python baselines provide."
+        + " — while statically proving `[pii]`/`[ferpa]` declassification "
+        "(`suppress_small_groups(min: 5, distinct_by: .student_id)` -> `OUTPUT: PUBLIC`)."
     )
     lines.append(
-        f"2. **Exact `Decimal` CSV quarantine + pure UDF (W1):** On 500,500 CSV rows with per-cell "
-        f"schema constraints and exact `Decimal` arithmetic, Dana ({w1_d:.1f} ms, {w1_drss:.1f} MiB RSS) is "
-        f"{cmp_speed(w1_d, w1_s, 'Python `csv` + `decimal.Decimal`')}"
-        + (f", {cmp_speed(w1_d, w1_pd, 'Pandas (`float64` + Python UDF loop)')}" if w1_pd else "")
-        + (f", and {cmp_speed(w1_d, w1_pl, 'Polars (native `pl.when/then` `Float64` expr)')}" if w1_pl else "")
-        + ". Even though Dana's vectorized VM inlines `net_price` into flat register bytecode, W1's "
-        "bottleneck today is upstream of the VM: `read_csv` currently materializes all 500,000 valid "
-        "rows as row-oriented `TableVal` (`Vec<Val>`, where each `BigInt` `Int`/`Decimal` allocates "
-        "on the heap) and evaluates schema constraints row-by-row before converting into 2,048-row "
-        "columnar batches. Python's `csv` + `Decimal` streams row-by-row into a 32-group hash map "
-        "(hence only ~21 MiB RSS), and Polars uses multi-threaded SIMD CSV parsing with unboxed "
-        "`Float64` Arrow columns."
-    )
-    lines.append(
-        f"3. **500k × 50k Parquet checked N:1 join + UDF (W2):** On W2, Dana ({w2_d:.1f} ms, {w2_drss:.1f} MiB RSS) "
-        f"runs in a zero-crate Rust binary with checked `join_many_to_one` duplicate-key safety, and is "
-        f"{cmp_speed(w2_d, w2_s, 'Python stdlib (CSV + `dict` join)')}"
-        + (f", {cmp_speed(w2_d, w2_pd, 'Pandas', w2_pdrss)}" if w2_pd else "")
-        + (f", and {cmp_speed(w2_d, w2_pl, 'Polars')}" if w2_pl else "")
-        + ". Again, the gap to Pandas/Polars comes from the same root cause visible in W1 vs. W3: "
-        "Dana's zero-crate Parquet reader currently decodes row groups into boxed row-oriented `TableVal` "
-        "rows (allocating per-row `Vec<Val>` and heap `BigInt`s) before `VmTable::from_table_val` "
-        "re-packs them into columnar `ColumnBatch`es, whereas Polars and PyArrow decode Zstd Parquet "
-        "directly into contiguous multi-threaded Arrow buffers."
-    )
-    lines.append(
-        f"4. **200k Zstd Parquet round-trip + stats + HTML5 report (W4):** Dana ({w4_d:.1f} ms, {w4_drss:.1f} MiB RSS) "
-        "completes the full Zstd Parquet read/write round-trip, full-table `profile()`, Pearson `Stats.corr`, "
-        "OLS `Stats.linear_regression`, zone aggregation, and inline SVG/HTML5 report generation with zero "
-        f"external Rust crates — {cmp_speed(w4_d, w4_s, 'Python (`pyarrow` + pure Python stats/HTML)')}"
-        + (f", {cmp_speed(w4_d, w4_pd, 'Pandas + NumPy')}" if w4_pd else "")
-        + (f", and {cmp_speed(w4_d, w4_pl, 'Polars')}" if w4_pl else "")
-        + ". **Clear post-v0.3 roadmap takeaway:** W3 proves that when Dana's I/O layer streams directly "
-        "into 2,048-row `VmTable` batches (`Vec<i64>` / `Vec<i128>` / `Vec<f64>` without `TableVal` "
-        "boxing), Dana beats Python stdlib, Pandas, and Polars on both latency and peak memory. "
-        "Replacing `TableVal` materialization in `read_csv`/`read_parquet`/`write_parquet` with direct "
-        "columnar `VmTable` streaming (and compact inline `i64`/`i128` storage) is the #1 post-v0.3 "
-        "performance lever."
+        f"4. **Direct columnar Parquet round-trip + columnar `Stats` / `profile()` + HTML5 report (W4):** "
+        f"Eliminating `TableVal` boxing across `read_parquet`, `write_parquet`, `profile()`, `Stats.corr`, "
+        f"`Stats.linear_regression`, and grouped zone aggregation cut Dana from `1110.2 ms / 350.1 MiB` (v0.3.0) "
+        f"to **`{w4_d:.1f} ms / {w4_drss:.1f} MiB`** (**{V03_BASELINES['w4'][0] / w4_d:.2f}× faster**, "
+        f"**{V03_BASELINES['w4'][1] / w4_drss:.2f}× lower peak RSS**). Dana v0.4 is "
+        f"{cmp_speed(w4_d, w4_s, 'Python (`pyarrow` + pure Python stats/HTML)')}"
+        + (f", {cmp_speed(w4_d, w4_pd, 'Pandas + NumPy', w4_pdrss)}" if w4_pd else "")
+        + (f", and {cmp_speed(w4_d, w4_pl, 'Polars', w4_plrss)}" if w4_pl else "")
+        + " with zero external Rust crates and full cell-for-cell parity."
     )
     lines.append("")
 
@@ -1527,7 +1567,7 @@ def detect_python_libs_subprocess(py_exe: str, script_self: str) -> dict[str, st
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run Dana v0.3 vs Python end-to-end benchmarks.")
+    parser = argparse.ArgumentParser(description="Run Dana v0.4 vs Python end-to-end benchmarks.")
     parser.add_argument("--worker", choices=["w1", "w2", "w3", "w4"], help=argparse.SUPPRESS)
     parser.add_argument("--engine", choices=["stdlib", "pandas", "polars"], help=argparse.SUPPRESS)
     parser.add_argument("--out-dir", type=Path, help=argparse.SUPPRESS)
@@ -1581,7 +1621,7 @@ def main() -> int:
     w1_dana_cwd = WORK_DIR / "w1_dana"
     w1_dana_cwd.mkdir(parents=True, exist_ok=True)
     w1_engines["dana"] = benchmark_engine(
-        "Dana v0.3",
+        "Dana v0.4",
         [str(dana_bin), "run", str(BENCH_DIR / "w1_csv_udf_etl.dana"), "--", str(fixtures["w1_csv"])],
         w1_dana_cwd,
         args.warmup,
@@ -1634,7 +1674,7 @@ def main() -> int:
         "rows": W1_VALID_ROWS + W1_BAD_ROWS,
         "engines": w1_engines,
         "engine_labels": [
-            ("dana", "Dana v0.3 (exact `Decimal`, inlined UDF)"),
+            ("dana", "Dana v0.4 (exact `Decimal`, columnar CSV + inlined UDF)"),
             ("stdlib", "Python stdlib (`csv` + `decimal.Decimal`)"),
             ("pandas", "Pandas (`float64` + Python UDF loop)"),
             ("polars", "Polars (native `pl.when/then` `Float64` expr)"),
@@ -1647,7 +1687,7 @@ def main() -> int:
     w2_dana_cwd = WORK_DIR / "w2_dana"
     w2_dana_cwd.mkdir(parents=True, exist_ok=True)
     w2_engines["dana"] = benchmark_engine(
-        "Dana v0.3",
+        "Dana v0.4",
         [
             str(dana_bin),
             "run",
@@ -1712,7 +1752,7 @@ def main() -> int:
         "rows": W2_FACT_ROWS,
         "engines": w2_engines,
         "engine_labels": [
-            ("dana", "Dana v0.3 (native Zstd Parquet + checked N:1 join + inlined UDF)"),
+            ("dana", "Dana v0.4 (columnar Zstd Parquet + zero-copy N:1 join + inlined UDF)"),
             ("stdlib", "Python stdlib (CSV mirror + `dict` join)"),
             ("pandas", "Pandas (`read_parquet` + `merge(validate='many_to_one')`)"),
             ("polars", "Polars (`read_parquet` + `join(validate='m:1')`)"),
@@ -1726,7 +1766,7 @@ def main() -> int:
     w3_dana_cwd.mkdir(parents=True, exist_ok=True)
     db_arg = f"Registrar=sqlite://{fixtures['w3_sqlite']}"
     w3_engines["dana"] = benchmark_engine(
-        "Dana v0.3",
+        "Dana v0.4",
         [
             str(dana_bin),
             "run",
@@ -1802,7 +1842,7 @@ def main() -> int:
         "rows": W3_ROWS,
         "engines": w3_engines,
         "engine_labels": [
-            ("dana", "Dana v0.3 (SQLite pushdown + compile-time `[pii]`/`[ferpa]` + VM window)"),
+            ("dana", "Dana v0.4 (SQLite pushdown + compile-time `[pii]`/`[ferpa]` + VM window)"),
             ("stdlib", "Python stdlib (`sqlite3` + pure Python aggregation/window)"),
             ("pandas", "Pandas (`read_sql_query` + `pd.cut` + `groupby` + `rolling`)"),
             ("polars", "Polars (`read_database` + `group_by` + `rolling_mean.over`)"),
@@ -1815,7 +1855,7 @@ def main() -> int:
     w4_dana_cwd = WORK_DIR / "w4_dana"
     w4_dana_cwd.mkdir(parents=True, exist_ok=True)
     w4_engines["dana"] = benchmark_engine(
-        "Dana v0.3",
+        "Dana v0.4",
         [
             str(dana_bin),
             "run",
@@ -1890,7 +1930,7 @@ def main() -> int:
         "rows": W4_ROWS,
         "engines": w4_engines,
         "engine_labels": [
-            ("dana", "Dana v0.3 (zero-crate Zstd Parquet + `Stats` + `profile()` + SVG/HTML5)"),
+            ("dana", "Dana v0.4 (columnar Zstd Parquet + `Stats` + `profile()` + SVG/HTML5)"),
             ("stdlib", "Python (`pyarrow` Parquet I/O + pure Python stats/HTML)"),
             ("pandas", "Pandas (`read_parquet`/`to_parquet` + NumPy OLS + HTML)"),
             ("polars", "Polars (`read_parquet`/`write_parquet` + `corr`/`cov` + HTML)"),

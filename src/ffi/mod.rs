@@ -14,4 +14,4 @@ pub use sqlite::{
 };
 pub use tls::{TlsClientConfig, TlsServerAcceptor, TlsStream};
 pub use zlib::{GzipReader, GzipWriter, raw_deflate, raw_inflate};
-pub use zstd::{ZstdReader, ZstdWriter};
+pub use zstd::{ZstdReader, ZstdWriter, zstd_compress_block, zstd_decompress_block};

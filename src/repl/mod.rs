@@ -1110,7 +1110,7 @@ pub fn run_repl_reader<R: BufRead, W: Write, E: Write>(
     if interactive {
         let _ = writeln!(
             out,
-            "Dana v0.3 Safe REPL (read-only, sensitive values redacted by default). Type :help or :quit."
+            "Dana v0.4 Safe REPL (read-only, sensitive values redacted by default). Type :help or :quit."
         );
     }
     let mut buf = String::new();
@@ -1343,6 +1343,9 @@ pub fn format_repl_value(
     // Tables handle per-column & row_tags redaction so column headers and row count remain visible.
     if let (Val::Table(tv), Ty::Table(tt)) = (val, &lty.ty) {
         return format_repl_table(tv, tt, &lty.tags, allowed_show_tags);
+    }
+    if let (Val::Columnar(vm), Ty::Table(tt)) = (val, &lty.ty) {
+        return format_repl_vm_table(vm, tt, &lty.tags, allowed_show_tags);
     }
 
     // Profiles redact every tagged column inside `ProfileVal`, AND if `Ty::Profile(ptags)` carries
@@ -1595,6 +1598,101 @@ fn format_repl_table(
     let mut out = String::new();
     out.push('|');
     for (ci, c) in tv.cols.iter().enumerate() {
+        let pad = widths[ci].saturating_sub(c.name.chars().count());
+        out.push(' ');
+        out.push_str(&c.name);
+        for _ in 0..pad {
+            out.push(' ');
+        }
+        out.push_str(" |");
+    }
+    out.push('\n');
+    out.push('|');
+    for &w in &widths {
+        out.push(' ');
+        for _ in 0..w {
+            out.push('-');
+        }
+        out.push_str(" |");
+    }
+    for row in rendered_rows {
+        out.push('\n');
+        out.push('|');
+        for (ci, cell) in row.iter().enumerate() {
+            let pad = widths[ci].saturating_sub(cell.chars().count());
+            out.push(' ');
+            out.push_str(cell);
+            for _ in 0..pad {
+                out.push(' ');
+            }
+            out.push_str(" |");
+        }
+    }
+    if total_rows > preview_rows {
+        let _ = write!(out, "\n... ({} more rows)", total_rows - preview_rows);
+    }
+    let _ = write!(out, "\n({total_rows} rows, {col_count} cols)");
+    out
+}
+
+fn format_repl_vm_table(
+    vm: &crate::vm::ops::VmTable,
+    tt: &TableTy,
+    outer_tags: &TagSet,
+    allowed_show_tags: &TagSet,
+) -> String {
+    let col_count = vm.cols.len();
+    let total_rows = vm.total_rows();
+    let preview_rows = total_rows.min(MAX_TABLE_PREVIEW_ROWS);
+
+    // Precompute per-column redaction markers combining static `TableTy`, runtime `VmTable`,
+    // table `row_tags`, `order_tags`, and outer `LTy.tags`.
+    let col_redactions: Vec<Option<String>> = vm
+        .cols
+        .iter()
+        .enumerate()
+        .map(|(i, rt_col)| {
+            let st_tags = tt
+                .cols
+                .get(i)
+                .map_or_else(TagSet::empty, |c| c.tags.clone());
+            let eff = rt_col
+                .tags
+                .union(&st_tags)
+                .union(&tt.row_tags)
+                .union(&tt.order_tags)
+                .union(outer_tags);
+            let unallowed = eff.diff(allowed_show_tags);
+            if unallowed.is_empty() {
+                None
+            } else {
+                Some(redact_tags(&unallowed))
+            }
+        })
+        .collect();
+
+    let mut widths: Vec<usize> = vm.cols.iter().map(|c| c.name.chars().count()).collect();
+    let sample_rows = vm.collect_rows_limited(preview_rows);
+    let mut rendered_rows: Vec<Vec<String>> = Vec::with_capacity(sample_rows.len());
+    for row_cells in &sample_rows {
+        let mut rcells = Vec::with_capacity(col_count);
+        for ci in 0..col_count {
+            let cell_str = if let Some(marker) = &col_redactions[ci] {
+                marker.clone()
+            } else {
+                row_cells
+                    .get(ci)
+                    .map_or_else(|| "none".to_string(), format_public_cell)
+            };
+            widths[ci] = widths[ci].max(cell_str.chars().count());
+            rcells.push(cell_str);
+        }
+        rendered_rows.push(rcells);
+    }
+
+    let mut out = String::new();
+    out.push('|');
+    for (ci, c) in vm.cols.iter().enumerate() {
         let pad = widths[ci].saturating_sub(c.name.chars().count());
         out.push(' ');
         out.push_str(&c.name);

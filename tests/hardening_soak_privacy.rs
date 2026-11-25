@@ -341,13 +341,13 @@ fn assert_all_engines_match(
             for (vname, vres) in variants {
                 match vres {
                     EvalProgramResult::Ok { val: v_val, .. } => {
-                        let Val::Table(v_tbl) = v_val.as_ref() else {
+                        let Some(v_tbl) = v_val.to_table_val() else {
                             return Err(format!(
                                 "{case_label}/{vname}: returned non-Table {v_val:?}"
                             ));
                         };
                         assert_tables_cell_for_cell(
-                            v_tbl,
+                            &v_tbl,
                             o_tbl,
                             &format!("{case_label} ({vname} vs oracle)"),
                         )?;

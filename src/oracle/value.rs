@@ -11,6 +11,8 @@ use crate::core::check::{ArcTyEnv, TyEnv};
 use crate::core::syntax::{
     BugKind, ChartKind, ColSpec, Expr, Float64, Ident, LTy, ScalarTy, TagSet,
 };
+use crate::vm::key::eq_col_cells;
+use crate::vm::ops::VmTable;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CapHandle {
@@ -282,6 +284,9 @@ pub enum Val {
         fields: Vec<Val>,
     },
     Table(TableVal),
+    /// Zero-copy columnar runtime table (8-byte `Arc`, keeping `Val` compact).
+    /// Treated 100% identically to `Val::Table` across equality, ordering, display, and ops.
+    Columnar(Arc<VmTable>),
     DynTable {
         headers: Vec<String>,
         rows: Vec<Vec<Val>>,
@@ -339,6 +344,65 @@ impl Val {
     pub fn into_table(mut self) -> Option<TableVal> {
         match &mut self {
             Self::Table(tv) => Some(std::mem::take(tv)),
+            Self::Columnar(arc) => {
+                let owned = std::mem::replace(arc, Arc::new(VmTable::empty()));
+                match Arc::try_unwrap(owned) {
+                    Ok(vm) => Some(vm.into_table_val()),
+                    Err(shared) => Some(shared.to_table_val()),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Borrow or materialize this table value (`Val::Table` or `Val::Columnar`) into a [`TableVal`].
+    #[must_use]
+    pub fn to_table_val(&self) -> Option<TableVal> {
+        match self {
+            Self::Table(tv) => Some(tv.clone()),
+            Self::Columnar(vm) => Some(vm.to_table_val()),
+            _ => None,
+        }
+    }
+
+    /// Return the schema columns of a `Val::Table` or `Val::Columnar` in O(1).
+    #[must_use]
+    pub fn table_cols(&self) -> Option<&[ColSpec]> {
+        match self {
+            Self::Table(tv) => Some(&tv.cols),
+            Self::Columnar(vm) => Some(&vm.cols),
+            _ => None,
+        }
+    }
+
+    /// Return the row count of a `Val::Table` or `Val::Columnar` in O(batches) without materializing rows.
+    #[must_use]
+    pub fn table_row_count(&self) -> Option<usize> {
+        match self {
+            Self::Table(tv) => Some(tv.rows.len()),
+            Self::Columnar(vm) => Some(vm.total_rows()),
+            _ => None,
+        }
+    }
+
+    /// Convert a `Val::Columnar` (zero-copy when uniquely owned) or `Val::Table` into a [`VmTable`].
+    #[must_use]
+    pub fn into_vm_table(mut self, batch_size: usize) -> Option<VmTable> {
+        match &mut self {
+            Self::Columnar(arc) => {
+                let owned = std::mem::replace(arc, Arc::new(VmTable::empty()));
+                Some(Arc::unwrap_or_clone(owned))
+            }
+            Self::Table(tv) => Some(VmTable::from_table_val(tv, batch_size)),
+            _ => None,
+        }
+    }
+
+    /// Borrow the underlying [`VmTable`] when this value is `Val::Columnar`.
+    #[must_use]
+    pub fn as_columnar(&self) -> Option<&Arc<VmTable>> {
+        match self {
+            Self::Columnar(arc) => Some(arc),
             _ => None,
         }
     }
@@ -521,7 +585,7 @@ fn val_rank(v: &Val) -> u8 {
         Val::List(_) => 15,
         Val::Map(_) => 16,
         Val::Ctor { .. } => 17,
-        Val::Table(_) => 18,
+        Val::Table(_) | Val::Columnar(_) => 18,
         Val::DynTable { .. } => 19,
         Val::Chart(_) => 20,
         Val::Report(_) => 21,
@@ -638,6 +702,16 @@ pub fn val_eq(v1: &Val, v2: &Val) -> bool {
                     }
                 }
             }
+            (Val::Columnar(v1), Val::Columnar(v2)) => {
+                if !vm_tables_eq(v1, v2) {
+                    return false;
+                }
+            }
+            (Val::Table(tv), Val::Columnar(vm)) | (Val::Columnar(vm), Val::Table(tv)) => {
+                if !table_eq_vm(tv, vm) {
+                    return false;
+                }
+            }
             (
                 Val::DynTable {
                     headers: h1,
@@ -699,6 +773,121 @@ pub fn val_eq(v1: &Val, v2: &Val) -> bool {
         }
     }
     true
+}
+
+fn vm_tables_eq(t1: &Arc<VmTable>, t2: &Arc<VmTable>) -> bool {
+    if Arc::ptr_eq(t1, t2) {
+        return true;
+    }
+    let ncols = t1.cols.len();
+    if ncols != t2.cols.len()
+        || !t1
+            .cols
+            .iter()
+            .zip(&t2.cols)
+            .all(|(c1, c2)| c1.name == c2.name)
+    {
+        return false;
+    }
+    let total = t1.total_rows();
+    if total != t2.total_rows() {
+        return false;
+    }
+    if total == 0 {
+        return true;
+    }
+    let mut b1 = 0usize;
+    let mut p1 = 0usize;
+    let mut b2 = 0usize;
+    let mut p2 = 0usize;
+    for _ in 0..total {
+        while b1 < t1.batches.len() && p1 >= t1.batches[b1].active_len() {
+            b1 += 1;
+            p1 = 0;
+        }
+        while b2 < t2.batches.len() && p2 >= t2.batches[b2].active_len() {
+            b2 += 1;
+            p2 = 0;
+        }
+        let batch1 = &t1.batches[b1];
+        let batch2 = &t2.batches[b2];
+        if batch1.cols.len() != ncols || batch2.cols.len() != ncols {
+            return false;
+        }
+        let r1 = match &batch1.selection {
+            Some(sel) => usize::from(sel[p1]),
+            None => p1,
+        };
+        let r2 = match &batch2.selection {
+            Some(sel) => usize::from(sel[p2]),
+            None => p2,
+        };
+        for ci in 0..ncols {
+            if !eq_col_cells(&batch1.cols[ci], r1, &batch2.cols[ci], r2) {
+                return false;
+            }
+        }
+        p1 += 1;
+        p2 += 1;
+    }
+    true
+}
+
+fn table_eq_vm(tv: &TableVal, vm: &VmTable) -> bool {
+    let ncols = tv.cols.len();
+    if ncols != vm.cols.len()
+        || !tv
+            .cols
+            .iter()
+            .zip(&vm.cols)
+            .all(|(c1, c2)| c1.name == c2.name)
+        || tv.rows.len() != vm.total_rows()
+    {
+        return false;
+    }
+    let mut row_iter = tv.rows.iter();
+    for b in &vm.batches {
+        if b.is_empty() {
+            continue;
+        }
+        if b.cols.len() != ncols {
+            return false;
+        }
+        match &b.selection {
+            Some(sel) => {
+                for &r_u16 in sel {
+                    let Some(row) = row_iter.next() else {
+                        return false;
+                    };
+                    if row.cells.len() != ncols {
+                        return false;
+                    }
+                    let r = usize::from(r_u16);
+                    for (ci, col) in b.cols.iter().enumerate() {
+                        if !val_eq(&row.cells[ci], &col.get_val(r)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            None => {
+                for r in 0..b.len {
+                    let Some(row) = row_iter.next() else {
+                        return false;
+                    };
+                    if row.cells.len() != ncols {
+                        return false;
+                    }
+                    for (ci, col) in b.cols.iter().enumerate() {
+                        if !val_eq(&row.cells[ci], &col.get_val(r)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    row_iter.next().is_none()
 }
 
 #[must_use]
@@ -978,8 +1167,45 @@ pub fn redact_tags(ts: &TagSet) -> String {
     format!("[REDACTED:{}]", ts.elems().join(","))
 }
 
+/// Zero-allocation canonical formatting of an unboxed `10^-18`-scaled `i128` `Decimal`
+/// directly into `out`, matching [`render_decimal`] byte-for-byte.
+pub fn render_decimal_i128_into(out: &mut String, scaled: i128) {
+    use std::fmt::Write as _;
+    if scaled < 0 {
+        out.push('-');
+    }
+    let abs_u = scaled.unsigned_abs();
+    let scale_u = DEC_SCALE as u128;
+    let whole = abs_u / scale_u;
+    let frac = abs_u % scale_u;
+    let _ = write!(out, "{whole}");
+    if frac == 0 {
+        out.push_str(".0");
+    } else {
+        out.push('.');
+        let mut buf = [b'0'; 18];
+        let mut f = frac;
+        for slot in buf.iter_mut().rev() {
+            *slot = b'0' + (f % 10) as u8;
+            f /= 10;
+        }
+        let mut end = 18usize;
+        while end > 1 && buf[end - 1] == b'0' {
+            end -= 1;
+        }
+        if let Ok(s) = std::str::from_utf8(&buf[..end]) {
+            out.push_str(s);
+        }
+    }
+}
+
 #[must_use]
 pub fn render_decimal(scaled: &BigInt) -> String {
+    if let Some(v) = scaled.to_i128() {
+        let mut out = String::with_capacity(24);
+        render_decimal_i128_into(&mut out, v);
+        return out;
+    }
     let sign = if scaled.is_negative() { "-" } else { "" };
     let abs_val = scaled.abs();
     let scale = BigInt::from(DEC_SCALE);
@@ -1092,6 +1318,9 @@ pub fn render_public_val(val: &Val) -> String {
                 }
                 Val::Table(tv) => {
                     let _ = write!(out, "Table(rows={})", tv.rows.len());
+                }
+                Val::Columnar(vm) => {
+                    let _ = write!(out, "Table(rows={})", vm.total_rows());
                 }
                 Val::DynTable { headers, rows } => {
                     let _ = write!(

@@ -64,6 +64,23 @@ unsafe extern "C" {
         end_op: c_int,
     ) -> usize;
     fn ZSTD_CStreamOutSize() -> usize;
+
+    fn ZSTD_compressBound(src_size: usize) -> usize;
+    fn ZSTD_compress2(
+        cctx: *mut ZstdCStream,
+        dst: *mut c_void,
+        dst_capacity: usize,
+        src: *const c_void,
+        src_size: usize,
+    ) -> usize;
+    fn ZSTD_getFrameContentSize(src: *const c_void, src_size: usize) -> u64;
+    fn ZSTD_findFrameCompressedSize(src: *const c_void, src_size: usize) -> usize;
+    fn ZSTD_decompress(
+        dst: *mut c_void,
+        dst_capacity: usize,
+        src: *const c_void,
+        compressed_size: usize,
+    ) -> usize;
 }
 
 fn check_zstd(code: usize, context: &str) -> io::Result<usize> {
@@ -382,4 +399,115 @@ impl<W: Write> Drop for ZstdWriter<W> {
             self.cstream = ptr::null_mut();
         }
     }
+}
+
+struct ZstdCctxGuard(*mut ZstdCStream);
+
+impl Drop for ZstdCctxGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` was created by `ZSTD_createCStream` and is freed once here.
+            let _ = unsafe { ZSTD_freeCStream(self.0) };
+            self.0 = ptr::null_mut();
+        }
+    }
+}
+
+/// Compress a single in-memory block into one standard Zstandard frame with known content size
+/// and 32-bit xxHash content checksum.
+///
+/// Unlike streaming compression with unknown input length, `ZSTD_compress2` receives the exact
+/// `input.len()` up front so `libzstd` sizes its window and hash tables proportionally to the
+/// block rather than allocating a full streaming window.
+///
+/// # Errors
+/// Returns an `io::Error` if `libzstd` fails to allocate a context or compress the block.
+pub fn zstd_compress_block(input: &[u8], level: i32) -> io::Result<Vec<u8>> {
+    // SAFETY: `ZSTD_compressBound` is a pure size calculation with no pointer arguments.
+    let bound = unsafe { ZSTD_compressBound(input.len()) };
+    let bound = check_zstd(bound, "zstd compress bound failed")?;
+
+    // SAFETY: `ZSTD_createCStream` allocates a fresh ZSTD_CCtx/ZSTD_CStream or returns NULL.
+    let cctx = unsafe { ZSTD_createCStream() };
+    if cctx.is_null() {
+        return Err(io::Error::other("ZSTD_createCStream returned null"));
+    }
+    let _guard = ZstdCctxGuard(cctx);
+
+    // SAFETY: `cctx` is live and non-null for the lifetime of `_guard`.
+    let rc_lvl = unsafe { ZSTD_CCtx_setParameter(cctx, ZSTD_C_COMPRESSION_LEVEL, level as c_int) };
+    check_zstd(rc_lvl, "zstd set compression level failed")?;
+
+    // SAFETY: `cctx` is live and non-null for the lifetime of `_guard`.
+    let rc_crc = unsafe { ZSTD_CCtx_setParameter(cctx, ZSTD_C_CHECKSUM_FLAG, 1) };
+    check_zstd(rc_crc, "zstd enable checksum flag failed")?;
+
+    let mut out = vec![0u8; bound.max(1)];
+    let src_ptr = if input.is_empty() {
+        ptr::null()
+    } else {
+        input.as_ptr().cast::<c_void>()
+    };
+    // SAFETY: `cctx` is live, `out` has capacity `out.len() >= bound`, and `src_ptr` is valid
+    // for `input.len()` bytes (or null when `input.len() == 0`).
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            out.as_mut_ptr().cast::<c_void>(),
+            out.len(),
+            src_ptr,
+            input.len(),
+        )
+    };
+    let written = check_zstd(written, "zstd block compression error")?;
+    out.truncate(written);
+    Ok(out)
+}
+
+/// Fast one-shot Zstandard single-frame decompression when the frame declares an exact content
+/// size matching `expected_size` and spans the entire `input` buffer.
+///
+/// Returns `Ok(None)` when `expected_size == 0`, the frame omits content size, or `input`
+/// contains multiple frames so callers can fall back to [`ZstdReader`].
+///
+/// # Errors
+/// Returns an `io::Error` if single-frame decompression fails or yields a mismatched length.
+pub fn zstd_decompress_block(input: &[u8], expected_size: usize) -> io::Result<Option<Vec<u8>>> {
+    if input.is_empty() || expected_size == 0 {
+        return Ok(None);
+    }
+    let src_ptr = input.as_ptr().cast::<c_void>();
+    // SAFETY: `src_ptr` is valid for `input.len()` bytes; `ZSTD_getFrameContentSize` only reads
+    // the frame header within `input.len()`.
+    let frame_content_size = unsafe { ZSTD_getFrameContentSize(src_ptr, input.len()) };
+    if frame_content_size != expected_size as u64 {
+        return Ok(None);
+    }
+    // SAFETY: `src_ptr` is valid for `input.len()` bytes; `ZSTD_findFrameCompressedSize` checks
+    // that the input is strictly one complete frame with no trailing frames.
+    let frame_comp_size = unsafe { ZSTD_findFrameCompressedSize(src_ptr, input.len()) };
+    // SAFETY: `ZSTD_isError` is a pure status check on any `size_t` return code.
+    if unsafe { ZSTD_isError(frame_comp_size) } != 0 || frame_comp_size != input.len() {
+        return Ok(None);
+    }
+
+    let mut out = vec![0u8; expected_size];
+    // SAFETY: `out` has `expected_size` writable bytes and `src_ptr` has `input.len()` readable
+    // bytes; the buffers are disjoint.
+    let decoded = unsafe {
+        ZSTD_decompress(
+            out.as_mut_ptr().cast::<c_void>(),
+            expected_size,
+            src_ptr,
+            input.len(),
+        )
+    };
+    let decoded = check_zstd(decoded, "zstd block decompression error")?;
+    if decoded != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("zstd decompressed size mismatch: expected {expected_size}, got {decoded}"),
+        ));
+    }
+    Ok(Some(out))
 }

@@ -4,15 +4,21 @@
 //! over any [`BufRead`], preserving exact 1-based line numbers across multiline quoted fields
 //! and enforcing `quarantine_bad_row_table_ty` sensitivity tag propagation on `bad_rows`.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 
 use crate::core::bigint::BigInt;
 use crate::core::check::quarantine_bad_row_table_ty;
-use crate::core::syntax::{Float64, ScalarTy, TableTy};
+use crate::core::syntax::{ColSpec, Float64, ScalarTy, TableTy};
+use crate::formats::constraint::{FastColConstraint, UnboxedCell};
 use crate::formats::crypto::to_hex_lower;
-use crate::formats::time::{parse_decimal_bigint_strict, parse_iso_date, parse_iso_timestamp};
-use crate::oracle::value::{TableRow, TableVal, Val};
+use crate::formats::time::{
+    format_iso_date, format_iso_timestamp, parse_decimal_bigint_strict, parse_decimal_i128,
+    parse_iso_date, parse_iso_timestamp,
+};
+use crate::oracle::value::{TableRow, TableVal, Val, render_decimal_i128_into};
+use crate::vm::batch::{Batch, Column, ColumnData, NullBitmap};
+use crate::vm::ops::VmTable;
 
 /// Default streaming batch size for CSV/TSV record iteration (matches the Phase 2C VM batch size).
 pub const CSV_BATCH_SIZE: usize = 2048;
@@ -333,7 +339,21 @@ impl<R: BufRead> CsvBatchReader<R> {
                 if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
                     let raw = &buf[..nl];
                     let clean = raw.strip_suffix(b"\r").unwrap_or(raw);
-                    if !clean.contains(&b'"') && !clean.contains(&b'\r') {
+                    // Single pass: split on `delimiter` while checking for `"` or bare `\r`.
+                    scratch_ranges.clear();
+                    let delim = self.delimiter;
+                    let mut start = 0usize;
+                    let mut special = false;
+                    for (idx, &b) in clean.iter().enumerate() {
+                        if b == delim {
+                            scratch_ranges.push((start, idx));
+                            start = idx + 1;
+                        } else if b == b'"' || b == b'\r' {
+                            special = true;
+                            break;
+                        }
+                    }
+                    if !special {
                         let rec_line = self.line_no;
                         self.line_no += 1;
                         if clean.is_empty() {
@@ -355,15 +375,6 @@ impl<R: BufRead> CsvBatchReader<R> {
                         })?;
                         scratch_line.clear();
                         scratch_line.push_str(line_str);
-                        scratch_ranges.clear();
-                        let delim = self.delimiter;
-                        let mut start = 0usize;
-                        for (idx, &b) in clean.iter().enumerate() {
-                            if b == delim {
-                                scratch_ranges.push((start, idx));
-                                start = idx + 1;
-                            }
-                        }
                         scratch_ranges.push((start, clean.len()));
                         self.reader.consume(nl + 1);
                         *scratch_fallback = None;
@@ -616,6 +627,619 @@ where
         delimiter,
         check_constraint,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Direct Streaming-Columnar CSV/TSV Decoder into 2,048-Row `VmTable` Batches
+// ---------------------------------------------------------------------------
+
+enum CsvColBuf {
+    Unit(usize),
+    Bool(Vec<u8>),
+    Int(Vec<i64>),
+    Decimal(Vec<i128>),
+    Float(Vec<u64>),
+    Text { offsets: Vec<usize>, data: Vec<u8> },
+    Bytes { offsets: Vec<usize>, data: Vec<u8> },
+    Date(Vec<i64>),
+    Timestamp(Vec<i64>),
+    Duration(Vec<i64>),
+    Generic(Vec<Val>),
+}
+
+impl CsvColBuf {
+    fn new_for_scalar(ty: &ScalarTy, cap: usize) -> (Self, Option<NullBitmap>) {
+        match ty {
+            ScalarTy::Option(inner) if !inner.is_option() => {
+                let buf = Self::new_leaf(inner, cap);
+                if matches!(buf, Self::Generic(_)) {
+                    (buf, None)
+                } else {
+                    (buf, Some(NullBitmap::with_capacity(cap)))
+                }
+            }
+            other => (Self::new_leaf(other, cap), None),
+        }
+    }
+
+    fn new_leaf(ty: &ScalarTy, cap: usize) -> Self {
+        match ty {
+            ScalarTy::Unit => Self::Unit(0),
+            ScalarTy::Bool => Self::Bool(Vec::with_capacity(cap)),
+            ScalarTy::Int => Self::Int(Vec::with_capacity(cap)),
+            ScalarTy::Decimal => Self::Decimal(Vec::with_capacity(cap)),
+            ScalarTy::Float => Self::Float(Vec::with_capacity(cap)),
+            ScalarTy::Text => {
+                let mut offsets = Vec::with_capacity(cap + 1);
+                offsets.push(0);
+                Self::Text {
+                    offsets,
+                    data: Vec::with_capacity(cap * 8),
+                }
+            }
+            ScalarTy::Bytes => {
+                let mut offsets = Vec::with_capacity(cap + 1);
+                offsets.push(0);
+                Self::Bytes {
+                    offsets,
+                    data: Vec::with_capacity(cap * 8),
+                }
+            }
+            ScalarTy::Date => Self::Date(Vec::with_capacity(cap)),
+            ScalarTy::Timestamp => Self::Timestamp(Vec::with_capacity(cap)),
+            ScalarTy::Duration => Self::Duration(Vec::with_capacity(cap)),
+            ScalarTy::Data(_) | ScalarTy::Option(_) => Self::Generic(Vec::with_capacity(cap)),
+        }
+    }
+
+    #[inline]
+    fn push_null(&mut self) {
+        match self {
+            Self::Unit(n) => *n += 1,
+            Self::Bool(v) => v.push(0),
+            Self::Int(v) | Self::Date(v) | Self::Timestamp(v) | Self::Duration(v) => v.push(0),
+            Self::Decimal(v) => v.push(0),
+            Self::Float(v) => v.push(0),
+            Self::Text { offsets, data } | Self::Bytes { offsets, data } => {
+                offsets.push(data.len());
+            }
+            Self::Generic(v) => v.push(Val::OptNone),
+        }
+    }
+
+    fn into_column_data(self) -> ColumnData {
+        match self {
+            Self::Unit(n) => ColumnData::Unit(n),
+            Self::Bool(v) => ColumnData::Bool(v),
+            Self::Int(v) => ColumnData::Int(v),
+            Self::Decimal(v) => ColumnData::Decimal(v),
+            Self::Float(v) => ColumnData::Float(v),
+            Self::Text { offsets, data } => ColumnData::Text { offsets, data },
+            Self::Bytes { offsets, data } => ColumnData::Bytes { offsets, data },
+            Self::Date(v) => ColumnData::Date(v),
+            Self::Timestamp(v) => ColumnData::Timestamp(v),
+            Self::Duration(v) => ColumnData::Duration(v),
+            Self::Generic(v) => ColumnData::Generic(v),
+        }
+    }
+}
+
+/// Reusable unboxed row cell slot (zero heap allocation per cell on all primitive/Text columns).
+enum CsvRowSlot {
+    Null,
+    Unit,
+    Bool(bool),
+    Int(i64),
+    Decimal(i128),
+    Float(u64),
+    TextField(usize),
+    BytesField(usize),
+    Date(i64),
+    Timestamp(i64),
+    Duration(i64),
+    Generic(Val),
+}
+
+#[inline]
+fn parse_csv_bool_fast(trimmed: &str) -> Result<bool, &'static str> {
+    if trimmed.is_empty() {
+        return Err("MissingRequired");
+    }
+    if trimmed == "1" || trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("yes")
+    {
+        Ok(true)
+    } else if trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("no")
+    {
+        Ok(false)
+    } else {
+        Err("BadBool")
+    }
+}
+
+#[inline]
+fn parse_csv_cell_slot(
+    raw: &str,
+    field_idx: usize,
+    ty: &ScalarTy,
+) -> Result<CsvRowSlot, &'static str> {
+    match ty {
+        ScalarTy::Option(inner) if !inner.is_option() => {
+            if raw.trim().is_empty() {
+                Ok(CsvRowSlot::Null)
+            } else {
+                parse_csv_cell_slot(raw, field_idx, inner)
+            }
+        }
+        ScalarTy::Option(_) => parse_csv_cell(raw, ty).map(CsvRowSlot::Generic),
+        ScalarTy::Text => Ok(CsvRowSlot::TextField(field_idx)),
+        ScalarTy::Bytes => Ok(CsvRowSlot::BytesField(field_idx)),
+        ScalarTy::Unit => Ok(CsvRowSlot::Unit),
+        ScalarTy::Bool => parse_csv_bool_fast(raw.trim()).map(CsvRowSlot::Bool),
+        ScalarTy::Int => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err("MissingRequired");
+            }
+            trimmed
+                .parse::<i64>()
+                .map(CsvRowSlot::Int)
+                .map_err(|_| "BadInt")
+        }
+        ScalarTy::Decimal => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err("MissingRequired");
+            }
+            parse_decimal_i128(trimmed)
+                .map(CsvRowSlot::Decimal)
+                .ok_or("BadDecimal")
+        }
+        ScalarTy::Float => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err("MissingRequired");
+            }
+            let f: f64 = trimmed.parse().map_err(|_| "BadFloat")?;
+            if f.is_nan() || f.is_infinite() {
+                return Err("BadFloat");
+            }
+            Ok(CsvRowSlot::Float(Float64::from_f64(f).bits))
+        }
+        ScalarTy::Date => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err("MissingRequired");
+            }
+            parse_iso_date(trimmed)
+                .map(CsvRowSlot::Date)
+                .map_err(|_| "BadDate")
+        }
+        ScalarTy::Timestamp => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err("MissingRequired");
+            }
+            parse_iso_timestamp(trimmed)
+                .map(CsvRowSlot::Timestamp)
+                .map_err(|_| "BadTimestamp")
+        }
+        ScalarTy::Duration => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err("MissingRequired");
+            }
+            trimmed
+                .parse::<i64>()
+                .map(CsvRowSlot::Duration)
+                .map_err(|_| "BadDuration")
+        }
+        ScalarTy::Data(_) => Err("UnsupportedCellType"),
+    }
+}
+
+#[inline]
+fn slot_as_unboxed<'a>(slot: &'a CsvRowSlot, raw_str: &'a str) -> Option<UnboxedCell<'a>> {
+    match slot {
+        CsvRowSlot::Null => Some(UnboxedCell::Null),
+        CsvRowSlot::Unit => Some(UnboxedCell::Unit),
+        CsvRowSlot::Bool(b) => Some(UnboxedCell::Bool(*b)),
+        CsvRowSlot::Int(n) => Some(UnboxedCell::Int(*n)),
+        CsvRowSlot::Decimal(d) => Some(UnboxedCell::Decimal(*d)),
+        CsvRowSlot::Float(bits) => Some(UnboxedCell::Float(*bits)),
+        CsvRowSlot::TextField(_) => Some(UnboxedCell::Text(raw_str)),
+        CsvRowSlot::BytesField(_) => Some(UnboxedCell::Bytes(raw_str.as_bytes())),
+        CsvRowSlot::Date(d) => Some(UnboxedCell::Date(*d)),
+        CsvRowSlot::Timestamp(t) => Some(UnboxedCell::Timestamp(*t)),
+        CsvRowSlot::Duration(d) => Some(UnboxedCell::Duration(*d)),
+        CsvRowSlot::Generic(_) => None,
+    }
+}
+
+fn flush_csv_batch(
+    specs: &[ColSpec],
+    bufs: &mut Vec<(CsvColBuf, Option<NullBitmap>)>,
+    cur_len: &mut usize,
+    batch_size: usize,
+    batches: &mut Vec<Batch>,
+) {
+    if *cur_len == 0 {
+        return;
+    }
+    let fresh = specs
+        .iter()
+        .map(|s| CsvColBuf::new_for_scalar(&s.ty, batch_size))
+        .collect();
+    let finished = std::mem::replace(bufs, fresh);
+    let cols = specs
+        .iter()
+        .cloned()
+        .zip(finished)
+        .map(|(spec, (buf, validity))| Column {
+            spec,
+            data: buf.into_column_data(),
+            validity,
+        })
+        .collect();
+    batches.push(Batch {
+        cols,
+        len: *cur_len,
+        selection: None,
+        group_meta: None,
+    });
+    *cur_len = 0;
+}
+
+/// Stream CSV/TSV bytes from any [`Read`] directly into 2,048-row columnar [`VmTable`] batches
+/// plus quarantined `bad_rows` [`TableVal`], eliminating row-wise `TableVal` / `Val` / `BigInt`
+/// materialization on the VM path.
+///
+/// Matches [`read_csv_stream_with_schema`] cell-for-cell across valid rows, bad-row quarantine
+/// line numbers, error kinds, multiline quoted fields, `.gz`/`.zst` streams, and `where` constraints.
+///
+/// # Errors
+/// Returns an error string on I/O, UTF-8, or missing required header column errors.
+pub fn read_csv_stream_to_vm_table<R, F>(
+    reader: R,
+    schema: &TableTy,
+    delimiter: u8,
+    batch_size: usize,
+    fast_constraints: &[FastColConstraint],
+    mut fallback_constraint: F,
+) -> Result<(VmTable, TableVal), String>
+where
+    R: Read,
+    F: FnMut(usize, &Val) -> bool,
+{
+    let mut batch_reader =
+        CsvBatchReader::new(BufReader::with_capacity(64 * 1024, reader), delimiter);
+    let bad_tt = quarantine_bad_row_table_ty(schema);
+
+    let Some(header) = batch_reader.next_record().map_err(|e| e.to_string())? else {
+        return Ok((
+            VmTable {
+                cols: schema.cols.clone(),
+                batches: Vec::new(),
+            },
+            TableVal {
+                cols: bad_tt.cols,
+                rows: Vec::new(),
+            },
+        ));
+    };
+
+    let mut col_indices = Vec::with_capacity(schema.cols.len());
+    for col in &schema.cols {
+        let Some(idx) = header
+            .fields
+            .iter()
+            .position(|h| h.trim() == col.name.as_str())
+        else {
+            return Err(format!("missing required CSV column `{}`", col.name));
+        };
+        col_indices.push(idx);
+    }
+    if header.fields.len() == 1 {
+        batch_reader.set_preserve_empty_lines(true);
+    }
+
+    let chunk = batch_size.clamp(1, usize::from(u16::MAX));
+    let mut col_bufs: Vec<(CsvColBuf, Option<NullBitmap>)> = schema
+        .cols
+        .iter()
+        .map(|s| CsvColBuf::new_for_scalar(&s.ty, chunk))
+        .collect();
+    let mut cur_len = 0usize;
+    let mut batches: Vec<Batch> = Vec::new();
+    let mut bad_rows: Vec<TableRow> = Vec::new();
+
+    let mut scratch_line = String::with_capacity(256);
+    let mut scratch_ranges: Vec<(usize, usize)> = Vec::with_capacity(header.fields.len().max(8));
+    let mut scratch_fallback: Option<CsvRecord> = None;
+    let mut row_slots: Vec<CsvRowSlot> = Vec::with_capacity(schema.cols.len());
+
+    while let Some(rec_line) = batch_reader
+        .next_record_fast(
+            &mut scratch_line,
+            &mut scratch_ranges,
+            &mut scratch_fallback,
+        )
+        .map_err(|e| e.to_string())?
+    {
+        row_slots.clear();
+        let mut bad_hit: Option<(&str, &str, String)> = None;
+
+        for (ci, col) in schema.cols.iter().enumerate() {
+            let field_idx = col_indices[ci];
+            let raw_opt: Option<&str> = match &scratch_fallback {
+                Some(rec) => rec.fields.get(field_idx).map(String::as_str),
+                None => scratch_ranges
+                    .get(field_idx)
+                    .map(|&(s, e)| &scratch_line[s..e]),
+            };
+            let Some(raw_val) = raw_opt else {
+                bad_hit = Some((col.name.as_str(), "MissingColumn", String::new()));
+                break;
+            };
+            match parse_csv_cell_slot(raw_val, field_idx, &col.ty) {
+                Ok(slot) => {
+                    let constraint_ok = match &slot {
+                        CsvRowSlot::Null => true,
+                        CsvRowSlot::Generic(v) => match v {
+                            Val::OptNone => true,
+                            Val::OptSome(inner) => fallback_constraint(ci, inner),
+                            other => fallback_constraint(ci, other),
+                        },
+                        _ => {
+                            let fc = fast_constraints
+                                .get(ci)
+                                .unwrap_or(&FastColConstraint::AlwaysTrue);
+                            if fc.is_always_true() {
+                                true
+                            } else if let Some(unboxed) = slot_as_unboxed(&slot, raw_val)
+                                && let Some(res) = fc.eval_unboxed(unboxed)
+                            {
+                                res
+                            } else {
+                                let boxed = slot_as_unboxed(&slot, raw_val)
+                                    .map_or(Val::Unit, UnboxedCell::to_val);
+                                fallback_constraint(ci, &boxed)
+                            }
+                        }
+                    };
+                    if !constraint_ok {
+                        bad_hit =
+                            Some((col.name.as_str(), "ConstraintFailed", raw_val.to_string()));
+                        break;
+                    }
+                    row_slots.push(slot);
+                }
+                Err(kind) => {
+                    bad_hit = Some((col.name.as_str(), kind, raw_val.to_string()));
+                    break;
+                }
+            }
+        }
+
+        if let Some((col_name, err_kind, raw_val)) = bad_hit {
+            let raw_line = match scratch_fallback.take() {
+                Some(rec) => rec.raw_line,
+                None => scratch_line.clone(),
+            };
+            bad_rows.push(TableRow {
+                cells: vec![
+                    Val::Int(BigInt::from(rec_line)),
+                    Val::Text(col_name.to_string()),
+                    Val::Text(err_kind.to_string()),
+                    Val::Text(raw_val),
+                    Val::Text(raw_line),
+                ],
+                group_meta: None,
+            });
+            continue;
+        }
+
+        // Row passed every parse & `where` check: commit unboxed cells straight into column buffers!
+        for ((buf, validity), slot) in col_bufs.iter_mut().zip(row_slots.drain(..)) {
+            if matches!(slot, CsvRowSlot::Null) {
+                if let Some(bm) = validity {
+                    bm.push(false);
+                }
+                buf.push_null();
+                continue;
+            }
+            if let Some(bm) = validity {
+                bm.push(true);
+            }
+            match (buf, slot) {
+                (CsvColBuf::Unit(n), CsvRowSlot::Unit) => *n += 1,
+                (CsvColBuf::Bool(v), CsvRowSlot::Bool(b)) => v.push(u8::from(b)),
+                (CsvColBuf::Int(v), CsvRowSlot::Int(n)) => v.push(n),
+                (CsvColBuf::Decimal(v), CsvRowSlot::Decimal(d)) => v.push(d),
+                (CsvColBuf::Float(v), CsvRowSlot::Float(bits)) => v.push(bits),
+                (CsvColBuf::Date(v), CsvRowSlot::Date(d)) => v.push(d),
+                (CsvColBuf::Timestamp(v), CsvRowSlot::Timestamp(t)) => v.push(t),
+                (CsvColBuf::Duration(v), CsvRowSlot::Duration(d)) => v.push(d),
+                (CsvColBuf::Text { offsets, data }, CsvRowSlot::TextField(fidx)) => {
+                    let s: &str = match &scratch_fallback {
+                        Some(rec) => rec.fields.get(fidx).map_or("", String::as_str),
+                        None => scratch_ranges
+                            .get(fidx)
+                            .map_or("", |&(s, e)| &scratch_line[s..e]),
+                    };
+                    data.extend_from_slice(s.as_bytes());
+                    offsets.push(data.len());
+                }
+                (CsvColBuf::Bytes { offsets, data }, CsvRowSlot::BytesField(fidx)) => {
+                    let s: &str = match &scratch_fallback {
+                        Some(rec) => rec.fields.get(fidx).map_or("", String::as_str),
+                        None => scratch_ranges
+                            .get(fidx)
+                            .map_or("", |&(s, e)| &scratch_line[s..e]),
+                    };
+                    data.extend_from_slice(s.as_bytes());
+                    offsets.push(data.len());
+                }
+                (CsvColBuf::Generic(v), CsvRowSlot::Generic(val)) => v.push(val),
+                (CsvColBuf::Generic(v), other) => {
+                    let raw_s: &str = match other {
+                        CsvRowSlot::TextField(fidx) | CsvRowSlot::BytesField(fidx) => {
+                            match &scratch_fallback {
+                                Some(rec) => rec.fields.get(fidx).map_or("", String::as_str),
+                                None => scratch_ranges
+                                    .get(fidx)
+                                    .map_or("", |&(s, e)| &scratch_line[s..e]),
+                            }
+                        }
+                        _ => "",
+                    };
+                    v.push(slot_as_unboxed(&other, raw_s).map_or(Val::Unit, UnboxedCell::to_val));
+                }
+                _ => {}
+            }
+        }
+        cur_len += 1;
+        if cur_len >= chunk {
+            flush_csv_batch(
+                &schema.cols,
+                &mut col_bufs,
+                &mut cur_len,
+                chunk,
+                &mut batches,
+            );
+        }
+    }
+
+    flush_csv_batch(
+        &schema.cols,
+        &mut col_bufs,
+        &mut cur_len,
+        chunk,
+        &mut batches,
+    );
+
+    Ok((
+        VmTable {
+            cols: schema.cols.clone(),
+            batches,
+        },
+        TableVal {
+            cols: bad_tt.cols,
+            rows: bad_rows,
+        },
+    ))
+}
+
+/// Append a single columnar batch cell directly into `line` in RFC 4180 CSV/TSV format,
+/// matching [`render_csv_cell`] + [`push_csv_escaped`] byte-for-byte with zero per-cell allocation.
+fn push_column_csv_cell(out: &mut String, col: &Column, row: usize, delimiter: u8) {
+    if let Some(bm) = &col.validity
+        && !bm.is_valid(row)
+    {
+        return;
+    }
+    match &col.data {
+        ColumnData::Unit(_) => out.push_str("Unit"),
+        ColumnData::Bool(v) => out.push_str(if v[row] != 0 { "true" } else { "false" }),
+        ColumnData::Int(v) => {
+            let _ = write!(out, "{}", v[row]);
+        }
+        ColumnData::Decimal(v) => render_decimal_i128_into(out, v[row]),
+        ColumnData::Float(v) => {
+            let fv = Float64::from_bits(v[row]).to_f64();
+            if fv.is_finite() {
+                let _ = write!(out, "{fv}");
+            }
+        }
+        ColumnData::Text { .. } => {
+            if let Some(s) = col.data.text_at(row) {
+                push_csv_escaped(out, s, delimiter);
+            }
+        }
+        ColumnData::Bytes { .. } => {
+            if let Some(bs) = col.data.bytes_at(row) {
+                match std::str::from_utf8(bs) {
+                    Ok(s) => push_csv_escaped(out, s, delimiter),
+                    Err(_) => {
+                        let hex = to_hex_lower(bs);
+                        out.push_str(&hex);
+                    }
+                }
+            }
+        }
+        ColumnData::Date(v) => out.push_str(&format_iso_date(v[row])),
+        ColumnData::Timestamp(v) => out.push_str(&format_iso_timestamp(v[row])),
+        ColumnData::Duration(v) => {
+            let _ = write!(out, "duration({})", v[row]);
+        }
+        ColumnData::Generic(v) => {
+            let rendered = render_csv_cell(&v[row]);
+            push_csv_escaped(out, &rendered, delimiter);
+        }
+    }
+}
+
+/// Stream a columnar [`VmTable`] as RFC 4180 CSV/TSV directly to any [`Write`] sink
+/// without materializing row-wise [`TableVal`] rows.
+///
+/// # Errors
+/// Returns any underlying I/O error.
+pub fn write_csv_vm_table<W: Write>(writer: &mut W, vm: &VmTable, delimiter: u8) -> io::Result<()> {
+    let delim = delimiter as char;
+    let mut line = String::with_capacity(256);
+    for (i, c) in vm.cols.iter().enumerate() {
+        if i > 0 {
+            line.push(delim);
+        }
+        push_csv_escaped(&mut line, &c.name, delimiter);
+    }
+    line.push('\n');
+    writer.write_all(line.as_bytes())?;
+
+    for batch in &vm.batches {
+        if batch.is_empty() {
+            continue;
+        }
+        match &batch.selection {
+            Some(sel) => {
+                for &r_u16 in sel {
+                    let r = usize::from(r_u16);
+                    line.clear();
+                    for (i, col) in batch.cols.iter().enumerate() {
+                        if i > 0 {
+                            line.push(delim);
+                        }
+                        push_column_csv_cell(&mut line, col, r, delimiter);
+                    }
+                    line.push('\n');
+                    writer.write_all(line.as_bytes())?;
+                }
+            }
+            None => {
+                for r in 0..batch.len {
+                    line.clear();
+                    for (i, col) in batch.cols.iter().enumerate() {
+                        if i > 0 {
+                            line.push(delim);
+                        }
+                        push_column_csv_cell(&mut line, col, r, delimiter);
+                    }
+                    line.push('\n');
+                    writer.write_all(line.as_bytes())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Format a columnar [`VmTable`] as RFC 4180 CSV text directly from columnar batches.
+#[must_use]
+pub fn format_csv_vm_table(vm: &VmTable, delimiter: u8) -> String {
+    let mut buf = Vec::new();
+    let _ = write_csv_vm_table(&mut buf, vm, delimiter);
+    String::from_utf8(buf).unwrap_or_default()
 }
 
 /// Stream a [`TableVal`] as RFC 4180 CSV/TSV directly to any [`Write`] sink.

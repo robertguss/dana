@@ -2,17 +2,21 @@
 //! small-group suppression (`SuppressSmallGroups` in `Drop` and `MaskComplementary` modes).
 //!
 //! Features:
-//! - Parallel arg expression evaluation across batches via `std::thread::scope`
-//! - O(1)-memory fast streaming accumulators for `Count`, `Sum(Int/Decimal)`, `Min`, `Max`,
-//!   `First`, `Last` with automatic exact sorted-sum fallback on extreme near-overflow values
-//! - Deterministic radix hash partitioning for multi-core grouped aggregations
+//! - Zero-copy bare-column aggregate arguments (`AggArgSource::BatchCol`) and parallel
+//!   computed expression evaluation across batches via `std::thread::scope`
+//! - O(1)-memory unboxed streaming accumulators for `Count`, `CountDistinct(Int)`,
+//!   `Sum(Int/Decimal/Float)`, `Mean(Int/Decimal/Float)`, `Min`, `Max`, `First`, `Last`
+//!   with automatic exact sorted-sum fallback on extreme near-overflow values
+//! - Zero-allocation columnar group lookup (`hash_row_key` + `eq_col_cells` against group
+//!   exemplars) and deterministic radix hash partitioning for multi-core grouped aggregations
 //! - Exact bit-for-bit parity with `Eval.lean` / `src/oracle/eval.rs` in `CoreV01` mode and
 //!   `src/runtime/exec.rs` in `ExecSurface` mode.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasherDefault;
 
-use crate::core::bigint::{BigInt, DEC_MAX, DEC_SCALE};
+use crate::core::bigint::{BigInt, DEC_MAX, DEC_MIN, DEC_SCALE};
 use crate::core::syntax::{
     AggKind, AggOp, BugKind, ColSpec, Float64, Ident, ScalarTy, SuppressMode, TagSet,
 };
@@ -25,10 +29,13 @@ use crate::oracle::value::{
     val_list_lt, val_to_float,
 };
 use crate::vm::batch::{Batch, Column, ColumnData, rows_to_batches};
-use crate::vm::expr::{RowEvalHost, RowProgram, eval_row_program};
-use crate::vm::key::{KeyTuple, SingleKey, hash_row_key};
+use crate::vm::expr::{RowEvalHost, RowInstr, RowProgram, eval_row_program};
+use crate::vm::key::{FastHasher, KeyTuple, SingleKey, eq_col_cells, hash_row_key};
 use crate::vm::ops::{OpErr, OpExecConfig, VmMode, VmTable};
 use crate::vm::parallel::{parallel_map_batches, parallel_map_ref, resolve_thread_count};
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
+type FastSet<K> = HashSet<K, BuildHasherDefault<FastHasher>>;
 
 /// Compiled specification for a single aggregate item inside `Summarize`.
 #[derive(Debug)]
@@ -43,26 +50,106 @@ type GroupRowOut = (KeyTuple, usize, TableRow);
 type GroupPartErr = (KeyTuple, usize, OpErr);
 type PartAggResult = Result<Vec<GroupRowOut>, GroupPartErr>;
 
+/// Detected uniform physical column type across all non-empty batches for one aggregate argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AggColKind {
+    Int,
+    Decimal,
+    Float,
+    Other,
+}
+
+/// Distinct-key tracker for `SuppressSmallGroups(distinct_by: ...)`.
+enum DistinctTracker {
+    Int(FastSet<i64>),
+    Generic(FastSet<SingleKey>),
+}
+
+impl DistinctTracker {
+    fn new(kind: AggColKind) -> Self {
+        if kind == AggColKind::Int {
+            Self::Int(FastSet::default())
+        } else {
+            Self::Generic(FastSet::default())
+        }
+    }
+
+    #[inline]
+    fn push_cell(&mut self, col: &Column, row: usize) {
+        if col.validity.as_ref().is_some_and(|bm| !bm.is_valid(row)) {
+            return;
+        }
+        match (self, &col.data) {
+            (Self::Int(set), ColumnData::Int(vs)) => {
+                set.insert(vs[row]);
+            }
+            (Self::Generic(set), _) => {
+                let v = col.get_val(row);
+                if let Some(inner) = unwrap_opt_owned(v) {
+                    set.insert(SingleKey::new(inner));
+                }
+            }
+            (Self::Int(_), _) => {}
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Int(s) => s.len(),
+            Self::Generic(s) => s.len(),
+        }
+    }
+}
+
 /// Fast per-group streaming accumulator for one aggregate column.
 enum AggAcc {
     Count(usize),
-    CountDistinct(HashSet<SingleKey>),
-    /// O(1) fast Int sum tracking `pos_sum` and `neg_sum` magnitudes separately.
-    /// If either exceeds safe no-intermediate-overflow bounds, switches to `Exact(Vec<i64>)`
-    /// for permutation-invariant sorted right-to-left checking matching `Eval.lean`!
+    CountDistinctInt(FastSet<i64>),
+    CountDistinct(FastSet<SingleKey>),
+    /// `CoreV01` O(1) fast Int sum tracking `pos_sum` and `neg_sum` magnitudes separately.
+    /// If either exceeds safe no-intermediate-overflow bounds, switches to sorted fallback
+    /// matching `Eval.lean`!
     SumInt {
         pos_sum: u128,
         neg_sum: u128,
         overflow_buf: Option<Vec<i64>>,
     },
-    /// O(1) fast Decimal sum tracking positive/negative `u128` sums separately;
-    /// falls back to `overflow_buf: Vec<i128>` only if intermediate overflow is possible.
+    /// `CoreV01` O(1) fast Decimal sum tracking positive/negative `u128` sums separately.
     SumDec {
         pos_sum: u128,
         neg_sum: u128,
         overflow_buf: Option<Vec<i128>>,
     },
-    /// `CoreV01` float sum sorts non-null floats before folding for permutation invariance.
+    /// `ExecSurface` O(1) unboxed Int sum (zero `Val` / `BigInt` boxing).
+    ExecSumInt {
+        sum: i128,
+        overflow: Option<BigInt>,
+        seen_any: bool,
+    },
+    /// `ExecSurface` O(1) unboxed Decimal sum (zero `Val` / `BigInt` boxing).
+    ExecSumDec {
+        sum: i128,
+        overflow: Option<BigInt>,
+        seen_any: bool,
+    },
+    /// `ExecSurface` O(1) unboxed Float sum preserving exact left-to-right row order.
+    ExecSumFloat {
+        sum: f64,
+        seen_any: bool,
+    },
+    /// `ExecSurface` O(1) unboxed Float/Int mean preserving exact left-to-right row order.
+    ExecMeanFloat {
+        sum: f64,
+        count: usize,
+    },
+    /// `ExecSurface` O(1) unboxed Decimal mean with exact truncating division.
+    ExecMeanDec {
+        sum: i128,
+        overflow: Option<BigInt>,
+        count: usize,
+    },
+    /// Generic value collector (`CoreV01` float sum/mean/median/var/stddev/pct, `ExecSurface`
+    /// median/var/stddev/pct, or heterogeneous columns).
     CollectVals(Vec<Val>),
     Min(Option<Val>),
     Max(Option<Val>),
@@ -76,10 +163,16 @@ enum AggAcc {
 }
 
 impl AggAcc {
-    fn new(op: AggOp, out_ty: &ScalarTy, mode: VmMode) -> Self {
+    fn new(op: AggOp, out_ty: &ScalarTy, col_kind: AggColKind, mode: VmMode) -> Self {
         match op {
             AggOp::Count => Self::Count(0),
-            AggOp::CountDistinct => Self::CountDistinct(HashSet::new()),
+            AggOp::CountDistinct => {
+                if col_kind == AggColKind::Int {
+                    Self::CountDistinctInt(FastSet::default())
+                } else {
+                    Self::CountDistinct(FastSet::default())
+                }
+            }
             AggOp::Sum if mode == VmMode::CoreV01 => match out_ty {
                 ScalarTy::Int => Self::SumInt {
                     pos_sum: 0,
@@ -93,7 +186,32 @@ impl AggAcc {
                 },
                 _ => Self::CollectVals(Vec::new()),
             },
-            AggOp::Sum => Self::CollectVals(Vec::new()),
+            AggOp::Sum => match col_kind {
+                AggColKind::Int => Self::ExecSumInt {
+                    sum: 0,
+                    overflow: None,
+                    seen_any: false,
+                },
+                AggColKind::Decimal => Self::ExecSumDec {
+                    sum: 0,
+                    overflow: None,
+                    seen_any: false,
+                },
+                AggColKind::Float => Self::ExecSumFloat {
+                    sum: 0.0,
+                    seen_any: false,
+                },
+                AggColKind::Other => Self::CollectVals(Vec::new()),
+            },
+            AggOp::Mean if mode == VmMode::ExecSurface => match col_kind {
+                AggColKind::Float | AggColKind::Int => Self::ExecMeanFloat { sum: 0.0, count: 0 },
+                AggColKind::Decimal => Self::ExecMeanDec {
+                    sum: 0,
+                    overflow: None,
+                    count: 0,
+                },
+                AggColKind::Other => Self::CollectVals(Vec::new()),
+            },
             AggOp::Min => Self::Min(None),
             AggOp::Max => Self::Max(None),
             AggOp::First => {
@@ -123,64 +241,151 @@ impl AggAcc {
 
     #[inline]
     fn push_int_fast(&mut self, v: i64) {
-        if let Self::SumInt {
-            pos_sum,
-            neg_sum,
-            overflow_buf,
-        } = self
-        {
-            if let Some(buf) = overflow_buf {
-                buf.push(v);
-                return;
+        match self {
+            Self::SumInt {
+                pos_sum,
+                neg_sum,
+                overflow_buf,
+            } => {
+                if let Some(buf) = overflow_buf {
+                    buf.push(v);
+                    return;
+                }
+                if v >= 0 {
+                    *pos_sum = pos_sum.saturating_add(v as u128);
+                } else {
+                    *neg_sum = neg_sum.saturating_add(v.unsigned_abs() as u128);
+                }
             }
-            if v >= 0 {
-                *pos_sum = pos_sum.saturating_add(v as u128);
-            } else {
-                *neg_sum = neg_sum.saturating_add(v.unsigned_abs() as u128);
+            Self::ExecSumInt {
+                sum,
+                overflow,
+                seen_any,
+            } => {
+                *seen_any = true;
+                if let Some(big) = overflow {
+                    *big = &*big + &BigInt::from(v);
+                } else if let Some(next) = sum.checked_add(i128::from(v)) {
+                    *sum = next;
+                } else {
+                    *overflow = Some(&BigInt::from(*sum) + &BigInt::from(v));
+                }
             }
+            Self::ExecMeanFloat { sum, count } => {
+                *sum += v as f64;
+                *count += 1;
+            }
+            Self::CountDistinctInt(set) => {
+                set.insert(v);
+            }
+            _ => {}
         }
     }
 
     #[inline]
     fn push_dec_fast(&mut self, v: i128) {
-        if let Self::SumDec {
-            pos_sum,
-            neg_sum,
-            overflow_buf,
-        } = self
-        {
-            if let Some(buf) = overflow_buf {
-                buf.push(v);
-                return;
+        match self {
+            Self::SumDec {
+                pos_sum,
+                neg_sum,
+                overflow_buf,
+            } => {
+                if let Some(buf) = overflow_buf {
+                    buf.push(v);
+                    return;
+                }
+                if v >= 0 {
+                    *pos_sum = pos_sum.saturating_add(v as u128);
+                } else {
+                    *neg_sum = neg_sum.saturating_add(v.unsigned_abs());
+                }
             }
-            if v >= 0 {
-                *pos_sum = pos_sum.saturating_add(v as u128);
-            } else {
-                *neg_sum = neg_sum.saturating_add(v.unsigned_abs());
+            Self::ExecSumDec {
+                sum,
+                overflow,
+                seen_any,
+            } => {
+                *seen_any = true;
+                if let Some(big) = overflow {
+                    *big = &*big + &BigInt::from(v);
+                } else if let Some(next) = sum.checked_add(v) {
+                    *sum = next;
+                } else {
+                    *overflow = Some(&BigInt::from(*sum) + &BigInt::from(v));
+                }
             }
+            Self::ExecMeanDec {
+                sum,
+                overflow,
+                count,
+            } => {
+                *count += 1;
+                if let Some(big) = overflow {
+                    *big = &*big + &BigInt::from(v);
+                } else if let Some(next) = sum.checked_add(v) {
+                    *sum = next;
+                } else {
+                    *overflow = Some(&BigInt::from(*sum) + &BigInt::from(v));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[inline]
+    fn push_float_fast(&mut self, v: f64) {
+        match self {
+            Self::ExecSumFloat { sum, seen_any } => {
+                *seen_any = true;
+                *sum += v;
+            }
+            Self::ExecMeanFloat { sum, count } => {
+                *sum += v;
+                *count += 1;
+            }
+            _ => {}
         }
     }
 
     fn push_val(&mut self, v: Val) {
         match self {
             Self::Count(n) => *n += 1,
+            Self::CountDistinctInt(set) => {
+                if let Some(Val::Int(ref n)) = unwrap_opt_owned(v)
+                    && let Some(x) = n.to_i64()
+                {
+                    set.insert(x);
+                }
+            }
             Self::CountDistinct(set) => {
                 if let Some(inner) = unwrap_opt_owned(v) {
                     set.insert(SingleKey::new(inner));
                 }
             }
-            Self::SumInt { .. } => {
+            Self::SumInt { .. } | Self::ExecSumInt { .. } => {
                 if let Some(Val::Int(ref n)) = unwrap_opt_owned(v)
                     && let Some(x) = n.to_i64()
                 {
                     self.push_int_fast(x);
                 }
             }
-            Self::SumDec { .. } => {
+            Self::SumDec { .. } | Self::ExecSumDec { .. } | Self::ExecMeanDec { .. } => {
                 if let Some(Val::Decimal(ref d)) = unwrap_opt_owned(v)
                     && let Some(x) = d.to_i128()
                 {
                     self.push_dec_fast(x);
+                }
+            }
+            Self::ExecSumFloat { .. } => {
+                if let Some(Val::Float(f)) = unwrap_opt_owned(v) {
+                    self.push_float_fast(f.to_f64());
+                }
+            }
+            Self::ExecMeanFloat { .. } => {
+                if let Some(inner) = unwrap_opt_owned(v)
+                    && let Some(x) = val_to_f64_exec(&inner)
+                {
+                    self.push_float_fast(x);
                 }
             }
             Self::CollectVals(vs) => {
@@ -242,6 +447,7 @@ impl AggAcc {
     ) -> Result<Val, OpErr> {
         match self {
             Self::Count(n) => checked_int_usize(n),
+            Self::CountDistinctInt(set) => checked_int_usize(set.len()),
             Self::CountDistinct(set) => checked_int_usize(set.len()),
             Self::SumInt {
                 pos_sum,
@@ -314,6 +520,94 @@ impl AggAcc {
                     })?;
                 }
                 Ok(Val::Decimal(BigInt::from(acc)))
+            }
+            Self::ExecSumInt {
+                sum,
+                overflow,
+                seen_any,
+            } => {
+                if !seen_any {
+                    return Ok(Val::Int(BigInt::ZERO));
+                }
+                if let Some(big) = overflow {
+                    if big.in_int64_range() {
+                        Ok(Val::Int(big))
+                    } else {
+                        Err(OpErr::Stopped(Bug {
+                            kind: BugKind::IntOverflow,
+                            message: "sum Int64 overflow".to_string(),
+                        }))
+                    }
+                } else if let Ok(v) = i64::try_from(sum) {
+                    Ok(Val::Int(BigInt::from(v)))
+                } else {
+                    Err(OpErr::Stopped(Bug {
+                        kind: BugKind::IntOverflow,
+                        message: "sum Int64 overflow".to_string(),
+                    }))
+                }
+            }
+            Self::ExecSumDec {
+                sum,
+                overflow,
+                seen_any,
+            } => {
+                if !seen_any {
+                    return Ok(Val::Int(BigInt::ZERO));
+                }
+                if let Some(big) = overflow {
+                    if big.in_decimal_range() {
+                        Ok(Val::Decimal(big))
+                    } else {
+                        Err(OpErr::Stopped(Bug {
+                            kind: BugKind::DecimalOverflow,
+                            message: "sum Decimal overflow".to_string(),
+                        }))
+                    }
+                } else if (DEC_MIN..=DEC_MAX).contains(&sum) {
+                    Ok(Val::Decimal(BigInt::from(sum)))
+                } else {
+                    Err(OpErr::Stopped(Bug {
+                        kind: BugKind::DecimalOverflow,
+                        message: "sum Decimal overflow".to_string(),
+                    }))
+                }
+            }
+            Self::ExecSumFloat { sum, seen_any } => {
+                if !seen_any {
+                    Ok(Val::Int(BigInt::ZERO))
+                } else {
+                    Ok(Val::Float(Float64::from_f64(sum)))
+                }
+            }
+            Self::ExecMeanFloat { sum, count } => {
+                if count == 0 {
+                    Ok(Val::OptNone)
+                } else {
+                    Ok(Val::OptSome(Box::new(Val::Float(Float64::from_f64(
+                        sum / (count as f64),
+                    )))))
+                }
+            }
+            Self::ExecMeanDec {
+                sum,
+                overflow,
+                count,
+            } => {
+                if count == 0 {
+                    return Ok(Val::OptNone);
+                }
+                let q = if let Some(big) = overflow {
+                    let denom = BigInt::from(count);
+                    if big.is_negative() {
+                        -big.abs().div_euclid(&denom).unwrap_or(BigInt::ZERO)
+                    } else {
+                        big.div_euclid(&denom).unwrap_or(BigInt::ZERO)
+                    }
+                } else {
+                    BigInt::from(sum / (count as i128))
+                };
+                Ok(Val::OptSome(Box::new(Val::Decimal(q))))
             }
             Self::Min(opt)
             | Self::Max(opt)
@@ -612,19 +906,31 @@ fn finalize_exec_vals(op: AggOp, non_null: &[Val], _row_count: usize) -> Result<
     }
 }
 
-/// Per-batch evaluated aggregate inputs (one evaluated `Column` per agg that has an `arg_prog`).
+/// Source for one aggregate argument inside a batch — avoids cloning bare column inputs!
+enum AggArgSource {
+    None,
+    BatchCol(usize),
+    Computed(Column),
+}
+
+/// Per-batch evaluated aggregate inputs.
 struct EvalBatchAggInputs {
     batch: Batch,
-    arg_cols: Vec<Option<Column>>,
-    /// If any agg arg expression stopped on a row in this batch, we store the per-agg
-    /// earliest error per row ONLY when needed; fast path stores `None` when clean!
+    arg_cols: Vec<AggArgSource>,
     arg_errors: Vec<Option<(usize, OpErr)>>,
 }
 
-/// Evaluate an agg arg expression cleanly across all active rows of `batch`.
-/// Returns `Ok(col)` if all active rows succeeded, or if an error occurred, computes
-/// per-row values/errors so `CoreV01` can report the **exact** stop from the earliest
-/// sorted group key and earliest agg index!
+impl EvalBatchAggInputs {
+    #[inline]
+    fn arg_col(&self, ai: usize) -> Option<&Column> {
+        match &self.arg_cols[ai] {
+            AggArgSource::None => None,
+            AggArgSource::BatchCol(ci) => Some(&self.batch.cols[*ci]),
+            AggArgSource::Computed(col) => Some(col),
+        }
+    }
+}
+
 fn eval_batch_agg_args(
     batch: Batch,
     aggs: &[CompiledAgg],
@@ -635,23 +941,36 @@ fn eval_batch_agg_args(
     for a in aggs {
         match &a.arg_prog {
             None => {
-                arg_cols.push(None);
+                arg_cols.push(AggArgSource::None);
                 arg_errors.push(None);
             }
-            Some(rp) => match eval_row_program(rp, &batch, host) {
-                Ok(reg) => {
-                    arg_cols.push(Some(reg.into_column(ColSpec::default(), batch.len)));
+            Some(rp) => {
+                // Zero-copy fast path for bare column references (`sum(.col)`, `mean(.col)`).
+                if let [RowInstr::LoadCol { dst, name }] = rp.instrs.as_slice()
+                    && *dst == rp.result_reg
+                    && let Some(ci) = batch.find_col_idx(name)
+                {
+                    arg_cols.push(AggArgSource::BatchCol(ci));
                     arg_errors.push(None);
+                    continue;
                 }
-                Err(err) => {
-                    let lane = match &err {
-                        crate::vm::expr::RowEvalErr::Stopped { lane, .. } => *lane,
-                        crate::vm::expr::RowEvalErr::Failed(_) => 0,
-                    };
-                    arg_cols.push(None);
-                    arg_errors.push(Some((lane, OpErr::from(err))));
+                match eval_row_program(rp, &batch, host) {
+                    Ok(reg) => {
+                        arg_cols.push(AggArgSource::Computed(
+                            reg.into_column(ColSpec::default(), batch.len),
+                        ));
+                        arg_errors.push(None);
+                    }
+                    Err(err) => {
+                        let lane = match &err {
+                            crate::vm::expr::RowEvalErr::Stopped { lane, .. } => *lane,
+                            crate::vm::expr::RowEvalErr::Failed(_) => 0,
+                        };
+                        arg_cols.push(AggArgSource::None);
+                        arg_errors.push(Some((lane, OpErr::from(err))));
+                    }
                 }
-            },
+            }
         }
     }
     Ok(EvalBatchAggInputs {
@@ -661,12 +980,66 @@ fn eval_batch_agg_args(
     })
 }
 
+fn col_data_agg_kind(data: &ColumnData) -> AggColKind {
+    match data {
+        ColumnData::Int(_) => AggColKind::Int,
+        ColumnData::Decimal(_) => AggColKind::Decimal,
+        ColumnData::Float(_) => AggColKind::Float,
+        _ => AggColKind::Other,
+    }
+}
+
+fn detect_agg_col_kinds(evaluated: &[EvalBatchAggInputs], n_aggs: usize) -> Vec<AggColKind> {
+    let mut kinds = Vec::with_capacity(n_aggs);
+    for ai in 0..n_aggs {
+        let mut unified: Option<AggColKind> = None;
+        for eb in evaluated {
+            if eb.batch.is_empty() {
+                continue;
+            }
+            let Some(col) = eb.arg_col(ai) else {
+                unified = Some(AggColKind::Other);
+                break;
+            };
+            let k = col_data_agg_kind(&col.data);
+            match unified {
+                None => unified = Some(k),
+                Some(prev) if prev == k => {}
+                Some(_) => {
+                    unified = Some(AggColKind::Other);
+                    break;
+                }
+            }
+        }
+        kinds.push(unified.unwrap_or(AggColKind::Other));
+    }
+    kinds
+}
+
+fn detect_batch_col_kind(evaluated: &[EvalBatchAggInputs], col_idx: usize) -> AggColKind {
+    let mut unified: Option<AggColKind> = None;
+    for eb in evaluated {
+        if eb.batch.is_empty() {
+            continue;
+        }
+        let k = col_data_agg_kind(&eb.batch.cols[col_idx].data);
+        match unified {
+            None => unified = Some(k),
+            Some(prev) if prev == k => {}
+            Some(_) => return AggColKind::Other,
+        }
+    }
+    unified.unwrap_or(AggColKind::Other)
+}
+
 /// Group-level state inside a radix partition.
 struct GroupState {
     key: KeyTuple,
+    exemplar_bi: u32,
+    exemplar_ri: u16,
     first_seen_order: usize,
     row_count: usize,
-    distinct_set: Option<HashSet<SingleKey>>,
+    distinct_tracker: Option<DistinctTracker>,
     accs: Vec<AggAcc>,
     /// Retained only if an Int/Dec sum enters near-overflow fallback.
     fallback_vals: Vec<Option<Vec<Val>>>,
@@ -710,7 +1083,7 @@ pub fn op_hash_aggregate(
         }
         let mut cells = Vec::with_capacity(aggs.len());
         for a in aggs {
-            let acc = AggAcc::new(a.op, &a.out_spec.ty, mode);
+            let acc = AggAcc::new(a.op, &a.out_spec.ty, AggColKind::Other, mode);
             cells.push(acc.finalize(a.op, &a.out_spec.ty, mode, 0, None)?);
         }
         let row = TableRow {
@@ -751,29 +1124,32 @@ pub fn op_hash_aggregate(
         return resolve_agg_with_arg_errors(&evaluated, &g_idxs, aggs, host, mode);
     }
 
+    let arg_col_kinds = detect_agg_col_kinds(&evaluated, aggs.len());
+    let dk_kind = dk_idx.map_or(AggColKind::Other, |ci| {
+        detect_batch_col_kind(&evaluated, ci)
+    });
+
     // Check if we can use the fast streaming ungrouped path (0 group keys).
     if group_keys.is_empty() {
         let mut accs: Vec<AggAcc> = aggs
             .iter()
-            .map(|a| AggAcc::new(a.op, &a.out_spec.ty, mode))
+            .zip(&arg_col_kinds)
+            .map(|(a, &ck)| AggAcc::new(a.op, &a.out_spec.ty, ck, mode))
             .collect();
-        let mut distinct_set = dk_idx.map(|_| HashSet::<SingleKey>::new());
+        let mut distinct_tracker = dk_idx.map(|_| DistinctTracker::new(dk_kind));
         let mut row_count = 0usize;
 
         for eb in &evaluated {
             let active = eb.batch.active_indices();
             row_count += active.len();
-            if let (Some(didx), Some(dset)) = (dk_idx, &mut distinct_set) {
+            if let (Some(didx), Some(dt)) = (dk_idx, &mut distinct_tracker) {
                 let dcol = &eb.batch.cols[didx];
                 for &r_u16 in &active {
-                    let v = dcol.get_val(usize::from(r_u16));
-                    if let Some(inner) = unwrap_opt_owned(v) {
-                        dset.insert(SingleKey::new(inner));
-                    }
+                    dt.push_cell(dcol, usize::from(r_u16));
                 }
             }
             for (ai, acc) in accs.iter_mut().enumerate() {
-                feed_agg_column_slice(acc, eb.arg_cols[ai].as_ref(), &active);
+                feed_agg_column_slice(acc, eb.arg_col(ai), &active);
             }
         }
 
@@ -791,7 +1167,7 @@ pub fn op_hash_aggregate(
             let fb = if needs_fallback {
                 let mut vs = Vec::with_capacity(row_count);
                 for eb in &evaluated {
-                    if let Some(col) = &eb.arg_cols[ai] {
+                    if let Some(col) = eb.arg_col(ai) {
                         for &r_u16 in &eb.batch.active_indices() {
                             vs.push(col.get_val(usize::from(r_u16)));
                         }
@@ -807,7 +1183,7 @@ pub fn op_hash_aggregate(
             cells,
             group_meta: Some(GroupMeta {
                 row_count,
-                distinct_count: distinct_set.map(|s| s.len()),
+                distinct_count: distinct_tracker.map(|d| d.len()),
             }),
         };
         return Ok(VmTable {
@@ -827,9 +1203,12 @@ pub fn op_hash_aggregate(
     };
     let part_mask = num_parts - 1;
 
-    // Partition `(batch_idx, row_u16, global_row_order)` into `num_parts` radix buckets.
-    // Note: each bucket preserves exact global row order (so `First` / `Last` are 100% deterministic!).
-    let mut part_rows: Vec<Vec<(u32, u16, usize)>> = vec![Vec::new(); num_parts];
+    // Partition `(batch_idx, row_u16, global_row_order, key_hash)` into `num_parts` radix buckets.
+    // Note: each bucket preserves exact global row order (so `First` / `Last` / float sum are 100% deterministic!).
+    let cap_per_part = (total_rows / num_parts).saturating_add(64);
+    let mut part_rows: Vec<Vec<(u32, u16, usize, u64)>> = (0..num_parts)
+        .map(|_| Vec::with_capacity(cap_per_part))
+        .collect();
     let mut global_order = 0usize;
     for (bi, eb) in evaluated.iter().enumerate() {
         let active = eb.batch.active_indices();
@@ -837,7 +1216,7 @@ pub fn op_hash_aggregate(
             let ri = usize::from(r_u16);
             let h = hash_row_key(&eb.batch.cols, &g_idxs, ri);
             let p = (h as usize) & part_mask;
-            part_rows[p].push((bi as u32, r_u16, global_order));
+            part_rows[p].push((bi as u32, r_u16, global_order, h));
             global_order += 1;
         }
     }
@@ -854,7 +1233,9 @@ pub fn op_hash_aggregate(
                 &evaluated,
                 &g_idxs,
                 dk_idx,
+                dk_kind,
                 aggs,
+                &arg_col_kinds,
                 mode,
             ))
         },
@@ -903,55 +1284,83 @@ pub fn op_hash_aggregate(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Partition worker receives pre-evaluated columnar batches, key indices, and detected column types"
+)]
 fn aggregate_partition(
-    rows_in_part: &[(u32, u16, usize)],
+    rows_in_part: &[(u32, u16, usize, u64)],
     evaluated: &[EvalBatchAggInputs],
     g_idxs: &[usize],
     dk_idx: Option<usize>,
+    dk_kind: AggColKind,
     aggs: &[CompiledAgg],
+    arg_col_kinds: &[AggColKind],
     mode: VmMode,
 ) -> PartAggResult {
-    let mut group_map: HashMap<KeyTuple, usize> = HashMap::new();
+    // Zero-allocation group lookup: hash -> candidate group indices compared directly via
+    // `eq_col_cells` against each group's stored exemplar `(exemplar_bi, exemplar_ri)`.
+    let mut group_buckets: FastMap<u64, Vec<usize>> = FastMap::default();
     let mut groups: Vec<GroupState> = Vec::new();
 
-    for &(bi_u32, r_u16, g_ord) in rows_in_part {
+    for &(bi_u32, r_u16, g_ord, h) in rows_in_part {
         let bi = bi_u32 as usize;
         let ri = usize::from(r_u16);
         let eb = &evaluated[bi];
-        let key_vals: Vec<Val> = g_idxs
-            .iter()
-            .map(|&ci| eb.batch.cols[ci].get_val(ri))
-            .collect();
-        let kt = KeyTuple::new(key_vals);
-        let g_slot = if let Some(&idx) = group_map.get(&kt) {
-            idx
+
+        let mut found_slot: Option<usize> = None;
+        if let Some(cands) = group_buckets.get(&h) {
+            for &slot in cands {
+                let g = &groups[slot];
+                let ex_eb = &evaluated[g.exemplar_bi as usize];
+                let ex_ri = usize::from(g.exemplar_ri);
+                if g_idxs
+                    .iter()
+                    .all(|&ci| eq_col_cells(&ex_eb.batch.cols[ci], ex_ri, &eb.batch.cols[ci], ri))
+                {
+                    found_slot = Some(slot);
+                    break;
+                }
+            }
+        }
+
+        let g_slot = if let Some(slot) = found_slot {
+            slot
         } else {
-            let idx = groups.len();
-            group_map.insert(kt.clone(), idx);
+            let slot = groups.len();
+            let key_vals: Vec<Val> = g_idxs
+                .iter()
+                .map(|&ci| eb.batch.cols[ci].get_val(ri))
+                .collect();
+            let kt = KeyTuple {
+                vals: key_vals,
+                hash: h,
+            };
+            group_buckets.entry(h).or_default().push(slot);
             groups.push(GroupState {
                 key: kt,
+                exemplar_bi: bi_u32,
+                exemplar_ri: r_u16,
                 first_seen_order: g_ord,
                 row_count: 0,
-                distinct_set: dk_idx.map(|_| HashSet::new()),
+                distinct_tracker: dk_idx.map(|_| DistinctTracker::new(dk_kind)),
                 accs: aggs
                     .iter()
-                    .map(|a| AggAcc::new(a.op, &a.out_spec.ty, mode))
+                    .zip(arg_col_kinds)
+                    .map(|(a, &ck)| AggAcc::new(a.op, &a.out_spec.ty, ck, mode))
                     .collect(),
                 fallback_vals: vec![None; aggs.len()],
             });
-            idx
+            slot
         };
 
         let g = &mut groups[g_slot];
         g.row_count += 1;
-        if let (Some(didx), Some(dset)) = (dk_idx, &mut g.distinct_set) {
-            let dv = eb.batch.cols[didx].get_val(ri);
-            if let Some(inner) = unwrap_opt_owned(dv) {
-                dset.insert(SingleKey::new(inner));
-            }
+        if let (Some(didx), Some(dt)) = (dk_idx, &mut g.distinct_tracker) {
+            dt.push_cell(&eb.batch.cols[didx], ri);
         }
         for (ai, acc) in g.accs.iter_mut().enumerate() {
-            match &eb.arg_cols[ai] {
+            match eb.arg_col(ai) {
                 None => acc.push_val(Val::Unit),
                 Some(col) => feed_agg_single_cell(acc, col, ri),
             }
@@ -979,12 +1388,12 @@ fn aggregate_partition(
         })
     });
     if any_need_fb {
-        // Rebuild key->sorted_slot map and collect exact raw values for those near-overflow groups.
-        let mut sorted_map: HashMap<KeyTuple, usize> = HashMap::with_capacity(groups.len());
+        let mut sorted_map: FastMap<KeyTuple, usize> =
+            FastMap::with_capacity_and_hasher(groups.len(), BuildHasherDefault::default());
         for (idx, g) in groups.iter().enumerate() {
             sorted_map.insert(g.key.clone(), idx);
         }
-        for &(bi_u32, r_u16, _) in rows_in_part {
+        for &(bi_u32, r_u16, _, _) in rows_in_part {
             let eb = &evaluated[bi_u32 as usize];
             let ri = usize::from(r_u16);
             let kv: Vec<Val> = g_idxs
@@ -993,8 +1402,8 @@ fn aggregate_partition(
                 .collect();
             if let Some(&idx) = sorted_map.get(&KeyTuple::new(kv)) {
                 let g = &mut groups[idx];
-                for (ai, col_opt) in eb.arg_cols.iter().enumerate() {
-                    if let Some(col) = col_opt {
+                for ai in 0..aggs.len() {
+                    if let Some(col) = eb.arg_col(ai) {
                         g.fallback_vals[ai]
                             .get_or_insert_with(Vec::new)
                             .push(col.get_val(ri));
@@ -1021,7 +1430,7 @@ fn aggregate_partition(
         }
         let gm = GroupMeta {
             row_count: g.row_count,
-            distinct_count: g.distinct_set.map(|s| s.len()),
+            distinct_count: g.distinct_tracker.map(|d| d.len()),
         };
         out.push((
             g.key,
@@ -1038,19 +1447,47 @@ fn aggregate_partition(
 #[inline]
 fn feed_agg_single_cell(acc: &mut AggAcc, col: &Column, row: usize) {
     match acc {
-        AggAcc::Count(n) => *n += 1,
-        AggAcc::SumInt { .. } if col.validity.is_none() => {
+        AggAcc::Count(n) => {
+            *n += 1;
+        }
+        AggAcc::CountDistinctInt(_) | AggAcc::SumInt { .. } | AggAcc::ExecSumInt { .. } => {
+            if col.validity.as_ref().is_some_and(|bm| !bm.is_valid(row)) {
+                return;
+            }
             if let ColumnData::Int(vs) = &col.data {
                 acc.push_int_fast(vs[row]);
             } else {
                 acc.push_val(col.get_val(row));
             }
         }
-        AggAcc::SumDec { .. } if col.validity.is_none() => {
+        AggAcc::SumDec { .. } | AggAcc::ExecSumDec { .. } | AggAcc::ExecMeanDec { .. } => {
+            if col.validity.as_ref().is_some_and(|bm| !bm.is_valid(row)) {
+                return;
+            }
             if let ColumnData::Decimal(vs) = &col.data {
                 acc.push_dec_fast(vs[row]);
             } else {
                 acc.push_val(col.get_val(row));
+            }
+        }
+        AggAcc::ExecSumFloat { .. } => {
+            if col.validity.as_ref().is_some_and(|bm| !bm.is_valid(row)) {
+                return;
+            }
+            if let ColumnData::Float(vs) = &col.data {
+                acc.push_float_fast(f64::from_bits(vs[row]));
+            } else {
+                acc.push_val(col.get_val(row));
+            }
+        }
+        AggAcc::ExecMeanFloat { .. } => {
+            if col.validity.as_ref().is_some_and(|bm| !bm.is_valid(row)) {
+                return;
+            }
+            match &col.data {
+                ColumnData::Float(vs) => acc.push_float_fast(f64::from_bits(vs[row])),
+                ColumnData::Int(vs) => acc.push_int_fast(vs[row]),
+                _ => acc.push_val(col.get_val(row)),
             }
         }
         _ => acc.push_val(col.get_val(row)),
@@ -1066,14 +1503,73 @@ fn feed_agg_column_slice(acc: &mut AggAcc, col_opt: Option<&Column>, active: &[u
     };
     match (acc, &col.data, &col.validity) {
         (AggAcc::Count(n), _, _) => *n += active.len(),
-        (acc @ AggAcc::SumInt { .. }, ColumnData::Int(vs), None) => {
+        (
+            acc @ (AggAcc::SumInt { .. }
+            | AggAcc::ExecSumInt { .. }
+            | AggAcc::CountDistinctInt(_)
+            | AggAcc::ExecMeanFloat { .. }),
+            ColumnData::Int(vs),
+            None,
+        ) => {
             for &l in active {
                 acc.push_int_fast(vs[usize::from(l)]);
             }
         }
-        (acc @ AggAcc::SumDec { .. }, ColumnData::Decimal(vs), None) => {
+        (
+            acc @ (AggAcc::SumInt { .. }
+            | AggAcc::ExecSumInt { .. }
+            | AggAcc::CountDistinctInt(_)
+            | AggAcc::ExecMeanFloat { .. }),
+            ColumnData::Int(vs),
+            Some(bm),
+        ) => {
+            for &l in active {
+                let r = usize::from(l);
+                if bm.is_valid(r) {
+                    acc.push_int_fast(vs[r]);
+                }
+            }
+        }
+        (
+            acc @ (AggAcc::SumDec { .. } | AggAcc::ExecSumDec { .. } | AggAcc::ExecMeanDec { .. }),
+            ColumnData::Decimal(vs),
+            None,
+        ) => {
             for &l in active {
                 acc.push_dec_fast(vs[usize::from(l)]);
+            }
+        }
+        (
+            acc @ (AggAcc::SumDec { .. } | AggAcc::ExecSumDec { .. } | AggAcc::ExecMeanDec { .. }),
+            ColumnData::Decimal(vs),
+            Some(bm),
+        ) => {
+            for &l in active {
+                let r = usize::from(l);
+                if bm.is_valid(r) {
+                    acc.push_dec_fast(vs[r]);
+                }
+            }
+        }
+        (
+            acc @ (AggAcc::ExecSumFloat { .. } | AggAcc::ExecMeanFloat { .. }),
+            ColumnData::Float(vs),
+            None,
+        ) => {
+            for &l in active {
+                acc.push_float_fast(f64::from_bits(vs[usize::from(l)]));
+            }
+        }
+        (
+            acc @ (AggAcc::ExecSumFloat { .. } | AggAcc::ExecMeanFloat { .. }),
+            ColumnData::Float(vs),
+            Some(bm),
+        ) => {
+            for &l in active {
+                let r = usize::from(l);
+                if bm.is_valid(r) {
+                    acc.push_float_fast(f64::from_bits(vs[r]));
+                }
             }
         }
         (acc, _, _) => {

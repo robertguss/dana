@@ -13,10 +13,14 @@
 pub mod profile;
 
 use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 
+use crate::core::bigint::DEC_SCALE;
 use crate::core::syntax::{AggKind, ColSpec, ScalarTy, TagSet};
 use crate::oracle::value::{TableRow, TableVal, Val, unwrap_numeric_float};
-use crate::vm::key::SingleKey;
+use crate::vm::batch::{Column, ColumnData};
+use crate::vm::key::{FastHasher, SingleKey, eq_col_cells, hash_col_cell};
+use crate::vm::ops::VmTable;
 
 /// Result of a simple OLS linear regression `y = slope * x + intercept`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -805,5 +809,420 @@ pub fn detect_outliers_table(
     Ok(TableVal {
         cols: out_cols,
         rows: out_rows,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Direct Columnar Analytics Wrappers over `&VmTable` (Zero `TableVal` Boxing)
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn extract_col_f64_at(col: &Column, row: usize) -> Option<f64> {
+    if col.validity.as_ref().is_some_and(|bm| !bm.is_valid(row)) {
+        return None;
+    }
+    match &col.data {
+        ColumnData::Float(vs) => Some(f64::from_bits(vs[row])),
+        ColumnData::Int(vs) => Some(vs[row] as f64),
+        ColumnData::Decimal(vs) => Some((vs[row] as f64) / (DEC_SCALE as f64)),
+        ColumnData::Generic(vs) => unwrap_numeric_float(&vs[row]),
+        _ => None,
+    }
+}
+
+/// Extract aligned finite `(x, y)` numeric pairs directly from columnar [`VmTable`] batches.
+pub fn extract_numeric_pairs_vm(
+    vm: &VmTable,
+    col_x: &str,
+    col_y: &str,
+) -> Result<(Vec<f64>, Vec<f64>), String> {
+    let ix = vm
+        .find_col_idx(col_x)
+        .ok_or_else(|| format!("missing column `{col_x}`"))?;
+    let iy = vm
+        .find_col_idx(col_y)
+        .ok_or_else(|| format!("missing column `{col_y}`"))?;
+    let total = vm.total_rows();
+    let mut xs = Vec::with_capacity(total);
+    let mut ys = Vec::with_capacity(total);
+
+    for b in &vm.batches {
+        if b.is_empty() {
+            continue;
+        }
+        let cx = &b.cols[ix];
+        let cy = &b.cols[iy];
+        // Fast unboxed path for dense non-null Float64 columns (common analytics hot path).
+        if b.selection.is_none()
+            && cx.validity.is_none()
+            && cy.validity.is_none()
+            && let (ColumnData::Float(fx), ColumnData::Float(fy)) = (&cx.data, &cy.data)
+        {
+            for (&bx, &by) in fx.iter().zip(fy).take(b.len) {
+                let x = f64::from_bits(bx);
+                let y = f64::from_bits(by);
+                if x.is_finite() && y.is_finite() {
+                    xs.push(x);
+                    ys.push(y);
+                }
+            }
+            continue;
+        }
+        for &r_u16 in &b.active_indices() {
+            let r = usize::from(r_u16);
+            if let (Some(x), Some(y)) = (extract_col_f64_at(cx, r), extract_col_f64_at(cy, r))
+                && x.is_finite()
+                && y.is_finite()
+            {
+                xs.push(x);
+                ys.push(y);
+            }
+        }
+    }
+    Ok((xs, ys))
+}
+
+/// Extract finite numeric column values directly from a columnar [`VmTable`], skipping nulls.
+pub fn extract_numeric_col_vm(vm: &VmTable, col: &str) -> Result<Vec<f64>, String> {
+    let idx = vm
+        .find_col_idx(col)
+        .ok_or_else(|| format!("missing column `{col}`"))?;
+    let mut vals = Vec::with_capacity(vm.total_rows());
+    for b in &vm.batches {
+        if b.is_empty() {
+            continue;
+        }
+        let c = &b.cols[idx];
+        if b.selection.is_none() && c.validity.is_none() {
+            match &c.data {
+                ColumnData::Float(vs) => {
+                    for &bits in vs.iter().take(b.len) {
+                        let x = f64::from_bits(bits);
+                        if x.is_finite() {
+                            vals.push(x);
+                        }
+                    }
+                    continue;
+                }
+                ColumnData::Int(vs) => {
+                    for &v in vs.iter().take(b.len) {
+                        vals.push(v as f64);
+                    }
+                    continue;
+                }
+                ColumnData::Decimal(vs) => {
+                    let scale_f = DEC_SCALE as f64;
+                    for &v in vs.iter().take(b.len) {
+                        let x = (v as f64) / scale_f;
+                        if x.is_finite() {
+                            vals.push(x);
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        for &r_u16 in &b.active_indices() {
+            if let Some(x) = extract_col_f64_at(c, usize::from(r_u16))
+                && x.is_finite()
+            {
+                vals.push(x);
+            }
+        }
+    }
+    Ok(vals)
+}
+
+/// Direct columnar Pearson correlation over `&VmTable`.
+pub fn pearson_corr_vm_table(
+    vm: &VmTable,
+    col_x: &str,
+    col_y: &str,
+) -> Result<Option<f64>, String> {
+    let (xs, ys) = extract_numeric_pairs_vm(vm, col_x, col_y)?;
+    Ok(pearson_corr(&xs, &ys))
+}
+
+/// Direct columnar Spearman rank correlation over `&VmTable`.
+pub fn spearman_corr_vm_table(
+    vm: &VmTable,
+    col_x: &str,
+    col_y: &str,
+) -> Result<Option<f64>, String> {
+    let (xs, ys) = extract_numeric_pairs_vm(vm, col_x, col_y)?;
+    Ok(spearman_corr(&xs, &ys))
+}
+
+/// Direct columnar OLS simple linear regression over `&VmTable`.
+pub fn linear_regression_vm_table(
+    vm: &VmTable,
+    col_x: &str,
+    col_y: &str,
+) -> Result<Option<LinearRegressionResult>, String> {
+    let (xs, ys) = extract_numeric_pairs_vm(vm, col_x, col_y)?;
+    Ok(linear_regression(&xs, &ys))
+}
+
+/// Direct columnar two-sample Welch t-test over two `&VmTable`s.
+pub fn welch_t_test_vm_tables(
+    a: &VmTable,
+    b: &VmTable,
+    col: &str,
+) -> Result<Option<WelchTTestResult>, String> {
+    let xa = extract_numeric_col_vm(a, col)?;
+    let xb = extract_numeric_col_vm(b, col)?;
+    Ok(welch_t_test(&xa, &xb))
+}
+
+/// Direct columnar Pearson chi-square test of independence over two categorical columns.
+pub fn chi_square_independence_vm_table(
+    vm: &VmTable,
+    col_x: &str,
+    col_y: &str,
+) -> Result<Option<ChiSquareResult>, String> {
+    let ix = vm
+        .find_col_idx(col_x)
+        .ok_or_else(|| format!("Stats.chi_square: missing column `{col_x}`"))?;
+    let iy = vm
+        .find_col_idx(col_y)
+        .ok_or_else(|| format!("Stats.chi_square: missing column `{col_y}`"))?;
+
+    let is_uniform_typed = |ci: usize| {
+        let mut first_disc: Option<(std::mem::Discriminant<ColumnData>, bool)> = None;
+        for b in &vm.batches {
+            if b.is_empty() {
+                continue;
+            }
+            let c = &b.cols[ci];
+            if matches!(c.data, ColumnData::Generic(_)) {
+                return false;
+            }
+            let tag = (std::mem::discriminant(&c.data), c.validity.is_some());
+            match first_disc {
+                None => first_disc = Some(tag),
+                Some(prev) if prev == tag => {}
+                Some(_) => return false,
+            }
+        }
+        true
+    };
+
+    if is_uniform_typed(ix) && is_uniform_typed(iy) {
+        type FastBucketMap =
+            HashMap<u64, Vec<(usize, usize, usize)>, BuildHasherDefault<FastHasher>>;
+        let mut x_buckets: FastBucketMap = FastBucketMap::default();
+        let mut y_buckets: FastBucketMap = FastBucketMap::default();
+        let mut next_x = 0usize;
+        let mut next_y = 0usize;
+        let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(vm.total_rows());
+
+        for (bi, b) in vm.batches.iter().enumerate() {
+            if b.is_empty() {
+                continue;
+            }
+            let cx = &b.cols[ix];
+            let cy = &b.cols[iy];
+            for &r_u16 in &b.active_indices() {
+                let r = usize::from(r_u16);
+                if cx.validity.as_ref().is_some_and(|bm| !bm.is_valid(r))
+                    || cy.validity.as_ref().is_some_and(|bm| !bm.is_valid(r))
+                {
+                    continue;
+                }
+                let mut hx = FastHasher::new();
+                hash_col_cell(cx, r, &mut hx);
+                let hxv = hx.finish_u64();
+                let xi = {
+                    let bucket = x_buckets.entry(hxv).or_default();
+                    if let Some(&(_, _, id)) = bucket
+                        .iter()
+                        .find(|&&(pbi, pri, _)| eq_col_cells(&vm.batches[pbi].cols[ix], pri, cx, r))
+                    {
+                        id
+                    } else {
+                        let id = next_x;
+                        next_x += 1;
+                        bucket.push((bi, r, id));
+                        id
+                    }
+                };
+                let mut hy = FastHasher::new();
+                hash_col_cell(cy, r, &mut hy);
+                let hyv = hy.finish_u64();
+                let yi = {
+                    let bucket = y_buckets.entry(hyv).or_default();
+                    if let Some(&(_, _, id)) = bucket
+                        .iter()
+                        .find(|&&(pbi, pri, _)| eq_col_cells(&vm.batches[pbi].cols[iy], pri, cy, r))
+                    {
+                        id
+                    } else {
+                        let id = next_y;
+                        next_y += 1;
+                        bucket.push((bi, r, id));
+                        id
+                    }
+                };
+                pairs.push((xi, yi));
+            }
+        }
+        if next_x < 2 || next_y < 2 {
+            return Ok(None);
+        }
+        let mut counts = vec![vec![0usize; next_y]; next_x];
+        for (xi, yi) in pairs {
+            counts[xi][yi] += 1;
+        }
+        return Ok(chi_square_contingency(&counts));
+    }
+
+    // Fallback for `ColumnData::Generic` or heterogeneous column batches.
+    let mut x_ids: HashMap<SingleKey, usize, BuildHasherDefault<FastHasher>> = HashMap::default();
+    let mut y_ids: HashMap<SingleKey, usize, BuildHasherDefault<FastHasher>> = HashMap::default();
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    for b in &vm.batches {
+        if b.is_empty() {
+            continue;
+        }
+        let cx = &b.cols[ix];
+        let cy = &b.cols[iy];
+        for &r_u16 in &b.active_indices() {
+            let r = usize::from(r_u16);
+            let raw_x = cx.get_val(r);
+            let raw_y = cy.get_val(r);
+            let Some(vx) = unwrap_non_null_val(&raw_x) else {
+                continue;
+            };
+            let Some(vy) = unwrap_non_null_val(&raw_y) else {
+                continue;
+            };
+            let next_x = x_ids.len();
+            let xi = *x_ids.entry(SingleKey::new(vx.clone())).or_insert(next_x);
+            let next_y = y_ids.len();
+            let yi = *y_ids.entry(SingleKey::new(vy.clone())).or_insert(next_y);
+            pairs.push((xi, yi));
+        }
+    }
+    let r_cnt = x_ids.len();
+    let c_cnt = y_ids.len();
+    if r_cnt < 2 || c_cnt < 2 {
+        return Ok(None);
+    }
+    let mut counts = vec![vec![0usize; c_cnt]; r_cnt];
+    for (xi, yi) in pairs {
+        counts[xi][yi] += 1;
+    }
+    Ok(chi_square_contingency(&counts))
+}
+
+/// Direct columnar Pearson chi-square goodness-of-fit test over `(observed, expected)` columns.
+pub fn chi_square_gof_vm_table(
+    vm: &VmTable,
+    observed_col: &str,
+    expected_col: &str,
+) -> Result<Option<ChiSquareResult>, String> {
+    let (obs, exp) = extract_numeric_pairs_vm(vm, observed_col, expected_col)
+        .map_err(|e| format!("Stats.chi_square: {e}"))?;
+    Ok(chi_square_gof(&obs, &exp))
+}
+
+/// Direct columnar outlier detection over `&VmTable`, appending an unboxed `ColumnData::Bool`
+/// column named `flag_col` stamped with `col.tags ∪ flag_tags` without materializing [`TableVal`].
+pub fn detect_outliers_vm_table(
+    vm: &VmTable,
+    col: &str,
+    method: OutlierMethod,
+    threshold: f64,
+    flag_col: &str,
+    flag_tags: &TagSet,
+) -> Result<VmTable, String> {
+    let idx = vm
+        .find_col_idx(col)
+        .ok_or_else(|| format!("Stats.outliers: missing column `{col}`"))?;
+
+    let non_null_vals = extract_numeric_col_vm(vm, col)?;
+
+    enum Rule {
+        AlwaysFalse,
+        ZScore { mu: f64, s: f64, thresh: f64 },
+        Iqr { lo: f64, hi: f64 },
+    }
+
+    let rule = if non_null_vals.len() < 2 || !threshold.is_finite() {
+        Rule::AlwaysFalse
+    } else {
+        match method {
+            OutlierMethod::ZScore => {
+                match (mean_f64(&non_null_vals), sample_stddev(&non_null_vals)) {
+                    (Some(mu), Some(s)) if s > 0.0 && s.is_finite() => Rule::ZScore {
+                        mu,
+                        s,
+                        thresh: threshold,
+                    },
+                    _ => Rule::AlwaysFalse,
+                }
+            }
+            OutlierMethod::Iqr => {
+                let mut sorted = non_null_vals;
+                sorted.sort_by(f64::total_cmp);
+                match (
+                    quantile_sorted(&sorted, 0.25),
+                    quantile_sorted(&sorted, 0.75),
+                ) {
+                    (Some(q1), Some(q3)) => {
+                        let iqr = q3 - q1;
+                        Rule::Iqr {
+                            lo: q1 - threshold * iqr,
+                            hi: q3 + threshold * iqr,
+                        }
+                    }
+                    _ => Rule::AlwaysFalse,
+                }
+            }
+        }
+    };
+
+    let eff_tags = vm.cols[idx].tags.union(flag_tags);
+    let flag_spec = ColSpec {
+        name: flag_col.to_string(),
+        ty: ScalarTy::Bool,
+        tags: eff_tags,
+        bucketed: false,
+        agg_kind: AggKind::Raw,
+    };
+    let mut out_cols = vm.cols.clone();
+    out_cols.push(flag_spec.clone());
+
+    let mut out_batches = Vec::with_capacity(vm.batches.len());
+    for b in &vm.batches {
+        let mut out_b = b.clone();
+        let mut flags = vec![0u8; b.len];
+        if !matches!(rule, Rule::AlwaysFalse) {
+            let src = &b.cols[idx];
+            for &r_u16 in &b.active_indices() {
+                let r = usize::from(r_u16);
+                let is_out = extract_col_f64_at(src, r).is_some_and(|x| {
+                    x.is_finite()
+                        && match rule {
+                            Rule::AlwaysFalse => false,
+                            Rule::ZScore { mu, s, thresh } => ((x - mu).abs() / s) >= thresh,
+                            Rule::Iqr { lo, hi } => x < lo || x > hi,
+                        }
+                });
+                flags[r] = u8::from(is_out);
+            }
+        }
+        out_b.cols.push(Column {
+            spec: flag_spec.clone(),
+            data: ColumnData::Bool(flags),
+            validity: None,
+        });
+        out_batches.push(out_b);
+    }
+
+    Ok(VmTable {
+        cols: out_cols,
+        batches: out_batches,
     })
 }

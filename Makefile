@@ -2,7 +2,7 @@ CC ?= gcc
 BISON ?= bison
 CFLAGS ?= -std=c17 -Wall -Wextra -Werror -O2
 
-.PHONY: grammar formal oracle test-parser-parity test-examples test-db test-phase4 test-diff fuzz-parsers fuzz-soak soak learnability bench check-all check-v03 clean
+.PHONY: grammar formal oracle test-parser-parity test-examples test-db test-phase4 test-v04 test-diff fuzz-parsers fuzz-soak soak learnability bench check-all check-v03 check-v04 clean
 
 build/dana.tab.c build/dana.tab.h: grammar/dana.y
 	mkdir -p build
@@ -55,6 +55,9 @@ test-db:
 test-phase4:
 	cargo test --test phase4a_formats_https --test phase4b_stats_viz --test phase4c_repl_vendor_e2e
 
+test-v04:
+	cargo test --test v04_columnar_io
+
 test-diff:
 	cargo test --test differential_vm --test differential_sql --test differential_lean
 
@@ -76,6 +79,8 @@ bench:
 check-all: grammar formal oracle
 
 check-v03: grammar formal oracle fuzz-parsers fuzz-soak learnability
+
+check-v04: grammar formal oracle fuzz-parsers fuzz-soak learnability
 
 clean:
 	rm -rf build

@@ -209,7 +209,7 @@ pub fn eval_exec_plan_vm(
         bridge,
         true,
     )?;
-    Ok(Val::Table(out_tbl.into_table_val()))
+    Ok(Val::Columnar(Arc::new(out_tbl)))
 }
 
 fn collect_exec_source_db_caps<'a>(plan: &'a ExecPlan, out: &mut Vec<&'a ExecExpr>) {
@@ -340,16 +340,27 @@ fn eval_exec_plan_to_table(
             } else if let ExecExpr::Var(name) = e.as_ref()
                 && let Some(val) = env.get(name)
             {
-                let Val::Table(tv) = val.as_ref() else {
-                    return Err(OpErr::Failed("plan did not evaluate to Table".to_string()));
-                };
-                VmTable::from_table_val(tv, cfg.batch_size)
+                match val.as_ref() {
+                    Val::Columnar(vm_arc) => {
+                        // Fast-path `tbl |> limit(n)` directly on a shared columnar table
+                        // without cloning batches past `n`.
+                        if let Some(ExecPlan::Limit { n, .. }) = unary_stack.last() {
+                            let lim = n.to_u64().unwrap_or(0) as usize;
+                            unary_stack.pop();
+                            vm_arc.slice_first(lim)
+                        } else {
+                            vm_arc.as_ref().clone()
+                        }
+                    }
+                    Val::Table(tv) => VmTable::from_table_val(tv, cfg.batch_size),
+                    _ => return Err(OpErr::Failed("plan did not evaluate to Table".to_string())),
+                }
             } else {
                 let v = bridge.eval_outer_expr(e, env)?;
-                let Some(tv) = v.into_table() else {
+                let Some(vm) = v.into_vm_table(cfg.batch_size) else {
                     return Err(OpErr::Failed("plan did not evaluate to Table".to_string()));
                 };
-                VmTable::from_table_val(&tv, cfg.batch_size)
+                vm
             }
         }
         ExecPlan::SourceDB {
@@ -398,11 +409,53 @@ fn eval_exec_plan_to_table(
             on,
             suffixes,
         } => {
-            let lt =
-                eval_exec_plan_to_table(left, prog, env, preloaded, row_host, cfg, bridge, true)?;
-            let rt =
-                eval_exec_plan_to_table(right, prog, env, preloaded, row_host, cfg, bridge, true)?;
-            op_hash_join(*kind, lt, rt, on, suffixes, &TagSet::empty(), cfg)?
+            // Borrow `Val::Columnar` inputs directly from `env` without cloning full tables!
+            enum JoinInput<'a> {
+                Borrowed(&'a VmTable),
+                Owned(VmTable),
+            }
+            impl JoinInput<'_> {
+                fn as_table(&self) -> &VmTable {
+                    match self {
+                        Self::Borrowed(t) => t,
+                        Self::Owned(t) => t,
+                    }
+                }
+            }
+            let borrow_env_col = |side: &ExecPlan, pre: &[(Ident, VmTable)]| -> Option<&VmTable> {
+                if let ExecPlan::SourceExpr(e) = side
+                    && let ExecExpr::Var(name) = e.as_ref()
+                    && !pre.iter().any(|(k, _)| k == name)
+                    && let Some(val) = env.get(name)
+                    && let Val::Columnar(vm_arc) = val.as_ref()
+                {
+                    return Some(vm_arc.as_ref());
+                }
+                None
+            };
+            let lt = if let Some(b) = borrow_env_col(left, preloaded) {
+                JoinInput::Borrowed(b)
+            } else {
+                JoinInput::Owned(eval_exec_plan_to_table(
+                    left, prog, env, preloaded, row_host, cfg, bridge, true,
+                )?)
+            };
+            let rt = if let Some(b) = borrow_env_col(right, preloaded) {
+                JoinInput::Borrowed(b)
+            } else {
+                JoinInput::Owned(eval_exec_plan_to_table(
+                    right, prog, env, preloaded, row_host, cfg, bridge, true,
+                )?)
+            };
+            op_hash_join(
+                *kind,
+                lt.as_table(),
+                rt.as_table(),
+                on,
+                suffixes,
+                &TagSet::empty(),
+                cfg,
+            )?
         }
         _ => {
             return Err(OpErr::Failed(
@@ -1007,7 +1060,7 @@ fn eval_core_plan_direct(
                 source_var,
                 source_slot,
             )?;
-            op_hash_join(*kind, lt, rt, on, suffixes, pc, cfg)
+            op_hash_join(*kind, &lt, &rt, on, suffixes, pc, cfg)
         }
         Plan::Union { left, right } => {
             let lt = eval_core_plan_direct(
@@ -1423,7 +1476,7 @@ fn eval_core_plan_to_table(
         } => {
             let lt = eval_core_plan_to_table(fuel_next, prog, env, pc, world, left, cfg)?;
             let rt = eval_core_plan_to_table(fuel_next, prog, env, pc, world, right, cfg)?;
-            op_hash_join(*kind, lt, rt, on, suffixes, pc, cfg).map_err(VmStep::boxed_op_err)
+            op_hash_join(*kind, &lt, &rt, on, suffixes, pc, cfg).map_err(VmStep::boxed_op_err)
         }
         Plan::Union { left, right } => {
             let lt = eval_core_plan_to_table(fuel_next, prog, env, pc, world, left, cfg)?;

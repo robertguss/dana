@@ -1,6 +1,6 @@
-# Dana Language Reference, v0.3
+# Dana Language Reference, v0.4
 
-**Version 0.3 (pre-1.0).** This is the complete, authoritative language reference for Dana,
+**Version 0.4 (pre-1.0).** This is the complete, authoritative language reference for Dana,
 embedded directly into `dana guide` for human authors and AI coding agents.
 
 Every rule is illustrated with real syntax checked by Dana's 0-conflict IELR(1) grammar
@@ -58,6 +58,11 @@ Key design rules:
   Indentation is purely stylistic (`dana format` uses 2 spaces).
 - **Zero friction on public data.** Schemas with no `[tag]` annotations carry empty tag sets
   and require no privacy boilerplate anywhere.
+- **Direct streaming-columnar I/O & vectorized VM.** By default (`dana run`), CSV/TSV
+  (`read_csv`, `read_tsv`) and Apache Parquet (`read_parquet`, `write_parquet`) stream directly
+  into and out of 2,048-row contiguous columnar batches (`VmTable`) — feeding relational
+  pipelines, inlined pure UDFs, `Stats.*`, `table.profile()`, and CSV/JSONL/Parquet writers
+  without row-oriented boxing while preserving 100% parity with `dana run --oracle`.
 - **Vectorized VM & SQL pushdown.** `dana run` compiles pipelines to Dana's 2,048-row
   vectorized columnar VM with automatic SQLite/PostgreSQL SQL pushdown and pure-UDF bytecode
   inlining (`dana run --oracle` executes the naive row-by-row reference oracle).

@@ -958,3 +958,46 @@ pub fn format_jsonl_table(tv: &TableVal) -> String {
     let _ = write_jsonl_table(&mut buf, tv);
     String::from_utf8(buf).unwrap_or_default()
 }
+
+/// Stream a columnar [`crate::vm::ops::VmTable`] directly as JSONL without materializing [`TableVal`].
+///
+/// # Errors
+/// Returns any underlying I/O error.
+pub fn write_jsonl_vm_table<W: Write>(
+    writer: &mut W,
+    vm: &crate::vm::ops::VmTable,
+) -> io::Result<()> {
+    let mut line = String::new();
+    let ncols = vm.cols.len();
+    for batch in &vm.batches {
+        if batch.is_empty() {
+            continue;
+        }
+        let active = batch.active_indices();
+        for &r_u16 in &active {
+            let r = usize::from(r_u16);
+            line.clear();
+            line.push('{');
+            for (ci, col) in vm.cols.iter().enumerate().take(ncols) {
+                if ci > 0 {
+                    line.push(',');
+                }
+                push_json_string(&mut line, &col.name);
+                line.push(':');
+                let cell = batch.cols[ci].get_val(r);
+                push_dana_val_as_json(&mut line, &cell);
+            }
+            line.push_str("}\n");
+            writer.write_all(line.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+/// Format a columnar [`crate::vm::ops::VmTable`] directly as JSONL text.
+#[must_use]
+pub fn format_jsonl_vm_table(vm: &crate::vm::ops::VmTable) -> String {
+    let mut buf = Vec::new();
+    let _ = write_jsonl_vm_table(&mut buf, vm);
+    String::from_utf8(buf).unwrap_or_default()
+}

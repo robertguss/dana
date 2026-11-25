@@ -416,8 +416,8 @@ fn bench_100k_rows_hash_join_agg_seq_vs_parallel() -> Result<(), String> {
     let run_pipeline = |cfg: &OpExecConfig, f: VmTable, d: VmTable| -> Result<VmTable, String> {
         let joined = op_hash_join(
             JoinKind::InnerManyToOne,
-            f,
-            d,
+            &f,
+            &d,
             &JoinOn::SameKeys(vec!["dept_id".into()]),
             &None,
             &TagSet::empty(),

@@ -3,6 +3,7 @@
 //! schema inference, and synthetic data generation.
 
 pub mod compress;
+pub mod constraint;
 pub mod crypto;
 pub mod csv;
 pub mod fake;

@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
+use std::hash::BuildHasherDefault;
 use std::io::{self, BufWriter, Cursor, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -20,11 +21,19 @@ use crate::formats::compress::{
     AutoDecodeReader, AutoEncodeWriter, CompressionKind, detect_compression_path,
     open_auto_decoded_file, strip_compression_ext,
 };
+use crate::formats::constraint::FastColConstraint;
 use crate::formats::crypto::hmac_sha256_pseudonym;
-use crate::formats::csv::{format_csv_table, read_csv_stream_with_schema, write_csv_table};
-use crate::formats::json::{format_jsonl_table, read_jsonl_stream_with_schema, write_jsonl_table};
+use crate::formats::csv::{
+    format_csv_table, format_csv_vm_table, read_csv_stream_to_vm_table,
+    read_csv_stream_with_schema, write_csv_table, write_csv_vm_table,
+};
+use crate::formats::json::{
+    format_jsonl_table, format_jsonl_vm_table, read_jsonl_stream_with_schema, write_jsonl_table,
+    write_jsonl_vm_table,
+};
 use crate::formats::parquet::{
-    ParquetCompression, read_parquet_bytes_with_schema, write_parquet_bytes,
+    ParquetCompression, read_parquet_bytes_to_vm_table, read_parquet_bytes_with_schema,
+    write_parquet_bytes, write_parquet_vm_table_bytes,
 };
 use crate::formats::time::{
     date_trunc_date, date_trunc_timestamp_duration, date_trunc_timestamp_unit, format_iso_date,
@@ -35,13 +44,16 @@ use crate::formats::xlsx::{read_xlsx_bytes_with_schema, write_xlsx_sheets};
 use crate::net::{HttpsClientConfig, JsonResponse, ParsedHttpsUrl, https_get_json};
 use crate::oracle::eval::{PrimResult, eval_literal, eval_prim_op, pseudonymize_token};
 use crate::oracle::value::{
-    Bug, CapHandle, GroupMeta, TableRow, TableVal, Val, render_decimal, render_public_val, val_cmp,
-    val_eq, val_list_eq, val_list_lt, val_lt,
+    Bug, CapHandle, GroupMeta, TableRow, TableVal, Val, render_decimal, render_decimal_i128_into,
+    render_public_val, val_cmp, val_eq, val_list_eq, val_list_lt, val_lt,
 };
 use crate::oracle::world::{
     FakeConsoleState, FakeDBState, FakeFilesState, FakeHttpsState, StoredTable, World,
 };
 use crate::runtime::ir::*;
+use crate::vm::batch::{Batch, Column, ColumnData, NullBitmap};
+use crate::vm::key::{FastHasher, eq_col_cells, hash_row_key};
+use crate::vm::ops::VmTable;
 
 const DEFAULT_FUEL: usize = 500_000;
 
@@ -1103,7 +1115,7 @@ impl<'a> Evaluator<'a> {
                                 | ExecHostOp::WriteJsonl
                         )
                         && let Some(tbl_arc) = cur_env.get(vname)
-                        && let Val::Table(tv) = tbl_arc.as_ref()
+                        && matches!(tbl_arc.as_ref(), Val::Table(_) | Val::Columnar(_))
                     {
                         let cap_v = match self.eval_expr(a0, cur_env) {
                             EvalOut::Ok(v) => v,
@@ -1133,8 +1145,8 @@ impl<'a> Evaluator<'a> {
                                 )))));
                             }
                             let full_rel = join_confined_path(root, rel);
-                            return match op {
-                                ExecHostOp::Core(HostOp::WriteParquet) => {
+                            return match (op, tbl_arc.as_ref()) {
+                                (ExecHostOp::Core(HostOp::WriteParquet), Val::Table(tv)) => {
                                     if matches!(handle, CapHandle::Real) && self.ew.dry_run {
                                         self.ew.world.stdout.push(format!(
                                             "[DRY-RUN] would write parquet \"{full_rel}\" ({} rows, {} cols)",
@@ -1153,7 +1165,29 @@ impl<'a> Evaluator<'a> {
                                         }
                                     }
                                 }
-                                ExecHostOp::WriteCsv => {
+                                (ExecHostOp::Core(HostOp::WriteParquet), Val::Columnar(vm)) => {
+                                    if matches!(handle, CapHandle::Real) && self.ew.dry_run {
+                                        self.ew.world.stdout.push(format!(
+                                            "[DRY-RUN] would write parquet \"{full_rel}\" ({} rows, {} cols)",
+                                            vm.total_rows(),
+                                            vm.cols.len()
+                                        ));
+                                        EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)))
+                                    } else {
+                                        match write_parquet_vm_table_bytes(
+                                            vm,
+                                            ParquetCompression::Zstd,
+                                        ) {
+                                            Ok(bytes) => {
+                                                self.write_confined_bytes(*handle, &full_rel, bytes)
+                                            }
+                                            Err(e) => {
+                                                EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e))))
+                                            }
+                                        }
+                                    }
+                                }
+                                (ExecHostOp::WriteCsv, Val::Table(tv)) => {
                                     let delim = if strip_compression_ext(rel).ends_with(".tsv") {
                                         b'\t'
                                     } else {
@@ -1166,12 +1200,33 @@ impl<'a> Evaluator<'a> {
                                         TableWriteFmt::Csv(delim),
                                     )
                                 }
-                                ExecHostOp::WriteJsonl => self.write_confined_table(
-                                    *handle,
-                                    &full_rel,
-                                    tv,
-                                    TableWriteFmt::Jsonl,
-                                ),
+                                (ExecHostOp::WriteCsv, Val::Columnar(vm)) => {
+                                    let delim = if strip_compression_ext(rel).ends_with(".tsv") {
+                                        b'\t'
+                                    } else {
+                                        b','
+                                    };
+                                    self.write_confined_vm_table(
+                                        *handle,
+                                        &full_rel,
+                                        vm,
+                                        TableWriteFmt::Csv(delim),
+                                    )
+                                }
+                                (ExecHostOp::WriteJsonl, Val::Table(tv)) => self
+                                    .write_confined_table(
+                                        *handle,
+                                        &full_rel,
+                                        tv,
+                                        TableWriteFmt::Jsonl,
+                                    ),
+                                (ExecHostOp::WriteJsonl, Val::Columnar(vm)) => self
+                                    .write_confined_vm_table(
+                                        *handle,
+                                        &full_rel,
+                                        vm,
+                                        TableWriteFmt::Jsonl,
+                                    ),
                                 _ => EvalOut::Failed("unexpected host write op".to_string()),
                             };
                         }
@@ -1254,48 +1309,103 @@ impl<'a> Evaluator<'a> {
 
     fn eval_promise(&mut self, ret_var: &str, promise: &ExecPromise, env: &RTEnv) -> EvalOut {
         match promise {
-            ExecPromise::UniqueCols(cols) => {
-                let Some(Val::Table(tv)) = env.get(ret_var).map(Arc::as_ref) else {
-                    return EvalOut::Failed("`promise unique` expected Table".to_string());
-                };
-                let idxs: Vec<usize> = cols
-                    .iter()
-                    .filter_map(|c| tv.cols.iter().position(|cs| cs.name == *c))
-                    .collect();
-                let mut seen: Vec<Vec<Val>> = Vec::with_capacity(tv.rows.len());
-                for row in &tv.rows {
-                    let key: Vec<Val> = idxs.iter().map(|&i| row.cells[i].clone()).collect();
-                    if seen.iter().any(|k| val_list_eq(k, &key)) {
-                        return EvalOut::Stopped(Bug {
-                            kind: BugKind::PromiseViolation,
-                            message: format!("`promise unique({cols:?})` violated"),
-                        });
-                    }
-                    seen.push(key);
-                }
-                EvalOut::Ok(Val::Unit)
-            }
-            ExecPromise::AllRows(pred) => {
-                let Some(Val::Table(tv)) = env.get(ret_var).map(Arc::as_ref) else {
-                    return EvalOut::Failed("`promise all` expected Table".to_string());
-                };
-                for row in &tv.rows {
-                    match self.eval_row_expr(pred, &tv.cols, &row.cells, env) {
-                        EvalOut::Ok(Val::Bool(true)) => {}
-                        EvalOut::Ok(Val::Bool(false)) => {
+            ExecPromise::UniqueCols(cols) => match env.get(ret_var).map(Arc::as_ref) {
+                Some(Val::Table(tv)) => {
+                    let idxs: Vec<usize> = cols
+                        .iter()
+                        .filter_map(|c| tv.cols.iter().position(|cs| cs.name == *c))
+                        .collect();
+                    let mut seen: Vec<Vec<Val>> = Vec::with_capacity(tv.rows.len());
+                    for row in &tv.rows {
+                        let key: Vec<Val> = idxs.iter().map(|&i| row.cells[i].clone()).collect();
+                        if seen.iter().any(|k| val_list_eq(k, &key)) {
                             return EvalOut::Stopped(Bug {
                                 kind: BugKind::PromiseViolation,
-                                message: "`promise all(...)` violated".to_string(),
+                                message: format!("`promise unique({cols:?})` violated"),
                             });
                         }
-                        EvalOut::Ok(_) => {
-                            return EvalOut::Failed("`promise all` returned non-Bool".to_string());
-                        }
-                        other => return other,
+                        seen.push(key);
                     }
+                    EvalOut::Ok(Val::Unit)
                 }
-                EvalOut::Ok(Val::Unit)
-            }
+                Some(Val::Columnar(vm)) => {
+                    let idxs: Vec<usize> = cols.iter().filter_map(|c| vm.find_col_idx(c)).collect();
+                    let mut seen: HashMap<u64, Vec<(u32, u16)>, BuildHasherDefault<FastHasher>> =
+                        HashMap::default();
+                    for (bi, b) in vm.batches.iter().enumerate() {
+                        for &r_u16 in &b.active_indices() {
+                            let ri = usize::from(r_u16);
+                            let h = hash_row_key(&b.cols, &idxs, ri);
+                            let bucket = seen.entry(h).or_default();
+                            if bucket.iter().any(|&(pbi, pri_u16)| {
+                                let pb = &vm.batches[pbi as usize];
+                                let pri = usize::from(pri_u16);
+                                idxs.iter()
+                                    .all(|&ci| eq_col_cells(&pb.cols[ci], pri, &b.cols[ci], ri))
+                            }) {
+                                return EvalOut::Stopped(Bug {
+                                    kind: BugKind::PromiseViolation,
+                                    message: format!("`promise unique({cols:?})` violated"),
+                                });
+                            }
+                            bucket.push((bi as u32, r_u16));
+                        }
+                    }
+                    EvalOut::Ok(Val::Unit)
+                }
+                _ => EvalOut::Failed("`promise unique` expected Table".to_string()),
+            },
+            ExecPromise::AllRows(pred) => match env.get(ret_var).map(Arc::as_ref) {
+                Some(Val::Table(tv)) => {
+                    for row in &tv.rows {
+                        match self.eval_row_expr(pred, &tv.cols, &row.cells, env) {
+                            EvalOut::Ok(Val::Bool(true)) => {}
+                            EvalOut::Ok(Val::Bool(false)) => {
+                                return EvalOut::Stopped(Bug {
+                                    kind: BugKind::PromiseViolation,
+                                    message: "`promise all(...)` violated".to_string(),
+                                });
+                            }
+                            EvalOut::Ok(_) => {
+                                return EvalOut::Failed(
+                                    "`promise all` returned non-Bool".to_string(),
+                                );
+                            }
+                            other => return other,
+                        }
+                    }
+                    EvalOut::Ok(Val::Unit)
+                }
+                Some(Val::Columnar(vm)) => {
+                    let mut cells = Vec::with_capacity(vm.cols.len());
+                    for b in &vm.batches {
+                        for &r_u16 in &b.active_indices() {
+                            let ri = usize::from(r_u16);
+                            cells.clear();
+                            for c in &b.cols {
+                                cells.push(c.get_val(ri));
+                            }
+                            match self.eval_row_expr(pred, &vm.cols, &cells, env) {
+                                EvalOut::Ok(Val::Bool(true)) => {}
+                                EvalOut::Ok(Val::Bool(false)) => {
+                                    return EvalOut::Stopped(Bug {
+                                        kind: BugKind::PromiseViolation,
+                                        message: "`promise all(...)` violated".to_string(),
+                                    });
+                                }
+                                EvalOut::Ok(_) => {
+                                    return EvalOut::Failed(
+                                        "`promise all` returned non-Bool".to_string(),
+                                    );
+                                }
+                                other => return other,
+                            }
+                        }
+                    }
+                    EvalOut::Ok(Val::Unit)
+                }
+                _ => EvalOut::Failed("`promise all` expected Table".to_string()),
+            },
             ExecPromise::BoolExpr(ex) => match self.eval_expr(ex, env) {
                 EvalOut::Ok(Val::Bool(true)) => EvalOut::Ok(Val::Unit),
                 EvalOut::Ok(Val::Bool(false)) => EvalOut::Stopped(Bug {
@@ -1320,6 +1430,13 @@ impl<'a> Evaluator<'a> {
                     Ok(None) => EvalOut::Ok(Val::Float(Float64::CANONICAL_NAN)),
                     Err(e) => EvalOut::Failed(format!("Stats.corr: {e}")),
                 },
+                [Val::Columnar(vm)] => {
+                    match crate::stats::pearson_corr_vm_table(vm, col_x, col_y) {
+                        Ok(Some(r)) => EvalOut::Ok(Val::Float(Float64::from_f64(r))),
+                        Ok(None) => EvalOut::Ok(Val::Float(Float64::CANONICAL_NAN)),
+                        Err(e) => EvalOut::Failed(format!("Stats.corr: {e}")),
+                    }
+                }
                 _ => EvalOut::Failed("Stats.corr requires a Table".to_string()),
             },
             ExecPrimOp::Core(PrimOp::StatsLinReg { col_x, col_y }) => match args {
@@ -1335,14 +1452,155 @@ impl<'a> Evaluator<'a> {
                     }),
                     Err(e) => EvalOut::Failed(format!("Stats.linear_regression: {e}")),
                 },
+                [Val::Columnar(vm)] => {
+                    match crate::stats::linear_regression_vm_table(vm, col_x, col_y) {
+                        Ok(Some(res)) => EvalOut::Ok(Val::LinearModel {
+                            slope: Float64::from_f64(res.slope),
+                            intercept: Float64::from_f64(res.intercept),
+                            r2: Float64::from_f64(res.r_squared),
+                        }),
+                        Ok(None) => EvalOut::Stopped(Bug {
+                            kind: BugKind::DivByZero,
+                            message: "degenerate linear regression: fewer than 2 points, non-finite inputs, or zero variance in x".to_string(),
+                        }),
+                        Err(e) => EvalOut::Failed(format!("Stats.linear_regression: {e}")),
+                    }
+                }
                 _ => EvalOut::Failed("Stats.linear_regression requires a Table".to_string()),
             },
             ExecPrimOp::Core(PrimOp::TableProfile) => match args {
                 [Val::Table(tv)] => EvalOut::Ok(Val::Profile(
                     crate::stats::profile::profile_table(tv, &TagSet::empty(), &[]),
                 )),
+                [Val::Columnar(vm)] => EvalOut::Ok(Val::Profile(
+                    crate::stats::profile::profile_vm_table(vm, &TagSet::empty(), &[]),
+                )),
                 _ => EvalOut::Failed("table.profile() requires a Table".to_string()),
             },
+            ExecPrimOp::Core(PrimOp::TableCount) => match args {
+                [Val::Columnar(vm)] => {
+                    let b = BigInt::from(vm.total_rows());
+                    if b.in_int64_range() {
+                        EvalOut::Ok(Val::Int(b))
+                    } else {
+                        EvalOut::Stopped(Bug {
+                            kind: BugKind::IntOverflow,
+                            message: "Int64 arithmetic overflow".to_string(),
+                        })
+                    }
+                }
+                _ => match eval_prim_op(&PrimOp::TableCount, args) {
+                    PrimResult::Ok(v) => EvalOut::Ok(v),
+                    PrimResult::Stopped(b) => EvalOut::Stopped(b),
+                    PrimResult::OutOfFuel => EvalOut::Stopped(Bug {
+                        kind: BugKind::OutsideBoundary,
+                        message: "out of fuel".to_string(),
+                    }),
+                    PrimResult::Wrong => {
+                        EvalOut::Failed("primitive type error in `TableCount`".to_string())
+                    }
+                },
+            },
+            ExecPrimOp::Core(PrimOp::TableConcat(schema))
+                if matches!(args, [Val::List(tbls)] if tbls.iter().any(|t| matches!(t, Val::Columnar(_)))) =>
+            {
+                let [Val::List(tbls)] = args else {
+                    return EvalOut::Failed("primitive type error in `TableConcat`".to_string());
+                };
+                let out_cols: Vec<ColSpec> = schema
+                    .cols
+                    .iter()
+                    .map(|c| ColSpec {
+                        agg_kind: AggKind::Raw,
+                        ..c.clone()
+                    })
+                    .collect();
+                let batch_size = self
+                    .vm_cfg
+                    .map_or(crate::vm::batch::BATCH_SIZE, |c| c.batch_size);
+                let mut batches = Vec::new();
+                for item in tbls {
+                    let Some(vm) = item.clone().into_vm_table(batch_size) else {
+                        return EvalOut::Failed(
+                            "primitive type error in `TableConcat`".to_string(),
+                        );
+                    };
+                    for mut b in vm.batches {
+                        b.group_meta = None;
+                        for (c, spec) in b.cols.iter_mut().zip(&out_cols) {
+                            c.spec = spec.clone();
+                        }
+                        batches.push(b);
+                    }
+                }
+                EvalOut::Ok(Val::Columnar(Arc::new(VmTable {
+                    cols: out_cols,
+                    batches,
+                })))
+            }
+            ExecPrimOp::Core(PrimOp::StatsTTest { col_x, col_y })
+                if matches!(args, [Val::Columnar(_)]) =>
+            {
+                let [Val::Columnar(vm)] = args else {
+                    return EvalOut::Failed("primitive type error in `StatsTTest`".to_string());
+                };
+                if vm.find_col_idx(col_x).is_some() && vm.find_col_idx(col_y).is_some() {
+                    EvalOut::Stopped(Bug {
+                        kind: BugKind::OutsideBoundary,
+                        message: "outside boundary: statsTTest is outside the Lean Core oracle"
+                            .to_string(),
+                    })
+                } else {
+                    EvalOut::Failed("primitive type error in `StatsTTest`".to_string())
+                }
+            }
+            ExecPrimOp::Core(PrimOp::ChartMake { kind, cols, title })
+                if matches!(args, [Val::Columnar(_)]) =>
+            {
+                let [Val::Columnar(vm)] = args else {
+                    return EvalOut::Failed("primitive type error in `ChartMake`".to_string());
+                };
+                let total_rows = vm.total_rows();
+                let mut series = Vec::with_capacity(cols.len());
+                for cn in cols {
+                    let Some(idx) = vm.find_col_idx(cn) else {
+                        return EvalOut::Failed(format!("chart: missing column `{cn}`"));
+                    };
+                    let mut vals = Vec::with_capacity(total_rows);
+                    for b in &vm.batches {
+                        let col = &b.cols[idx];
+                        for &r_u16 in &b.active_indices() {
+                            vals.push(col.get_val(usize::from(r_u16)));
+                        }
+                    }
+                    series.push(vals);
+                }
+                EvalOut::Ok(Val::Chart(Box::new(crate::oracle::value::ChartVal {
+                    kind: *kind,
+                    title: title.clone(),
+                    col_names: cols.clone(),
+                    series,
+                    ..crate::oracle::value::ChartVal::default()
+                })))
+            }
+            ExecPrimOp::Core(PrimOp::ReportAddTable)
+                if matches!(args, [Val::Report(_), Val::Columnar(_)]) =>
+            {
+                let [Val::Report(rv), Val::Columnar(vm)] = args else {
+                    return EvalOut::Failed("primitive type error in `ReportAddTable`".to_string());
+                };
+                let mut out = rv.as_ref().clone();
+                let headers = vm.cols.iter().map(|c| c.name.clone()).collect();
+                let mut raw_rows = Vec::with_capacity(vm.total_rows());
+                for b in &vm.batches {
+                    for &r_u16 in &b.active_indices() {
+                        let ri = usize::from(r_u16);
+                        raw_rows.push(b.cols.iter().map(|c| c.get_val(ri)).collect());
+                    }
+                }
+                out.tables.push((headers, raw_rows));
+                EvalOut::Ok(Val::Report(Box::new(out)))
+            }
             ExecPrimOp::Core(cop) => match eval_prim_op(cop, args) {
                 PrimResult::Ok(v) => EvalOut::Ok(v),
                 PrimResult::Stopped(b) => EvalOut::Stopped(b),
@@ -1535,6 +1793,7 @@ impl<'a> Evaluator<'a> {
             },
             ExecPrimOp::TableEmpty => match args {
                 [Val::Table(tv)] => EvalOut::Ok(Val::Bool(tv.rows.is_empty())),
+                [Val::Columnar(vm)] => EvalOut::Ok(Val::Bool(vm.total_rows() == 0)),
                 _ => EvalOut::Failed("TableEmpty requires Table".to_string()),
             },
             ExecPrimOp::TableFirstBang => match args {
@@ -1543,6 +1802,17 @@ impl<'a> Evaluator<'a> {
                         type_name: "__TableRow".to_string(),
                         ctor_name: "__TableRow".to_string(),
                         fields: r.cells.clone(),
+                    }),
+                    None => EvalOut::Stopped(Bug {
+                        kind: BugKind::UnwrapNone,
+                        message: "called `.first!` on an empty table".to_string(),
+                    }),
+                },
+                [Val::Columnar(vm)] => match vm.first_row_cells() {
+                    Some(fields) => EvalOut::Ok(Val::Ctor {
+                        type_name: "__TableRow".to_string(),
+                        ctor_name: "__TableRow".to_string(),
+                        fields,
                     }),
                     None => EvalOut::Stopped(Bug {
                         kind: BugKind::UnwrapNone,
@@ -1564,18 +1834,36 @@ impl<'a> Evaluator<'a> {
                         .collect();
                     EvalOut::Ok(Val::List(rows))
                 }
+                [Val::Columnar(vm)] => {
+                    let mut rows = Vec::with_capacity(vm.total_rows());
+                    for b in &vm.batches {
+                        for &r_u16 in &b.active_indices() {
+                            let ri = usize::from(r_u16);
+                            let fields = b.cols.iter().map(|c| c.get_val(ri)).collect();
+                            rows.push(Val::Ctor {
+                                type_name: "__TableRow".to_string(),
+                                ctor_name: "__TableRow".to_string(),
+                                fields,
+                            });
+                        }
+                    }
+                    EvalOut::Ok(Val::List(rows))
+                }
                 _ => EvalOut::Failed("TableRowsToList requires Table".to_string()),
             },
             ExecPrimOp::TableColSum(col) => match args {
                 [Val::Table(tv)] => eval_table_col_agg(tv, col, AggOp::Sum),
+                [Val::Columnar(vm)] => eval_vm_table_col_agg(vm, col, AggOp::Sum),
                 _ => EvalOut::Failed("TableColSum requires Table".to_string()),
             },
             ExecPrimOp::TableColMean(col) => match args {
                 [Val::Table(tv)] => eval_table_col_agg(tv, col, AggOp::Mean),
+                [Val::Columnar(vm)] => eval_vm_table_col_agg(vm, col, AggOp::Mean),
                 _ => EvalOut::Failed("TableColMean requires Table".to_string()),
             },
             ExecPrimOp::TableColStddev(col) => match args {
                 [Val::Table(tv)] => eval_table_col_agg(tv, col, AggOp::Stddev),
+                [Val::Columnar(vm)] => eval_vm_table_col_agg(vm, col, AggOp::Stddev),
                 _ => EvalOut::Failed("TableColStddev requires Table".to_string()),
             },
             ExecPrimOp::TableBuildDynamic(schema) => {
@@ -1623,6 +1911,13 @@ impl<'a> Evaluator<'a> {
                         rows,
                     }))
                 }
+                [Val::Columnar(vm)] => {
+                    if vm_table_matches_schema_exact(vm, dst_tt) {
+                        EvalOut::Ok(Val::Columnar(Arc::clone(vm)))
+                    } else {
+                        EvalOut::Ok(Val::Columnar(Arc::new(coerce_vm_table(vm, dst_tt))))
+                    }
+                }
                 _ => EvalOut::Failed("TableCoerce requires Table".to_string()),
             },
             ExecPrimOp::RecordField { field_idx, .. } => match args {
@@ -1657,8 +1952,29 @@ impl<'a> Evaluator<'a> {
                 ),
             },
             ExecPrimOp::StatsWelchTTest { col } => match args {
-                [Val::Table(a), Val::Table(b)] => {
-                    match crate::stats::welch_t_test_tables(a, b, col) {
+                [a @ (Val::Table(_) | Val::Columnar(_)), b @ (Val::Table(_) | Val::Columnar(_))] => {
+                    let res = match (a, b) {
+                        (Val::Table(ta), Val::Table(tb)) => {
+                            crate::stats::welch_t_test_tables(ta, tb, col)
+                        }
+                        (Val::Columnar(va), Val::Columnar(vb)) => {
+                            crate::stats::welch_t_test_vm_tables(va, vb, col)
+                        }
+                        (a_val, b_val) => (|| -> Result<Option<crate::stats::WelchTTestResult>, String> {
+                            let xa = match a_val {
+                                Val::Table(t) => crate::stats::extract_numeric_col(t, col)?,
+                                Val::Columnar(v) => crate::stats::extract_numeric_col_vm(v, col)?,
+                                _ => return Err("StatsWelchTTest requires two Tables".to_string()),
+                            };
+                            let xb = match b_val {
+                                Val::Table(t) => crate::stats::extract_numeric_col(t, col)?,
+                                Val::Columnar(v) => crate::stats::extract_numeric_col_vm(v, col)?,
+                                _ => return Err("StatsWelchTTest requires two Tables".to_string()),
+                            };
+                            Ok(crate::stats::welch_t_test(&xa, &xb))
+                        })(),
+                    };
+                    match res {
                         Ok(Some(res)) => EvalOut::Ok(Val::StatTest {
                             stat: Float64::from_f64(res.t_stat),
                             p_value: Float64::from_f64(res.p_value),
@@ -1678,6 +1994,13 @@ impl<'a> Evaluator<'a> {
                     Ok(None) => EvalOut::Ok(Val::Float(Float64::CANONICAL_NAN)),
                     Err(e) => EvalOut::Failed(format!("Stats.corr(:spearman): {e}")),
                 },
+                [Val::Columnar(vm)] => {
+                    match crate::stats::spearman_corr_vm_table(vm, col_x, col_y) {
+                        Ok(Some(rho)) => EvalOut::Ok(Val::Float(Float64::from_f64(rho))),
+                        Ok(None) => EvalOut::Ok(Val::Float(Float64::CANONICAL_NAN)),
+                        Err(e) => EvalOut::Failed(format!("Stats.corr(:spearman): {e}")),
+                    }
+                }
                 _ => EvalOut::Failed("StatsCorrSpearman requires a Table".to_string()),
             },
             ExecPrimOp::LinearModelPredict => match args {
@@ -1712,11 +2035,37 @@ impl<'a> Evaluator<'a> {
                         Err(e) => EvalOut::Failed(e),
                     }
                 }
+                [Val::Columnar(vm)] => {
+                    match crate::stats::chi_square_independence_vm_table(vm, col_x, col_y) {
+                        Ok(Some(res)) => EvalOut::Ok(Val::StatTest {
+                            stat: Float64::from_f64(res.stat),
+                            p_value: Float64::from_f64(res.p_value),
+                        }),
+                        Ok(None) => EvalOut::Ok(Val::StatTest {
+                            stat: Float64::CANONICAL_NAN,
+                            p_value: Float64::CANONICAL_NAN,
+                        }),
+                        Err(e) => EvalOut::Failed(e),
+                    }
+                }
                 _ => EvalOut::Failed("StatsChiSquareIndependence requires a Table".to_string()),
             },
             ExecPrimOp::StatsChiSquareGof { observed, expected } => match args {
                 [Val::Table(tv)] => {
                     match crate::stats::chi_square_gof_table(tv, observed, expected) {
+                        Ok(Some(res)) => EvalOut::Ok(Val::StatTest {
+                            stat: Float64::from_f64(res.stat),
+                            p_value: Float64::from_f64(res.p_value),
+                        }),
+                        Ok(None) => EvalOut::Ok(Val::StatTest {
+                            stat: Float64::CANONICAL_NAN,
+                            p_value: Float64::CANONICAL_NAN,
+                        }),
+                        Err(e) => EvalOut::Failed(e),
+                    }
+                }
+                [Val::Columnar(vm)] => {
+                    match crate::stats::chi_square_gof_vm_table(vm, observed, expected) {
                         Ok(Some(res)) => EvalOut::Ok(Val::StatTest {
                             stat: Float64::from_f64(res.stat),
                             p_value: Float64::from_f64(res.p_value),
@@ -1745,11 +2094,23 @@ impl<'a> Evaluator<'a> {
                         Err(e) => EvalOut::Failed(e),
                     }
                 }
+                [Val::Columnar(vm), thresh_val] => {
+                    let threshold = val_to_f64(thresh_val).unwrap_or(f64::NAN);
+                    match crate::stats::detect_outliers_vm_table(
+                        vm, col, *method, threshold, flag_col, flag_tags,
+                    ) {
+                        Ok(out_vm) => EvalOut::Ok(Val::Columnar(Arc::new(out_vm))),
+                        Err(e) => EvalOut::Failed(e),
+                    }
+                }
                 _ => EvalOut::Failed("StatsOutliers requires (Table, threshold)".to_string()),
             },
             ExecPrimOp::TableProfileEx { row_tags, col_tags } => match args {
                 [Val::Table(tv)] => EvalOut::Ok(Val::Profile(
                     crate::stats::profile::profile_table(tv, row_tags, col_tags),
+                )),
+                [Val::Columnar(vm)] => EvalOut::Ok(Val::Profile(
+                    crate::stats::profile::profile_vm_table(vm, row_tags, col_tags),
                 )),
                 _ => EvalOut::Failed("TableProfileEx requires a Table".to_string()),
             },
@@ -1763,10 +2124,13 @@ impl<'a> Evaluator<'a> {
                 has_trendline_expr,
                 has_bins_expr,
             } => {
-                let Some(Val::Table(tv)) = args.first() else {
-                    return EvalOut::Failed(
-                        "ChartMakeEx requires a Table as first arg".to_string(),
-                    );
+                let first_tbl = match args.first() {
+                    Some(v @ (Val::Table(_) | Val::Columnar(_))) => v,
+                    _ => {
+                        return EvalOut::Failed(
+                            "ChartMakeEx requires a Table as first arg".to_string(),
+                        );
+                    }
                 };
                 let mut cursor = 1usize;
                 let title = if *has_title_expr {
@@ -1810,16 +2174,37 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 let mut series = Vec::with_capacity(col_names.len());
-                for cn in &col_names {
-                    let Some(idx) = tv.cols.iter().position(|c| &c.name == cn) else {
-                        return EvalOut::Failed(format!("chart: missing column `{cn}`"));
-                    };
-                    let vals = tv
-                        .rows
-                        .iter()
-                        .map(|r| r.cells.get(idx).cloned().unwrap_or(Val::OptNone))
-                        .collect();
-                    series.push(vals);
+                match first_tbl {
+                    Val::Table(tv) => {
+                        for cn in &col_names {
+                            let Some(idx) = tv.cols.iter().position(|c| &c.name == cn) else {
+                                return EvalOut::Failed(format!("chart: missing column `{cn}`"));
+                            };
+                            let vals = tv
+                                .rows
+                                .iter()
+                                .map(|r| r.cells.get(idx).cloned().unwrap_or(Val::OptNone))
+                                .collect();
+                            series.push(vals);
+                        }
+                    }
+                    Val::Columnar(vm) => {
+                        let total_rows = vm.total_rows();
+                        for cn in &col_names {
+                            let Some(idx) = vm.find_col_idx(cn) else {
+                                return EvalOut::Failed(format!("chart: missing column `{cn}`"));
+                            };
+                            let mut vals = Vec::with_capacity(total_rows);
+                            for b in &vm.batches {
+                                let col = &b.cols[idx];
+                                for &r_u16 in &b.active_indices() {
+                                    vals.push(col.get_val(usize::from(r_u16)));
+                                }
+                            }
+                            series.push(vals);
+                        }
+                    }
+                    _ => {}
                 }
                 EvalOut::Ok(Val::Chart(Box::new(crate::oracle::value::ChartVal {
                     kind: *kind,
@@ -1881,17 +2266,10 @@ impl<'a> Evaluator<'a> {
                 _ => EvalOut::Failed("OptSubFloat requires (Float, Option(Float))".to_string()),
             },
             ExecPrimOp::TableEq => match args {
-                [Val::Table(a), Val::Table(b)] => {
-                    let same_cols = a.cols.len() == b.cols.len()
-                        && a.cols.iter().zip(&b.cols).all(|(x, y)| x.name == y.name);
-                    let same_rows = same_cols
-                        && a.rows.len() == b.rows.len()
-                        && a.rows
-                            .iter()
-                            .zip(&b.rows)
-                            .all(|(ra, rb)| val_list_eq(&ra.cells, &rb.cells));
-                    EvalOut::Ok(Val::Bool(same_rows))
-                }
+                [
+                    a @ (Val::Table(_) | Val::Columnar(_)),
+                    b @ (Val::Table(_) | Val::Columnar(_)),
+                ] => EvalOut::Ok(Val::Bool(val_eq(a, b))),
                 _ => EvalOut::Failed("TableEq requires two Tables".to_string()),
             },
             ExecPrimOp::PromiseUnique(_) | ExecPrimOp::PromiseAll => EvalOut::Ok(Val::Bool(true)),
@@ -1958,7 +2336,7 @@ impl<'a> Evaluator<'a> {
             ExecHostOp::FakeDbInMemory { db, table_names } => {
                 let mut tables = Vec::with_capacity(table_names.len());
                 for (tname, val) in table_names.iter().zip(args.iter()) {
-                    if let Val::Table(tv) = val {
+                    if let Some(tv) = val.to_table_val() {
                         let schema = self.prog.find_schema(tname).map_or_else(
                             || TableTy {
                                 cols: tv.cols.clone(),
@@ -1966,7 +2344,7 @@ impl<'a> Evaluator<'a> {
                             },
                             |s| s.decl.schema.clone(),
                         );
-                        let rows = tv.rows.iter().map(|r| r.cells.clone()).collect();
+                        let rows = tv.rows.into_iter().map(|r| r.cells).collect();
                         tables.push(StoredTable {
                             db: db.clone(),
                             table_name: tname.clone(),
@@ -2083,17 +2461,16 @@ impl<'a> Evaluator<'a> {
                     EvalOut::Failed("read_jsonl expects (ReadFiles, path)".to_string())
                 }
             }
-            ExecHostOp::WriteJsonl => {
-                if let [
+            ExecHostOp::WriteJsonl => match args {
+                [
                     Val::CapWriteFiles {
                         handle,
                         root,
                         allows,
                     },
                     Val::Text(rel),
-                    Val::Table(tv),
-                ] = args
-                {
+                    tbl @ (Val::Table(_) | Val::Columnar(_)),
+                ] => {
                     if !self.ew.dry_run
                         && let Some(bug) = self.check_export_gate(*handle, allows)
                     {
@@ -2105,22 +2482,33 @@ impl<'a> Evaluator<'a> {
                         )))));
                     }
                     let full_rel = join_confined_path(root, rel);
-                    self.write_confined_table(*handle, &full_rel, tv, TableWriteFmt::Jsonl)
-                } else {
-                    EvalOut::Failed("write_jsonl expects (WriteFiles, path, table)".to_string())
+                    match tbl {
+                        Val::Table(tv) => {
+                            self.write_confined_table(*handle, &full_rel, tv, TableWriteFmt::Jsonl)
+                        }
+                        Val::Columnar(vm) => self.write_confined_vm_table(
+                            *handle,
+                            &full_rel,
+                            vm,
+                            TableWriteFmt::Jsonl,
+                        ),
+                        _ => EvalOut::Failed(
+                            "write_jsonl expects (WriteFiles, path, table)".to_string(),
+                        ),
+                    }
                 }
-            }
-            ExecHostOp::WriteCsv => {
-                if let [
+                _ => EvalOut::Failed("write_jsonl expects (WriteFiles, path, table)".to_string()),
+            },
+            ExecHostOp::WriteCsv => match args {
+                [
                     Val::CapWriteFiles {
                         handle,
                         root,
                         allows,
                     },
                     Val::Text(rel),
-                    Val::Table(tv),
-                ] = args
-                {
+                    tbl @ (Val::Table(_) | Val::Columnar(_)),
+                ] => {
                     if !self.ew.dry_run
                         && let Some(bug) = self.check_export_gate(*handle, allows)
                     {
@@ -2137,11 +2525,26 @@ impl<'a> Evaluator<'a> {
                     } else {
                         b','
                     };
-                    self.write_confined_table(*handle, &full_rel, tv, TableWriteFmt::Csv(delim))
-                } else {
-                    EvalOut::Failed("write_csv expects (WriteFiles, path, table)".to_string())
+                    match tbl {
+                        Val::Table(tv) => self.write_confined_table(
+                            *handle,
+                            &full_rel,
+                            tv,
+                            TableWriteFmt::Csv(delim),
+                        ),
+                        Val::Columnar(vm) => self.write_confined_vm_table(
+                            *handle,
+                            &full_rel,
+                            vm,
+                            TableWriteFmt::Csv(delim),
+                        ),
+                        _ => EvalOut::Failed(
+                            "write_csv expects (WriteFiles, path, table)".to_string(),
+                        ),
+                    }
                 }
-            }
+                _ => EvalOut::Failed("write_csv expects (WriteFiles, path, table)".to_string()),
+            },
             ExecHostOp::WriteReportMarkdown => {
                 if let [
                     Val::CapWriteFiles {
@@ -2205,9 +2608,22 @@ impl<'a> Evaluator<'a> {
                         db,
                         table_name,
                     },
-                    Val::Table(tv),
+                    tbl_val @ (Val::Table(_) | Val::Columnar(_)),
                 ] = args
                 {
+                    let owned_tv;
+                    let tv: &TableVal = match tbl_val {
+                        Val::Table(tv) => tv,
+                        Val::Columnar(vm) => {
+                            owned_tv = vm.to_table_val();
+                            &owned_tv
+                        }
+                        _ => {
+                            return EvalOut::Failed(
+                                "WriteTable.upsert expects (WriteTable, table)".to_string(),
+                            );
+                        }
+                    };
                     let cap_ty = Ty::WriteTable {
                         db: db.clone(),
                         table_name: table_name.clone(),
@@ -2463,7 +2879,22 @@ impl<'a> Evaluator<'a> {
                 }
                 EvalOut::Ok(Val::Unit)
             }
-            (HostOp::ConsolePrintTable, [Val::CapConsole { handle, .. }, Val::Table(tv)]) => {
+            (
+                HostOp::ConsolePrintTable,
+                [
+                    Val::CapConsole { handle, .. },
+                    tbl_val @ (Val::Table(_) | Val::Columnar(_)),
+                ],
+            ) => {
+                let owned_tv;
+                let tv: &TableVal = match tbl_val {
+                    Val::Table(tv) => tv,
+                    Val::Columnar(vm) => {
+                        owned_tv = vm.to_table_val();
+                        &owned_tv
+                    }
+                    _ => return EvalOut::Failed("console.print_table expects Table".to_string()),
+                };
                 let rendered = format_pretty_table(tv);
                 match handle {
                     CapHandle::Real => self.ew.world.stdout.push(rendered),
@@ -2564,7 +2995,7 @@ impl<'a> Evaluator<'a> {
                         allows,
                     },
                     Val::Text(rel),
-                    Val::Table(tv),
+                    tbl_val @ (Val::Table(_) | Val::Columnar(_)),
                 ],
             ) => {
                 if !self.ew.dry_run
@@ -2578,17 +3009,36 @@ impl<'a> Evaluator<'a> {
                     )))));
                 }
                 let full_rel = join_confined_path(root, rel);
-                if matches!(handle, CapHandle::Real) && self.ew.dry_run {
-                    self.ew.world.stdout.push(format!(
-                        "[DRY-RUN] would write parquet \"{full_rel}\" ({} rows, {} cols)",
-                        tv.rows.len(),
-                        tv.cols.len()
-                    ));
-                    return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
-                }
-                match write_parquet_bytes(tv, ParquetCompression::Zstd) {
-                    Ok(bytes) => self.write_confined_bytes(*handle, &full_rel, bytes),
-                    Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e)))),
+                match tbl_val {
+                    Val::Table(tv) => {
+                        if matches!(handle, CapHandle::Real) && self.ew.dry_run {
+                            self.ew.world.stdout.push(format!(
+                                "[DRY-RUN] would write parquet \"{full_rel}\" ({} rows, {} cols)",
+                                tv.rows.len(),
+                                tv.cols.len()
+                            ));
+                            return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
+                        }
+                        match write_parquet_bytes(tv, ParquetCompression::Zstd) {
+                            Ok(bytes) => self.write_confined_bytes(*handle, &full_rel, bytes),
+                            Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e)))),
+                        }
+                    }
+                    Val::Columnar(vm) => {
+                        if matches!(handle, CapHandle::Real) && self.ew.dry_run {
+                            self.ew.world.stdout.push(format!(
+                                "[DRY-RUN] would write parquet \"{full_rel}\" ({} rows, {} cols)",
+                                vm.total_rows(),
+                                vm.cols.len()
+                            ));
+                            return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
+                        }
+                        match write_parquet_vm_table_bytes(vm, ParquetCompression::Zstd) {
+                            Ok(bytes) => self.write_confined_bytes(*handle, &full_rel, bytes),
+                            Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e)))),
+                        }
+                    }
+                    _ => EvalOut::Failed("write_parquet expects Table".to_string()),
                 }
             }
             (
@@ -2616,15 +3066,16 @@ impl<'a> Evaluator<'a> {
                 let full_rel = join_confined_path(root, rel);
                 let sheets: Vec<(String, TableVal)> = match payload {
                     Val::Table(tv) => vec![("Sheet1".to_string(), tv.clone())],
+                    Val::Columnar(vm) => vec![("Sheet1".to_string(), vm.to_table_val())],
                     Val::Map(pairs) => {
                         let mut out = Vec::with_capacity(pairs.len());
                         for (k, v) in pairs {
-                            let Val::Table(tv) = v else {
+                            let Some(tv) = v.to_table_val() else {
                                 return EvalOut::Failed(
                                     "write_xlsx `sheets:` map values must be Tables".to_string(),
                                 );
                             };
-                            out.push((format_display_val(k), tv.clone()));
+                            out.push((format_display_val(k), tv));
                         }
                         out
                     }
@@ -2697,6 +3148,99 @@ impl<'a> Evaluator<'a> {
         let schema_tt = cs.decl.schema.clone();
         let self_cols = build_constraint_self_cols(&schema_tt);
         let empty_env = RTEnv::new();
+
+        if let Some(vm_cfg) = self.vm_cfg {
+            let fast_constraints: Vec<FastColConstraint> = constraints
+                .iter()
+                .zip(&schema_tt.cols)
+                .map(|(c_opt, col)| {
+                    FastColConstraint::compile(c_opt.as_ref(), &col.ty, &|name| {
+                        self.prog.find_const(name).map(|c| c.value.clone())
+                    })
+                })
+                .collect();
+            let parsed = match handle {
+                CapHandle::Fake(idx) => {
+                    let Some(ff) = self.ew.world.fake_files.get(idx) else {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                            "file not found: {path}"
+                        )))));
+                    };
+                    let Some((_, content)) = ff.files.iter().find(|(p, _)| p == path) else {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                            "file not found: {path}"
+                        )))));
+                    };
+                    let content = content.clone();
+                    let reader = match AutoDecodeReader::new(Cursor::new(content.as_bytes())) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                                "{path}: {e}"
+                            )))));
+                        }
+                    };
+                    read_csv_stream_to_vm_table(
+                        reader,
+                        &schema_tt,
+                        delimiter,
+                        vm_cfg.batch_size,
+                        &fast_constraints,
+                        |ci, val| {
+                            self.eval_schema_constraint(
+                                &self_cols,
+                                &constraints,
+                                ci,
+                                val,
+                                &empty_env,
+                            )
+                        },
+                    )
+                }
+                CapHandle::Real => {
+                    if !self.ew.live_io {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                            "file I/O disabled in spec mode: {path}"
+                        )))));
+                    }
+                    let resolved = match &self.ew.work_dir {
+                        Some(base) if !Path::new(path).is_absolute() => base.join(path),
+                        _ => std::path::PathBuf::from(path),
+                    };
+                    let reader = match open_auto_decoded_file(&resolved) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                                "{path}: {e}"
+                            )))));
+                        }
+                    };
+                    read_csv_stream_to_vm_table(
+                        reader,
+                        &schema_tt,
+                        delimiter,
+                        vm_cfg.batch_size,
+                        &fast_constraints,
+                        |ci, val| {
+                            self.eval_schema_constraint(
+                                &self_cols,
+                                &constraints,
+                                ci,
+                                val,
+                                &empty_env,
+                            )
+                        },
+                    )
+                }
+            };
+            return match parsed {
+                Ok((good_vm, bad)) => EvalOut::Ok(Val::ResOk(Box::new(Val::Tuple(vec![
+                    Val::Columnar(Arc::new(good_vm)),
+                    Val::Table(bad),
+                ])))),
+                Err(msg) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(msg)))),
+            };
+        }
 
         let parsed = match handle {
             CapHandle::Fake(idx) => {
@@ -2906,6 +3450,71 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    fn write_confined_vm_table(
+        &mut self,
+        handle: CapHandle,
+        full_rel: &str,
+        vm: &VmTable,
+        fmt: TableWriteFmt,
+    ) -> EvalOut {
+        let comp = detect_compression_path(full_rel);
+        match handle {
+            CapHandle::Fake(idx) => {
+                let text = match fmt {
+                    TableWriteFmt::Csv(delim) => format_csv_vm_table(vm, delim),
+                    TableWriteFmt::Jsonl => format_jsonl_vm_table(vm),
+                };
+                if let Some(ff) = self.ew.world.fake_files.get_mut(idx) {
+                    ff.files.push((full_rel.to_string(), text));
+                }
+                EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)))
+            }
+            CapHandle::Real => {
+                if self.ew.dry_run {
+                    self.ew.world.stdout.push(format!(
+                        "[DRY-RUN] would write table \"{full_rel}\" ({} rows, {} cols)",
+                        vm.total_rows(),
+                        vm.cols.len()
+                    ));
+                    return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
+                }
+                if self.ew.live_io {
+                    let out_path = match &self.ew.work_dir {
+                        Some(base) => base.join(full_rel),
+                        None => std::path::PathBuf::from(full_rel),
+                    };
+                    if let Some(parent) = out_path.parent()
+                        && let Err(e) = fs::create_dir_all(parent)
+                    {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
+                    }
+                    let res = File::create(&out_path).and_then(|f| {
+                        let mut enc = AutoEncodeWriter::new(BufWriter::new(f), comp)?;
+                        match fmt {
+                            TableWriteFmt::Csv(delim) => write_csv_vm_table(&mut enc, vm, delim)?,
+                            TableWriteFmt::Jsonl => write_jsonl_vm_table(&mut enc, vm)?,
+                        }
+                        enc.finish()?;
+                        Ok(())
+                    });
+                    if let Err(e) = res {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
+                    }
+                } else {
+                    let text = match fmt {
+                        TableWriteFmt::Csv(delim) => format_csv_vm_table(vm, delim),
+                        TableWriteFmt::Jsonl => format_jsonl_vm_table(vm),
+                    };
+                    self.ew
+                        .world
+                        .written_files
+                        .push((full_rel.to_string(), text));
+                }
+                EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)))
+            }
+        }
+    }
+
     fn write_confined_output(
         &mut self,
         handle: CapHandle,
@@ -3064,6 +3673,29 @@ impl<'a> Evaluator<'a> {
             );
         let self_cols = build_constraint_self_cols(schema_tt);
         let empty_env = RTEnv::new();
+        if let Some(vm_cfg) = self.vm_cfg {
+            let fast_constraints: Vec<FastColConstraint> = constraints
+                .iter()
+                .zip(&schema_tt.cols)
+                .map(|(c_opt, col)| {
+                    FastColConstraint::compile(c_opt.as_ref(), &col.ty, &|name| {
+                        self.prog.find_const(name).map(|c| c.value.clone())
+                    })
+                })
+                .collect();
+            return match read_parquet_bytes_to_vm_table(
+                &bytes,
+                schema_tt,
+                vm_cfg.batch_size,
+                &fast_constraints,
+                |ci, val| {
+                    self.eval_schema_constraint(&self_cols, &constraints, ci, val, &empty_env)
+                },
+            ) {
+                Ok(vm_tbl) => EvalOut::Ok(Val::ResOk(Box::new(Val::Columnar(Arc::new(vm_tbl))))),
+                Err(msg) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(msg)))),
+            };
+        }
         match read_parquet_bytes_with_schema(&bytes, schema_tt, |ci, val| {
             self.eval_schema_constraint(&self_cols, &constraints, ci, val, &empty_env)
         }) {
@@ -4269,6 +4901,291 @@ fn eval_table_col_agg(tv: &TableVal, col: &str, op: AggOp) -> EvalOut {
     eval_agg_values(op, &vals, tv.rows.len())
 }
 
+fn eval_vm_table_col_agg(vm: &VmTable, col: &str, op: AggOp) -> EvalOut {
+    let Some(idx) = vm.find_col_idx(col) else {
+        return EvalOut::Failed(format!("unknown column `{col}`"));
+    };
+    let total_rows = vm.total_rows();
+    if total_rows == 0 {
+        return match op {
+            AggOp::Sum => match &vm.cols[idx].ty {
+                ScalarTy::Decimal => EvalOut::Ok(Val::Decimal(BigInt::ZERO)),
+                ScalarTy::Float => EvalOut::Ok(Val::Float(Float64::ZERO)),
+                _ => EvalOut::Ok(Val::Int(BigInt::ZERO)),
+            },
+            AggOp::Mean | AggOp::Stddev => EvalOut::Ok(Val::OptNone),
+            _ => eval_agg_values(op, &[], 0),
+        };
+    }
+
+    // Check if all non-empty batches share a uniform typed numeric layout.
+    enum NumLayout {
+        Int,
+        Decimal,
+        Float,
+        Other,
+    }
+    let mut layout: Option<NumLayout> = None;
+    for b in &vm.batches {
+        if b.is_empty() {
+            continue;
+        }
+        let k = match &b.cols[idx].data {
+            ColumnData::Int(_) => NumLayout::Int,
+            ColumnData::Decimal(_) => NumLayout::Decimal,
+            ColumnData::Float(_) => NumLayout::Float,
+            _ => NumLayout::Other,
+        };
+        match (&layout, &k) {
+            (None, _) => layout = Some(k),
+            (Some(NumLayout::Int), NumLayout::Int)
+            | (Some(NumLayout::Decimal), NumLayout::Decimal)
+            | (Some(NumLayout::Float), NumLayout::Float) => {}
+            _ => {
+                layout = Some(NumLayout::Other);
+                break;
+            }
+        }
+    }
+
+    match (op, layout.unwrap_or(NumLayout::Other)) {
+        (AggOp::Sum, NumLayout::Int) => {
+            let mut sum: i128 = 0;
+            let mut overflow: Option<BigInt> = None;
+            let mut seen_any = false;
+            for b in &vm.batches {
+                let c = &b.cols[idx];
+                if let ColumnData::Int(vs) = &c.data {
+                    for &r_u16 in &b.active_indices() {
+                        let r = usize::from(r_u16);
+                        if c.validity.as_ref().is_some_and(|bm| !bm.is_valid(r)) {
+                            continue;
+                        }
+                        seen_any = true;
+                        let v = vs[r];
+                        if let Some(big) = &mut overflow {
+                            *big = &*big + &BigInt::from(v);
+                        } else if let Some(next) = sum.checked_add(i128::from(v)) {
+                            sum = next;
+                        } else {
+                            overflow = Some(&BigInt::from(sum) + &BigInt::from(v));
+                        }
+                    }
+                }
+            }
+            if !seen_any {
+                return EvalOut::Ok(Val::Int(BigInt::ZERO));
+            }
+            if let Some(big) = overflow {
+                if big.in_int64_range() {
+                    EvalOut::Ok(Val::Int(big))
+                } else {
+                    EvalOut::Stopped(Bug {
+                        kind: BugKind::IntOverflow,
+                        message: "sum Int64 overflow".to_string(),
+                    })
+                }
+            } else if let Ok(v) = i64::try_from(sum) {
+                EvalOut::Ok(Val::Int(BigInt::from(v)))
+            } else {
+                EvalOut::Stopped(Bug {
+                    kind: BugKind::IntOverflow,
+                    message: "sum Int64 overflow".to_string(),
+                })
+            }
+        }
+        (AggOp::Sum, NumLayout::Decimal) => {
+            let mut sum: i128 = 0;
+            let mut overflow: Option<BigInt> = None;
+            let mut seen_any = false;
+            for b in &vm.batches {
+                let c = &b.cols[idx];
+                if let ColumnData::Decimal(vs) = &c.data {
+                    for &r_u16 in &b.active_indices() {
+                        let r = usize::from(r_u16);
+                        if c.validity.as_ref().is_some_and(|bm| !bm.is_valid(r)) {
+                            continue;
+                        }
+                        seen_any = true;
+                        let d = vs[r];
+                        if let Some(big) = &mut overflow {
+                            *big = &*big + &BigInt::from(d);
+                        } else if let Some(next) = sum.checked_add(d) {
+                            sum = next;
+                        } else {
+                            overflow = Some(&BigInt::from(sum) + &BigInt::from(d));
+                        }
+                    }
+                }
+            }
+            if !seen_any {
+                return EvalOut::Ok(Val::Int(BigInt::ZERO));
+            }
+            if let Some(big) = overflow {
+                if big.in_decimal_range() {
+                    EvalOut::Ok(Val::Decimal(big))
+                } else {
+                    EvalOut::Stopped(Bug {
+                        kind: BugKind::DecimalOverflow,
+                        message: "sum Decimal overflow".to_string(),
+                    })
+                }
+            } else if (DEC_MIN..=DEC_MAX).contains(&sum) {
+                EvalOut::Ok(Val::Decimal(BigInt::from(sum)))
+            } else {
+                EvalOut::Stopped(Bug {
+                    kind: BugKind::DecimalOverflow,
+                    message: "sum Decimal overflow".to_string(),
+                })
+            }
+        }
+        (AggOp::Sum, NumLayout::Float) => {
+            let mut sum = 0.0_f64;
+            let mut seen_any = false;
+            for b in &vm.batches {
+                let c = &b.cols[idx];
+                if let ColumnData::Float(vs) = &c.data {
+                    for &r_u16 in &b.active_indices() {
+                        let r = usize::from(r_u16);
+                        if c.validity.as_ref().is_some_and(|bm| !bm.is_valid(r)) {
+                            continue;
+                        }
+                        seen_any = true;
+                        sum += f64::from_bits(vs[r]);
+                    }
+                }
+            }
+            if !seen_any {
+                EvalOut::Ok(Val::Int(BigInt::ZERO))
+            } else {
+                EvalOut::Ok(Val::Float(Float64::from_f64(sum)))
+            }
+        }
+        (AggOp::Mean, NumLayout::Decimal) => {
+            let mut sum: i128 = 0;
+            let mut overflow: Option<BigInt> = None;
+            let mut count = 0usize;
+            for b in &vm.batches {
+                let c = &b.cols[idx];
+                if let ColumnData::Decimal(vs) = &c.data {
+                    for &r_u16 in &b.active_indices() {
+                        let r = usize::from(r_u16);
+                        if c.validity.as_ref().is_some_and(|bm| !bm.is_valid(r)) {
+                            continue;
+                        }
+                        count += 1;
+                        let d = vs[r];
+                        if let Some(big) = &mut overflow {
+                            *big = &*big + &BigInt::from(d);
+                        } else if let Some(next) = sum.checked_add(d) {
+                            sum = next;
+                        } else {
+                            overflow = Some(&BigInt::from(sum) + &BigInt::from(d));
+                        }
+                    }
+                }
+            }
+            if count == 0 {
+                return EvalOut::Ok(Val::OptNone);
+            }
+            let q = if let Some(big) = overflow {
+                let denom = BigInt::from(count);
+                if big.is_negative() {
+                    -big.abs().div_euclid(&denom).unwrap_or(BigInt::ZERO)
+                } else {
+                    big.div_euclid(&denom).unwrap_or(BigInt::ZERO)
+                }
+            } else {
+                BigInt::from(sum / (count as i128))
+            };
+            EvalOut::Ok(Val::OptSome(Box::new(Val::Decimal(q))))
+        }
+        (AggOp::Mean, NumLayout::Float | NumLayout::Int) => {
+            let mut sum = 0.0_f64;
+            let mut count = 0usize;
+            for b in &vm.batches {
+                let c = &b.cols[idx];
+                match &c.data {
+                    ColumnData::Float(vs) => {
+                        for &r_u16 in &b.active_indices() {
+                            let r = usize::from(r_u16);
+                            if c.validity.as_ref().is_some_and(|bm| !bm.is_valid(r)) {
+                                continue;
+                            }
+                            sum += f64::from_bits(vs[r]);
+                            count += 1;
+                        }
+                    }
+                    ColumnData::Int(vs) => {
+                        for &r_u16 in &b.active_indices() {
+                            let r = usize::from(r_u16);
+                            if c.validity.as_ref().is_some_and(|bm| !bm.is_valid(r)) {
+                                continue;
+                            }
+                            sum += vs[r] as f64;
+                            count += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if count == 0 {
+                EvalOut::Ok(Val::OptNone)
+            } else {
+                EvalOut::Ok(Val::OptSome(Box::new(Val::Float(Float64::from_f64(
+                    sum / (count as f64),
+                )))))
+            }
+        }
+        (AggOp::Stddev, NumLayout::Float | NumLayout::Int) => {
+            let mut fs = Vec::with_capacity(total_rows);
+            for b in &vm.batches {
+                let c = &b.cols[idx];
+                match &c.data {
+                    ColumnData::Float(vs) => {
+                        for &r_u16 in &b.active_indices() {
+                            let r = usize::from(r_u16);
+                            if c.validity.as_ref().is_some_and(|bm| !bm.is_valid(r)) {
+                                continue;
+                            }
+                            fs.push(f64::from_bits(vs[r]));
+                        }
+                    }
+                    ColumnData::Int(vs) => {
+                        for &r_u16 in &b.active_indices() {
+                            let r = usize::from(r_u16);
+                            if c.validity.as_ref().is_some_and(|bm| !bm.is_valid(r)) {
+                                continue;
+                            }
+                            fs.push(vs[r] as f64);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if fs.len() < 2 {
+                return EvalOut::Ok(Val::OptNone);
+            }
+            let mean = fs.iter().sum::<f64>() / (fs.len() as f64);
+            let var =
+                fs.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / ((fs.len() - 1) as f64);
+            EvalOut::Ok(Val::OptSome(Box::new(Val::Float(Float64::from_f64(
+                var.sqrt(),
+            )))))
+        }
+        _ => {
+            let mut vals = Vec::with_capacity(total_rows);
+            for b in &vm.batches {
+                let c = &b.cols[idx];
+                for &r_u16 in &b.active_indices() {
+                    vals.push(c.get_val(usize::from(r_u16)));
+                }
+            }
+            eval_agg_values(op, &vals, total_rows)
+        }
+    }
+}
+
 fn unary_plan_input(plan: &ExecPlan) -> Option<&ExecPlan> {
     match plan {
         ExecPlan::Select { input, .. }
@@ -4934,6 +5851,165 @@ fn coerce_cell_to_scalar(val: Val, target: &ScalarTy) -> Val {
             render_decimal(d).parse::<f64>().unwrap_or(0.0),
         )),
         _ => val,
+    }
+}
+
+#[inline]
+fn column_data_matches_scalar(data: &ColumnData, ty: &ScalarTy) -> bool {
+    matches!(
+        (data, ty),
+        (ColumnData::Unit(_), ScalarTy::Unit)
+            | (ColumnData::Bool(_), ScalarTy::Bool)
+            | (ColumnData::Int(_), ScalarTy::Int)
+            | (ColumnData::Decimal(_), ScalarTy::Decimal)
+            | (ColumnData::Float(_), ScalarTy::Float)
+            | (ColumnData::Text { .. }, ScalarTy::Text)
+            | (ColumnData::Bytes { .. }, ScalarTy::Bytes)
+            | (ColumnData::Date(_), ScalarTy::Date)
+            | (ColumnData::Timestamp(_), ScalarTy::Timestamp)
+            | (ColumnData::Duration(_), ScalarTy::Duration)
+    )
+}
+
+fn vm_table_matches_schema_exact(vm: &VmTable, dst_tt: &TableTy) -> bool {
+    if vm.cols.len() != dst_tt.cols.len() {
+        return false;
+    }
+    if !vm.cols.iter().zip(&dst_tt.cols).all(|(sc, dc)| sc == dc) {
+        return false;
+    }
+    for b in &vm.batches {
+        if b.cols.len() != dst_tt.cols.len() {
+            return false;
+        }
+        for (col, dc) in b.cols.iter().zip(&dst_tt.cols) {
+            if col.spec != *dc {
+                return false;
+            }
+            match &dc.ty {
+                ScalarTy::Option(inner) => {
+                    if inner.is_option()
+                        || col.validity.is_none()
+                        || !column_data_matches_scalar(&col.data, inner)
+                    {
+                        return false;
+                    }
+                }
+                other => {
+                    if col.validity.is_some() || !column_data_matches_scalar(&col.data, other) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn coerce_vm_column_data(
+    src_data: &ColumnData,
+    target: &ScalarTy,
+    validity: Option<NullBitmap>,
+    spec: &ColSpec,
+) -> Option<Column> {
+    if column_data_matches_scalar(src_data, target) {
+        return Some(Column {
+            spec: spec.clone(),
+            data: src_data.clone(),
+            validity,
+        });
+    }
+    match (src_data, target) {
+        (ColumnData::Int(vs), ScalarTy::Float) => Some(Column {
+            spec: spec.clone(),
+            data: ColumnData::Float(
+                vs.iter()
+                    .map(|&n| Float64::from_f64(n as f64).bits)
+                    .collect(),
+            ),
+            validity,
+        }),
+        (ColumnData::Int(vs), ScalarTy::Decimal) => Some(Column {
+            spec: spec.clone(),
+            data: ColumnData::Decimal(vs.iter().map(|&n| i128::from(n) * DEC_SCALE).collect()),
+            validity,
+        }),
+        (ColumnData::Decimal(vs), ScalarTy::Float) => {
+            let mut scratch = String::with_capacity(48);
+            let mut out = Vec::with_capacity(vs.len());
+            for &d in vs {
+                scratch.clear();
+                render_decimal_i128_into(&mut scratch, d);
+                let f = scratch.parse::<f64>().unwrap_or(0.0);
+                out.push(Float64::from_f64(f).bits);
+            }
+            Some(Column {
+                spec: spec.clone(),
+                data: ColumnData::Float(out),
+                validity,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn coerce_vm_column(sc: &Column, dc: &ColSpec, batch_len: usize) -> Column {
+    if !matches!(sc.data, ColumnData::Generic(_)) {
+        match &dc.ty {
+            ScalarTy::Option(inner) if !inner.is_option() => {
+                let out_validity = Some(
+                    sc.validity
+                        .clone()
+                        .unwrap_or_else(|| NullBitmap::all_valid(batch_len)),
+                );
+                if let Some(col) = coerce_vm_column_data(&sc.data, inner, out_validity, dc) {
+                    return col;
+                }
+            }
+            other if !matches!(other, ScalarTy::Option(_)) && sc.validity.is_none() => {
+                if let Some(col) = coerce_vm_column_data(&sc.data, other, None, dc) {
+                    return col;
+                }
+            }
+            _ => {}
+        }
+    }
+    let vals: Vec<Val> = (0..batch_len)
+        .map(|r| coerce_cell_to_scalar(sc.get_val(r), &dc.ty))
+        .collect();
+    Column::from_vals(dc.clone(), &vals)
+}
+
+fn coerce_vm_table(vm: &VmTable, dst_tt: &TableTy) -> VmTable {
+    let src_idxs: Vec<Option<usize>> = dst_tt
+        .cols
+        .iter()
+        .map(|dc| vm.cols.iter().position(|sc| sc.name == dc.name))
+        .collect();
+    let mut batches = Vec::with_capacity(vm.batches.len());
+    for b in &vm.batches {
+        let mut cols = Vec::with_capacity(dst_tt.cols.len());
+        for (ci, dc) in dst_tt.cols.iter().enumerate() {
+            let col = match src_idxs[ci].and_then(|si| b.cols.get(si)) {
+                Some(sc) => coerce_vm_column(sc, dc, b.len),
+                None => {
+                    let missing = coerce_cell_to_scalar(Val::Unit, &dc.ty);
+                    let vals = vec![missing; b.len];
+                    Column::from_vals(dc.clone(), &vals)
+                }
+            };
+            cols.push(col);
+        }
+        batches.push(Batch {
+            cols,
+            len: b.len,
+            selection: b.selection.clone(),
+            group_meta: b.group_meta.clone(),
+        });
+    }
+    VmTable {
+        cols: dst_tt.cols.clone(),
+        batches,
     }
 }
 

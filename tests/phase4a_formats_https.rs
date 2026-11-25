@@ -982,6 +982,16 @@ fn parquet_synthetic_rle_dictionary_snappy_and_type_conversions() -> TestResult 
     ]);
     let decoded = read_parquet_bytes_with_schema(&w, &schema, |_, _| true)?;
     assert_eq!(decoded.rows.len(), 5);
+    let fast_none =
+        vec![dana::formats::constraint::FastColConstraint::AlwaysTrue; schema.cols.len()];
+    let decoded_vm = dana::formats::parquet::read_parquet_bytes_to_vm_table(
+        &w,
+        &schema,
+        dana::vm::batch::BATCH_SIZE,
+        &fast_none,
+        |_, _| true,
+    )?;
+    assert_tables_eq(&decoded_vm.to_table_val(), &decoded);
 
     let expected_depts = [
         Val::OptSome(Box::new(Val::Text("ENG".to_string()))),

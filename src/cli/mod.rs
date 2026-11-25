@@ -43,11 +43,11 @@ use crate::runtime::{RunConfig, RunResult, run_exec_program, run_program_tests};
 use crate::syntax::{format_module, parse_module};
 use crate::vm::{VmConfig, run_exec_program_vm, run_program_tests_vm};
 
-/// Authoritative Dana Language Reference v0.3 embedded for offline `dana guide`.
+/// Authoritative Dana Language Reference v0.4 embedded for offline `dana guide`.
 pub const EMBEDDED_GUIDE: &str = include_str!("../../docs/reference/README.md");
 
 const USAGE: &str = "\
-dana — fast, private, database-native data language toolchain (v0.3)
+dana — fast, private, database-native data language toolchain (v0.4)
 
 USAGE:
   dana <COMMAND> [OPTIONS]

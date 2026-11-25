@@ -9,20 +9,21 @@ this repository. `CLAUDE.md` imports this file.
 fast, private, database-native data work—the data sibling to
 [Mo](https://github.com/robertguss/mo).
 
-Phases 0, 1, 2, 3, 4, and 5 (Design, Executable Grammar, Lean 4 Formal Core, Naive Rust
-Oracle, Zero-Crate Toolchain, Streaming Formats/FFI, Relational Optimizer & 2,048-Row
-Vectorized Columnar VM, Databases & SQL Pushdown — **v0.1**, Formats, Analytics, Charts,
-Safe REPL & Hash-Pinned Vendor Modules — **v0.2**, and 12-Parser Fuzzing, Differential Soak,
-Privacy Red-Team, End-to-End Python Benchmarks & 24/24 Multi-Model AI Learnability Gate —
-**v0.3, pre-1.0**) are complete. **`v1.0` GA is intentionally held** for direct
-streaming-columnar CSV/Parquet I/O into `VmTable`, pre-1.0 ergonomics/formatter polish from
-the v0.3 learnability eval, and production soak. Run `make check-all` (or `make check-v03`)
-after changes to `grammar/`, `examples/`, `formal/`, `src/`, or `docs/reference/README.md`.
+Phases 0, 1, 2, 3, 4, 5, and 6 (Slice 4.2) — Design, Executable Grammar, Lean 4 Formal Core,
+Naive Rust Oracle, Zero-Crate Toolchain, Streaming Formats/FFI, Relational Optimizer &
+2,048-Row Vectorized Columnar VM, Databases & SQL Pushdown (**v0.1**), Formats, Analytics,
+Charts, Safe REPL & Hash-Pinned Vendor Modules (**v0.2**), 12-Parser Fuzzing, Differential
+Soak, Privacy Red-Team, End-to-End Python Benchmarks & 24/24 Multi-Model AI Learnability Gate
+(**v0.3**), and Direct Streaming-Columnar CSV/Parquet Ingestion into `VmTable` + Zero-Copy
+Columnar Analytics & Writers (**v0.4, pre-1.0**) — are complete. **`v1.0` GA is intentionally
+held** for pre-1.0 ergonomics/formatter polish from the v0.3 learnability eval and production
+soak. Run `make check-all` (or `make check-v04`) after changes to `grammar/`, `examples/`,
+`formal/`, `src/`, or `docs/reference/README.md`.
 
 ## Documents in Order of Authority
 
 1. `docs/CHARTER.md` — locked-in v1 pillars, non-goals, and constraints.
-2. `docs/reference/README.md` — the Dana Language Reference v0.3 (embedded into `dana guide`).
+2. `docs/reference/README.md` — the Dana Language Reference v0.4 (embedded into `dana guide`).
    Wins over design docs on user-observable rules.
 3. `docs/design/privacy.md` — PII/FERPA taint, implicit-flow, and declassification semantics.
 4. `docs/design/core-ir.md` — Dana Core IR, canonical text wire protocol, and Lean theorems.
@@ -40,6 +41,7 @@ make test-parser-parity    # run Rust parser vs. Bison IELR(1) parity suite
 make test-examples         # run end-to-end tests across all 10 examples/*.dana (VM & oracle)
 make test-db               # run SQLite/Postgres driver, schema.lock, pushdown & CLI DB e2e tests
 make test-phase4           # run Phase 4A/4B/4C suites (Parquet, XLSX, HTTPS, stats, charts, REPL, vendor, all 10 live e2e)
+make test-v04              # run v0.4 Slice 4.2 streaming-columnar CSV/Parquet/Stats/profile/REPL parity suite
 make test-diff             # run Lean/oracle/VM/SQL-pushdown differential verification suites (6,000+ cases)
 make fuzz-parsers          # run 12-parser zero-crate fuzzer (--release)
 make fuzz-soak             # run extended differential soak & 47-probe adversarial privacy suite (--release)
@@ -47,7 +49,7 @@ make soak                  # run 10,000-case extended differential soak (DANA_SO
 make learnability          # run Phase 5C deterministic AI learnability grading harness
 make bench                 # build release binary and run Dana vs. Python/Pandas/Polars benchmarks
 make check-all             # run grammar, formal, and oracle checks end-to-end
-make check-v03             # run full v0.3 verification (grammar, formal, oracle, fuzz-parsers, fuzz-soak, learnability)
+make check-v04             # run full v0.4 verification (grammar, formal, oracle, fuzz-parsers, fuzz-soak, learnability)
 ```
 
 ## Non-Negotiable Engineering Rules

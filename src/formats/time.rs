@@ -340,6 +340,101 @@ pub fn parse_decimal_bigint_strict(raw: &str) -> Result<BigInt, ParseFormatError
     parse_decimal_bigint_inner(raw, false)
 }
 
+const POW10_U128: [u128; 19] = [
+    1,
+    10,
+    100,
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+    10_000_000_000,
+    100_000_000_000,
+    1_000_000_000_000,
+    10_000_000_000_000,
+    100_000_000_000_000,
+    1_000_000_000_000_000,
+    10_000_000_000_000_000,
+    100_000_000_000_000_000,
+    1_000_000_000_000_000_000,
+];
+
+/// Zero-allocation exact parser for fixed-point `Decimal` (scale `10^18`, symmetric range
+/// `[DEC_MIN, DEC_MAX] = [-(2^127 - 1), +(2^127 - 1)]`).
+///
+/// Matches [`parse_decimal_bigint_strict`] identically on every input: trims surrounding
+/// whitespace, allows optional leading `+`/`-`, requires at least one integer digit, rejects
+/// underscores, scientific notation, `> 18` fractional digits, and out-of-range values.
+#[inline]
+#[must_use]
+pub fn parse_decimal_i128(raw: &str) -> Option<i128> {
+    let trimmed = raw.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let (neg, rest) = match bytes[0] {
+        b'-' => (true, &bytes[1..]),
+        b'+' => (false, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    if rest.is_empty() {
+        return None;
+    }
+
+    let mut int_mag: u128 = 0;
+    let mut i = 0usize;
+    while i < rest.len() {
+        let b = rest[i];
+        if b == b'.' {
+            break;
+        }
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        int_mag = int_mag.checked_mul(10)?.checked_add(u128::from(b - b'0'))?;
+        i += 1;
+    }
+    if i == 0 {
+        // Reject leading `.` with empty integer part (matches `parse_decimal_bigint_strict`).
+        return None;
+    }
+
+    let mut frac_mag: u128 = 0;
+    let mut frac_len = 0usize;
+    if i < rest.len() {
+        // Consume '.'
+        i += 1;
+        frac_len = rest.len() - i;
+        if frac_len > 18 {
+            return None;
+        }
+        for &b in &rest[i..] {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            frac_mag = frac_mag * 10 + u128::from(b - b'0');
+        }
+        frac_mag *= POW10_U128[18 - frac_len];
+    }
+    let _ = frac_len;
+
+    let scaled_int = int_mag.checked_mul(DEC_SCALE as u128)?;
+    let total_mag = scaled_int.checked_add(frac_mag)?;
+    if total_mag > (DEC_MAX as u128) {
+        return None;
+    }
+    let signed = if neg && total_mag != 0 {
+        -(total_mag as i128)
+    } else {
+        total_mag as i128
+    };
+    if signed < DEC_MIN { None } else { Some(signed) }
+}
+
 fn parse_decimal_bigint_inner(
     raw: &str,
     allow_underscores: bool,

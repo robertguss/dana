@@ -1337,6 +1337,20 @@ fn merge_branch_regs(
             }
             return RegVal::Int(out);
         }
+        (RegVal::Broadcast(Val::Int(av)), RegVal::Broadcast(Val::Int(bv)))
+            if av.to_i64().is_some() && bv.to_i64().is_some() =>
+        {
+            let a_i = av.to_i64().unwrap_or(0);
+            let b_i = bv.to_i64().unwrap_or(0);
+            let mut out = vec![0i64; batch_len];
+            for &l in lanes_a {
+                out[usize::from(l)] = a_i;
+            }
+            for &l in lanes_b {
+                out[usize::from(l)] = b_i;
+            }
+            return RegVal::Int(out);
+        }
         (RegVal::Decimal(a), RegVal::Decimal(b)) => {
             let mut out = vec![0i128; batch_len];
             for &l in lanes_a {
@@ -1370,6 +1384,20 @@ fn merge_branch_regs(
             for &l in lanes_b {
                 let i = usize::from(l);
                 out[i] = b[i];
+            }
+            return RegVal::Decimal(out);
+        }
+        (RegVal::Broadcast(Val::Decimal(av)), RegVal::Broadcast(Val::Decimal(bv)))
+            if av.to_i128().is_some() && bv.to_i128().is_some() =>
+        {
+            let a_d = av.to_i128().unwrap_or(0);
+            let b_d = bv.to_i128().unwrap_or(0);
+            let mut out = vec![0i128; batch_len];
+            for &l in lanes_a {
+                out[usize::from(l)] = a_d;
+            }
+            for &l in lanes_b {
+                out[usize::from(l)] = b_d;
             }
             return RegVal::Decimal(out);
         }
@@ -1407,6 +1435,16 @@ fn merge_branch_regs(
             }
             return RegVal::Float(out);
         }
+        (RegVal::Broadcast(Val::Float(af)), RegVal::Broadcast(Val::Float(bf))) => {
+            let mut out = vec![0u64; batch_len];
+            for &l in lanes_a {
+                out[usize::from(l)] = af.bits;
+            }
+            for &l in lanes_b {
+                out[usize::from(l)] = bf.bits;
+            }
+            return RegVal::Float(out);
+        }
         (RegVal::Bool(a), RegVal::Bool(b)) => {
             let mut out = vec![0u8; batch_len];
             for &l in lanes_a {
@@ -1440,6 +1478,18 @@ fn merge_branch_regs(
             for &l in lanes_b {
                 let i = usize::from(l);
                 out[i] = b[i];
+            }
+            return RegVal::Bool(out);
+        }
+        (RegVal::Broadcast(Val::Bool(ab)), RegVal::Broadcast(Val::Bool(bb))) => {
+            let a_u = u8::from(*ab);
+            let b_u = u8::from(*bb);
+            let mut out = vec![0u8; batch_len];
+            for &l in lanes_a {
+                out[usize::from(l)] = a_u;
+            }
+            for &l in lanes_b {
+                out[usize::from(l)] = b_u;
             }
             return RegVal::Bool(out);
         }
