@@ -578,36 +578,38 @@ pub fn eval_prim_op(op: &PrimOp, args: &[Val]) -> PrimResult {
                 };
                 series.push(vals);
             }
-            PrimResult::Ok(Val::Chart(ChartVal {
+            PrimResult::Ok(Val::Chart(Box::new(ChartVal {
                 kind: *kind,
                 title: title.clone(),
                 col_names: cols.clone(),
                 series,
                 ..ChartVal::default()
-            }))
+            })))
         }
-        (PrimOp::ReportNew, [Val::Text(title)]) => PrimResult::Ok(Val::Report(ReportVal {
-            title: title.clone(),
-            summaries: Vec::new(),
-            charts: Vec::new(),
-            tables: Vec::new(),
-        })),
+        (PrimOp::ReportNew, [Val::Text(title)]) => {
+            PrimResult::Ok(Val::Report(Box::new(ReportVal {
+                title: title.clone(),
+                summaries: Vec::new(),
+                charts: Vec::new(),
+                tables: Vec::new(),
+            })))
+        }
         (PrimOp::ReportAddSummary, [Val::Report(rv), Val::Text(s)]) => {
-            let mut out = rv.clone();
+            let mut out = rv.as_ref().clone();
             out.summaries.push(s.clone());
-            PrimResult::Ok(Val::Report(out))
+            PrimResult::Ok(Val::Report(Box::new(out)))
         }
         (PrimOp::ReportAddChart, [Val::Report(rv), Val::Chart(cv)]) => {
-            let mut out = rv.clone();
-            out.charts.push(cv.clone());
-            PrimResult::Ok(Val::Report(out))
+            let mut out = rv.as_ref().clone();
+            out.charts.push(cv.as_ref().clone());
+            PrimResult::Ok(Val::Report(Box::new(out)))
         }
         (PrimOp::ReportAddTable, [Val::Report(rv), Val::Table(tv)]) => {
-            let mut out = rv.clone();
+            let mut out = rv.as_ref().clone();
             let headers = tv.cols.iter().map(|c| c.name.clone()).collect();
             let raw_rows = tv.rows.iter().map(|r| r.cells.clone()).collect();
             out.tables.push((headers, raw_rows));
-            PrimResult::Ok(Val::Report(out))
+            PrimResult::Ok(Val::Report(Box::new(out)))
         }
         _ => PrimResult::Wrong,
     }
@@ -2751,13 +2753,15 @@ fn eval_ir_iter<'a>(prog: &'a Program, world: &mut World, init_target: EvalTarge
                             body,
                         } => {
                             lam_bodies.insert(Arc::as_ptr(body) as usize, &**body);
-                            cur_step = Some(EvalStep::Ok(Val::Closure {
-                                params: params.clone(),
-                                fn_pc: fn_pc.clone(),
-                                ret_lty: ret_lty.clone(),
-                                body: Arc::clone(body),
-                                captured_env: env,
-                            }));
+                            cur_step = Some(EvalStep::Ok(Val::Closure(Box::new(
+                                crate::oracle::value::ClosureVal {
+                                    params: params.clone(),
+                                    fn_pc: fn_pc.clone(),
+                                    ret_lty: ret_lty.clone(),
+                                    body: Arc::clone(body),
+                                    captured_env: env,
+                                },
+                            ))));
                         }
                         Expr::App { fn_expr, args } => {
                             frames.push(EvalFrame::AppFn {
@@ -3274,21 +3278,14 @@ fn eval_ir_iter<'a>(prog: &'a Program, world: &mut World, init_target: EvalTarge
                         args,
                     } => {
                         let mut fn_val = v;
-                        let Val::Closure {
-                            params,
-                            fn_pc,
-                            body,
-                            captured_env,
-                            ..
-                        } = &mut fn_val
-                        else {
+                        let Val::Closure(cl) = &mut fn_val else {
                             return EvalStep::Wrong;
                         };
                         let kind = SeqKind::App {
-                            params: std::mem::take(params),
-                            fn_pc: std::mem::take(fn_pc),
-                            body: Arc::clone(body),
-                            captured_env: std::mem::take(captured_env),
+                            params: std::mem::take(&mut cl.params),
+                            fn_pc: std::mem::take(&mut cl.fn_pc),
+                            body: Arc::clone(&cl.body),
+                            captured_env: std::mem::take(&mut cl.captured_env),
                         };
                         let (t, s) = start_eval_seq(
                             prog,

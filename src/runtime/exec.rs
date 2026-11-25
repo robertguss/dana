@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Cursor, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::core::bigint::{BigInt, DEC_MAX, DEC_MIN, DEC_SCALE, INT64_MAX, INT64_MIN};
 use crate::core::check::{check_cap_against_policy, is_safe_relative_path, join_confined_path};
@@ -188,7 +189,7 @@ enum EvalOut {
     Failed(String),
 }
 
-type RTEnv = HashMap<Ident, Val>;
+type RTEnv = HashMap<Ident, Arc<Val>>;
 
 /// Execute `main(...)` of a lowered [`ExecProgram`] using the reference row-by-row engine (`--oracle`).
 #[must_use]
@@ -235,7 +236,7 @@ pub(crate) fn run_exec_program_with_engine(
     let mut env = RTEnv::new();
     for (pname, plty) in &entry_fn.params {
         let cap_val = real_cap_for_ty(&plty.ty);
-        env.insert(pname.clone(), cap_val);
+        env.insert(pname.clone(), Arc::new(cap_val));
     }
 
     let mut ev = Evaluator {
@@ -297,10 +298,10 @@ pub(crate) fn eval_exec_entry_with_engine(
     let mut env = RTEnv::new();
     for (pname, plty) in &entry_fn.params {
         if let Some((_, v)) = prebound.iter().find(|(n, _)| n == pname) {
-            env.insert(pname.clone(), v.clone());
+            env.insert(pname.clone(), Arc::new(v.clone()));
         } else {
             let cap_val = real_cap_for_ty(&plty.ty);
-            env.insert(pname.clone(), cap_val);
+            env.insert(pname.clone(), Arc::new(cap_val));
         }
     }
 
@@ -506,6 +507,22 @@ fn map_db_err_to_bug(err: DbError) -> Bug {
     }
 }
 
+fn build_constraint_self_cols(schema_tt: &TableTy) -> Vec<[ColSpec; 1]> {
+    schema_tt
+        .cols
+        .iter()
+        .map(|c| {
+            [ColSpec {
+                name: "__self".to_string(),
+                ty: c.ty.clone(),
+                tags: TagSet::empty(),
+                bucketed: false,
+                agg_kind: AggKind::Raw,
+            }]
+        })
+        .collect()
+}
+
 fn find_fake_db_table<'a>(db: &'a FakeDBState, table_name: &str) -> Option<&'a StoredTable> {
     if let Some(exact) = db.tables.iter().find(|t| t.table_name == table_name) {
         return Some(exact);
@@ -527,7 +544,7 @@ impl crate::vm::exec::ExecPlanBridge for Evaluator<'_> {
     fn eval_outer_expr(
         &mut self,
         expr: &ExecExpr,
-        env: &HashMap<Ident, Val>,
+        env: &HashMap<Ident, Arc<Val>>,
     ) -> Result<Val, crate::vm::OpErr> {
         match self.eval_expr(expr, env) {
             EvalOut::Ok(v) => Ok(v),
@@ -685,13 +702,13 @@ impl<'a> Evaluator<'a> {
                         other => return other,
                     };
                     let map = owned_env.get_or_insert_with(|| env.clone());
-                    map.insert(name.clone(), val);
+                    map.insert(name.clone(), Arc::new(val));
                     cur_expr = body;
                     continue;
                 }
                 ExecExpr::Lit(l) => return EvalOut::Ok(eval_literal(l)),
                 ExecExpr::Var(name) => {
-                    return cur_env.get(name).cloned().map_or_else(
+                    return cur_env.get(name).map(|v| v.as_ref().clone()).map_or_else(
                         || EvalOut::Failed(format!("unbound runtime variable `{name}`")),
                         EvalOut::Ok,
                     );
@@ -728,16 +745,16 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 ExecExpr::CaseE { scrut, arms } => {
-                    let sv = match self.eval_expr(scrut, cur_env) {
+                    let mut sv = match self.eval_expr(scrut, cur_env) {
                         EvalOut::Ok(v) => v,
                         other => return other,
                     };
                     let mut matched_body = None;
                     for arm in arms {
-                        if let Some(bindings) = match_pattern(&arm.pattern, &sv) {
+                        if let Some(bindings) = match_pattern_take(&arm.pattern, &mut sv) {
                             let map = owned_env.get_or_insert_with(|| env.clone());
                             for (k, v) in bindings {
-                                map.insert(k, v);
+                                map.insert(k, Arc::new(v));
                             }
                             matched_body = Some(&arm.body);
                             break;
@@ -807,14 +824,20 @@ impl<'a> Evaluator<'a> {
                         }
                         return EvalOut::Ok(acc);
                     }
-                    let mut vals = Vec::with_capacity(args.len());
+                    let mut arg_arcs = Vec::with_capacity(args.len());
                     for a in args {
+                        if let ExecExpr::Var(vname) = a
+                            && let Some(val) = cur_env.get(vname)
+                        {
+                            arg_arcs.push(Arc::clone(val));
+                            continue;
+                        }
                         match self.eval_expr(a, cur_env) {
-                            EvalOut::Ok(v) => vals.push(v),
+                            EvalOut::Ok(v) => arg_arcs.push(Arc::new(v)),
                             other => return other,
                         }
                     }
-                    return self.eval_call(fn_name, vals);
+                    return self.eval_call_arcs(fn_name, arg_arcs);
                 }
                 ExecExpr::Join {
                     label,
@@ -828,7 +851,7 @@ impl<'a> Evaluator<'a> {
                             EvalOut::Jumped(ref lbl, ref jargs) if lbl == label => {
                                 let mut jenv = cur_env.clone();
                                 for ((p, _), v) in params.iter().zip(jargs.iter()) {
-                                    jenv.insert(p.clone(), v.clone());
+                                    jenv.insert(p.clone(), Arc::new(v.clone()));
                                 }
                                 cur = self.eval_expr(rhs, &jenv);
                             }
@@ -866,22 +889,22 @@ impl<'a> Evaluator<'a> {
                         if let Some(stop) = self.tick() {
                             return stop;
                         }
-                        loop_env.insert(item_var.clone(), item);
+                        loop_env.insert(item_var.clone(), Arc::new(item));
                         match self.eval_expr(body, &loop_env) {
                             EvalOut::Ok(Val::Tuple(ref updated)) => {
                                 for ((k, _), v) in state_vars.iter().zip(updated.iter()) {
-                                    loop_env.insert(k.clone(), v.clone());
+                                    loop_env.insert(k.clone(), Arc::new(v.clone()));
                                 }
                             }
                             EvalOut::Ok(_) => {}
                             EvalOut::Jumped(lbl, vals) if lbl == "__continue" => {
                                 for ((k, _), v) in state_vars.iter().zip(vals) {
-                                    loop_env.insert(k.clone(), v);
+                                    loop_env.insert(k.clone(), Arc::new(v));
                                 }
                             }
                             EvalOut::Jumped(lbl, vals) if lbl == "__break" => {
                                 for ((k, _), v) in state_vars.iter().zip(vals) {
-                                    loop_env.insert(k.clone(), v);
+                                    loop_env.insert(k.clone(), Arc::new(v));
                                 }
                                 break;
                             }
@@ -916,18 +939,18 @@ impl<'a> Evaluator<'a> {
                         match self.eval_expr(body, &loop_env) {
                             EvalOut::Ok(Val::Tuple(ref updated)) => {
                                 for ((k, _), v) in state_vars.iter().zip(updated.iter()) {
-                                    loop_env.insert(k.clone(), v.clone());
+                                    loop_env.insert(k.clone(), Arc::new(v.clone()));
                                 }
                             }
                             EvalOut::Ok(_) => {}
                             EvalOut::Jumped(lbl, vals) if lbl == "__continue" => {
                                 for ((k, _), v) in state_vars.iter().zip(vals) {
-                                    loop_env.insert(k.clone(), v);
+                                    loop_env.insert(k.clone(), Arc::new(v));
                                 }
                             }
                             EvalOut::Jumped(lbl, vals) if lbl == "__break" => {
                                 for ((k, _), v) in state_vars.iter().zip(vals) {
-                                    loop_env.insert(k.clone(), v);
+                                    loop_env.insert(k.clone(), Arc::new(v));
                                 }
                                 break;
                             }
@@ -949,11 +972,19 @@ impl<'a> Evaluator<'a> {
                     return EvalOut::Ok(Val::Tuple(vals));
                 }
                 ExecExpr::Proj { tup, idx } => {
+                    let i = idx.to_u64().unwrap_or(usize::MAX as u64) as usize;
+                    if let ExecExpr::Var(name) = tup.as_ref()
+                        && let Some(val) = cur_env.get(name)
+                    {
+                        return match val.as_ref() {
+                            Val::Tuple(xs) if i < xs.len() => EvalOut::Ok(xs[i].clone()),
+                            _ => EvalOut::Failed("tuple projection out of bounds".to_string()),
+                        };
+                    }
                     let mut tv = match self.eval_expr(tup, cur_env) {
                         EvalOut::Ok(v) => v,
                         other => return other,
                     };
-                    let i = idx.to_u64().unwrap_or(usize::MAX as u64) as usize;
                     return match &mut tv {
                         Val::Tuple(xs) if i < xs.len() => EvalOut::Ok(xs.swap_remove(i)),
                         _ => EvalOut::Failed("tuple projection out of bounds".to_string()),
@@ -991,6 +1022,11 @@ impl<'a> Evaluator<'a> {
                     }));
                 }
                 ExecExpr::Prim { op, args } => {
+                    if let [ExecExpr::Var(vname)] = args.as_slice()
+                        && let Some(val) = cur_env.get(vname)
+                    {
+                        return self.eval_exec_prim(op, std::slice::from_ref(val.as_ref()));
+                    }
                     // Iteratively flatten deep left-leaning primitive chains (`1 + 1 + ...`)
                     // so 200,000-term arithmetic/field chains run in O(1) call stack.
                     if let Some(ExecExpr::Prim { .. }) = args.first() {
@@ -1059,6 +1095,87 @@ impl<'a> Evaluator<'a> {
                     return self.eval_plan(plan, cur_env);
                 }
                 ExecExpr::Host { op, args } => {
+                    if let [a0, a1, ExecExpr::Var(vname)] = args.as_slice()
+                        && matches!(
+                            op,
+                            ExecHostOp::Core(HostOp::WriteParquet)
+                                | ExecHostOp::WriteCsv
+                                | ExecHostOp::WriteJsonl
+                        )
+                        && let Some(tbl_arc) = cur_env.get(vname)
+                        && let Val::Table(tv) = tbl_arc.as_ref()
+                    {
+                        let cap_v = match self.eval_expr(a0, cur_env) {
+                            EvalOut::Ok(v) => v,
+                            other => return other,
+                        };
+                        let path_v = match self.eval_expr(a1, cur_env) {
+                            EvalOut::Ok(v) => v,
+                            other => return other,
+                        };
+                        if let (
+                            Val::CapWriteFiles {
+                                handle,
+                                root,
+                                allows,
+                            },
+                            Val::Text(rel),
+                        ) = (&cap_v, &path_v)
+                        {
+                            if !self.ew.dry_run
+                                && let Some(bug) = self.check_export_gate(*handle, allows)
+                            {
+                                return EvalOut::Stopped(bug);
+                            }
+                            if !is_safe_relative_path(rel) {
+                                return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                                    "unsafe write path `{rel}`"
+                                )))));
+                            }
+                            let full_rel = join_confined_path(root, rel);
+                            return match op {
+                                ExecHostOp::Core(HostOp::WriteParquet) => {
+                                    if matches!(handle, CapHandle::Real) && self.ew.dry_run {
+                                        self.ew.world.stdout.push(format!(
+                                            "[DRY-RUN] would write parquet \"{full_rel}\" ({} rows, {} cols)",
+                                            tv.rows.len(),
+                                            tv.cols.len()
+                                        ));
+                                        EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)))
+                                    } else {
+                                        match write_parquet_bytes(tv, ParquetCompression::Zstd) {
+                                            Ok(bytes) => {
+                                                self.write_confined_bytes(*handle, &full_rel, bytes)
+                                            }
+                                            Err(e) => {
+                                                EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e))))
+                                            }
+                                        }
+                                    }
+                                }
+                                ExecHostOp::WriteCsv => {
+                                    let delim = if strip_compression_ext(rel).ends_with(".tsv") {
+                                        b'\t'
+                                    } else {
+                                        b','
+                                    };
+                                    self.write_confined_table(
+                                        *handle,
+                                        &full_rel,
+                                        tv,
+                                        TableWriteFmt::Csv(delim),
+                                    )
+                                }
+                                ExecHostOp::WriteJsonl => self.write_confined_table(
+                                    *handle,
+                                    &full_rel,
+                                    tv,
+                                    TableWriteFmt::Jsonl,
+                                ),
+                                _ => EvalOut::Failed("unexpected host write op".to_string()),
+                            };
+                        }
+                    }
                     let mut vals = Vec::with_capacity(args.len());
                     for a in args {
                         match self.eval_expr(a, cur_env) {
@@ -1119,6 +1236,17 @@ impl<'a> Evaluator<'a> {
         };
         let mut fenv = RTEnv::new();
         for ((pname, _), val) in f.params.iter().zip(args) {
+            fenv.insert(pname.clone(), Arc::new(val));
+        }
+        self.eval_expr(&f.body, &fenv)
+    }
+
+    fn eval_call_arcs(&mut self, fn_name: &str, args: Vec<Arc<Val>>) -> EvalOut {
+        let Some(f) = self.prog.find_fun(fn_name) else {
+            return EvalOut::Failed(format!("unknown function `{fn_name}`"));
+        };
+        let mut fenv = RTEnv::new();
+        for ((pname, _), val) in f.params.iter().zip(args) {
             fenv.insert(pname.clone(), val);
         }
         self.eval_expr(&f.body, &fenv)
@@ -1127,7 +1255,7 @@ impl<'a> Evaluator<'a> {
     fn eval_promise(&mut self, ret_var: &str, promise: &ExecPromise, env: &RTEnv) -> EvalOut {
         match promise {
             ExecPromise::UniqueCols(cols) => {
-                let Some(Val::Table(tv)) = env.get(ret_var) else {
+                let Some(Val::Table(tv)) = env.get(ret_var).map(Arc::as_ref) else {
                     return EvalOut::Failed("`promise unique` expected Table".to_string());
                 };
                 let idxs: Vec<usize> = cols
@@ -1148,7 +1276,7 @@ impl<'a> Evaluator<'a> {
                 EvalOut::Ok(Val::Unit)
             }
             ExecPromise::AllRows(pred) => {
-                let Some(Val::Table(tv)) = env.get(ret_var) else {
+                let Some(Val::Table(tv)) = env.get(ret_var).map(Arc::as_ref) else {
                     return EvalOut::Failed("`promise all` expected Table".to_string());
                 };
                 for row in &tv.rows {
@@ -1193,6 +1321,21 @@ impl<'a> Evaluator<'a> {
                     Err(e) => EvalOut::Failed(format!("Stats.corr: {e}")),
                 },
                 _ => EvalOut::Failed("Stats.corr requires a Table".to_string()),
+            },
+            ExecPrimOp::Core(PrimOp::StatsLinReg { col_x, col_y }) => match args {
+                [Val::Table(tv)] => match crate::stats::linear_regression_table(tv, col_x, col_y) {
+                    Ok(Some(res)) => EvalOut::Ok(Val::LinearModel {
+                        slope: Float64::from_f64(res.slope),
+                        intercept: Float64::from_f64(res.intercept),
+                        r2: Float64::from_f64(res.r_squared),
+                    }),
+                    Ok(None) => EvalOut::Stopped(Bug {
+                        kind: BugKind::DivByZero,
+                        message: "degenerate linear regression: fewer than 2 points, non-finite inputs, or zero variance in x".to_string(),
+                    }),
+                    Err(e) => EvalOut::Failed(format!("Stats.linear_regression: {e}")),
+                },
+                _ => EvalOut::Failed("Stats.linear_regression requires a Table".to_string()),
             },
             ExecPrimOp::Core(PrimOp::TableProfile) => match args {
                 [Val::Table(tv)] => EvalOut::Ok(Val::Profile(
@@ -1678,7 +1821,7 @@ impl<'a> Evaluator<'a> {
                         .collect();
                     series.push(vals);
                 }
-                EvalOut::Ok(Val::Chart(crate::oracle::value::ChartVal {
+                EvalOut::Ok(Val::Chart(Box::new(crate::oracle::value::ChartVal {
                     kind: *kind,
                     title,
                     col_names,
@@ -1689,7 +1832,7 @@ impl<'a> Evaluator<'a> {
                     value_col: value_col.clone(),
                     bins,
                     trendline,
-                }))
+                })))
             }
             ExecPrimOp::OptSubInt => match args {
                 [Val::Int(_), Val::OptNone] => EvalOut::Ok(Val::OptNone),
@@ -2552,6 +2695,7 @@ impl<'a> Evaluator<'a> {
         };
         let constraints = cs.constraints.clone();
         let schema_tt = cs.decl.schema.clone();
+        let self_cols = build_constraint_self_cols(&schema_tt);
         let empty_env = RTEnv::new();
 
         let parsed = match handle {
@@ -2576,7 +2720,7 @@ impl<'a> Evaluator<'a> {
                     }
                 };
                 read_csv_stream_with_schema(reader, &schema_tt, delimiter, |ci, val| {
-                    self.eval_schema_constraint(&schema_tt, &constraints, ci, val, &empty_env)
+                    self.eval_schema_constraint(&self_cols, &constraints, ci, val, &empty_env)
                 })
             }
             CapHandle::Real => {
@@ -2598,7 +2742,7 @@ impl<'a> Evaluator<'a> {
                     }
                 };
                 read_csv_stream_with_schema(reader, &schema_tt, delimiter, |ci, val| {
-                    self.eval_schema_constraint(&schema_tt, &constraints, ci, val, &empty_env)
+                    self.eval_schema_constraint(&self_cols, &constraints, ci, val, &empty_env)
                 })
             }
         };
@@ -2617,6 +2761,7 @@ impl<'a> Evaluator<'a> {
         };
         let constraints = cs.constraints.clone();
         let schema_tt = cs.decl.schema.clone();
+        let self_cols = build_constraint_self_cols(&schema_tt);
         let empty_env = RTEnv::new();
 
         let parsed = match handle {
@@ -2641,7 +2786,7 @@ impl<'a> Evaluator<'a> {
                     }
                 };
                 read_jsonl_stream_with_schema(reader, &schema_tt, |ci, val| {
-                    self.eval_schema_constraint(&schema_tt, &constraints, ci, val, &empty_env)
+                    self.eval_schema_constraint(&self_cols, &constraints, ci, val, &empty_env)
                 })
             }
             CapHandle::Real => {
@@ -2663,7 +2808,7 @@ impl<'a> Evaluator<'a> {
                     }
                 };
                 read_jsonl_stream_with_schema(reader, &schema_tt, |ci, val| {
-                    self.eval_schema_constraint(&schema_tt, &constraints, ci, val, &empty_env)
+                    self.eval_schema_constraint(&self_cols, &constraints, ci, val, &empty_env)
                 })
             }
         };
@@ -2678,7 +2823,7 @@ impl<'a> Evaluator<'a> {
 
     fn eval_schema_constraint(
         &mut self,
-        schema_tt: &TableTy,
+        self_cols: &[[ColSpec; 1]],
         constraints: &[Option<ExecRowExpr>],
         ci: usize,
         val: &Val,
@@ -2687,15 +2832,11 @@ impl<'a> Evaluator<'a> {
         let Some(Some(re)) = constraints.get(ci) else {
             return true;
         };
-        let self_cols = vec![ColSpec {
-            name: "__self".to_string(),
-            ty: schema_tt.cols[ci].ty.clone(),
-            tags: TagSet::empty(),
-            bucketed: false,
-            agg_kind: AggKind::Raw,
-        }];
+        let Some(col_slice) = self_cols.get(ci) else {
+            return false;
+        };
         matches!(
-            self.eval_row_expr(re, &self_cols, std::slice::from_ref(val), empty_env),
+            self.eval_row_expr(re, col_slice, std::slice::from_ref(val), empty_env),
             EvalOut::Ok(Val::Bool(true))
         )
     }
@@ -2750,15 +2891,16 @@ impl<'a> Evaluator<'a> {
                     if let Err(e) = res {
                         return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
                     }
+                } else {
+                    let text = match fmt {
+                        TableWriteFmt::Csv(delim) => format_csv_table(tv, delim),
+                        TableWriteFmt::Jsonl => format_jsonl_table(tv),
+                    };
+                    self.ew
+                        .world
+                        .written_files
+                        .push((full_rel.to_string(), text));
                 }
-                let text = match fmt {
-                    TableWriteFmt::Csv(delim) => format_csv_table(tv, delim),
-                    TableWriteFmt::Jsonl => format_jsonl_table(tv),
-                };
-                self.ew
-                    .world
-                    .written_files
-                    .push((full_rel.to_string(), text));
                 EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)))
             }
         }
@@ -2809,11 +2951,12 @@ impl<'a> Evaluator<'a> {
                     if let Err(e) = write_res {
                         return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
                     }
+                } else {
+                    self.ew
+                        .world
+                        .written_files
+                        .push((full_rel.to_string(), content));
                 }
-                self.ew
-                    .world
-                    .written_files
-                    .push((full_rel.to_string(), content));
                 EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)))
             }
         }
@@ -2883,10 +3026,11 @@ impl<'a> Evaluator<'a> {
                     if let Err(e) = fs::write(&out_path, &bytes) {
                         return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
                     }
+                } else {
+                    self.ew
+                        .written_binary_files
+                        .push((full_rel.to_string(), bytes));
                 }
-                self.ew
-                    .written_binary_files
-                    .push((full_rel.to_string(), bytes));
                 EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)))
             }
         }
@@ -2918,9 +3062,10 @@ impl<'a> Evaluator<'a> {
                 || vec![None; schema_tt.cols.len()],
                 |cs| cs.constraints.clone(),
             );
+        let self_cols = build_constraint_self_cols(schema_tt);
         let empty_env = RTEnv::new();
         match read_parquet_bytes_with_schema(&bytes, schema_tt, |ci, val| {
-            self.eval_schema_constraint(schema_tt, &constraints, ci, val, &empty_env)
+            self.eval_schema_constraint(&self_cols, &constraints, ci, val, &empty_env)
         }) {
             Ok(tv) => EvalOut::Ok(Val::ResOk(Box::new(Val::Table(tv)))),
             Err(msg) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(msg)))),
@@ -2939,13 +3084,14 @@ impl<'a> Evaluator<'a> {
         };
         let constraints = cs.constraints.clone();
         let schema_tt = cs.decl.schema.clone();
+        let self_cols = build_constraint_self_cols(&schema_tt);
         let bytes = match self.read_file_bytes(handle, path) {
             Ok(b) => b,
             Err(e) => return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e)))),
         };
         let empty_env = RTEnv::new();
         match read_xlsx_bytes_with_schema(&bytes, sheet, &schema_tt, |ci, val| {
-            self.eval_schema_constraint(&schema_tt, &constraints, ci, val, &empty_env)
+            self.eval_schema_constraint(&self_cols, &constraints, ci, val, &empty_env)
         }) {
             Ok((good, bad)) => EvalOut::Ok(Val::ResOk(Box::new(Val::Tuple(vec![
                 Val::Table(good),
@@ -3065,12 +3211,13 @@ impl<'a> Evaluator<'a> {
         };
         let constraints = cs.constraints.clone();
         let schema_tt = cs.decl.schema.clone();
+        let self_cols = build_constraint_self_cols(&schema_tt);
         let Some(jresp) = self.extract_json_response(resp_val).cloned() else {
             return EvalOut::Failed("invalid JsonResponse handle".to_string());
         };
         let empty_env = RTEnv::new();
         match jresp.parse_table(field, &schema_tt, |ci, val| {
-            self.eval_schema_constraint(&schema_tt, &constraints, ci, val, &empty_env)
+            self.eval_schema_constraint(&self_cols, &constraints, ci, val, &empty_env)
         }) {
             Ok((good, bad)) => EvalOut::Ok(Val::Tuple(vec![Val::Table(good), Val::Table(bad)])),
             Err(e) => EvalOut::Failed(e),
@@ -3105,7 +3252,7 @@ impl<'a> Evaluator<'a> {
                         );
                 }
                 ExecRowExpr::OuterVar(name) => {
-                    return outer_env.get(name).cloned().map_or_else(
+                    return outer_env.get(name).map(|v| v.as_ref().clone()).map_or_else(
                         || EvalOut::Failed(format!("unknown outer variable `{name}`")),
                         EvalOut::Ok,
                     );
@@ -4701,10 +4848,10 @@ fn eval_crosstab(
     })
 }
 
-fn match_pattern(pat: &ExecPattern, val: &Val) -> Option<Vec<(Ident, Val)>> {
+fn match_pattern_take(pat: &ExecPattern, val: &mut Val) -> Option<Vec<(Ident, Val)>> {
     match pat {
         ExecPattern::Wildcard => Some(Vec::new()),
-        ExecPattern::Bind(name) => Some(vec![(name.clone(), val.clone())]),
+        ExecPattern::Bind(name) => Some(vec![(name.clone(), std::mem::take(val))]),
         ExecPattern::Lit(l) => {
             if val_eq(&eval_literal(l), val) {
                 Some(Vec::new())
@@ -4714,19 +4861,20 @@ fn match_pattern(pat: &ExecPattern, val: &Val) -> Option<Vec<(Ident, Val)>> {
         }
         ExecPattern::ListExact(binders) => match val {
             Val::List(xs) if xs.len() == binders.len() => {
-                Some(binders.iter().cloned().zip(xs.iter().cloned()).collect())
+                let moved = std::mem::take(xs);
+                Some(binders.iter().cloned().zip(moved).collect())
             }
             _ => None,
         },
         ExecPattern::Ctor { ctor, binders } => match (ctor.as_str(), val) {
             ("Ok", Val::ResOk(v)) if binders.len() == 1 => {
-                Some(vec![(binders[0].clone(), v.as_ref().clone())])
+                Some(vec![(binders[0].clone(), std::mem::take(v.as_mut()))])
             }
             ("Error", Val::ResErr(v)) if binders.len() == 1 => {
-                Some(vec![(binders[0].clone(), v.as_ref().clone())])
+                Some(vec![(binders[0].clone(), std::mem::take(v.as_mut()))])
             }
             ("Some", Val::OptSome(v)) if binders.len() == 1 => {
-                Some(vec![(binders[0].clone(), v.as_ref().clone())])
+                Some(vec![(binders[0].clone(), std::mem::take(v.as_mut()))])
             }
             ("None", Val::OptNone) if binders.is_empty() => Some(Vec::new()),
             (
@@ -4734,13 +4882,10 @@ fn match_pattern(pat: &ExecPattern, val: &Val) -> Option<Vec<(Ident, Val)>> {
                 Val::Ctor {
                     ctor_name, fields, ..
                 },
-            ) if c == ctor_name && fields.len() == binders.len() => Some(
-                binders
-                    .iter()
-                    .cloned()
-                    .zip(fields.iter().cloned())
-                    .collect(),
-            ),
+            ) if c == ctor_name && fields.len() == binders.len() => {
+                let moved = std::mem::take(fields);
+                Some(binders.iter().cloned().zip(moved).collect())
+            }
             _ => None,
         },
     }

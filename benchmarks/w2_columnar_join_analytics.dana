@@ -1,0 +1,98 @@
+## Benchmark W2: 500,000-row fact x 50,000-row dimension Parquet join_many_to_one + UDF + agg.
+##
+## Exercises native Zstd Parquet ingestion, checked N:1 hash join (enforcing right-side
+## key uniqueness), an inlined pure Dana margin UDF, and parallel grouped aggregation.
+module BenchW2ColumnarJoinAnalytics
+
+schema SaleEvent
+  sale_id: Int
+  product_id: Int
+  channel: Text
+  units: Int where . > 0
+  discount_bps: Int where . >= 0 and . <= 5000
+end
+
+schema ProductDim
+  product_id: Int
+  department: Text
+  list_price: Float where . > 0.0
+  unit_cost: Float where . >= 0.0
+  hazardous?: Bool
+end
+
+## Pure custom margin UDF inlined into vectorized register bytecode.
+fn effective_margin(
+  list_price: Float,
+  unit_cost: Float,
+  units: Int,
+  discount_bps: Int,
+  hazardous?: Bool
+) : Float
+  u = units.to_float
+  disc_factor = 1.0 - (discount_bps.to_float / 10000.0)
+  net_unit = list_price * disc_factor
+  var handling: Float = if hazardous?: 2.5 else: 0.5
+  (net_unit - unit_cost - handling) * u
+end
+
+fn analyze_sales(sales: Table(SaleEvent), products: Table(ProductDim))
+  promise unique(.department, .channel)
+
+  sales
+    |> join_many_to_one(products, on: .product_id)
+    |> derive(
+         net_revenue: .list_price * (1.0 - (.discount_bps.to_float / 10000.0)) * .units.to_float,
+         gross_margin: effective_margin(.list_price, .unit_cost, .units, .discount_bps, .hazardous?)
+       )
+    |> group_by(.department, .channel)
+    |> summarize(
+         total_revenue: sum(.net_revenue),
+         total_margin: sum(.gross_margin),
+         total_units: sum(.units),
+         txn_count: count()
+       )
+    |> sort_by(.department, .channel)
+end
+
+fn main(args: Args, files: ReadFiles, out: WriteFiles("bench-out/"), console: Console) : Int
+  (fact_path, dim_path) = case args.list
+    [f, d]: (f, d)
+    _:
+      console.error("usage: w2_columnar_join_analytics FACT.parquet DIM.parquet")
+      return 2
+  end
+
+  sales = try files.read_parquet(fact_path, as: SaleEvent)
+  products = try files.read_parquet(dim_path, as: ProductDim)
+
+  summary = analyze_sales(sales, products)
+  try out.write_csv("w2_summary.csv", summary)
+
+  console.print("W2 ok: sales=#{sales.count()} products=#{products.count()} groups=#{summary.count()}")
+  0
+end
+
+test "w2 joins fact and dimension tables and computes exact margin UDF"
+  sales = table
+    | sale_id | product_id | channel  | units | discount_bps |
+    | 1       | 101        | "web"    | 2     | 1000         |
+    | 2       | 102        | "web"    | 3     | 0            |
+    | 3       | 101        | "retail" | 1     | 500          |
+  end
+  products = table
+    | product_id | department | list_price | unit_cost | hazardous? |
+    | 101        | "tools"    | 100.0      | 40.0      | false      |
+    | 102        | "tools"    | 50.0       | 20.0      | true       |
+  end
+
+  res = analyze_sales(sales, products)
+  assert res.count() == 2
+  # retail: list=100, disc=5% -> net=95, margin=(95-40-0.5)*1 = 54.5
+  assert res.first!.channel == "retail"
+  assert (res.first!.total_revenue - 95.0).abs < 1e-9
+  assert (res.first!.total_margin - 54.5).abs < 1e-9
+  # web: sale1 rev=180 margin=(90-40-0.5)*2=99; sale2 rev=150 margin=(50-20-2.5)*3=82.5 -> rev=330 margin=181.5
+  web = res |> where(.channel == "web")
+  assert (web.first!.total_revenue - 330.0).abs < 1e-9
+  assert (web.first!.total_margin - 181.5).abs < 1e-9
+end

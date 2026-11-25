@@ -1,0 +1,101 @@
+## Benchmark W4: 200,000-row native Zstd Parquet round-trip + Stats + profile + HTML report.
+##
+## Exercises zero-crate Zstd Parquet read & write, full-table Pearson correlation and OLS
+## linear regression, privacy-safe `table.profile()`, standalone SVG scatter chart with
+## OLS trendline overlay, and self-contained HTML5 report generation.
+module BenchW4ParquetStatsReport
+use Stats
+
+schema TelemetryRow
+  reading_id: Int
+  zone: Text
+  load_pct: Float where . >= 0.0 and . <= 100.0
+  latency_ms: Float where . >= 0.0
+  healthy?: Bool
+end
+
+fn filter_healthy(rows: Table(TelemetryRow))
+  rows
+    |> where(.healthy?)
+    |> derive(load_ratio: .load_pct / 100.0)
+end
+
+fn summarize_zones(clean: Table(reading_id: Int, zone: Text, load_pct: Float, latency_ms: Float, healthy?: Bool, load_ratio: Float))
+  clean
+    |> group_by(.zone)
+    |> summarize(
+         readings: count(),
+         avg_load: mean(.load_pct) ?? 0.0,
+         avg_latency: mean(.latency_ms) ?? 0.0
+       )
+    |> sort_by(.zone)
+end
+
+fn main(args: Args, files: ReadFiles, out: WriteFiles("bench-out/"), console: Console) : Int
+  in_path = args.first.or_return(2)
+  raw = try files.read_parquet(in_path, as: TelemetryRow)
+
+  clean = filter_healthy(raw)
+  try out.write_parquet("w4_clean.parquet", clean)
+
+  prof = clean.profile()
+  r_pearson = Stats.corr(clean, x: .load_pct, y: .latency_ms, method: :pearson)
+  model = Stats.linear_regression(clean, x: .load_pct, y: .latency_ms)
+  zones = summarize_zones(clean)
+
+  stats_tbl = table
+    | clean_rows    | r_pearson | slope       | intercept       | r_squared       |
+    | clean.count() | r_pearson | model.slope | model.intercept | model.r_squared |
+  end
+  try out.write_csv("w4_stats.csv", stats_tbl)
+  try out.write_csv("w4_zones.csv", zones)
+
+  scatter = clean
+    |> limit(1000)
+    |> chart_scatter(
+         x: .load_pct,
+         y: .latency_ms,
+         color: .zone,
+         trendline: model,
+         title: "Load vs. Latency (r = #{r_pearson.round(4)}, R^2 = #{model.r_squared.round(4)})"
+       )
+
+  report = Report.new("Telemetry Performance & Regression Report")
+    |> add_summary(
+         "Analyzed #{clean.count()} healthy readings: Pearson r = #{r_pearson.round(6)}, "
+         + "OLS latency = #{model.slope.round(6)} * load + #{model.intercept.round(6)} "
+         + "(R^2 = #{model.r_squared.round(6)})."
+       )
+    |> add_chart(scatter)
+    |> add_table(zones)
+
+  try out.write_html("w4_report.html", report)
+  console.print_profile(prof)
+  console.print("W4 ok: clean=#{clean.count()} r=#{r_pearson.round(6)} slope=#{model.slope.round(6)}")
+  0
+end
+
+test "w4 computes exact correlation, OLS regression, profile, and zone summary"
+  rows = table
+    | reading_id | zone      | load_pct | latency_ms | healthy? |
+    | 1          | "us-east" | 20.0     | 30.0       | true     |
+    | 2          | "us-east" | 40.0     | 50.0       | true     |
+    | 3          | "eu-west" | 60.0     | 70.0       | true     |
+    | 4          | "eu-west" | 80.0     | 90.0       | true     |
+    | 5          | "us-east" | 50.0     | 999.0      | false    |
+  end
+
+  clean = filter_healthy(rows)
+  assert clean.count() == 4
+  r = Stats.corr(clean, x: .load_pct, y: .latency_ms, method: :pearson)
+  m = Stats.linear_regression(clean, x: .load_pct, y: .latency_ms)
+  z = summarize_zones(clean)
+
+  assert (r - 1.0).abs < 1e-12
+  assert (m.slope - 1.0).abs < 1e-12
+  assert (m.intercept - 10.0).abs < 1e-12
+  assert (m.r_squared - 1.0).abs < 1e-12
+  assert z.count() == 2
+  assert z.first!.zone == "eu-west"
+  assert (z.first!.avg_latency - 80.0).abs < 1e-9
+end

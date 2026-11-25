@@ -7,12 +7,14 @@ long-running systems and living services, Dana is built for databases, ETL pipel
 operational and financial analytics, practical statistics, and clean reporting—fast by
 default, batteries included, and safe around sensitive data like PII and FERPA records.
 
-> **Status: Phase 1 Complete (Ready for Phase 2: Core Toolchain & Vectorized VM).**
-> Dana's design charter, privacy model, Core IR specification, Language Reference v0.1,
-> 10 sample programs, 0-conflict Bison IELR(1) executable grammar (`make grammar`),
-> Lean 4 formal core with soundness & non-interference proofs (`make formal`), and
-> Zero-Crate Rust Core IR + differential reference oracle (`make oracle`) are in place.
-> Contributions are not yet open.
+> **Status: Dana v0.3 (pre-1.0) — Hardening, Lockstep Reference & End-to-End Benchmarks.**
+> Dana's 0-conflict Bison IELR(1) executable grammar (`make grammar`), Lean 4 formal core with
+> soundness & non-interference proofs (`make formal`), **Zero-Crate Rust** compiler, 2,048-row
+> vectorized columnar VM with pure-UDF bytecode inlining, embedded SQLite + native PostgreSQL
+> v3.0 SQL pushdown runtime, native Parquet & Excel (`.xlsx`) codecs, capability-gated HTTPS,
+> `Stats` analytics, standalone SVG/HTML/Markdown reporting, safe read-only `dana repl`,
+> SHA-256 hash-pinned `vendor/` modules, and 12-parser zero-crate fuzzer + adversarial privacy
+> hardening suite are complete and verified.
 
 ## Why Dana
 
@@ -30,21 +32,27 @@ Python's data ecosystem is remarkable, but it carries four structural headaches:
 Dana addresses all four at the language, compiler, and runtime level:
 
 - **Native PII & FERPA sensitivity tracking:** Columns carry schema-level sensitivity tags
-  (`[pii]`, `[ferpa]`, or custom tags) that propagate automatically through expressions,
-  filters, joins, and aggregations. Unauthorized sinks fail at compile time; crash reports
-  and AI debug views auto-redact sensitive fields; FERPA small-cell suppression and
-  consistent pseudonymization are built in.
-- **Unified relational pipelines with SQL pushdown:** Local CSV/JSON/Parquet/XLSX files,
-  in-memory tables, SQLite, and Postgres share one typed `|>` pipeline API. Database stages
-  compile automatically into parameterized SQL, with offline `schema.lock` snapshots and
-  redacted `dana dry-run` diffs before writes.
+  (`[pii]`, `[ferpa]`, `[financial]`, `[health]`, `[secret]`, or custom `tag`s) that propagate
+  automatically through expressions, filters, joins, windows, stats, and charts. Unauthorized
+  sinks fail at compile time; crash reports, `dana dry-run` diffs, `profile()`, and `dana repl`
+  auto-redact sensitive fields; FERPA small-cell suppression (`suppress_small_groups`),
+  `bucket`, `redact`, and keyed HMAC-SHA256 `pseudonymize` are built in.
+- **Unified relational pipelines with SQL pushdown:** Local CSV/TSV/JSONL (`.gz`/`.zst`),
+  native Apache Parquet, Excel `.xlsx`, in-memory tables, embedded SQLite, and native
+  PostgreSQL share one typed `|>` pipeline API. Eligible DB stages compile automatically into
+  100% parameterized SQL, verified against offline `schema.lock` snapshots.
 - **Own vectorized columnar VM, zero UDF cliff:** Built in **Zero-Crate Rust** (`std` only
-  plus tiny audited C shims for SQLite, system TLS, and zlib/zstd), executing 2,048-row
-  contiguous columnar batches in parallel with streaming support.
+  plus tiny audited C shims for SQLite, system OpenSSL TLS, and `zlib`/`zstd`), executing
+  2,048-row contiguous columnar batches in parallel and inlining pure Dana UDFs directly into
+  register bytecode.
+- **Batteries-included analytics, charts & safe REPL:** Built-in `use Stats` (`corr`,
+  `linear_regression`, Welch `t_test`, `chi_square`, `outliers`), `pivot_longer`/`pivot_wider`,
+  `table.profile()`, standalone SVG & terminal charts, self-contained HTML5/Markdown reports,
+  and a read-only, privacy-redacted `dana repl` with `untyped` exploration.
 - **Human-readable, AI-first, formally verified:** Shares Mo's Ruby/Elixir readability
-  (`fn ... end`, `?` predicates, `case`, `Decimal`, explicit capabilities, `examples`,
-  `promise`, `dana guide`, multi-model learnability gates) and proves **schema/type
-  soundness** and **PII/FERPA non-interference** over Dana Core IR in **Lean**.
+  (`fn ... end`, `?` predicates, `case`, exact `Decimal`, explicit capabilities, `examples`,
+  `promise`, `dana guide`) and proves **schema/type soundness** and **PII/FERPA
+  non-interference** over Dana Core IR in **Lean 4**.
 
 ## A taste of Dana
 
@@ -73,38 +81,76 @@ fn by_program(students: Table(Student), apps: Table(Application))
 
   students
     |> where(.enrolled_year == 2026 and .active?)
-    |> select(.id, .program, .gpa)               # pushes down to Postgres SQL
-    |> join_one(apps, on: left.id == right.student_id) # fails loudly on duplicate keys
+    |> select(.id, .program, .gpa)                      # pushes down to SQLite / Postgres SQL
+    |> join_one(apps, on: left.id == right.student_id)  # fails loudly on duplicate keys
     |> group_by(.program)
     |> summarize(
-         applicants: count(),
+         applicants: count_distinct(.id),
          avg_gpa: mean(.gpa),
          total_requested: sum(.requested)
        )
-    |> suppress_small_groups(min: 5)             # declassifies [ferpa] once k >= 5
+    |> suppress_small_groups(min: 5, distinct_by: .id)  # declassifies [pii]/[ferpa] once k >= 5
     |> sort_desc(.total_requested)
 end
 ```
 
-## What's here
+## Quickstart CLI
 
-- [Dana Language Reference v0.1](docs/reference/README.md): readable language reference
-  (destined for `dana guide`), with every code example parsed by the
-  [executable grammar](grammar/README.md) (`make grammar`, 0 Bison IELR(1) conflicts).
-- [Design Charter v1](docs/CHARTER.md): the locked-in v1 pillars, non-goals, and design
-  principles.
+Build the zero-crate toolchain (`cargo build --release`) and run Dana directly:
+
+```sh
+# Print the embedded Dana v0.3 Language Reference (or a specific section)
+dana guide
+dana guide Privacy
+
+# Check types, schemas, privacy tags, and dana.policy ceilings offline
+dana check examples/expenses.dana examples/enrollment-report.dana
+
+# Execute inline `examples` and `test` blocks on the vectorized VM
+dana test examples/
+
+# Run a pipeline over CSV, Parquet, Excel, SQLite, or PostgreSQL
+dana run examples/expenses.dana -- data/october.csv
+dana run --db Seminary=sqlite:///path/to/seminary.db examples/enrollment-report.dana
+
+# Inspect optimized plans, parameterized SQL pushdown, and sensitivity provenance
+dana explain --dialect sqlite examples/enrollment-report.dana
+
+# Preview redacted database/file writes strictly read-only
+dana dry-run --db Seminary=sqlite:///path/to/seminary.db examples/registrar-sync.dana
+
+# Launch the safe, read-only, privacy-redacted interactive REPL
+dana repl --db Seminary=sqlite:///path/to/seminary.db
+```
+
+## Documentation & Benchmarks
+
+- [Dana Language Reference v0.3](docs/reference/README.md): complete language, privacy, I/O,
+  stats, charts, REPL, and CLI reference (embedded into `dana guide`), with every example
+  parsed by the [0-conflict Bison IELR(1) grammar](grammar/README.md) (`make grammar`) and
+  type-checked under `dana check`.
+- [End-to-End Benchmarks vs. Python](benchmarks/RESULTS.md): reproducible real-world pipeline
+  benchmarks comparing Dana v0.3 against Python stdlib/`sqlite3`, Pandas, and Polars across
+  CSV+UDF ETL, 500k×50k columnar Parquet joins, 250k-row SQLite pushdown + FERPA privacy, and
+  200k-row Zstd Parquet stats & HTML reporting (with exact output parity assertions).
+- [Ten Sample Programs](examples/README.md): realistic `.dana` scripts across higher ed,
+  SaaS, fintech, DevOps logs, healthcare, and exploratory statistics.
+- [Design Charter v1](docs/CHARTER.md): locked-in design pillars, non-goals, and principles.
 - [Privacy & Declassification Model](docs/design/privacy.md): sensitivity tag algebra,
   implicit flows, audited declassifiers, optional `dana.policy`, runtime redaction, and Lean
   non-interference contract.
-- [Roadmap](docs/ROADMAP.md): phase-gated build plan from Phase 0 (Design) through Phase 5
-  (Learnability & Hardening).
 - [Architecture Overview](docs/design/architecture.md): compiler pipeline, Dana Core IR,
   vectorized columnar VM, Lean verification boundary, and Zero-Crate Rust policy.
-- [Dana Core IR Specification](docs/design/core-ir.md): monomorphic Core IR, pure
-  relational `Plan` calculus, canonical S-expression wire protocol, and Lean soundness and
-  non-interference theorems.
-- [Ten Sample Programs](examples/README.md): realistic `.dana` scripts across higher ed,
-  SaaS, fintech, DevOps logs, healthcare, and exploratory statistics.
+- [Dana Core IR Specification](docs/design/core-ir.md): monomorphic Core IR, pure relational
+  `Plan` calculus, canonical S-expression wire protocol, and Lean soundness and non-interference
+  theorems.
+- [Roadmap](docs/ROADMAP.md): phase-gated build plan and verification gates.
+
+## Verification
+
+```sh
+make check-all   # 0-conflict Bison grammar + Lean 4 proofs + Rust fmt/clippy/doc/test suite
+```
 
 ## License
 

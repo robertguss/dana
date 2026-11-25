@@ -1,0 +1,79 @@
+## Benchmark W1: 500,000-row CSV quarantine ingestion + pure Dana UDF + group_by/summarize/sort.
+##
+## Exercises streaming RFC-4180 CSV parsing with schema `where` constraints, automatic
+## bad-row quarantine, a multi-branch pure Dana UDF (`net_price`) inlined directly into
+## 2,048-row vectorized columnar bytecode (zero UDF cliff), exact Decimal arithmetic, and
+## multi-core radix-partitioned aggregation.
+module BenchW1CsvUdfEtl
+
+schema OrderLine
+  order_id: Int
+  region: Text where not .empty?
+  category: Text where not .empty?
+  tier: Int where . >= 1 and . <= 3
+  qty: Int where . >= 0
+  unit_price: Decimal where . > 0
+  tax_rate: Decimal where . >= 0 and . <= 0.25
+end
+
+## Pure custom business-logic UDF: tiered volume discount + tax in exact Decimal math.
+## Automatically inlined into the VM's vectorized register bytecode.
+fn net_price(unit_price: Decimal, qty: Int, tier: Int, tax_rate: Decimal) : Decimal
+  gross = unit_price * qty.to_decimal
+  discount = if tier == 3 and qty >= 5: 0.15
+    else if tier == 2 and qty >= 3: 0.08
+    else if qty >= 10: 0.05
+    else: 0.00
+  subtotal = gross - (gross * discount)
+  subtotal + (subtotal * tax_rate)
+end
+
+fn summarize_orders(orders: Table(OrderLine))
+  promise unique(.region, .category)
+
+  orders
+    |> where(.qty > 0)
+    |> derive(net_amount: net_price(.unit_price, .qty, .tier, .tax_rate))
+    |> group_by(.region, .category)
+    |> summarize(
+         total_net: sum(.net_amount),
+         total_qty: sum(.qty),
+         order_count: count()
+       )
+    |> sort_desc(.total_net)
+end
+
+fn main(args: Args, files: ReadFiles, out: WriteFiles("bench-out/"), console: Console) : Int
+  in_path = args.first.or_return(2)
+  (orders, bad_rows) = try files.read_csv(in_path, as: OrderLine)
+
+  summary = summarize_orders(orders)
+  try out.write_csv("w1_summary.csv", summary)
+
+  console.print("W1 ok: valid=#{orders.count()} bad=#{bad_rows.count()} groups=#{summary.count()}")
+  0
+end
+
+test "w1 quarantines invalid rows and computes exact tiered Decimal net_price"
+  csv = """
+    order_id,region,category,tier,qty,unit_price,tax_rate
+    1,north,books,3,5,20.00,0.10
+    2,north,books,1,0,15.00,0.05
+    3,south,software,2,4,50.00,0.08
+    4,south,software,1,2,BAD,0.08
+    5,east,hardware,1,10,10.00,0.05
+    6,west,services,1,-1,25.00,0.05
+  """
+  files = Files.in_memory({"orders.csv": csv}).read_only
+  (orders, bad) = try files.read_csv("orders.csv", as: OrderLine)
+  assert bad.count() == 2
+
+  res = summarize_orders(orders)
+  assert res.count() == 3
+  # Row 3: 50*4 = 200, 8% disc = 184, +8% tax = 198.72
+  # Row 5: 10*10 = 100, 5% disc = 95, +5% tax = 99.75
+  # Row 1: 20*5 = 100, 15% disc = 85, +10% tax = 93.50
+  assert res.first!.region == "south"
+  assert res.first!.total_net == 198.72
+  assert res.sum(.order_count) == 3
+end

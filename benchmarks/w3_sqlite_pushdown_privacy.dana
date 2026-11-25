@@ -1,0 +1,91 @@
+## Benchmark W3: 250,000-row SQLite ReadDB SQL pushdown + [pii]/[ferpa] privacy + window.
+##
+## Exercises live parameterized SQLite SQL pushdown (where + select + bucket CASE WHEN),
+## compile-time [pii]/[ferpa] sensitivity tracking, audited `bucket` +
+## `suppress_small_groups(min: 5, distinct_by: .student_id)` declassification, and
+## partitioned 3-term `rolling_mean` window analytics.
+module BenchW3SqlitePushdownPrivacy
+
+schema StudentEnrollment
+  enrollment_id: Int
+  student_id: Int [pii]
+  student_email: Text [pii]
+  department: Text
+  term_year: Int
+  term_seq: Int
+  active?: Bool
+  age_years: Int [ferpa]
+  grade_points: Float [ferpa]
+end
+
+## Takes `db: ReadDB(Registrar)` directly so `db.table(...) |> where(...) |> select(...) |> derive(bucket)`
+## compiles into a single live parameterized SQLite pushdown query at runtime.
+fn department_term_summary(db: ReadDB(Registrar))
+  promise unique(.department, .age_band, .term_seq)
+  promise all(.students >= 5)
+
+  db.table(StudentEnrollment)
+    |> where(.active? and .term_year >= 2024)
+    |> select(.student_id, .department, .term_seq, .age_years, .grade_points)
+    |> derive(
+         age_band: bucket(
+           .age_years,
+           cuts: [22, 30, 45],
+           labels: ["under_22", "22_to_29", "30_to_44", "45_plus"]
+         )
+       )
+    |> group_by(.department, .age_band, .term_seq)
+    |> summarize(
+         students: count_distinct(.student_id),
+         enrollments: count(),
+         avg_gpa: mean(.grade_points)
+       )
+    |> suppress_small_groups(min: 5, distinct_by: .student_id)
+    |> sort_by(.department, .age_band, .term_seq)
+    |> window(
+         rolling_3t_gpa: rolling_mean(.avg_gpa, rows: 3),
+         over: [.department, .age_band],
+         order: .term_seq
+       )
+end
+
+fn main(db: ReadDB(Registrar), out: WriteFiles("bench-out/"), console: Console) : Int
+  summary = department_term_summary(db)
+
+  # Compiles ONLY because `bucket` + `suppress_small_groups` declassified [pii] and [ferpa].
+  try out.write_csv("w3_summary.csv", summary)
+  console.print("W3 ok: published_cells=#{summary.count()}")
+  0
+end
+
+test "w3 enforces distinct-student k>=5 FERPA suppression and computes 3-term rolling mean"
+  rows = table
+    | enrollment_id | student_id | student_email   | department | term_year | term_seq | active? | age_years | grade_points |
+    | 1             | 101        | "a@example.edu" | "CS"       | 2024      | 1        | true    | 24        | 3.5          |
+    | 2             | 102        | "b@example.edu" | "CS"       | 2024      | 1        | true    | 25        | 3.7          |
+    | 3             | 103        | "c@example.edu" | "CS"       | 2024      | 1        | true    | 26        | 3.9          |
+    | 4             | 104        | "d@example.edu" | "CS"       | 2024      | 1        | true    | 27        | 3.3          |
+    | 5             | 105        | "e@example.edu" | "CS"       | 2024      | 1        | true    | 28        | 3.6          |
+    | 6             | 101        | "a@example.edu" | "CS"       | 2025      | 2        | true    | 24        | 4.0          |
+    | 7             | 102        | "b@example.edu" | "CS"       | 2025      | 2        | true    | 25        | 3.8          |
+    | 8             | 103        | "c@example.edu" | "CS"       | 2025      | 2        | true    | 26        | 3.8          |
+    | 9             | 104        | "d@example.edu" | "CS"       | 2025      | 2        | true    | 27        | 3.6          |
+    | 10            | 105        | "e@example.edu" | "CS"       | 2025      | 2        | true    | 28        | 3.8          |
+    | 11            | 201        | "z@example.edu" | "Rare"     | 2024      | 1        | true    | 25        | 4.0          |
+    | 12            | 201        | "z@example.edu" | "Rare"     | 2024      | 1        | true    | 25        | 4.0          |
+    | 13            | 201        | "z@example.edu" | "Rare"     | 2024      | 1        | true    | 25        | 4.0          |
+    | 14            | 201        | "z@example.edu" | "Rare"     | 2024      | 1        | true    | 25        | 4.0          |
+    | 15            | 201        | "z@example.edu" | "Rare"     | 2024      | 1        | true    | 25        | 4.0          |
+  end
+
+  db = DB.in_memory(Registrar, {StudentEnrollment: rows})
+  res = department_term_summary(db)
+  # Rare has 5 rows but only 1 distinct student -> must be suppressed!
+  assert res.count() == 2
+  assert res.first!.department == "CS"
+  assert res.first!.age_band == "22_to_29"
+  assert res.first!.students == 5
+  assert ((res.first!.rolling_3t_gpa ?? 0.0) - 3.6).abs < 1e-9
+  t2 = res |> where(.term_seq == 2)
+  assert ((t2.first!.rolling_3t_gpa ?? 0.0) - 3.7).abs < 1e-9
+end

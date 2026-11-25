@@ -19,8 +19,8 @@ use crate::db::schema_lock::SchemaLockFile;
 use crate::db::{SqlDialect, SqlParam, quote_sql_ident};
 use crate::oracle::eval::{PrimResult, RuntimeError, eval_literal, eval_prim_op};
 use crate::oracle::value::{
-    Bug, CapHandle, EnvEntry, EnvList, ReportVal, TableRow, TableVal, Val, format_diag_detail,
-    render_public_val, repr_bug_kind,
+    Bug, CapHandle, ClosureVal, EnvEntry, EnvList, ReportVal, TableRow, TableVal, Val,
+    format_diag_detail, render_public_val, repr_bug_kind,
 };
 use crate::oracle::world::{
     ExecReport, FakeConsoleState, FakeDBState, FakeFilesState, FakeHttpsState, Outcome,
@@ -95,13 +95,13 @@ pub fn run_program_tests_vm(
 
 struct ExecRowHost<'a> {
     prog: &'a ExecProgram,
-    outer_env: &'a HashMap<Ident, Val>,
+    outer_env: &'a HashMap<Ident, Arc<Val>>,
     fuel: usize,
 }
 
 impl RowEvalHost for ExecRowHost<'_> {
     fn lookup_outer(&self, name: &str) -> Option<Val> {
-        self.outer_env.get(name).cloned()
+        self.outer_env.get(name).map(|v| v.as_ref().clone())
     }
 
     fn lookup_const(&self, name: &str) -> Option<Val> {
@@ -115,8 +115,11 @@ impl RowEvalHost for ExecRowHost<'_> {
 
 /// Callbacks bridging `ExecPlan` outer expressions & capabilities into the vectorized VM.
 pub trait ExecPlanBridge {
-    fn eval_outer_expr(&mut self, expr: &ExecExpr, env: &HashMap<Ident, Val>)
-    -> Result<Val, OpErr>;
+    fn eval_outer_expr(
+        &mut self,
+        expr: &ExecExpr,
+        env: &HashMap<Ident, Arc<Val>>,
+    ) -> Result<Val, OpErr>;
     fn load_fake_db_table(
         &mut self,
         cap: Val,
@@ -150,7 +153,7 @@ pub trait ExecPlanBridge {
 pub fn eval_exec_plan_vm(
     plan: &ExecPlan,
     prog: &ExecProgram,
-    env: &HashMap<Ident, Val>,
+    env: &HashMap<Ident, Arc<Val>>,
     vm_cfg: &VmConfig,
     fuel: usize,
     bridge: &mut dyn ExecPlanBridge,
@@ -235,7 +238,7 @@ fn collect_exec_source_db_caps<'a>(plan: &'a ExecPlan, out: &mut Vec<&'a ExecExp
 fn eval_exec_plan_to_table(
     plan: &ExecPlan,
     prog: &ExecProgram,
-    env: &HashMap<Ident, Val>,
+    env: &HashMap<Ident, Arc<Val>>,
     preloaded: &mut Vec<(Ident, VmTable)>,
     row_host: &ExecRowHost<'_>,
     cfg: &OpExecConfig,
@@ -272,7 +275,7 @@ fn eval_exec_plan_to_table(
                     SplitPlan::FullyPushed(q) => {
                         let params = q
                             .resolve_params(
-                                |v| env.get(v).cloned(),
+                                |v| env.get(v).map(|val| val.as_ref().clone()),
                                 |c| prog.find_const(c).map(|d| eval_literal(&d.value)),
                             )
                             .map_err(OpErr::Failed)?;
@@ -291,7 +294,7 @@ fn eval_exec_plan_to_table(
                     } => {
                         let params = pushdown
                             .resolve_params(
-                                |v| env.get(v).cloned(),
+                                |v| env.get(v).map(|val| val.as_ref().clone()),
                                 |c| prog.find_const(c).map(|d| eval_literal(&d.value)),
                             )
                             .map_err(OpErr::Failed)?;
@@ -334,6 +337,13 @@ fn eval_exec_plan_to_table(
                 && let Some(pos) = preloaded.iter().rposition(|(k, _)| k == name)
             {
                 preloaded.remove(pos).1
+            } else if let ExecExpr::Var(name) = e.as_ref()
+                && let Some(val) = env.get(name)
+            {
+                let Val::Table(tv) = val.as_ref() else {
+                    return Err(OpErr::Failed("plan did not evaluate to Table".to_string()));
+                };
+                VmTable::from_table_val(tv, cfg.batch_size)
             } else {
                 let v = bridge.eval_outer_expr(e, env)?;
                 let Some(tv) = v.into_table() else {
@@ -1740,13 +1750,13 @@ fn eval_core_expr_vm(
                     ret,
                     body,
                 } => {
-                    cur_step = Some(VmStep::Ok(Val::Closure {
+                    cur_step = Some(VmStep::Ok(Val::Closure(Box::new(ClosureVal {
                         params: params.clone(),
                         fn_pc: fn_pc.clone(),
                         ret_lty: ret.clone(),
                         body: Arc::clone(body),
                         captured_env: env,
-                    }));
+                    }))));
                 }
                 Expr::App { fn_expr, args } => {
                     frames.push(Frame::AppFn {
@@ -2065,21 +2075,14 @@ fn eval_core_expr_vm(
                         args,
                     } => {
                         let mut fn_val = v;
-                        let Val::Closure {
-                            params,
-                            fn_pc,
-                            body,
-                            captured_env,
-                            ..
-                        } = &mut fn_val
-                        else {
+                        let Val::Closure(cl) = &mut fn_val else {
                             return VmStep::Wrong;
                         };
                         let kind = SeqKind::App {
-                            params: std::mem::take(params),
-                            fn_pc: std::mem::take(fn_pc),
-                            body: Arc::clone(body),
-                            captured_env: std::mem::take(captured_env),
+                            params: std::mem::take(&mut cl.params),
+                            fn_pc: std::mem::take(&mut cl.fn_pc),
+                            body: Arc::clone(&cl.body),
+                            captured_env: std::mem::take(&mut cl.captured_env),
                         };
                         if let Some((first, rest)) = args.split_first() {
                             frames.push(Frame::Seq {

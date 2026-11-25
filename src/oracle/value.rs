@@ -247,6 +247,15 @@ impl Drop for EnvList {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ClosureVal {
+    pub params: Vec<(Ident, LTy)>,
+    pub fn_pc: TagSet,
+    pub ret_lty: LTy,
+    pub body: Arc<Expr>,
+    pub captured_env: EnvList,
+}
+
 #[derive(Clone, Debug, Default)]
 pub enum Val {
     #[default]
@@ -277,8 +286,8 @@ pub enum Val {
         headers: Vec<String>,
         rows: Vec<Vec<Val>>,
     },
-    Chart(ChartVal),
-    Report(ReportVal),
+    Chart(Box<ChartVal>),
+    Report(Box<ReportVal>),
     Profile(ProfileVal),
     LinearModel {
         slope: Float64,
@@ -289,13 +298,7 @@ pub enum Val {
         stat: Float64,
         p_value: Float64,
     },
-    Closure {
-        params: Vec<(Ident, LTy)>,
-        fn_pc: TagSet,
-        ret_lty: LTy,
-        body: Arc<Expr>,
-        captured_env: EnvList,
-    },
+    Closure(Box<ClosureVal>),
     // First-class capability values
     CapArgs,
     CapClock,
@@ -430,8 +433,8 @@ fn push_val_children(val: &mut Val, stack: &mut Vec<Val>) {
                 }
             }
         }
-        Val::Closure { captured_env, .. } => {
-            captured_env.drain_unique_into(stack);
+        Val::Closure(cl) => {
+            cl.captured_env.drain_unique_into(stack);
         }
         _ => {}
     }

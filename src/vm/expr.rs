@@ -85,7 +85,7 @@ pub enum RowInstr {
     },
     Prim {
         dst: usize,
-        op: ExecPrimOp,
+        op: Box<ExecPrimOp>,
         args: Vec<usize>,
     },
     If {
@@ -427,7 +427,7 @@ fn compile_core_re(
             let dst = comp.alloc();
             comp.instrs.push(RowInstr::Prim {
                 dst,
-                op: ExecPrimOp::Core(op.clone()),
+                op: Box::new(ExecPrimOp::Core(op.clone())),
                 args: arg_regs,
             });
             dst
@@ -593,7 +593,7 @@ fn compile_inlined_core_expr(
             let dst = comp.alloc();
             comp.instrs.push(RowInstr::Prim {
                 dst,
-                op: ExecPrimOp::Core(op.clone()),
+                op: Box::new(ExecPrimOp::Core(op.clone())),
                 args: arg_regs,
             });
             Some(dst)
@@ -727,7 +727,7 @@ fn compile_exec_re(
             let dst = comp.alloc();
             comp.instrs.push(RowInstr::Prim {
                 dst,
-                op: op.clone(),
+                op: Box::new(op.clone()),
                 args: arg_regs,
             });
             dst
@@ -893,7 +893,7 @@ fn compile_inlined_exec_expr(
             let dst = comp.alloc();
             comp.instrs.push(RowInstr::Prim {
                 dst,
-                op: op.clone(),
+                op: Box::new(op.clone()),
                 args: arg_regs,
             });
             Some(dst)

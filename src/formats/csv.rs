@@ -309,6 +309,78 @@ impl<R: BufRead> CsvBatchReader<R> {
         }
         Ok(batch)
     }
+
+    /// Zero-allocation fast path for unquoted single-line CSV records residing inside the
+    /// underlying `BufRead` buffer; falls back to full RFC 4180 `next_record` on quotes,
+    /// cross-buffer lines, bare `\r`, or EOF lines without trailing newline.
+    fn next_record_fast(
+        &mut self,
+        scratch_line: &mut String,
+        scratch_ranges: &mut Vec<(usize, usize)>,
+        scratch_fallback: &mut Option<CsvRecord>,
+    ) -> io::Result<Option<usize>> {
+        self.skip_utf8_bom()?;
+        loop {
+            if self.eof && self.pending_pos >= self.pending_len {
+                return Ok(None);
+            }
+            if self.pending_pos == self.pending_len {
+                let buf = self.reader.fill_buf()?;
+                if buf.is_empty() {
+                    self.eof = true;
+                    return Ok(None);
+                }
+                if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                    let raw = &buf[..nl];
+                    let clean = raw.strip_suffix(b"\r").unwrap_or(raw);
+                    if !clean.contains(&b'"') && !clean.contains(&b'\r') {
+                        let rec_line = self.line_no;
+                        self.line_no += 1;
+                        if clean.is_empty() {
+                            self.reader.consume(nl + 1);
+                            if self.preserve_empty_lines {
+                                scratch_line.clear();
+                                scratch_ranges.clear();
+                                scratch_ranges.push((0, 0));
+                                *scratch_fallback = None;
+                                return Ok(Some(rec_line));
+                            }
+                            continue;
+                        }
+                        let line_str = std::str::from_utf8(clean).map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid UTF-8 in CSV line {rec_line}: {e}"),
+                            )
+                        })?;
+                        scratch_line.clear();
+                        scratch_line.push_str(line_str);
+                        scratch_ranges.clear();
+                        let delim = self.delimiter;
+                        let mut start = 0usize;
+                        for (idx, &b) in clean.iter().enumerate() {
+                            if b == delim {
+                                scratch_ranges.push((start, idx));
+                                start = idx + 1;
+                            }
+                        }
+                        scratch_ranges.push((start, clean.len()));
+                        self.reader.consume(nl + 1);
+                        *scratch_fallback = None;
+                        return Ok(Some(rec_line));
+                    }
+                }
+            }
+            match self.next_record()? {
+                Some(rec) => {
+                    let line = rec.line;
+                    *scratch_fallback = Some(rec);
+                    return Ok(Some(line));
+                }
+                None => return Ok(None),
+            }
+        }
+    }
 }
 
 /// Parse UTF-8 CSV/TSV text into RFC 4180 records with 1-based line numbers.
@@ -407,7 +479,8 @@ where
     R: Read,
     F: FnMut(usize, &Val) -> bool,
 {
-    let mut batch_reader = CsvBatchReader::new(BufReader::new(reader), delimiter);
+    let mut batch_reader =
+        CsvBatchReader::new(BufReader::with_capacity(64 * 1024, reader), delimiter);
     let bad_tt = quarantine_bad_row_table_ty(schema);
 
     let Some(header) = batch_reader.next_record().map_err(|e| e.to_string())? else {
@@ -440,62 +513,74 @@ where
 
     let mut good_rows = Vec::new();
     let mut bad_rows = Vec::new();
+    let mut scratch_line = String::with_capacity(256);
+    let mut scratch_ranges: Vec<(usize, usize)> = Vec::with_capacity(header.fields.len().max(8));
+    let mut scratch_fallback: Option<CsvRecord> = None;
 
-    loop {
-        let batch = batch_reader
-            .next_batch(CSV_BATCH_SIZE)
-            .map_err(|e| e.to_string())?;
-        if batch.is_empty() {
-            break;
-        }
-        for rec in batch {
-            let mut cells = Vec::with_capacity(schema.cols.len());
-            let mut bad_hit: Option<(&str, &str, String)> = None;
+    while let Some(rec_line) = batch_reader
+        .next_record_fast(
+            &mut scratch_line,
+            &mut scratch_ranges,
+            &mut scratch_fallback,
+        )
+        .map_err(|e| e.to_string())?
+    {
+        let mut cells = Vec::with_capacity(schema.cols.len());
+        let mut bad_hit: Option<(&str, &str, String)> = None;
 
-            for (ci, col) in schema.cols.iter().enumerate() {
-                let field_idx = col_indices[ci];
-                let Some(raw_val) = rec.fields.get(field_idx) else {
-                    bad_hit = Some((col.name.as_str(), "MissingColumn", String::new()));
-                    break;
-                };
-                match parse_csv_cell(raw_val, &col.ty) {
-                    Ok(val) => {
-                        let inner_ok = match &val {
-                            Val::OptNone => true,
-                            Val::OptSome(inner) => check_constraint(ci, inner),
-                            other => check_constraint(ci, other),
-                        };
-                        if !inner_ok {
-                            bad_hit =
-                                Some((col.name.as_str(), "ConstraintFailed", raw_val.clone()));
-                            break;
-                        }
-                        cells.push(val);
-                    }
-                    Err(kind) => {
-                        bad_hit = Some((col.name.as_str(), kind, raw_val.clone()));
+        for (ci, col) in schema.cols.iter().enumerate() {
+            let field_idx = col_indices[ci];
+            let raw_opt: Option<&str> = match &scratch_fallback {
+                Some(rec) => rec.fields.get(field_idx).map(String::as_str),
+                None => scratch_ranges
+                    .get(field_idx)
+                    .map(|&(s, e)| &scratch_line[s..e]),
+            };
+            let Some(raw_val) = raw_opt else {
+                bad_hit = Some((col.name.as_str(), "MissingColumn", String::new()));
+                break;
+            };
+            match parse_csv_cell(raw_val, &col.ty) {
+                Ok(val) => {
+                    let inner_ok = match &val {
+                        Val::OptNone => true,
+                        Val::OptSome(inner) => check_constraint(ci, inner),
+                        other => check_constraint(ci, other),
+                    };
+                    if !inner_ok {
+                        bad_hit =
+                            Some((col.name.as_str(), "ConstraintFailed", raw_val.to_string()));
                         break;
                     }
+                    cells.push(val);
+                }
+                Err(kind) => {
+                    bad_hit = Some((col.name.as_str(), kind, raw_val.to_string()));
+                    break;
                 }
             }
+        }
 
-            if let Some((col_name, err_kind, raw_val)) = bad_hit {
-                bad_rows.push(TableRow {
-                    cells: vec![
-                        Val::Int(BigInt::from(rec.line)),
-                        Val::Text(col_name.to_string()),
-                        Val::Text(err_kind.to_string()),
-                        Val::Text(raw_val),
-                        Val::Text(rec.raw_line),
-                    ],
-                    group_meta: None,
-                });
-            } else {
-                good_rows.push(TableRow {
-                    cells,
-                    group_meta: None,
-                });
-            }
+        if let Some((col_name, err_kind, raw_val)) = bad_hit {
+            let raw_line = match scratch_fallback.take() {
+                Some(rec) => rec.raw_line,
+                None => scratch_line.clone(),
+            };
+            bad_rows.push(TableRow {
+                cells: vec![
+                    Val::Int(BigInt::from(rec_line)),
+                    Val::Text(col_name.to_string()),
+                    Val::Text(err_kind.to_string()),
+                    Val::Text(raw_val),
+                    Val::Text(raw_line),
+                ],
+                group_meta: None,
+            });
+        } else {
+            good_rows.push(TableRow {
+                cells,
+                group_meta: None,
+            });
         }
     }
 
