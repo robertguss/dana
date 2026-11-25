@@ -247,3 +247,26 @@ fn diagnostic_snippet_truncates_huge_lines() {
         "expected truncation ellipsis in rendered diagnostic:\n{rendered}"
     );
 }
+
+#[test]
+fn wts_examples_parse_and_format_idempotently() -> Result<(), String> {
+    let wts_dir = repo_root().join("examples").join("wts");
+    let files = collect_dana_files(&wts_dir)?;
+    assert_eq!(files.len(), 2, "expected 2 pilot modules in examples/wts/");
+    for path in files {
+        let src = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        let mut sm = SourceMap::new();
+        let fid = sm.add_file(path.display().to_string(), src.clone());
+        let module =
+            parse_module(fid, &src).map_err(|d| format!("parse {}: {d:?}", path.display()))?;
+        let formatted = format_module(&module);
+        assert_eq!(
+            formatted,
+            src,
+            "{} is not canonically formatted (`dana format`)",
+            path.display()
+        );
+    }
+    Ok(())
+}

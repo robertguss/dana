@@ -7,7 +7,7 @@ long-running systems and living services, Dana is built for databases, ETL pipel
 operational and financial analytics, practical statistics, and clean reporting—fast by
 default, batteries included, and safe around sensitive data like PII and FERPA records.
 
-> **Status: Dana v0.4 (pre-1.0) — Direct Streaming-Columnar CSV/Parquet I/O & Zero-Copy Columnar Analytics Complete.**
+> **Status: Dana v0.5 (pre-1.0) — WTS-Readiness, Multi-Schema PostgreSQL Interop, Atomic FERPA Exports, CSV Formula Sanitization & Row-Level k-Anonymity Complete (`v1.0` GA held for production soak).**
 > Dana's 0-conflict Bison IELR(1) executable grammar (`make grammar`), Lean 4 formal core with
 > soundness & non-interference proofs (`make formal`), **Zero-Crate Rust** compiler, 2,048-row
 > vectorized columnar VM with pure-UDF bytecode inlining, direct streaming-columnar CSV/TSV &
@@ -106,7 +106,7 @@ end
 Build the zero-crate toolchain (`cargo build --release`) and run Dana directly:
 
 ```sh
-# Print the embedded Dana v0.4 Language Reference (or a specific section)
+# Print the embedded Dana v0.5 Language Reference (or a specific section)
 dana guide
 dana guide Privacy
 
@@ -132,7 +132,7 @@ dana repl --db Seminary=sqlite:///path/to/seminary.db
 
 ## Documentation & Benchmarks
 
-- [Dana Language Reference v0.4](docs/reference/README.md): complete language, privacy, I/O,
+- [Dana Language Reference v0.5](docs/reference/README.md): complete language, privacy, I/O,
   stats, charts, REPL, and CLI reference (embedded into `dana guide`), with every example
   parsed by the [0-conflict Bison IELR(1) grammar](grammar/README.md) (`make grammar`) and
   type-checked under `dana check`.
@@ -166,7 +166,8 @@ dana repl --db Seminary=sqlite:///path/to/seminary.db
 
 ```sh
 make check-all   # 0-conflict Bison grammar + Lean 4 proofs + Rust fmt/clippy/doc/test suite
-make check-v04   # full v0.4 gate: check-all + 12-parser fuzzer + differential soak/privacy + learnability harness
+make test-v05    # run v0.5 WTS-readiness suite (Postgres multi-schema, stdlib, FERPA exports, pilots)
+make check-v05   # full v0.5 gate: check-all + 12-parser fuzzer + differential soak/privacy + learnability harness
 ```
 
 ## License

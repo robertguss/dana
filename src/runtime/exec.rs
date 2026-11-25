@@ -6,11 +6,14 @@
 //! - Isolated `dana test` fake capabilities (`Args.of`, `Files.in_memory`, `DB.in_memory`, `Console.fake`, `Secret.fake`).
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::hash::BuildHasherDefault;
 use std::io::{self, BufWriter, Cursor, Write};
-use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::bigint::{BigInt, DEC_MAX, DEC_MIN, DEC_SCALE, INT64_MAX, INT64_MIN};
 use crate::core::check::{check_cap_against_policy, is_safe_relative_path, join_confined_path};
@@ -24,8 +27,8 @@ use crate::formats::compress::{
 use crate::formats::constraint::FastColConstraint;
 use crate::formats::crypto::hmac_sha256_pseudonym;
 use crate::formats::csv::{
-    format_csv_table, format_csv_vm_table, read_csv_stream_to_vm_table,
-    read_csv_stream_with_schema, write_csv_table, write_csv_vm_table,
+    format_csv_table_with_options, format_csv_vm_table_with_options, read_csv_stream_to_vm_table,
+    read_csv_stream_with_schema, write_csv_table_with_options, write_csv_vm_table_with_options,
 };
 use crate::formats::json::{
     format_jsonl_table, format_jsonl_vm_table, read_jsonl_stream_with_schema, write_jsonl_table,
@@ -52,10 +55,12 @@ use crate::oracle::world::{
 };
 use crate::runtime::ir::*;
 use crate::vm::batch::{Batch, Column, ColumnData, NullBitmap};
-use crate::vm::key::{FastHasher, eq_col_cells, hash_row_key};
+use crate::vm::key::{FastHasher, eq_col_cells, hash_row_key, hash_val, hash_val_slice};
 use crate::vm::ops::VmTable;
+use crate::vm::ops::sort_win::{fisher_yates_shuffle, seed_from_bigint};
 
 const DEFAULT_FUEL: usize = 500_000;
+static PRIVATE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Configuration for running an [`ExecProgram`].
 #[derive(Clone, Debug)]
@@ -495,7 +500,10 @@ fn real_cap_for_ty(ty: &Ty) -> Val {
 
 #[derive(Clone, Copy, Debug)]
 enum TableWriteFmt {
-    Csv(u8),
+    Csv {
+        delimiter: u8,
+        sanitize_formulas: bool,
+    },
     Jsonl,
 }
 
@@ -1107,14 +1115,25 @@ impl<'a> Evaluator<'a> {
                     return self.eval_plan(plan, cur_env);
                 }
                 ExecExpr::Host { op, args } => {
-                    if let [a0, a1, ExecExpr::Var(vname)] = args.as_slice()
+                    let fast_match = match args.as_slice() {
+                        [a0, a1, ExecExpr::Var(vname)] => Some((a0, a1, vname, None, None)),
+                        [a0, a1, ExecExpr::Var(vname), a3] => Some((a0, a1, vname, Some(a3), None)),
+                        [a0, a1, ExecExpr::Var(vname), a3, a4] => {
+                            Some((a0, a1, vname, Some(a3), Some(a4)))
+                        }
+                        _ => None,
+                    };
+                    if let Some((a0, a1, vname, priv_arg, san_arg)) = fast_match
                         && matches!(
                             op,
                             ExecHostOp::Core(HostOp::WriteParquet)
+                                | ExecHostOp::WritePrivate {
+                                    inner: HostOp::WriteParquet
+                                }
                                 | ExecHostOp::WriteCsv
                                 | ExecHostOp::WriteJsonl
                         )
-                        && let Some(tbl_arc) = cur_env.get(vname)
+                        && let Some(tbl_arc) = cur_env.get(vname).cloned()
                         && matches!(tbl_arc.as_ref(), Val::Table(_) | Val::Columnar(_))
                     {
                         let cap_v = match self.eval_expr(a0, cur_env) {
@@ -1124,6 +1143,28 @@ impl<'a> Evaluator<'a> {
                         let path_v = match self.eval_expr(a1, cur_env) {
                             EvalOut::Ok(v) => v,
                             other => return other,
+                        };
+                        let explicit_private = match priv_arg {
+                            Some(pa) => match self.eval_expr(pa, cur_env) {
+                                EvalOut::Ok(Val::Bool(b)) => b,
+                                EvalOut::Ok(_) => {
+                                    return EvalOut::Failed("`private:` expects Bool".to_string());
+                                }
+                                other => return other,
+                            },
+                            None => false,
+                        };
+                        let sanitize_formulas = match san_arg {
+                            Some(sa) => match self.eval_expr(sa, cur_env) {
+                                EvalOut::Ok(Val::Bool(b)) => b,
+                                EvalOut::Ok(_) => {
+                                    return EvalOut::Failed(
+                                        "`sanitize_formulas:` expects Bool".to_string(),
+                                    );
+                                }
+                                other => return other,
+                            },
+                            None => false,
                         };
                         if let (
                             Val::CapWriteFiles {
@@ -1144,9 +1185,16 @@ impl<'a> Evaluator<'a> {
                                     "unsafe write path `{rel}`"
                                 )))));
                             }
+                            let is_private = explicit_private || !allows.is_empty();
                             let full_rel = join_confined_path(root, rel);
                             return match (op, tbl_arc.as_ref()) {
-                                (ExecHostOp::Core(HostOp::WriteParquet), Val::Table(tv)) => {
+                                (
+                                    ExecHostOp::Core(HostOp::WriteParquet)
+                                    | ExecHostOp::WritePrivate {
+                                        inner: HostOp::WriteParquet,
+                                    },
+                                    Val::Table(tv),
+                                ) => {
                                     if matches!(handle, CapHandle::Real) && self.ew.dry_run {
                                         self.ew.world.stdout.push(format!(
                                             "[DRY-RUN] would write parquet \"{full_rel}\" ({} rows, {} cols)",
@@ -1156,16 +1204,22 @@ impl<'a> Evaluator<'a> {
                                         EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)))
                                     } else {
                                         match write_parquet_bytes(tv, ParquetCompression::Zstd) {
-                                            Ok(bytes) => {
-                                                self.write_confined_bytes(*handle, &full_rel, bytes)
-                                            }
+                                            Ok(bytes) => self.write_confined_bytes(
+                                                *handle, &full_rel, bytes, is_private,
+                                            ),
                                             Err(e) => {
                                                 EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e))))
                                             }
                                         }
                                     }
                                 }
-                                (ExecHostOp::Core(HostOp::WriteParquet), Val::Columnar(vm)) => {
+                                (
+                                    ExecHostOp::Core(HostOp::WriteParquet)
+                                    | ExecHostOp::WritePrivate {
+                                        inner: HostOp::WriteParquet,
+                                    },
+                                    Val::Columnar(vm),
+                                ) => {
                                     if matches!(handle, CapHandle::Real) && self.ew.dry_run {
                                         self.ew.world.stdout.push(format!(
                                             "[DRY-RUN] would write parquet \"{full_rel}\" ({} rows, {} cols)",
@@ -1178,9 +1232,9 @@ impl<'a> Evaluator<'a> {
                                             vm,
                                             ParquetCompression::Zstd,
                                         ) {
-                                            Ok(bytes) => {
-                                                self.write_confined_bytes(*handle, &full_rel, bytes)
-                                            }
+                                            Ok(bytes) => self.write_confined_bytes(
+                                                *handle, &full_rel, bytes, is_private,
+                                            ),
                                             Err(e) => {
                                                 EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e))))
                                             }
@@ -1197,7 +1251,11 @@ impl<'a> Evaluator<'a> {
                                         *handle,
                                         &full_rel,
                                         tv,
-                                        TableWriteFmt::Csv(delim),
+                                        TableWriteFmt::Csv {
+                                            delimiter: delim,
+                                            sanitize_formulas,
+                                        },
+                                        is_private,
                                     )
                                 }
                                 (ExecHostOp::WriteCsv, Val::Columnar(vm)) => {
@@ -1210,7 +1268,11 @@ impl<'a> Evaluator<'a> {
                                         *handle,
                                         &full_rel,
                                         vm,
-                                        TableWriteFmt::Csv(delim),
+                                        TableWriteFmt::Csv {
+                                            delimiter: delim,
+                                            sanitize_formulas,
+                                        },
+                                        is_private,
                                     )
                                 }
                                 (ExecHostOp::WriteJsonl, Val::Table(tv)) => self
@@ -1219,6 +1281,7 @@ impl<'a> Evaluator<'a> {
                                         &full_rel,
                                         tv,
                                         TableWriteFmt::Jsonl,
+                                        is_private,
                                     ),
                                 (ExecHostOp::WriteJsonl, Val::Columnar(vm)) => self
                                     .write_confined_vm_table(
@@ -1226,6 +1289,7 @@ impl<'a> Evaluator<'a> {
                                         &full_rel,
                                         vm,
                                         TableWriteFmt::Jsonl,
+                                        is_private,
                                     ),
                                 _ => EvalOut::Failed("unexpected host write op".to_string()),
                             };
@@ -1994,6 +2058,15 @@ impl<'a> Evaluator<'a> {
                 }
                 _ => EvalOut::Failed("TableCoerce requires Table".to_string()),
             },
+            ExecPrimOp::FormatCsv => match args {
+                [Val::Table(tv), Val::Bool(san)] => {
+                    EvalOut::Ok(Val::Text(format_csv_table_with_options(tv, b',', *san)))
+                }
+                [Val::Columnar(vm), Val::Bool(san)] => EvalOut::Ok(Val::Text(
+                    format_csv_vm_table_with_options(vm, b',', *san),
+                )),
+                _ => EvalOut::Failed("format_csv expects (Table, Bool)".to_string()),
+            },
             ExecPrimOp::RecordField { field_idx, .. } => match args {
                 [Val::Ctor { fields, .. }] => fields.get(*field_idx).cloned().map_or_else(
                     || EvalOut::Failed("record field index out of bounds".to_string()),
@@ -2535,16 +2608,31 @@ impl<'a> Evaluator<'a> {
                     EvalOut::Failed("read_jsonl expects (ReadFiles, path)".to_string())
                 }
             }
-            ExecHostOp::WriteJsonl => match args {
-                [
-                    Val::CapWriteFiles {
-                        handle,
-                        root,
-                        allows,
-                    },
-                    Val::Text(rel),
-                    tbl @ (Val::Table(_) | Val::Columnar(_)),
-                ] => {
+            ExecHostOp::WriteJsonl => {
+                let (cap, rel, tbl, explicit_private) = match args {
+                    [
+                        cap,
+                        Val::Text(rel),
+                        tbl @ (Val::Table(_) | Val::Columnar(_)),
+                    ] => (cap, rel, tbl, false),
+                    [
+                        cap,
+                        Val::Text(rel),
+                        tbl @ (Val::Table(_) | Val::Columnar(_)),
+                        Val::Bool(p),
+                    ] => (cap, rel, tbl, *p),
+                    _ => {
+                        return EvalOut::Failed(
+                            "write_jsonl expects (WriteFiles, path, table)".to_string(),
+                        );
+                    }
+                };
+                if let Val::CapWriteFiles {
+                    handle,
+                    root,
+                    allows,
+                } = cap
+                {
                     if !self.ew.dry_run
                         && let Some(bug) = self.check_export_gate(*handle, allows)
                     {
@@ -2555,34 +2643,57 @@ impl<'a> Evaluator<'a> {
                             "unsafe write path `{rel}`"
                         )))));
                     }
+                    let is_private = explicit_private || !allows.is_empty();
                     let full_rel = join_confined_path(root, rel);
                     match tbl {
-                        Val::Table(tv) => {
-                            self.write_confined_table(*handle, &full_rel, tv, TableWriteFmt::Jsonl)
-                        }
+                        Val::Table(tv) => self.write_confined_table(
+                            *handle,
+                            &full_rel,
+                            tv,
+                            TableWriteFmt::Jsonl,
+                            is_private,
+                        ),
                         Val::Columnar(vm) => self.write_confined_vm_table(
                             *handle,
                             &full_rel,
                             vm,
                             TableWriteFmt::Jsonl,
+                            is_private,
                         ),
                         _ => EvalOut::Failed(
                             "write_jsonl expects (WriteFiles, path, table)".to_string(),
                         ),
                     }
+                } else {
+                    EvalOut::Failed("write_jsonl expects (WriteFiles, path, table)".to_string())
                 }
-                _ => EvalOut::Failed("write_jsonl expects (WriteFiles, path, table)".to_string()),
-            },
-            ExecHostOp::WriteCsv => match args {
-                [
-                    Val::CapWriteFiles {
-                        handle,
-                        root,
-                        allows,
-                    },
-                    Val::Text(rel),
-                    tbl @ (Val::Table(_) | Val::Columnar(_)),
-                ] => {
+            }
+            ExecHostOp::WriteCsv => {
+                let (cap, rel, tbl, explicit_private, sanitize_formulas) = match args {
+                    [
+                        cap,
+                        Val::Text(rel),
+                        tbl @ (Val::Table(_) | Val::Columnar(_)),
+                    ] => (cap, rel, tbl, false, false),
+                    [
+                        cap,
+                        Val::Text(rel),
+                        tbl @ (Val::Table(_) | Val::Columnar(_)),
+                        Val::Bool(p),
+                        Val::Bool(s),
+                    ] => (cap, rel, tbl, *p, *s),
+                    _ => {
+                        return EvalOut::Failed(
+                            "write_csv expects (WriteFiles, path, table)".to_string(),
+                        );
+                    }
+                };
+                if let Val::CapWriteFiles {
+                    handle,
+                    root,
+                    allows,
+                } = cap
+                {
                     if !self.ew.dry_run
                         && let Some(bug) = self.check_export_gate(*handle, allows)
                     {
@@ -2593,42 +2704,47 @@ impl<'a> Evaluator<'a> {
                             "unsafe write path `{rel}`"
                         )))));
                     }
+                    let is_private = explicit_private || !allows.is_empty();
                     let full_rel = join_confined_path(root, rel);
                     let delim = if strip_compression_ext(rel).ends_with(".tsv") {
                         b'\t'
                     } else {
                         b','
                     };
+                    let fmt = TableWriteFmt::Csv {
+                        delimiter: delim,
+                        sanitize_formulas,
+                    };
                     match tbl {
-                        Val::Table(tv) => self.write_confined_table(
-                            *handle,
-                            &full_rel,
-                            tv,
-                            TableWriteFmt::Csv(delim),
-                        ),
-                        Val::Columnar(vm) => self.write_confined_vm_table(
-                            *handle,
-                            &full_rel,
-                            vm,
-                            TableWriteFmt::Csv(delim),
-                        ),
+                        Val::Table(tv) => {
+                            self.write_confined_table(*handle, &full_rel, tv, fmt, is_private)
+                        }
+                        Val::Columnar(vm) => {
+                            self.write_confined_vm_table(*handle, &full_rel, vm, fmt, is_private)
+                        }
                         _ => EvalOut::Failed(
                             "write_csv expects (WriteFiles, path, table)".to_string(),
                         ),
                     }
+                } else {
+                    EvalOut::Failed("write_csv expects (WriteFiles, path, table)".to_string())
                 }
-                _ => EvalOut::Failed("write_csv expects (WriteFiles, path, table)".to_string()),
-            },
+            }
             ExecHostOp::WriteReportMarkdown => {
-                if let [
-                    Val::CapWriteFiles {
-                        handle,
-                        root,
-                        allows,
-                    },
-                    Val::Text(rel),
-                    Val::Report(rep),
-                ] = args
+                let (cap, rel, rep, explicit_private) = match args {
+                    [cap, Val::Text(rel), Val::Report(rep)] => (cap, rel, rep, false),
+                    [cap, Val::Text(rel), Val::Report(rep), Val::Bool(p)] => (cap, rel, rep, *p),
+                    _ => {
+                        return EvalOut::Failed(
+                            "write_markdown expects (WriteFiles, path, Report)".to_string(),
+                        );
+                    }
+                };
+                if let Val::CapWriteFiles {
+                    handle,
+                    root,
+                    allows,
+                } = cap
                 {
                     if !self.ew.dry_run
                         && let Some(bug) = self.check_export_gate(*handle, allows)
@@ -2640,23 +2756,29 @@ impl<'a> Evaluator<'a> {
                             "unsafe write path `{rel}`"
                         )))));
                     }
+                    let is_private = explicit_private || !allows.is_empty();
                     let full_rel = join_confined_path(root, rel);
                     let md = crate::viz::report::render_markdown_report(rep);
-                    self.write_confined_output(*handle, &full_rel, md)
+                    self.write_confined_output(*handle, &full_rel, md, is_private)
                 } else {
                     EvalOut::Failed("write_markdown expects (WriteFiles, path, Report)".to_string())
                 }
             }
             ExecHostOp::WriteChartSvg => {
-                if let [
-                    Val::CapWriteFiles {
-                        handle,
-                        root,
-                        allows,
-                    },
-                    Val::Text(rel),
-                    Val::Chart(chart),
-                ] = args
+                let (cap, rel, chart, explicit_private) = match args {
+                    [cap, Val::Text(rel), Val::Chart(chart)] => (cap, rel, chart, false),
+                    [cap, Val::Text(rel), Val::Chart(chart), Val::Bool(p)] => (cap, rel, chart, *p),
+                    _ => {
+                        return EvalOut::Failed(
+                            "write_svg expects (WriteFiles, path, Chart)".to_string(),
+                        );
+                    }
+                };
+                if let Val::CapWriteFiles {
+                    handle,
+                    root,
+                    allows,
+                } = cap
                 {
                     if !self.ew.dry_run
                         && let Some(bug) = self.check_export_gate(*handle, allows)
@@ -2668,13 +2790,20 @@ impl<'a> Evaluator<'a> {
                             "unsafe write path `{rel}`"
                         )))));
                     }
+                    let is_private = explicit_private || !allows.is_empty();
                     let full_rel = join_confined_path(root, rel);
                     let svg = crate::viz::svg::render_chart_svg(chart);
-                    self.write_confined_output(*handle, &full_rel, svg)
+                    self.write_confined_output(*handle, &full_rel, svg, is_private)
                 } else {
                     EvalOut::Failed("write_svg expects (WriteFiles, path, Chart)".to_string())
                 }
             }
+            ExecHostOp::WritePrivate { inner } => match args {
+                [cap, path, payload, Val::Bool(priv_flag)] => {
+                    self.eval_core_write_host(inner.clone(), cap, path, payload, *priv_flag)
+                }
+                _ => EvalOut::Failed(format!("write op `{inner:?}` expects 4 arguments")),
+            },
             ExecHostOp::WriteTableUpsert { key_col, allows } => {
                 if let [
                     Val::CapWriteTable {
@@ -2987,56 +3116,12 @@ impl<'a> Evaluator<'a> {
                 self.eval_read_csv(schema_name, *handle, path)
             }
             (
-                HostOp::WriteFile,
-                [
-                    Val::CapWriteFiles {
-                        handle,
-                        root,
-                        allows,
-                    },
-                    Val::Text(rel),
-                    Val::Text(content),
-                ],
-            ) => {
-                if !self.ew.dry_run
-                    && let Some(bug) = self.check_export_gate(*handle, allows)
-                {
-                    return EvalOut::Stopped(bug);
-                }
-                if !is_safe_relative_path(rel) {
-                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
-                        "unsafe write path `{rel}`"
-                    )))));
-                }
-                let full_rel = join_confined_path(root, rel);
-                self.write_confined_output(*handle, &full_rel, content.clone())
-            }
-            (
-                HostOp::WriteReportHtml,
-                [
-                    Val::CapWriteFiles {
-                        handle,
-                        root,
-                        allows,
-                    },
-                    Val::Text(rel),
-                    Val::Report(rep),
-                ],
-            ) => {
-                if !self.ew.dry_run
-                    && let Some(bug) = self.check_export_gate(*handle, allows)
-                {
-                    return EvalOut::Stopped(bug);
-                }
-                if !is_safe_relative_path(rel) {
-                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
-                        "unsafe write path `{rel}`"
-                    )))));
-                }
-                let full_rel = join_confined_path(root, rel);
-                let html = crate::viz::report::render_html_report(rep);
-                self.write_confined_output(*handle, &full_rel, html)
-            }
+                HostOp::WriteFile
+                | HostOp::WriteReportHtml
+                | HostOp::WriteParquet
+                | HostOp::WriteXlsx,
+                [cap, path, payload],
+            ) => self.eval_core_write_host(op.clone(), cap, path, payload, false),
             (HostOp::FakeConsole(allows), []) => {
                 let idx = self.ew.world.fake_consoles.len();
                 self.ew
@@ -3059,117 +3144,6 @@ impl<'a> Evaluator<'a> {
             }
             (HostOp::ReadParquet(schema_tt), [Val::CapReadFiles(handle), Val::Text(path)]) => {
                 self.eval_read_parquet(schema_tt, *handle, path)
-            }
-            (
-                HostOp::WriteParquet,
-                [
-                    Val::CapWriteFiles {
-                        handle,
-                        root,
-                        allows,
-                    },
-                    Val::Text(rel),
-                    tbl_val @ (Val::Table(_) | Val::Columnar(_)),
-                ],
-            ) => {
-                if !self.ew.dry_run
-                    && let Some(bug) = self.check_export_gate(*handle, allows)
-                {
-                    return EvalOut::Stopped(bug);
-                }
-                if !is_safe_relative_path(rel) {
-                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
-                        "unsafe write path `{rel}`"
-                    )))));
-                }
-                let full_rel = join_confined_path(root, rel);
-                match tbl_val {
-                    Val::Table(tv) => {
-                        if matches!(handle, CapHandle::Real) && self.ew.dry_run {
-                            self.ew.world.stdout.push(format!(
-                                "[DRY-RUN] would write parquet \"{full_rel}\" ({} rows, {} cols)",
-                                tv.rows.len(),
-                                tv.cols.len()
-                            ));
-                            return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
-                        }
-                        match write_parquet_bytes(tv, ParquetCompression::Zstd) {
-                            Ok(bytes) => self.write_confined_bytes(*handle, &full_rel, bytes),
-                            Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e)))),
-                        }
-                    }
-                    Val::Columnar(vm) => {
-                        if matches!(handle, CapHandle::Real) && self.ew.dry_run {
-                            self.ew.world.stdout.push(format!(
-                                "[DRY-RUN] would write parquet \"{full_rel}\" ({} rows, {} cols)",
-                                vm.total_rows(),
-                                vm.cols.len()
-                            ));
-                            return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
-                        }
-                        match write_parquet_vm_table_bytes(vm, ParquetCompression::Zstd) {
-                            Ok(bytes) => self.write_confined_bytes(*handle, &full_rel, bytes),
-                            Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e)))),
-                        }
-                    }
-                    _ => EvalOut::Failed("write_parquet expects Table".to_string()),
-                }
-            }
-            (
-                HostOp::WriteXlsx,
-                [
-                    Val::CapWriteFiles {
-                        handle,
-                        root,
-                        allows,
-                    },
-                    Val::Text(rel),
-                    payload,
-                ],
-            ) => {
-                if !self.ew.dry_run
-                    && let Some(bug) = self.check_export_gate(*handle, allows)
-                {
-                    return EvalOut::Stopped(bug);
-                }
-                if !is_safe_relative_path(rel) {
-                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
-                        "unsafe write path `{rel}`"
-                    )))));
-                }
-                let full_rel = join_confined_path(root, rel);
-                let sheets: Vec<(String, TableVal)> = match payload {
-                    Val::Table(tv) => vec![("Sheet1".to_string(), tv.clone())],
-                    Val::Columnar(vm) => vec![("Sheet1".to_string(), vm.to_table_val())],
-                    Val::Map(pairs) => {
-                        let mut out = Vec::with_capacity(pairs.len());
-                        for (k, v) in pairs {
-                            let Some(tv) = v.to_table_val() else {
-                                return EvalOut::Failed(
-                                    "write_xlsx `sheets:` map values must be Tables".to_string(),
-                                );
-                            };
-                            out.push((format_display_val(k), tv));
-                        }
-                        out
-                    }
-                    _ => {
-                        return EvalOut::Failed(
-                            "write_xlsx expects a Table or `sheets: Map(Text, Table)`".to_string(),
-                        );
-                    }
-                };
-                if matches!(handle, CapHandle::Real) && self.ew.dry_run {
-                    self.ew.world.stdout.push(format!(
-                        "[DRY-RUN] would write xlsx \"{full_rel}\" ({} sheet(s))",
-                        sheets.len()
-                    ));
-                    return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
-                }
-                match write_xlsx_sheets(&sheets) {
-                    Ok(bytes) => self.write_confined_bytes(*handle, &full_rel, bytes),
-                    Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e)))),
-                }
             }
             (
                 HostOp::HttpsGetJson,
@@ -3459,18 +3433,129 @@ impl<'a> Evaluator<'a> {
         )
     }
 
+    fn eval_core_write_host(
+        &mut self,
+        op: HostOp,
+        cap: &Val,
+        path: &Val,
+        payload: &Val,
+        explicit_private: bool,
+    ) -> EvalOut {
+        let (
+            Val::CapWriteFiles {
+                handle,
+                root,
+                allows,
+            },
+            Val::Text(rel),
+        ) = (cap, path)
+        else {
+            return EvalOut::Failed(format!(
+                "write op `{op:?}` expects (WriteFiles, path, payload)"
+            ));
+        };
+        if !self.ew.dry_run
+            && let Some(bug) = self.check_export_gate(*handle, allows)
+        {
+            return EvalOut::Stopped(bug);
+        }
+        if !is_safe_relative_path(rel) {
+            return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                "unsafe write path `{rel}`"
+            )))));
+        }
+        let is_private = explicit_private || !allows.is_empty();
+        let full_rel = join_confined_path(root, rel);
+        match (op.clone(), payload) {
+            (HostOp::WriteFile, Val::Text(content)) => {
+                self.write_confined_output(*handle, &full_rel, content.clone(), is_private)
+            }
+            (HostOp::WriteReportHtml, Val::Report(rep)) => {
+                let html = crate::viz::report::render_html_report(rep);
+                self.write_confined_output(*handle, &full_rel, html, is_private)
+            }
+            (HostOp::WriteParquet, Val::Table(tv)) => {
+                if matches!(handle, CapHandle::Real) && self.ew.dry_run {
+                    self.ew.world.stdout.push(format!(
+                        "[DRY-RUN] would write parquet \"{full_rel}\" ({} rows, {} cols)",
+                        tv.rows.len(),
+                        tv.cols.len()
+                    ));
+                    return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
+                }
+                match write_parquet_bytes(tv, ParquetCompression::Zstd) {
+                    Ok(bytes) => self.write_confined_bytes(*handle, &full_rel, bytes, is_private),
+                    Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e)))),
+                }
+            }
+            (HostOp::WriteParquet, Val::Columnar(vm)) => {
+                if matches!(handle, CapHandle::Real) && self.ew.dry_run {
+                    self.ew.world.stdout.push(format!(
+                        "[DRY-RUN] would write parquet \"{full_rel}\" ({} rows, {} cols)",
+                        vm.total_rows(),
+                        vm.cols.len()
+                    ));
+                    return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
+                }
+                match write_parquet_vm_table_bytes(vm, ParquetCompression::Zstd) {
+                    Ok(bytes) => self.write_confined_bytes(*handle, &full_rel, bytes, is_private),
+                    Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e)))),
+                }
+            }
+            (HostOp::WriteXlsx, payload) => {
+                let sheets: Vec<(String, TableVal)> = match payload {
+                    Val::Table(tv) => vec![("Sheet1".to_string(), tv.clone())],
+                    Val::Columnar(vm) => vec![("Sheet1".to_string(), vm.to_table_val())],
+                    Val::Map(pairs) => {
+                        let mut out = Vec::with_capacity(pairs.len());
+                        for (k, v) in pairs {
+                            let Some(tv) = v.to_table_val() else {
+                                return EvalOut::Failed(
+                                    "write_xlsx `sheets:` map values must be Tables".to_string(),
+                                );
+                            };
+                            out.push((format_display_val(k), tv));
+                        }
+                        out
+                    }
+                    _ => {
+                        return EvalOut::Failed(
+                            "write_xlsx expects a Table or `sheets: Map(Text, Table)`".to_string(),
+                        );
+                    }
+                };
+                if matches!(handle, CapHandle::Real) && self.ew.dry_run {
+                    self.ew.world.stdout.push(format!(
+                        "[DRY-RUN] would write xlsx \"{full_rel}\" ({} sheet(s))",
+                        sheets.len()
+                    ));
+                    return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
+                }
+                match write_xlsx_sheets(&sheets) {
+                    Ok(bytes) => self.write_confined_bytes(*handle, &full_rel, bytes, is_private),
+                    Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e)))),
+                }
+            }
+            _ => EvalOut::Failed(format!("invalid payload for `{op:?}`")),
+        }
+    }
+
     fn write_confined_table(
         &mut self,
         handle: CapHandle,
         full_rel: &str,
         tv: &TableVal,
         fmt: TableWriteFmt,
+        private: bool,
     ) -> EvalOut {
         let comp = detect_compression_path(full_rel);
         match handle {
             CapHandle::Fake(idx) => {
                 let text = match fmt {
-                    TableWriteFmt::Csv(delim) => format_csv_table(tv, delim),
+                    TableWriteFmt::Csv {
+                        delimiter,
+                        sanitize_formulas,
+                    } => format_csv_table_with_options(tv, delimiter, sanitize_formulas),
                     TableWriteFmt::Jsonl => format_jsonl_table(tv),
                 };
                 if let Some(ff) = self.ew.world.fake_files.get_mut(idx) {
@@ -3488,30 +3573,37 @@ impl<'a> Evaluator<'a> {
                     return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
                 }
                 if self.ew.live_io {
-                    let out_path = match &self.ew.work_dir {
-                        Some(base) => base.join(full_rel),
-                        None => std::path::PathBuf::from(full_rel),
-                    };
-                    if let Some(parent) = out_path.parent()
-                        && let Err(e) = fs::create_dir_all(parent)
-                    {
-                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
-                    }
-                    let res = File::create(&out_path).and_then(|f| {
-                        let mut enc = AutoEncodeWriter::new(BufWriter::new(f), comp)?;
-                        match fmt {
-                            TableWriteFmt::Csv(delim) => write_csv_table(&mut enc, tv, delim)?,
-                            TableWriteFmt::Jsonl => write_jsonl_table(&mut enc, tv)?,
-                        }
-                        enc.finish()?;
-                        Ok(())
-                    });
+                    let res = write_file_maybe_private(
+                        self.ew.work_dir.as_deref(),
+                        full_rel,
+                        private,
+                        |file| {
+                            let mut enc = AutoEncodeWriter::new(BufWriter::new(file), comp)?;
+                            match fmt {
+                                TableWriteFmt::Csv {
+                                    delimiter,
+                                    sanitize_formulas,
+                                } => write_csv_table_with_options(
+                                    &mut enc,
+                                    tv,
+                                    delimiter,
+                                    sanitize_formulas,
+                                )?,
+                                TableWriteFmt::Jsonl => write_jsonl_table(&mut enc, tv)?,
+                            }
+                            enc.finish()?;
+                            Ok(())
+                        },
+                    );
                     if let Err(e) = res {
                         return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
                     }
                 } else {
                     let text = match fmt {
-                        TableWriteFmt::Csv(delim) => format_csv_table(tv, delim),
+                        TableWriteFmt::Csv {
+                            delimiter,
+                            sanitize_formulas,
+                        } => format_csv_table_with_options(tv, delimiter, sanitize_formulas),
                         TableWriteFmt::Jsonl => format_jsonl_table(tv),
                     };
                     self.ew
@@ -3530,12 +3622,16 @@ impl<'a> Evaluator<'a> {
         full_rel: &str,
         vm: &VmTable,
         fmt: TableWriteFmt,
+        private: bool,
     ) -> EvalOut {
         let comp = detect_compression_path(full_rel);
         match handle {
             CapHandle::Fake(idx) => {
                 let text = match fmt {
-                    TableWriteFmt::Csv(delim) => format_csv_vm_table(vm, delim),
+                    TableWriteFmt::Csv {
+                        delimiter,
+                        sanitize_formulas,
+                    } => format_csv_vm_table_with_options(vm, delimiter, sanitize_formulas),
                     TableWriteFmt::Jsonl => format_jsonl_vm_table(vm),
                 };
                 if let Some(ff) = self.ew.world.fake_files.get_mut(idx) {
@@ -3553,30 +3649,37 @@ impl<'a> Evaluator<'a> {
                     return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
                 }
                 if self.ew.live_io {
-                    let out_path = match &self.ew.work_dir {
-                        Some(base) => base.join(full_rel),
-                        None => std::path::PathBuf::from(full_rel),
-                    };
-                    if let Some(parent) = out_path.parent()
-                        && let Err(e) = fs::create_dir_all(parent)
-                    {
-                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
-                    }
-                    let res = File::create(&out_path).and_then(|f| {
-                        let mut enc = AutoEncodeWriter::new(BufWriter::new(f), comp)?;
-                        match fmt {
-                            TableWriteFmt::Csv(delim) => write_csv_vm_table(&mut enc, vm, delim)?,
-                            TableWriteFmt::Jsonl => write_jsonl_vm_table(&mut enc, vm)?,
-                        }
-                        enc.finish()?;
-                        Ok(())
-                    });
+                    let res = write_file_maybe_private(
+                        self.ew.work_dir.as_deref(),
+                        full_rel,
+                        private,
+                        |file| {
+                            let mut enc = AutoEncodeWriter::new(BufWriter::new(file), comp)?;
+                            match fmt {
+                                TableWriteFmt::Csv {
+                                    delimiter,
+                                    sanitize_formulas,
+                                } => write_csv_vm_table_with_options(
+                                    &mut enc,
+                                    vm,
+                                    delimiter,
+                                    sanitize_formulas,
+                                )?,
+                                TableWriteFmt::Jsonl => write_jsonl_vm_table(&mut enc, vm)?,
+                            }
+                            enc.finish()?;
+                            Ok(())
+                        },
+                    );
                     if let Err(e) = res {
                         return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
                     }
                 } else {
                     let text = match fmt {
-                        TableWriteFmt::Csv(delim) => format_csv_vm_table(vm, delim),
+                        TableWriteFmt::Csv {
+                            delimiter,
+                            sanitize_formulas,
+                        } => format_csv_vm_table_with_options(vm, delimiter, sanitize_formulas),
                         TableWriteFmt::Jsonl => format_jsonl_vm_table(vm),
                     };
                     self.ew
@@ -3594,6 +3697,7 @@ impl<'a> Evaluator<'a> {
         handle: CapHandle,
         full_rel: &str,
         content: String,
+        private: bool,
     ) -> EvalOut {
         match handle {
             CapHandle::Fake(idx) => {
@@ -3611,26 +3715,22 @@ impl<'a> Evaluator<'a> {
                     return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
                 }
                 if self.ew.live_io {
-                    let out_path = match &self.ew.work_dir {
-                        Some(base) => base.join(full_rel),
-                        None => std::path::PathBuf::from(full_rel),
-                    };
-                    if let Some(parent) = out_path.parent()
-                        && let Err(e) = fs::create_dir_all(parent)
-                    {
-                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
-                    }
                     let comp = detect_compression_path(full_rel);
-                    let write_res: io::Result<()> = if comp == CompressionKind::Plain {
-                        fs::write(&out_path, &content)
-                    } else {
-                        File::create(&out_path).and_then(|f| {
-                            let mut enc = AutoEncodeWriter::new(BufWriter::new(f), comp)?;
-                            enc.write_all(content.as_bytes())?;
-                            enc.finish()?;
-                            Ok(())
-                        })
-                    };
+                    let write_res = write_file_maybe_private(
+                        self.ew.work_dir.as_deref(),
+                        full_rel,
+                        private,
+                        |file| {
+                            if comp == CompressionKind::Plain {
+                                file.write_all(content.as_bytes())
+                            } else {
+                                let mut enc = AutoEncodeWriter::new(BufWriter::new(file), comp)?;
+                                enc.write_all(content.as_bytes())?;
+                                enc.finish()?;
+                                Ok(())
+                            }
+                        },
+                    );
                     if let Err(e) = write_res {
                         return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
                     }
@@ -3678,6 +3778,7 @@ impl<'a> Evaluator<'a> {
         handle: CapHandle,
         full_rel: &str,
         bytes: Vec<u8>,
+        private: bool,
     ) -> EvalOut {
         match handle {
             CapHandle::Fake(idx) => {
@@ -3697,16 +3798,13 @@ impl<'a> Evaluator<'a> {
                     return EvalOut::Ok(Val::ResOk(Box::new(Val::Unit)));
                 }
                 if self.ew.live_io {
-                    let out_path = match &self.ew.work_dir {
-                        Some(base) => base.join(full_rel),
-                        None => std::path::PathBuf::from(full_rel),
-                    };
-                    if let Some(parent) = out_path.parent()
-                        && let Err(e) = fs::create_dir_all(parent)
-                    {
-                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
-                    }
-                    if let Err(e) = fs::write(&out_path, &bytes) {
+                    let write_res = write_file_maybe_private(
+                        self.ew.work_dir.as_deref(),
+                        full_rel,
+                        private,
+                        |file| file.write_all(&bytes),
+                    );
+                    if let Err(e) = write_res {
                         return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
                     }
                 } else {
@@ -4589,6 +4687,32 @@ impl<'a> Evaluator<'a> {
                     }
                 }
             }
+            ExecPlan::Shuffle { seed, .. } => {
+                let seed_val = match self.eval_expr(seed, env) {
+                    EvalOut::Ok(v) => v,
+                    other => return other,
+                };
+                let Val::Int(ref n) = seed_val else {
+                    return EvalOut::Failed("shuffle(seed:) expects Int".to_string());
+                };
+                let mut tv = tv;
+                for r in &mut tv.rows {
+                    r.group_meta = None;
+                }
+                fisher_yates_shuffle(&mut tv.rows, seed_from_bigint(n));
+                EvalOut::Ok(Val::Table(tv))
+            }
+            ExecPlan::SuppressSmallCells {
+                by_cols,
+                min_k,
+                distinct_by,
+                ..
+            } => eval_suppress_small_cells_table(
+                tv,
+                by_cols,
+                &self.prog.min_cell_floor().max(min_k.clone()),
+                distinct_by.as_deref(),
+            ),
             ExecPlan::Window { items, .. } => eval_window(tv, items),
             ExecPlan::FillGaps {
                 col,
@@ -5283,6 +5407,8 @@ fn unary_plan_input(plan: &ExecPlan) -> Option<&ExecPlan> {
         | ExecPlan::GroupBy { input, .. }
         | ExecPlan::Summarize { input, .. }
         | ExecPlan::SuppressSmallGroups { input, .. }
+        | ExecPlan::Shuffle { input, .. }
+        | ExecPlan::SuppressSmallCells { input, .. }
         | ExecPlan::Window { input, .. }
         | ExecPlan::FillGaps { input, .. }
         | ExecPlan::PivotWider { input, .. }
@@ -6305,5 +6431,271 @@ pub(crate) fn round_to_float_val(x: Float64, step: Float64) -> Result<Float64, B
     Ok(Float64::from_f64(if q == 0.0 { 0.0 } else { q }))
 }
 
+#[cfg(unix)]
+fn ensure_private_dir_chain(work_dir: Option<&Path>, full_rel: &str) -> io::Result<()> {
+    if let Some(base) = work_dir {
+        fs::create_dir_all(base)?;
+    }
+    let Some(parent) = Path::new(full_rel).parent() else {
+        return Ok(());
+    };
+    let mut cur = work_dir.map_or_else(PathBuf::new, Path::to_path_buf);
+    for comp in parent.components() {
+        match comp {
+            Component::CurDir => continue,
+            Component::RootDir | Component::Prefix(_) => {
+                cur.push(comp.as_os_str());
+            }
+            Component::ParentDir => {
+                cur.push(comp.as_os_str());
+            }
+            Component::Normal(seg) => {
+                cur.push(seg);
+                match fs::DirBuilder::new().mode(0o700).create(&cur) {
+                    Ok(()) => {
+                        fs::set_permissions(&cur, fs::Permissions::from_mode(0o700))?;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_file_maybe_private(
+    work_dir: Option<&Path>,
+    full_rel: &str,
+    private: bool,
+    writer: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    let out_path = match work_dir {
+        Some(base) => base.join(full_rel),
+        None => PathBuf::from(full_rel),
+    };
+    if !private {
+        if let Some(parent) = out_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let mut f = File::create(&out_path)?;
+        writer(&mut f)?;
+        f.flush()?;
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    ensure_private_dir_chain(work_dir, full_rel)?;
+    #[cfg(not(unix))]
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let parent_dir = match out_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let file_name = out_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("dana_out");
+    let pid = std::process::id();
+    let mut tmp_opt: Option<(PathBuf, File)> = None;
+    let mut last_err: Option<io::Error> = None;
+    for _ in 0..16 {
+        let seq = PRIVATE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent_dir.join(format!(".{file_name}.dana-tmp.{pid}.{seq}"));
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o600);
+        }
+        match opts.open(&candidate) {
+            Ok(f) => {
+                tmp_opt = Some((candidate, f));
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let Some((tmp_path, mut file)) = tmp_opt else {
+        return Err(last_err.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "failed to allocate temporary private output file",
+            )
+        }));
+    };
+
+    let write_res: io::Result<()> = (|| {
+        writer(&mut file)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        drop(file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    drop(file);
+
+    #[cfg(unix)]
+    if let Err(e) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp_path, &out_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn unwrap_opt_cell(mut v: &Val) -> Option<&Val> {
+    loop {
+        match v {
+            Val::OptNone => return None,
+            Val::OptSome(inner) => v = inner.as_ref(),
+            other => return Some(other),
+        }
+    }
+}
+
+fn eval_suppress_small_cells_table(
+    tv: TableVal,
+    by_cols: &[Ident],
+    min_k: &BigInt,
+    distinct_by: Option<&str>,
+) -> EvalOut {
+    if by_cols.is_empty() {
+        return EvalOut::Failed(
+            "suppress_small_cells requires non-empty `by:` columns".to_string(),
+        );
+    }
+    let mut by_indices = Vec::with_capacity(by_cols.len());
+    for name in by_cols {
+        let Some(idx) = tv.cols.iter().position(|c| c.name == *name) else {
+            return EvalOut::Failed(format!(
+                "unknown column `.{name}` in `suppress_small_cells`"
+            ));
+        };
+        by_indices.push(idx);
+    }
+    let distinct_idx = match distinct_by {
+        Some(dn) => {
+            let Some(idx) = tv.cols.iter().position(|c| c.name == dn) else {
+                return EvalOut::Failed(format!(
+                    "unknown column `.{dn}` in `suppress_small_cells(distinct_by: ...)`"
+                ));
+            };
+            Some(idx)
+        }
+        None => None,
+    };
+
+    let floor = min_k.to_usize_saturating();
+    let out_cols: Vec<ColSpec> = tv
+        .cols
+        .iter()
+        .map(|c| {
+            let clear_ferpa = by_cols.contains(&c.name) || c.bucketed;
+            ColSpec {
+                name: c.name.clone(),
+                ty: c.ty.clone(),
+                tags: if clear_ferpa {
+                    c.tags.remove("ferpa")
+                } else {
+                    c.tags.clone()
+                },
+                bucketed: c.bucketed,
+                agg_kind: AggKind::Raw,
+            }
+        })
+        .collect();
+
+    type DistinctMap = HashMap<u64, Vec<Val>, BuildHasherDefault<FastHasher>>;
+    let mut hash_buckets: HashMap<u64, Vec<usize>, BuildHasherDefault<FastHasher>> =
+        HashMap::default();
+    let mut exemplars: Vec<usize> = Vec::new();
+    let mut group_counts: Vec<usize> = Vec::new();
+    let mut group_distinct: Vec<(DistinctMap, usize)> = Vec::new();
+    let mut row_groups: Vec<usize> = Vec::with_capacity(tv.rows.len());
+
+    for (r_idx, row) in tv.rows.iter().enumerate() {
+        let mut h = FastHasher::new();
+        for &ci in &by_indices {
+            hash_val(&row.cells[ci], &mut h);
+        }
+        let hv = h.finish_u64();
+        let candidates = hash_buckets.entry(hv).or_default();
+        let found_gid = candidates.iter().copied().find(|&gid| {
+            let ex_row = &tv.rows[exemplars[gid]];
+            by_indices
+                .iter()
+                .all(|&ci| val_eq(&ex_row.cells[ci], &row.cells[ci]))
+        });
+        let gid = if let Some(gid) = found_gid {
+            gid
+        } else {
+            let gid = exemplars.len();
+            exemplars.push(r_idx);
+            candidates.push(gid);
+            group_counts.push(0);
+            if distinct_idx.is_some() {
+                group_distinct.push((DistinctMap::default(), 0));
+            }
+            gid
+        };
+        if let Some(d_idx) = distinct_idx {
+            if let Some(inner) = unwrap_opt_cell(&row.cells[d_idx]) {
+                let mut dh = FastHasher::new();
+                hash_val(inner, &mut dh);
+                let dhv = dh.finish_u64();
+                let (map, total) = &mut group_distinct[gid];
+                let bucket = map.entry(dhv).or_default();
+                if !bucket.iter().any(|existing| val_eq(existing, inner)) {
+                    bucket.push(inner.clone());
+                    *total += 1;
+                }
+            }
+        } else {
+            group_counts[gid] += 1;
+        }
+        row_groups.push(gid);
+    }
+
+    let mut kept_rows = Vec::new();
+    for (r_idx, mut row) in tv.rows.into_iter().enumerate() {
+        let Some(&gid) = row_groups.get(r_idx) else {
+            continue;
+        };
+        let sz = if distinct_idx.is_some() {
+            group_distinct[gid].1
+        } else {
+            group_counts[gid]
+        };
+        if sz >= floor {
+            row.group_meta = None;
+            kept_rows.push(row);
+        }
+    }
+
+    EvalOut::Ok(Val::Table(TableVal {
+        cols: out_cols,
+        rows: kept_rows,
+    }))
+}
+
 // Keep reference constants visible for checked range consistency.
 const _: (i64, i64, i128, i128) = (INT64_MIN, INT64_MAX, DEC_MIN, DEC_MAX);
+const _: fn(&[Val]) -> u64 = hash_val_slice;

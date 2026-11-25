@@ -1,6 +1,6 @@
-# Dana Language Reference, v0.4
+# Dana Language Reference, v0.5
 
-**Version 0.4 (pre-1.0).** This is the complete, authoritative language reference for Dana,
+**Version 0.5 (pre-1.0).** This is the complete, authoritative language reference for Dana,
 embedded directly into `dana guide` for human authors and AI coding agents.
 
 Every rule is illustrated with real syntax checked by Dana's 0-conflict IELR(1) grammar
@@ -120,11 +120,12 @@ Contextual words:
   name (`.tag`).
 - After `.`, `table`, `where`, `tag`, and capitalized column names (`.M0`, `.Q1`) are valid
   member names (e.g., `db.table(Student)`, `.M0 - .M3`).
-- Named-argument labels (`as`, `on`, `left`, `right`, `allows`, `over`, `order`, `cuts`,
+- Named-argument labels (`as`, `on`, `from`, `left`, `right`, `allows`, `over`, `order`, `cuts`,
   `labels`, `columns`, `cols`, `names_from`, `values_from`, `names_to`, `values_to`, `fill`,
   `key`, `sheet`, `sheets`, `method`, `threshold`, `flag`, `bins`, `trendline`, `title`,
-  `params`, `headers`, `responses`, `every`, `rows`, `min`, `distinct_by`, `mode`, `suffixes`)
-  are ordinary identifiers.
+  `params`, `headers`, `responses`, `every`, `rows`, `by`, `min`, `distinct_by`, `mode`, `seed`,
+  `private`, `sanitize_formulas`, `sub`, `prefix`, `suffix`, `start`, `len`, `list`, `lo`, `hi`,
+  `step`, `suffixes`) are ordinary identifiers.
 
 ### 2.4 Line Breaks & Continuations
 
@@ -166,10 +167,22 @@ immediately before a closing delimiter, `.`, `|>`, or any binary operator other 
    - On `Float`: `.abs` -> `Float`, `.round(n)` -> `Float`.
    - There is intentionally **no** `.to_decimal` on `Float` (keep exact money/financial values
      as `Decimal` from the schema boundary).
-3. **Scalar text & time helpers** (available both in normal expressions and inside row
-   expressions `where`/`derive`):
+3. **Scalar text, numeric, parsing & time helpers** (available both in normal expressions and
+   inside row expressions `where`/`derive`):
    - `Text`: `a + b` (concatenation), `#{expr}` (interpolation), `.empty?`, `.trim`,
-     `.ascii_lowercase`, `.contains?("sub")`.
+     `.ascii_lowercase`, `.lower`, `.upper`, `.slice(start, len)` (UTF-8 char slicing; negative
+     `start` counts from end, `len <= 0` returns `""`), `.contains?("sub")`,
+     `.starts_with?("prefix")`, `.ends_with?("suffix")`.
+   - **Safe parsing on `Text`** (trims ASCII whitespace, returns `T?`, never traps):
+     `.try_parse_date : Date?`, `.try_parse_int : Int?`, `.try_parse_decimal : Decimal?`,
+     `.try_parse_float : Float?`.
+   - **Numeric bounding & quantization:** `.clamp(lo, hi)` (on `Int`/`Decimal`/`Float`;
+     traps on `DomainError` if `lo > hi` or `NaN` bounds) and `.round_to(step)` (on `Float`;
+     quantizes to multiples of `step > 0` with IEEE-754 ties-away-from-zero; traps on
+     `step <= 0` or non-finite inputs). Inside `derive(...)`, `.round_to(...)` marks the
+     resulting column as coarsened (`bucketed = true`).
+   - **List membership:** `val.in?(list) : Bool` works across `Bool`, `Int`, `Decimal`, `Float`,
+     `Text`, `Date`, `Timestamp`, `Duration`, and `Option(T)` (returning `false` when `none`).
    - `Date` / `Timestamp`: `date_trunc(.d, :month)` (also `:year`, `:day`, `:hour`, `:minute`),
      `date_trunc(.ts, 5.minutes)`, `months_between(.d1, .d2) : Int`,
      `.ts.in_tz("America/Chicago") : Text`, `.ts.date_in_tz("America/Chicago") : Date`,
@@ -357,6 +370,8 @@ end
 | `group_by` | `group_by(.a, .b)` — Set grouping keys for `summarize`. Adds key tags to `row_tags`. |
 | `summarize` | `summarize(n: count(), avg: mean(.x), ...)` — Aggregate per group (or whole table if ungrouped). |
 | `suppress_small_groups` | `suppress_small_groups(min: k, distinct_by: .id)` (opt. `mode: :drop \| :mask`) — Audited k-anonymity declassifier immediately after `summarize`. |
+| `suppress_small_cells` | `suppress_small_cells(by: [.c1, ...], min: k)` (opt. `distinct_by: .id`) — Audited row-level k-anonymity suppression keeping rows in classes with `>= k` rows (or distinct values); requires zero `[pii]`/`[secret]` columns. |
+| `shuffle` | `shuffle(seed: Int)` — Deterministic SplitMix64 Fisher-Yates row permutation clearing `order_tags`. |
 | `window` | `window(c: win_fn, ..., over: [.g], order: .t)` — Partitioned/ordered window computations (`over: []` for whole table). |
 | `fill_gaps` | `fill_gaps(.t, every: 5.minutes, over: [.g], fill: {col: 0})` — Fill missing time buckets; unfilled non-key columns become `T?`. |
 | `pivot_wider` | `pivot_wider(names_from: .k, values_from: .v, columns: ["M0", "M3"], fill: 0.0)` — Statically typed wide table with compile-time column list. |
@@ -376,6 +391,7 @@ descending by `.total_amount` with ties broken ascending by `.category`.
 | --- | --- | --- |
 | `count()` | `Int` | Yes (blending) |
 | `count_distinct(.col)` | `Int` | Yes (blending; enables `distinct_by: .col`) |
+| `count_if(cond)` | `Int` | Yes (blending; pushes SQL `SUM(CASE WHEN cond THEN 1 ELSE 0 END)`) |
 | `sum(.col)` | `Int` / `Decimal` / `Float` | Yes (blending; `0` on empty) |
 | `mean(.col)` | `Decimal?` (if `Decimal`) or `Float?` | Yes (blending) |
 | `stddev(.col)`, `variance(.col)` | `Float?` | Yes (blending) |
@@ -548,9 +564,9 @@ over Dana Core IR) and enforces runtime redaction everywhere.
    (printing, writing files/DBs, HTTPS) are forbidden unless the sink allows the condition's
    tags, and any returned/assigned values inherit the condition's tags.
 
-### 7.2 Four Audited Built-In Declassifiers
+### 7.2 Audited Built-In Declassifiers
 
-There is no unguarded manual `declassify` escape hatch. Use the four audited mechanisms:
+There is no unguarded manual `declassify` escape hatch. Use Dana's audited declassifiers:
 
 1. **`redact(.col)`** — Replaces every value in `.col` with `"[REDACTED]"` (`Text`) and clears
    `col_tags(.col)` to `[]`.
@@ -558,10 +574,10 @@ There is no unguarded manual `declassify` escape hatch. Use the four audited mec
    HMAC-SHA256 hex token (`Text`), requiring a `Secret(...)` capability. Clears **`[pii]`**
    only (non-PII tags like `[health]` or `[counseling]` remain tracked). Identical keys produce
    identical tokens, so downstream joins on pseudonymized IDs still match 100%.
-3. **`bucket(.col, cuts: [c1, c2, ...], labels: ["l0", "l1", "l2", ...])`** (inside `derive`) —
-   Maps sensitive values into compile-time-constant `Text` buckets (`labels.len() == cuts.len() + 1`).
-   Stays tagged on individual rows (`bucketed = true`) and clears only once grouped and
-   protected by `suppress_small_groups`.
+3. **`bucket(.col, cuts: [c1, c2, ...], labels: ["l0", "l1", "l2", ...])`** and **`.round_to(step)`**
+   (inside `derive`) — Coarsen sensitive values into intervals or step multiples (`bucketed = true`).
+   Both stay tagged on individual rows and clear `[ferpa]` / group tags only once protected by
+   `suppress_small_groups` or `suppress_small_cells`.
 4. **`suppress_small_groups(min: k, distinct_by: .id)`** (optional `mode: :drop` [default] or
    `mode: :mask`):
    - Must immediately follow `summarize(...)`.
@@ -569,12 +585,23 @@ There is no unguarded manual `declassify` escape hatch. Use the four audited mec
    - `distinct_by: .id` requires a matching `count_distinct(.id)` inside `summarize(...)` so
      one person with 5 rows cannot satisfy `k = 5`.
    - **Clears:** `row_tags`, `order_tags`, **blending** aggregates (`count`, `count_distinct`,
-     `sum`, `mean`, `stddev`, `variance`), and **`bucketed`** group keys.
+     `count_if`, `sum`, `mean`, `stddev`, `variance`), and **`bucketed`** group keys.
    - **Keeps tagged:** non-bucketed sensitive group keys AND **order statistics / extremes**
      (`min`, `max`, `median`, `percentile`, `first`, `last`) — preventing single-record outlier
      re-identification!
    - With `mode: :mask`, suppressed cells (and complementary suppression cells) become `none`
      and aggregate columns widen to `T?`.
+5. **`suppress_small_cells(by: [.c1, ...], min: k, [distinct_by: .id])`** (row-level
+   `k`-anonymity) & **`shuffle(seed: Int)`**:
+   - Retains individual rows whose quasi-identifier equivalence class (`by:`) has `>= k` rows
+     (or `>= k` distinct non-null `distinct_by` values), dropping rows from smaller classes;
+     `min: k` must be a literal integer `>= 2` and `>= policy.min_group_size`.
+   - Statically rejects with **`E0202`** if `[pii]` or `[secret]` remains tagged on any column
+     (`.drop`, `.select`, `redact`, or `pseudonymize` direct identifiers first).
+   - **Clears:** `row_tags` and `[ferpa]` on `by:` columns and coarsened (`bucket` / `.round_to`)
+     columns; **keeps `[ferpa]`** on un-coarsened columns. Logs `K_ANON` in `dana explain`.
+   - Pair with `|> shuffle(seed: Int)` to deterministically permute row order and clear
+     `order_tags`.
 
 <!-- dana-example: file -->
 ```dana
@@ -617,7 +644,7 @@ explicit tag allowlists:
 | `Args` | CLI arguments (`args.first : Text?`, `args.list : List(Text)`) |
 | `Console` / `Console(allows: [...])` | Terminal output (`print`, `error`, `print_table`, `print_chart`, `print_profile`) |
 | `ReadFiles` | Read local files (`read_csv`, `read_jsonl`, `read_xlsx`, `read_parquet`) |
-| `WriteFiles("prefix/", allows: [...])` | Confined directory writer (rejects `..` and absolute paths; sensitive tags require runtime `--allow-export=...`) |
+| `WriteFiles("prefix/", allows: [...])` | Confined directory writer (`0700` dirs / `0600` atomic temp+rename when `private: true` or non-empty `allows:`; sensitive tags require runtime `--allow-export=...`) |
 | `ReadDB(DbName)` | Typed read-only DB access (`db.table(Schema)`) with automatic SQL pushdown |
 | `WriteTable(DbName, "table_name", allows: [...])` | Typed DB upsert (`try w.upsert(tbl, key: .id)`) with column-by-column `schema.lock` tag verification |
 | `RawReadDB(DbName)` | Capability-gated parameterized raw SQL (`try raw.raw_sql("...", params: [...], as: Schema)`) |
@@ -678,33 +705,40 @@ rows = try files.read_parquet("data/orders.parquet", as: Order)
 ```
 
 **Confined writers** on `out: WriteFiles("reports/")` all return `Result(Unit, Text)` and write
-under the capability's prefix (creating subdirectories automatically):
+under the capability's prefix (creating subdirectories automatically). Every `WriteFiles`
+writer accepts optional `private: Bool` (default `false`); whenever `private: true` **or**
+`WriteFiles` carries non-empty `allows:` tags, missing parent directories are created with mode
+`0700` and payloads are flushed, synced, and atomically renamed from a `0600` temp file:
 
 | Method | Payload | Notes |
 | --- | --- | --- |
-| `try out.write_csv("out.csv", tbl)` | `Table` | `.tsv` uses tabs; `.gz`/`.zst` auto-compress |
-| `try out.write_jsonl("out.jsonl.zst", tbl)` | `Table` | Auto `.gz`/`.zst` compression |
-| `try out.write_parquet("out.parquet", tbl)` | `Table` | Native Zstd-compressed Apache Parquet |
-| `try out.write_xlsx("out.xlsx", sheets: {"S1": t1, "S2": t2})` | `Map(Text, Table)` or `Table` | Single- or multi-sheet OOXML `.xlsx` |
-| `try out.write_html("report.html", report)` | `Report` | Self-contained HTML5 with inline SVGs |
-| `try out.write_markdown("report.md", report)` | `Report` | GitHub-flavored Markdown report |
-| `try out.write_svg("chart.svg", chart)` | `Chart` | Standalone `<svg>` file |
-| `try out.write_text("notes.txt", text)` | `Text` | Plain UTF-8 text |
+| `try out.write_csv("out.csv", tbl, private: false, sanitize_formulas: false)` | `Table` | `.tsv` uses tabs; `.gz`/`.zst` auto-compress; `sanitize_formulas: true` prefixes `'`, preserving negative decimals (also via `format_csv(tbl, sanitize_formulas: true)`) |
+| `try out.write_jsonl("out.jsonl.zst", tbl, private: false)` | `Table` | Auto `.gz`/`.zst` compression |
+| `try out.write_parquet("out.parquet", tbl, private: false)` | `Table` | Native Zstd-compressed Apache Parquet |
+| `try out.write_xlsx("out.xlsx", sheets: {"S1": t1, "S2": t2}, private: false)` | `Map(Text, Table)` or `Table` | Single- or multi-sheet OOXML `.xlsx` |
+| `try out.write_html("report.html", report, private: false)` | `Report` | Self-contained HTML5 with inline SVGs |
+| `try out.write_markdown("report.md", report, private: false)` | `Report` | GitHub-flavored Markdown report |
+| `try out.write_svg("chart.svg", chart, private: false)` | `Chart` | Standalone `<svg>` file |
+| `try out.write_file("notes.txt", text, private: false)` | `Text` | Plain UTF-8 text (alias: `write_text`) |
 
 ### 8.2 Databases, `schema.lock` & SQL Pushdown
 
 Bind databases at runtime with `--db Name=URI` (e.g., `--db Seminary=sqlite:///path/to/db.sqlite`
 or `--db Seminary=postgres://user:pass@host:5432/db`) or env var `DANA_DB_<NAME>`.
 
-- **Typed scan with automatic SQL pushdown:** `db.table(Schema)` returns `Table(Schema)`
-  directly (not a `Result`). Eligible `where`, `select`, `drop`, `rename`, `derive` (including
-  `bucket`), `join_*`, `distinct`, `group_by`/`summarize`, `sort_by`, and `limit` prefixes
-  compile automatically into 100% parameterized SQL (`?` on SQLite, `$1..$n` on PostgreSQL)
-  and stream 2,048-row batches into the columnar VM. To get live runtime SQL pushdown inside a
-  helper function, pass `db: ReadDB(MyDb)` and start the pipeline with `db.table(Schema) |> ...`
-  (passing `db.table(Schema)` into a `Table(Schema)` parameter materializes the scan before the
-  call). Inspect pushdown boundaries with `dana explain --dialect sqlite|postgres FILE`.
-- **Offline `schema.lock`:** Run `dana schema-sync --db Seminary=... --out schema.lock` to
+- **Typed scan with automatic SQL pushdown:** `db.table(Schema)` (or schema-qualified
+  `db.table(Schema, from: "populi.enrollments")` for PostgreSQL schemas & multi-schema
+  `WriteTable(Db, "schema.table")`) returns `Table(Schema)` directly (not a `Result`).
+  Eligible `where`, `select`, `drop`, `rename`, `derive` (including `bucket`, `.lower`/`.upper`/
+  `.slice`, `.in?`, `Int`/`Decimal` `.clamp`), `join_*`, `distinct`, `group_by`/`summarize`
+  (including `count_if`), `sort_by`, and `limit` prefixes compile automatically into 100%
+  parameterized SQL (`?` on SQLite, `$1..$n` on PostgreSQL) and stream 2,048-row batches into
+  the columnar VM (`shuffle` and `suppress_small_cells` act as local VM boundaries). To get
+  live runtime SQL pushdown inside a helper function, pass `db: ReadDB(MyDb)` and start the
+  pipeline with `db.table(Schema) |> ...` (passing `db.table(Schema)` into a `Table(Schema)`
+  parameter materializes the scan before the call). Inspect pushdown boundaries with
+  `dana explain --dialect sqlite|postgres FILE`.
+- **Offline `schema.lock`:** Run `dana schema-sync --db Seminary=... [--schemas s1,s2,...] --out schema.lock` to
   snapshot table schemas while preserving human-authored `[pii]`/`[ferpa]` annotations. `dana check`
   verifies every `db.table(Schema)` and `WriteTable.upsert(...)` offline against `schema.lock`.
 - **Typed upsert & `dana dry-run`:** `stats = try db_write.upsert(rows, key: .student_id)`
@@ -966,7 +1000,7 @@ dana run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--a
 dana dry-run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]
 dana test [--oracle] [--policy FILE] [--filter SUBSTR] [PATH...]
 dana explain [--dialect sqlite|postgres] [--schema-lock FILE] [--policy FILE] <FILE>
-dana schema-sync --db Name=URI [--db Name2=URI2 ...] [--out schema.lock]
+dana schema-sync --db Name=URI [--db Name2=URI2 ...] [--schemas s1,s2,...] [--out schema.lock]
 dana repl [--policy FILE] [--db Name=URI]... [--schema-lock FILE] [--show-sensitive TAGS] [--eval EXPR]
 dana vendor pin|verify [--dir PATH]
 dana format [--check] <PATH...>
@@ -996,13 +1030,17 @@ dana guide [SECTION]
 4. **`WriteTable` vs. `dana.policy` syntax:** In Dana function signatures write
    `WriteTable(Seminary, "students", allows: [pii, ferpa])` (two arguments). In `dana.policy`
    write `allow write Seminary.students tags [pii, ferpa]` (dot syntax).
-5. **FERPA/HIPAA `suppress_small_groups` rules:**
-   - Must immediately follow `summarize(...)`.
-   - `distinct_by: .student_id` requires `count_distinct(.student_id)` inside `summarize(...)`.
-   - `min:` must be `>= 5` (and `>= dana.policy`'s `min_group_size`).
-   - Only **blending** aggregates (`count`, `count_distinct`, `sum`, `mean`, `stddev`, `variance`)
-     and **`bucket`**-ed group keys clear tags. `min`, `max`, `median`, and `percentile` remain
-     tagged!
+5. **FERPA/HIPAA `suppress_small_groups` & `suppress_small_cells` rules:**
+   - `suppress_small_groups` must immediately follow `summarize(...)` (`distinct_by: .student_id`
+     requires `count_distinct(.student_id)` inside `summarize(...)`; `min:` >= 5 and
+     `>= dana.policy`'s `min_group_size`). Only **blending** aggregates (`count`, `count_distinct`,
+     `count_if`, `sum`, `mean`, `stddev`, `variance`) and **`bucket`**-ed group keys clear
+     tags; `min`, `max`, `median`, and `percentile` remain tagged!
+   - `suppress_small_cells(by: [...], min: k, [distinct_by: .id])` preserves individual rows
+     (`min:` >= 2 and `>= dana.policy`'s `min_group_size`), rejects any remaining
+     `[pii]`/`[secret]` column with `E0202`, clears `[ferpa]` only on `by:` columns and
+     coarsened (`bucket` / `.round_to`) columns, and pairs cleanly with `shuffle(seed:)`,
+     `private: true`, and `sanitize_formulas: true`.
 6. **Implicit `row_tags` on `.count()`:** Filtering (`where`) on a tagged column taints
    `row_tags`, so `filtered.count()` carries that tag and cannot print to plain public
    `Console`. Select public columns only, aggregate + `suppress_small_groups`, or use an

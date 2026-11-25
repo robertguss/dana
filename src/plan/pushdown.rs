@@ -409,6 +409,21 @@ pub fn bind_exec_plan_sources(plan: &ExecPlan, bindings: &HashMap<Ident, ExecPla
             distinct_by: distinct_by.clone(),
             mode: *mode,
         },
+        ExecPlan::Shuffle { input, seed } => ExecPlan::Shuffle {
+            input: Box::new(bind_exec_plan_sources(input, bindings)),
+            seed: seed.clone(),
+        },
+        ExecPlan::SuppressSmallCells {
+            input,
+            by_cols,
+            min_k,
+            distinct_by,
+        } => ExecPlan::SuppressSmallCells {
+            input: Box::new(bind_exec_plan_sources(input, bindings)),
+            by_cols: by_cols.clone(),
+            min_k: min_k.clone(),
+            distinct_by: distinct_by.clone(),
+        },
         ExecPlan::Window { input, items } => ExecPlan::Window {
             input: Box::new(bind_exec_plan_sources(input, bindings)),
             items: items.clone(),
@@ -4162,6 +4177,8 @@ fn exec_unary_child(plan: &ExecPlan) -> Option<&ExecPlan> {
         | ExecPlan::GroupBy { input, .. }
         | ExecPlan::Summarize { input, .. }
         | ExecPlan::SuppressSmallGroups { input, .. }
+        | ExecPlan::Shuffle { input, .. }
+        | ExecPlan::SuppressSmallCells { input, .. }
         | ExecPlan::Window { input, .. }
         | ExecPlan::FillGaps { input, .. }
         | ExecPlan::PivotWider { input, .. }
@@ -4235,6 +4252,21 @@ fn rebuild_exec_unary(stage: &ExecPlan, new_input: ExecPlan) -> ExecPlan {
             min_k: min_k.clone(),
             distinct_by: distinct_by.clone(),
             mode: *mode,
+        },
+        ExecPlan::Shuffle { seed, .. } => ExecPlan::Shuffle {
+            input: Box::new(new_input),
+            seed: seed.clone(),
+        },
+        ExecPlan::SuppressSmallCells {
+            by_cols,
+            min_k,
+            distinct_by,
+            ..
+        } => ExecPlan::SuppressSmallCells {
+            input: Box::new(new_input),
+            by_cols: by_cols.clone(),
+            min_k: min_k.clone(),
+            distinct_by: distinct_by.clone(),
         },
         ExecPlan::Window { items, .. } => ExecPlan::Window {
             input: Box::new(new_input),
@@ -4887,7 +4919,9 @@ fn exec_plan_cols_and_uqs_hint(
         | ExecPlan::Sort { input, .. }
         | ExecPlan::Limit { input, .. }
         | ExecPlan::GroupBy { input, .. }
-        | ExecPlan::SuppressSmallGroups { input, .. } => exec_plan_cols_and_uqs_hint(input, ctx),
+        | ExecPlan::SuppressSmallGroups { input, .. }
+        | ExecPlan::Shuffle { input, .. }
+        | ExecPlan::SuppressSmallCells { input, .. } => exec_plan_cols_and_uqs_hint(input, ctx),
         ExecPlan::Distinct { input, cols } => {
             let (in_cols, mut uqs) = exec_plan_cols_and_uqs_hint(input, ctx)?;
             if cols.is_empty() || in_cols.iter().all(|c| cols.contains(c)) {
@@ -5487,6 +5521,24 @@ fn split_exec_node(
             parent_has_sort,
             "suppress_small_groups requires local VM",
         ),
+        ExecPlan::Shuffle { input, .. } => split_exec_local_barrier(
+            plan,
+            input,
+            ctx,
+            false,
+            false,
+            false,
+            "shuffle requires local VM",
+        ),
+        ExecPlan::SuppressSmallCells { input, .. } => split_exec_local_barrier(
+            plan,
+            input,
+            ctx,
+            order_insensitive,
+            false,
+            parent_has_sort,
+            "suppress_small_cells requires local VM",
+        ),
         ExecPlan::Window { input, .. } => split_exec_local_barrier(
             plan,
             input,
@@ -5695,12 +5747,13 @@ fn collect_exec_rec(
                 reasons.push(reason);
                 plan.clone()
             }
-            ExecPlan::SuppressSmallGroups { input, .. } => {
+            ExecPlan::SuppressSmallGroups { input, .. }
+            | ExecPlan::SuppressSmallCells { input, .. } => {
                 let new_in = collect_exec_rec(
                     input,
                     ctx,
                     order_insensitive,
-                    true,
+                    matches!(plan, ExecPlan::SuppressSmallGroups { .. }),
                     parent_has_sort,
                     next_id,
                     branches,

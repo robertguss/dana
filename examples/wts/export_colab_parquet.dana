@@ -1,0 +1,129 @@
+## Exports k-anonymous, deterministically shuffled Colab training Parquet features (policy min_group_size >= 10).
+module ExportColabParquet
+
+schema ColabRawRow
+  sid: Int [pii]
+  student_name: Text [pii]
+  tid: Int
+  term_name: Text
+  term_start: Text
+  term_end: Text
+  yr: Int [ferpa]
+  term_season: Text [ferpa]
+  is_semester_track: Bool [ferpa]
+  primary_program: Text [ferpa]
+  course_code: Text
+  course_name: Text
+  active_courses_d21: Int [ferpa]
+  had_dfw_d21: Bool [ferpa]
+  net_oop: Float [ferpa]
+  gap_days: Float [ferpa]
+  prev_term_gpa: Float? [ferpa]
+  prev_cum_gpa: Float? [ferpa]
+  gpa_delta: Float? [ferpa]
+  prev_comp_pct: Float? [ferpa]
+  prior_terms: Int [ferpa]
+  prior_dfw_rate: Float [ferpa]
+  online_rate: Float [ferpa]
+end
+
+fn prepare_colab_dataset(raw: Table(ColabRawRow)) : Table(
+  yr: Int,
+  term_season: Text,
+  is_semester_track: Bool,
+  primary_program: Text,
+  active_courses_d21: Int [ferpa],
+  net_oop: Float,
+  gap_days: Float,
+  prev_term_gpa: Float?,
+  prev_cum_gpa: Float?,
+  gpa_delta: Float?,
+  prev_comp_pct: Float?,
+  prior_terms: Int [ferpa],
+  prior_dfw_rate: Float,
+  online_rate: Float,
+  had_dfw: Bool [ferpa]
+)
+  raw
+    |> where(.active_courses_d21 > 0)
+    |> derive(
+      term_season: if .term_season.in?(["Winter", "Spring", "Summer", "Fall"]): .term_season
+        else if .term_season.ascii_lowercase.contains?("win") or .term_season.ascii_lowercase.contains?("jan"): "Winter"
+        else if .term_season.ascii_lowercase.contains?("spr"): "Spring"
+        else if .term_season.ascii_lowercase.contains?("sum"): "Summer"
+        else: "Fall",
+      primary_program: if .primary_program.in?(["Graduate", "Graduate: Online"]): .primary_program
+        else: "Non-Degree / Other",
+      active_courses_d21: .active_courses_d21.clamp(0, 12),
+      net_oop: .net_oop.clamp(0.0, 15000.0).round_to(500.0),
+      gap_days: .gap_days.clamp(0.0, 730.0).round_to(30.0),
+      prev_term_gpa: if .prev_term_gpa.some?: (.prev_term_gpa ?? 0.0).clamp(0.0, 4.0).round_to(0.1) else: none,
+      prev_cum_gpa: if .prev_cum_gpa.some?: (.prev_cum_gpa ?? 0.0).clamp(0.0, 4.0).round_to(0.1) else: none,
+      gpa_delta: if .gpa_delta.some?: (.gpa_delta ?? 0.0).clamp(-4.0, 4.0).round_to(0.1) else: none,
+      prev_comp_pct: if .prev_comp_pct.some?: (.prev_comp_pct ?? 0.0).clamp(0.0, 100.0).round_to(5.0) else: none,
+      prior_terms: .prior_terms.clamp(0, 20),
+      prior_dfw_rate: .prior_dfw_rate.clamp(0.0, 1.0).round_to(0.05),
+      online_rate: .online_rate.clamp(0.0, 1.0).round_to(0.02),
+      had_dfw: .had_dfw_d21
+    )
+    |> drop(
+      .sid,
+      .student_name,
+      .tid,
+      .term_name,
+      .term_start,
+      .term_end,
+      .course_code,
+      .course_name,
+      .had_dfw_d21
+    )
+    |> suppress_small_cells(by: [.yr, .term_season, .is_semester_track, .primary_program], min: 10)
+    |> shuffle(seed: 42)
+end
+
+fn main(files: ReadFiles, out: WriteFiles("colab-exports/", allows: [ferpa]), console: Console) : Int
+  (raw, _bad) = try files.read_csv("colab_raw.csv", as: ColabRawRow)
+  dataset = prepare_colab_dataset(raw)
+  try out.write_parquet("colab_training.parquet", dataset, private: true)
+  console.print("exported #{dataset.count()} k-anonymous rows")
+  0
+end
+
+test "colab export drops small cells, coarsens features, and shuffles deterministically"
+  hdr = "sid,student_name,tid,term_name,term_start,term_end,yr,term_season,is_semester_track,primary_program,course_code,course_name,active_courses_d21,had_dfw_d21,net_oop,gap_days,prev_term_gpa,prev_cum_gpa,gpa_delta,prev_comp_pct,prior_terms,prior_dfw_rate,online_rate\n"
+  # 10 rows in (2026, Spring, true, Graduate) -> kept; 2 rows in rare Certificate cell -> dropped; 1 row active_courses_d21=0 -> filtered out.
+  r1 = "101,Alice,1,2026SP,2026-01-12,2026-05-01,2026,Spring,true,Graduate,ST501,Systematic Theology,15,false,16234.0,920.0,3.84,3.77,0.14,96.0,4,0.03,0.99\n"
+  r2 = "102,Bob,1,2026SP,2026-01-12,2026-05-01,2026,Spring,true,Graduate,ST501,Systematic Theology,2,true,-200.0,-10.0,,,,,0,0.28,0.51\n"
+  r3 = "103,Cara,1,2026SP,2026-01-12,2026-05-01,2026,Spring,true,Graduate,ST502,Church History,3,false,1240.0,44.0,3.56,3.49,0.07,88.0,2,0.11,0.74\n"
+  r4 = "104,Dan,1,2026SP,2026-01-12,2026-05-01,2026,Spring,true,Graduate,ST502,Church History,1,false,490.0,16.0,3.12,3.18,-0.06,77.0,1,0.00,0.00\n"
+  r5 = "105,Eve,1,2026SP,2026-01-12,2026-05-01,2026,Spring,true,Graduate,OT501,Hebrew I,2,false,2300.0,61.0,4.50,3.95,5.00,104.0,25,1.20,1.05\n"
+  r6 = "106,Fay,1,2026SP,2026-01-12,2026-05-01,2026,Spring,true,Graduate,OT501,Hebrew I,1,true,510.0,29.0,2.84,2.92,-0.08,82.0,3,0.17,0.49\n"
+  r7 = "107,Gus,1,2026SP,2026-01-12,2026-05-01,2026,Spring,true,Graduate,NT501,Greek I,2,false,760.0,88.0,3.41,3.33,0.08,91.0,2,0.06,0.26\n"
+  r8 = "108,Hana,1,2026SP,2026-01-12,2026-05-01,2026,Spring,true,Graduate,NT501,Greek I,3,false,1010.0,122.0,3.68,3.62,0.06,94.0,5,0.02,0.61\n"
+  r9 = "109,Ian,1,2026SP,2026-01-12,2026-05-01,2026,Spring,true,Graduate,PT501,Pastoral Care,1,false,1490.0,151.0,3.91,3.88,0.03,98.0,3,0.01,0.81\n"
+  r10 = "110,Joy,1,2026SP,2026-01-12,2026-05-01,2026,Spring,true,Graduate,PT501,Pastoral Care,2,true,1990.0,181.0,2.24,2.41,-0.17,67.0,6,0.34,0.39\n"
+  r_small1 = "111,Ken,2,2026JAN,2026-01-02,2026-01-20,2026,J-Term,false,Cert Rare,CH101,Intro,1,false,100.0,5.0,3.00,3.00,0.00,80.0,1,0.00,0.00\n"
+  r_small2 = "112,Lee,2,2026JAN,2026-01-02,2026-01-20,2026,J-Term,false,Cert Rare,CH101,Intro,1,true,100.0,5.0,3.00,3.00,0.00,80.0,1,0.00,0.00\n"
+  r_zero = "113,Mia,1,2026SP,2026-01-12,2026-05-01,2026,Spring,true,Graduate,ST501,Systematic Theology,0,false,0.0,0.0,,,,,0,0.00,0.00\n"
+  csv = hdr + r1 + r2 + r3 + r4 + r5 + r6 + r7 + r8 + r9 + r10 + r_small1 + r_small2 + r_zero
+  files = Files.in_memory({"colab_raw.csv": csv}).read_only
+  (raw, bad) = try files.read_csv("colab_raw.csv", as: ColabRawRow)
+  assert bad.empty?
+  out_a = prepare_colab_dataset(raw)
+  out_b = prepare_colab_dataset(raw)
+  assert out_a.count() == 10
+  assert out_a == out_b
+  bounds = (out_a
+    |> summarize(
+      max_act: max(.active_courses_d21),
+      min_oop: min(.net_oop),
+      max_oop: max(.net_oop),
+      max_pt: max(.prior_terms),
+      dfw_cnt: count_if(.had_dfw)
+    )).first!
+  assert (bounds.max_act ?? 0) == 12
+  assert (bounds.min_oop ?? -1.0) == 0.0
+  assert (bounds.max_oop ?? 0.0) == 15000.0
+  assert (bounds.max_pt ?? 0) == 20
+  assert bounds.dfw_cnt == 3
+end

@@ -1,0 +1,7 @@
+# WTS Institutional Data Lake FERPA export & k-anonymity policy
+version 1
+min_group_size 10
+forbid manual_declassify
+forbid repl_show_sensitive
+allow export "colab-exports/" tags [ferpa]
+allow export "exports/" tags [ferpa]

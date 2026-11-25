@@ -4383,7 +4383,7 @@ impl<'a> Checker<'a> {
                         name: name.name.clone(),
                         ty: scalar_ty,
                         tags: re_tags,
-                        bucketed: false,
+                        bucketed: crate::runtime::ir::is_exec_row_expr_coarsened(&re, &out_tt.cols),
                         agg_kind: AggKind::Raw,
                     };
                     upsert_col(&mut out_tt.cols, spec);
@@ -4548,6 +4548,23 @@ impl<'a> Checker<'a> {
             "suppress_small_groups" => {
                 self.check_suppress_verb(in_plan, in_tt, outer_tags, args, span)
             }
+            "shuffle" => self.check_shuffle_verb(
+                in_plan, in_tt, outer_tags, args, span, env, pc, scope, ret_ctx,
+            ),
+            "suppress_small_cells" => {
+                self.check_suppress_cells_verb(in_plan, in_tt, outer_tags, args, span)
+            }
+            "format_csv" => self.check_format_csv_call(
+                ExecExpr::Rel(Box::new(in_plan)),
+                &in_tt,
+                &outer_tags,
+                args,
+                span,
+                env,
+                pc,
+                scope,
+                ret_ctx,
+            ),
             "window" => self.check_window_verb(in_plan, in_tt, outer_tags, args, span, env),
             "fill_gaps" => self.check_fill_gaps_verb(in_plan, in_tt, outer_tags, args, span),
             "pivot_wider" => self.check_pivot_wider_verb(in_plan, in_tt, outer_tags, args, span),
@@ -5370,6 +5387,414 @@ impl<'a> Checker<'a> {
                 mode,
             })),
             LTy::new(Ty::Table(out_tt), outer_tags),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shuffle checks seed expression in caller scope while clearing order_tags"
+    )]
+    fn check_shuffle_verb(
+        &mut self,
+        in_plan: ExecPlan,
+        in_tt: TableTy,
+        outer_tags: TagSet,
+        args: &[CallArg],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        let mut seed_arg: Option<&Expr> = None;
+        for arg in args {
+            match arg {
+                CallArg::Named { name, value, .. } if name.name == "seed" => {
+                    if seed_arg.is_some() {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "duplicate `seed:` argument in `shuffle`",
+                            )
+                            .with_span(name.span),
+                        );
+                    } else {
+                        seed_arg = Some(value);
+                    }
+                }
+                other => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`shuffle` expects a single named argument `seed: Int`",
+                        )
+                        .with_span(other.span()),
+                    );
+                }
+            }
+        }
+        let seed_ex = if let Some(se) = seed_arg {
+            let (ex, lty) = self.check_expr(se, env, Some(&Ty::Int), pc, scope, ret_ctx);
+            if lty.ty != Ty::Int {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("`shuffle(seed: ...)` requires `Int`, found `{:?}`", lty.ty),
+                    )
+                    .with_span(se.span),
+                );
+            }
+            let mut out_tt = in_tt;
+            for c in &mut out_tt.cols {
+                c.agg_kind = AggKind::Raw;
+            }
+            out_tt.order_tags = lty.effective_tags();
+            out_tt.grouped_by = None;
+            out_tt.summarized = false;
+            out_tt.distinct_by = None;
+            return (
+                ExecExpr::Rel(Box::new(ExecPlan::Shuffle {
+                    input: Box::new(in_plan),
+                    seed: Box::new(ex),
+                })),
+                LTy::new(Ty::Table(out_tt), outer_tags),
+            );
+        } else {
+            self.diags.push(
+                Diagnostic::error(DiagCode::TypeError, "`shuffle` requires `seed: Int`")
+                    .with_span(span),
+            );
+            ExecExpr::Lit(Literal::int(0i64))
+        };
+        let mut out_tt = in_tt;
+        for c in &mut out_tt.cols {
+            c.agg_kind = AggKind::Raw;
+        }
+        out_tt.order_tags = TagSet::empty();
+        out_tt.grouped_by = None;
+        out_tt.summarized = false;
+        out_tt.distinct_by = None;
+        (
+            ExecExpr::Rel(Box::new(ExecPlan::Shuffle {
+                input: Box::new(in_plan),
+                seed: Box::new(seed_ex),
+            })),
+            LTy::new(Ty::Table(out_tt), outer_tags),
+        )
+    }
+
+    fn check_suppress_cells_verb(
+        &mut self,
+        in_plan: ExecPlan,
+        in_tt: TableTy,
+        outer_tags: TagSet,
+        args: &[CallArg],
+        span: Span,
+    ) -> (ExecExpr, LTy) {
+        let mut by_cols: Vec<Ident> = Vec::new();
+        let mut saw_by = false;
+        let mut min_k_opt: Option<u64> = None;
+        let mut distinct_by: Option<Ident> = None;
+
+        for arg in args {
+            match arg {
+                CallArg::Named { name, value, .. } => match name.name.as_str() {
+                    "by" => {
+                        if saw_by {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    "duplicate `by:` argument in `suppress_small_cells`",
+                                )
+                                .with_span(name.span),
+                            );
+                            continue;
+                        }
+                        saw_by = true;
+                        match &value.kind {
+                            ExprKind::List(items) => {
+                                for it in items {
+                                    if let ExprKind::DotField(m) = &it.kind {
+                                        if in_tt.find_col(&m.name).is_none() {
+                                            self.diags.push(
+                                                Diagnostic::error(
+                                                    DiagCode::TypeError,
+                                                    format!(
+                                                        "unknown column `.{}` in `suppress_small_cells(by: ...)`",
+                                                        m.name
+                                                    ),
+                                                )
+                                                .with_span(m.span),
+                                            );
+                                        } else if !by_cols.contains(&m.name) {
+                                            by_cols.push(m.name.clone());
+                                        }
+                                    } else {
+                                        self.diags.push(
+                                            Diagnostic::error(
+                                                DiagCode::TypeError,
+                                                "`suppress_small_cells(by: [...])` entries must be `.column` references",
+                                            )
+                                            .with_span(it.span),
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        "`suppress_small_cells` expects `by: [.col1, ...]`",
+                                    )
+                                    .with_span(value.span),
+                                );
+                            }
+                        }
+                    }
+                    "min" => {
+                        if let ExprKind::Int(raw) = &value.kind {
+                            match raw.replace('_', "").parse::<u64>() {
+                                Ok(n) => min_k_opt = Some(n),
+                                Err(_) => {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::PrivacyError,
+                                            "`min:` in `suppress_small_cells` must be a non-negative integer literal",
+                                        )
+                                        .with_span(value.span),
+                                    );
+                                }
+                            }
+                        } else {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::PrivacyError,
+                                    "`min:` in `suppress_small_cells` must be a constant integer literal",
+                                )
+                                .with_span(value.span),
+                            );
+                        }
+                    }
+                    "distinct_by" => {
+                        if let ExprKind::DotField(m) = &value.kind {
+                            if in_tt.find_col(&m.name).is_none() {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        format!(
+                                            "unknown column `.{}` in `suppress_small_cells(distinct_by: ...)`",
+                                            m.name
+                                        ),
+                                    )
+                                    .with_span(m.span),
+                                );
+                            }
+                            distinct_by = Some(m.name.clone());
+                        } else {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    "`suppress_small_cells(distinct_by: ...)` expects a `.column` reference",
+                                )
+                                .with_span(value.span),
+                            );
+                        }
+                    }
+                    other => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("unknown argument `{other}:` in `suppress_small_cells`"),
+                            )
+                            .with_span(name.span),
+                        );
+                    }
+                },
+                CallArg::Positional(e) => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`suppress_small_cells` expects named arguments `by: [...], min: k`",
+                        )
+                        .with_span(e.span),
+                    );
+                }
+            }
+        }
+
+        if !saw_by || by_cols.is_empty() {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    "`suppress_small_cells` requires a non-empty `by: [.col1, ...]` quasi-identifier list",
+                )
+                .with_span(span),
+            );
+        }
+
+        let min_k = match min_k_opt {
+            Some(n) => n,
+            None => {
+                if !args
+                    .iter()
+                    .any(|a| matches!(a, CallArg::Named { name, .. } if name.name == "min"))
+                {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::PrivacyError,
+                            "`suppress_small_cells` requires a constant integer `min: k`",
+                        )
+                        .with_span(span),
+                    );
+                }
+                0
+            }
+        };
+
+        let policy_floor = self
+            .resolved
+            .policy
+            .as_ref()
+            .and_then(|p| p.min_group_size.to_u64())
+            .unwrap_or(2)
+            .max(2);
+        if min_k < policy_floor {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::PrivacyError,
+                    format!(
+                        "`suppress_small_cells(min: {min_k})` is below the required minimum cell floor ({policy_floor})"
+                    ),
+                )
+                .with_span(span),
+            );
+        }
+
+        for c in &in_tt.cols {
+            if c.tags.contains("pii") || c.tags.contains("secret") {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::PrivacyError,
+                        format!(
+                            "`suppress_small_cells` cannot run while column `.{}` still carries `[pii]` or `[secret]`",
+                            c.name
+                        ),
+                    )
+                    .with_span(span)
+                    .with_hint(
+                        "drop, select away, redact, or pseudonymize `[pii]`/`[secret]` columns before calling `suppress_small_cells`",
+                    ),
+                );
+            }
+        }
+
+        let out_cols = in_tt
+            .cols
+            .iter()
+            .map(|c| {
+                let clear_ferpa = by_cols.contains(&c.name) || c.bucketed;
+                ColSpec {
+                    name: c.name.clone(),
+                    ty: c.ty.clone(),
+                    tags: if clear_ferpa {
+                        c.tags.remove("ferpa")
+                    } else {
+                        c.tags.clone()
+                    },
+                    bucketed: c.bucketed,
+                    agg_kind: AggKind::Raw,
+                }
+            })
+            .collect();
+        let out_tt = TableTy {
+            cols: out_cols,
+            row_tags: TagSet::empty(),
+            order_tags: in_tt.order_tags,
+            grouped_by: None,
+            summarized: false,
+            distinct_by: None,
+        };
+        (
+            ExecExpr::Rel(Box::new(ExecPlan::SuppressSmallCells {
+                input: Box::new(in_plan),
+                by_cols,
+                min_k: BigInt::from(min_k),
+                distinct_by,
+            })),
+            LTy::new(Ty::Table(out_tt), outer_tags),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "format_csv helper shares validation across method, pipe, and free-call syntax"
+    )]
+    fn check_format_csv_call(
+        &mut self,
+        tbl_ex: ExecExpr,
+        tbl_tt: &TableTy,
+        tbl_tags: &TagSet,
+        rest_args: &[CallArg],
+        span: Span,
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        let mut san_arg: Option<&Expr> = None;
+        for arg in rest_args {
+            match arg {
+                CallArg::Named { name, value, .. } if name.name == "sanitize_formulas" => {
+                    if san_arg.is_some() {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "duplicate `sanitize_formulas:` argument in `format_csv`",
+                            )
+                            .with_span(name.span),
+                        );
+                    } else {
+                        san_arg = Some(value);
+                    }
+                }
+                other => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`format_csv` only accepts optional `sanitize_formulas: Bool`",
+                        )
+                        .with_span(other.span()),
+                    );
+                }
+            }
+        }
+        let mut out_tags = tbl_tt.total_tags().union(tbl_tags);
+        let san_ex = if let Some(se) = san_arg {
+            let (ex, lty) = self.check_expr(se, env, Some(&Ty::Bool), pc, scope, ret_ctx);
+            if lty.ty != Ty::Bool {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!(
+                            "`sanitize_formulas:` in `format_csv` must be `Bool`, found `{:?}`",
+                            lty.ty
+                        ),
+                    )
+                    .with_span(se.span),
+                );
+            }
+            out_tags = out_tags.union(&lty.effective_tags());
+            ex
+        } else {
+            let _ = span;
+            ExecExpr::Lit(Literal::Bool(false))
+        };
+        (
+            ExecExpr::Prim {
+                op: ExecPrimOp::FormatCsv,
+                args: vec![tbl_ex, san_ex],
+            },
+            LTy::new(Ty::Text, out_tags),
         )
     }
 
@@ -6861,8 +7286,51 @@ impl<'a> Checker<'a> {
             return self.check_ctor_call(cname, args, span, env, expected, pc, scope, ret_ctx);
         }
 
-        // 4. Built-in free functions (`date_trunc`, `months_between`) & user functions.
+        // 4. Built-in free functions (`date_trunc`, `months_between`, `format_csv`) & user functions.
         if let ExprKind::Ident(fname) = &callee.kind {
+            if fname == "format_csv" {
+                let Some(CallArg::Positional(tbl_e)) = args.first() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`format_csv` expects `(table, [sanitize_formulas: Bool])`",
+                        )
+                        .with_span(span),
+                    );
+                    return (
+                        ExecExpr::Lit(Literal::Text(String::new())),
+                        LTy::public(Ty::Text),
+                    );
+                };
+                let (tbl_ex, tbl_lty) = self.check_expr(tbl_e, env, None, pc, scope, ret_ctx);
+                let Ty::Table(tt) = &tbl_lty.ty else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!(
+                                "`format_csv` requires a `Table` first argument, found `{:?}`",
+                                tbl_lty.ty
+                            ),
+                        )
+                        .with_span(tbl_e.span),
+                    );
+                    return (
+                        ExecExpr::Lit(Literal::Text(String::new())),
+                        LTy::new(Ty::Text, tbl_lty.tags),
+                    );
+                };
+                return self.check_format_csv_call(
+                    tbl_ex,
+                    tt,
+                    &tbl_lty.tags,
+                    &args[1..],
+                    span,
+                    env,
+                    pc,
+                    scope,
+                    ret_ctx,
+                );
+            }
             if fname == "date_trunc" {
                 return self.check_date_trunc_expr(args, span, env, pc, scope, ret_ctx);
             }
@@ -8024,7 +8492,7 @@ impl<'a> Checker<'a> {
             (
                 Ty::WriteFiles { root, allows },
                 "write_html" | "write_markdown" | "write_svg" | "write_parquet" | "write_xlsx"
-                | "write_csv" | "write_jsonl" | "write_text",
+                | "write_csv" | "write_jsonl" | "write_text" | "write_file",
             ) => {
                 let Some(CallArg::Positional(path_e)) = args.first() else {
                     self.diags.push(
@@ -8048,13 +8516,96 @@ impl<'a> Checker<'a> {
                     );
                 }
                 let (pex, plty) = self.check_expr(path_e, env, Some(&Ty::Text), pc, scope, ret_ctx);
-                let payload_expr = match args.get(1) {
-                    Some(CallArg::Positional(e)) => Some(e),
-                    Some(CallArg::Named { name, value, .. }) if name.name == "sheets" => {
-                        Some(value)
+
+                let mut payload_expr: Option<&Expr> = None;
+                let mut private_expr: Option<&Expr> = None;
+                let mut sanitize_expr: Option<&Expr> = None;
+                for extra in args.iter().skip(1) {
+                    match extra {
+                        CallArg::Positional(e) => {
+                            if payload_expr.is_none() {
+                                payload_expr = Some(e);
+                            } else {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        format!(
+                                            "unexpected extra positional argument in `out.{}`",
+                                            member.name
+                                        ),
+                                    )
+                                    .with_span(e.span),
+                                );
+                            }
+                        }
+                        CallArg::Named { name, value, .. } => match name.name.as_str() {
+                            "sheets" if member.name == "write_xlsx" => {
+                                if payload_expr.is_some() {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::TypeError,
+                                            "duplicate payload/`sheets:` argument in `out.write_xlsx`",
+                                        )
+                                        .with_span(name.span),
+                                    );
+                                } else {
+                                    payload_expr = Some(value);
+                                }
+                            }
+                            "private" => {
+                                if private_expr.is_some() {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::TypeError,
+                                            format!(
+                                                "duplicate `private:` argument in `out.{}`",
+                                                member.name
+                                            ),
+                                        )
+                                        .with_span(name.span),
+                                    );
+                                } else {
+                                    private_expr = Some(value);
+                                }
+                            }
+                            "sanitize_formulas" if member.name == "write_csv" => {
+                                if sanitize_expr.is_some() {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::TypeError,
+                                            "duplicate `sanitize_formulas:` argument in `out.write_csv`",
+                                        )
+                                        .with_span(name.span),
+                                    );
+                                } else {
+                                    sanitize_expr = Some(value);
+                                }
+                            }
+                            "sanitize_formulas" => {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        format!("`sanitize_formulas:` is only valid on `out.write_csv`, not `out.{}`", member.name),
+                                    )
+                                    .with_span(name.span),
+                                );
+                            }
+                            other => {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        format!(
+                                            "unknown argument `{other}:` in `out.{}`",
+                                            member.name
+                                        ),
+                                    )
+                                    .with_span(name.span),
+                                );
+                            }
+                        },
                     }
-                    _ => None,
-                };
+                }
+
                 let (pay_ex, pay_tags) = if let Some(pe) = payload_expr {
                     let (ex, lty) = self.check_expr(pe, env, None, pc, scope, ret_ctx);
                     if member.name == "write_markdown" && !matches!(lty.ty, Ty::Report(_)) {
@@ -8070,6 +8621,16 @@ impl<'a> Checker<'a> {
                             Diagnostic::error(
                                 DiagCode::TypeError,
                                 "`out.write_svg` requires a `Chart` payload",
+                            )
+                            .with_span(pe.span),
+                        );
+                    } else if matches!(member.name.as_str(), "write_text" | "write_file")
+                        && lty.ty != Ty::Text
+                    {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("`out.{}` requires a `Text` payload", member.name),
                             )
                             .with_span(pe.span),
                         );
@@ -8089,9 +8650,57 @@ impl<'a> Checker<'a> {
                     };
                     (coerced, tags)
                 } else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`out.{}` requires a payload argument", member.name),
+                        )
+                        .with_span(span),
+                    );
                     (ExecExpr::Lit(Literal::Unit), TagSet::empty())
                 };
-                let total_tags = pay_tags.union(&plty.effective_tags()).union(pc);
+
+                let mut total_tags = pay_tags.union(&plty.effective_tags()).union(pc);
+                let has_explicit_private = private_expr.is_some();
+                let priv_ex = if let Some(pe) = private_expr {
+                    let (ex, lty) = self.check_expr(pe, env, Some(&Ty::Bool), pc, scope, ret_ctx);
+                    if lty.ty != Ty::Bool {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!(
+                                    "`private:` in `out.{}` must be `Bool`, found `{:?}`",
+                                    member.name, lty.ty
+                                ),
+                            )
+                            .with_span(pe.span),
+                        );
+                    }
+                    total_tags = total_tags.union(&lty.effective_tags());
+                    ex
+                } else {
+                    ExecExpr::Lit(Literal::Bool(false))
+                };
+                let san_ex = if let Some(se) = sanitize_expr {
+                    let (ex, lty) = self.check_expr(se, env, Some(&Ty::Bool), pc, scope, ret_ctx);
+                    if lty.ty != Ty::Bool {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!(
+                                    "`sanitize_formulas:` in `out.write_csv` must be `Bool`, found `{:?}`",
+                                    lty.ty
+                                ),
+                            )
+                            .with_span(se.span),
+                        );
+                    }
+                    total_tags = total_tags.union(&lty.effective_tags());
+                    ex
+                } else {
+                    ExecExpr::Lit(Literal::Bool(false))
+                };
+
                 if !total_tags.is_subset(allows) {
                     self.diags.push(
                         Diagnostic::error(
@@ -8105,15 +8714,33 @@ impl<'a> Checker<'a> {
                         .with_span(span),
                     );
                 }
-                let hop = match member.name.as_str() {
-                    "write_html" => ExecHostOp::Core(HostOp::WriteReportHtml),
-                    "write_markdown" => ExecHostOp::WriteReportMarkdown,
-                    "write_svg" => ExecHostOp::WriteChartSvg,
-                    "write_parquet" => ExecHostOp::Core(HostOp::WriteParquet),
-                    "write_xlsx" => ExecHostOp::Core(HostOp::WriteXlsx),
-                    "write_csv" => ExecHostOp::WriteCsv,
-                    "write_jsonl" => ExecHostOp::WriteJsonl,
-                    _ => ExecHostOp::Core(HostOp::WriteFile),
+                let (hop, op_args) = match member.name.as_str() {
+                    "write_csv" => (
+                        ExecHostOp::WriteCsv,
+                        vec![rex, pex, pay_ex, priv_ex, san_ex],
+                    ),
+                    "write_jsonl" => (ExecHostOp::WriteJsonl, vec![rex, pex, pay_ex, priv_ex]),
+                    "write_markdown" => (
+                        ExecHostOp::WriteReportMarkdown,
+                        vec![rex, pex, pay_ex, priv_ex],
+                    ),
+                    "write_svg" => (ExecHostOp::WriteChartSvg, vec![rex, pex, pay_ex, priv_ex]),
+                    other => {
+                        let core_op = match other {
+                            "write_html" => HostOp::WriteReportHtml,
+                            "write_parquet" => HostOp::WriteParquet,
+                            "write_xlsx" => HostOp::WriteXlsx,
+                            _ => HostOp::WriteFile,
+                        };
+                        if has_explicit_private {
+                            (
+                                ExecHostOp::WritePrivate { inner: core_op },
+                                vec![rex, pex, pay_ex, priv_ex],
+                            )
+                        } else {
+                            (ExecHostOp::Core(core_op), vec![rex, pex, pay_ex])
+                        }
+                    }
                 };
                 let res_ty = Ty::Result {
                     ok_ty: Box::new(Ty::Unit),
@@ -8122,7 +8749,7 @@ impl<'a> Checker<'a> {
                 return (
                     ExecExpr::Host {
                         op: hop,
-                        args: vec![rex, pex, pay_ex],
+                        args: op_args,
                     },
                     LTy::public(res_ty),
                 );
@@ -9098,6 +9725,11 @@ impl<'a> Checker<'a> {
                         args: vec![rex],
                     },
                     LTy::new(out_ty, tags),
+                );
+            }
+            (Ty::Table(tt), "format_csv") => {
+                return self.check_format_csv_call(
+                    rex, tt, &rlty.tags, args, span, env, pc, scope, ret_ctx,
                 );
             }
             (Ty::Table(tt), verb) => {
@@ -11196,6 +11828,16 @@ impl<'a> Checker<'a> {
                                 "`suppress_small_groups` is a table pipeline verb, not a row function; pipe it directly after `summarize(...)` as `|> suppress_small_groups(min: k, distinct_by: .id)`",
                             );
                         }
+                        "suppress_small_cells" => {
+                            diag = diag.with_hint(
+                                "`suppress_small_cells` is a table pipeline verb, not a row function; use `|> suppress_small_cells(by: [...], min: k)` instead",
+                            );
+                        }
+                        "shuffle" => {
+                            diag = diag.with_hint(
+                                "`shuffle` is a table pipeline verb, not a row function; use `|> shuffle(seed: 42)` instead",
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -11245,32 +11887,79 @@ impl<'a> Checker<'a> {
         expected: Option<&Ty>,
         allow_dot_self: bool,
     ) -> (ExecRowExpr, Ty, TagSet) {
-        let mut arms: Vec<(ExecRowExpr, ExecRowExpr)> = Vec::with_capacity(1 + else_ifs.len());
+        let mut arms: Vec<(ExecRowExpr, ExecRowExpr, Ty)> = Vec::with_capacity(1 + else_ifs.len());
         let (c0, _, ct0) =
             self.check_row_expr(cond, cols, outer_env, Some(&Ty::Bool), allow_dot_self);
         let (t0, tty, tt0) =
             self.check_row_expr(then_expr, cols, outer_env, expected, allow_dot_self);
         let mut tags = ct0.union(&tt0);
-        arms.push((c0, t0));
-        let hint = expected.or(Some(&tty));
+        arms.push((c0, t0, tty.clone()));
+        let hint = expected.or_else(|| {
+            if matches!(&tty, Ty::Option(inner) if **inner == Ty::Unit) {
+                None
+            } else {
+                Some(&tty)
+            }
+        });
         for (ec, et) in else_ifs {
             let (cre, _, ctags) =
                 self.check_row_expr(ec, cols, outer_env, Some(&Ty::Bool), allow_dot_self);
-            let (tre, _, ttags) = self.check_row_expr(et, cols, outer_env, hint, allow_dot_self);
+            let (tre, tre_ty, ttags) =
+                self.check_row_expr(et, cols, outer_env, hint, allow_dot_self);
             tags = tags.union(&ctags).union(&ttags);
-            arms.push((cre, tre));
+            arms.push((cre, tre, tre_ty));
         }
-        let (mut acc, _, etags) =
+        let (mut acc, else_ty, etags) =
             self.check_row_expr(else_expr, cols, outer_env, hint, allow_dot_self);
         tags = tags.union(&etags);
-        while let Some((cre, tre)) = arms.pop() {
-            acc = ExecRowExpr::IfE {
-                cond: Box::new(cre),
-                then_br: Box::new(tre),
-                else_br: Box::new(acc),
-            };
-        }
-        (acc, tty, tags)
+
+        let any_opt = matches!(tty, Ty::Option(_))
+            || arms.iter().any(|(_, _, t)| matches!(t, Ty::Option(_)))
+            || matches!(else_ty, Ty::Option(_));
+        let concrete_non_opt = std::iter::once(&tty)
+            .chain(arms.iter().map(|(_, _, t)| t))
+            .chain(std::iter::once(&else_ty))
+            .find_map(|t| match t {
+                Ty::Option(inner) if **inner != Ty::Unit => Some((**inner).clone()),
+                Ty::Option(_) => None,
+                other => Some(other.clone()),
+            });
+
+        let wrap_opt_branch = |br: ExecRowExpr, br_ty: &Ty, inner: &Ty| -> ExecRowExpr {
+            if *br_ty == *inner {
+                ExecRowExpr::Prim {
+                    op: ExecPrimOp::Core(PrimOp::SomeVal(inner.clone())),
+                    args: vec![br],
+                }
+            } else if matches!(br, ExecRowExpr::Lit(Literal::NoneLit(_))) {
+                ExecRowExpr::Lit(Literal::NoneLit(inner.clone()))
+            } else {
+                br
+            }
+        };
+
+        let out_ty = if any_opt && let Some(ref inner) = concrete_non_opt {
+            acc = wrap_opt_branch(acc, &else_ty, inner);
+            while let Some((cre, tre, tre_ty)) = arms.pop() {
+                let wrapped = wrap_opt_branch(tre, &tre_ty, inner);
+                acc = ExecRowExpr::IfE {
+                    cond: Box::new(cre),
+                    then_br: Box::new(wrapped),
+                    else_br: Box::new(acc),
+                };
+            }
+            Ty::Option(Box::new(inner.clone()))
+        } else {
+            while let Some((cre, tre, _)) = arms.pop() {
+                acc = ExecRowExpr::IfE {
+                    cond: Box::new(cre),
+                    then_br: Box::new(tre),
+                    else_br: Box::new(acc),
+                };
+            }
+            tty
+        };
+        (acc, out_ty, tags)
     }
 
     // -----------------------------------------------------------------------

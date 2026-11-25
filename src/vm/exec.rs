@@ -34,10 +34,13 @@ use crate::runtime::exec::{
 use crate::runtime::ir::{ExecAggOp, ExecDeriveItem, ExecExpr, ExecPlan, ExecProgram};
 use crate::vm::VmConfig;
 use crate::vm::expr::{RowEvalErr, RowEvalHost, compile_core_row_expr, compile_exec_row_expr};
-use crate::vm::ops::agg::{CompiledAgg, op_hash_aggregate, op_suppress_small_groups};
+use crate::vm::ops::agg::{
+    CompiledAgg, op_hash_aggregate, op_suppress_small_cells, op_suppress_small_groups,
+};
 use crate::vm::ops::join::op_hash_join;
 use crate::vm::ops::sort_win::{
-    op_crosstab, op_distinct, op_fill_gaps, op_pivot_longer, op_pivot_wider, op_sort, op_window,
+    op_crosstab, op_distinct, op_fill_gaps, op_pivot_longer, op_pivot_wider, op_shuffle, op_sort,
+    op_window, seed_from_bigint,
 };
 use crate::vm::ops::{
     OpErr, OpExecConfig, VmMode, VmTable, op_derive_bucket, op_derive_col_expr, op_drop, op_filter,
@@ -569,6 +572,22 @@ fn eval_exec_plan_to_table(
                 let floor = prog.min_group_floor().max(min_k.clone());
                 op_suppress_small_groups(cur, &floor, distinct_by, *mode, &TagSet::empty(), cfg)
             }
+            ExecPlan::Shuffle { seed, .. } => {
+                let seed_val = bridge.eval_outer_expr(seed, env)?;
+                let Val::Int(ref n) = seed_val else {
+                    return Err(OpErr::Failed("shuffle(seed:) expects Int".to_string()));
+                };
+                op_shuffle(cur, seed_from_bigint(n), cfg)
+            }
+            ExecPlan::SuppressSmallCells {
+                by_cols,
+                min_k,
+                distinct_by,
+                ..
+            } => {
+                let floor = prog.min_cell_floor().max(min_k.clone());
+                op_suppress_small_cells(cur, by_cols, &floor, distinct_by.as_deref(), cfg)?
+            }
             ExecPlan::Window { items, .. } => op_window(cur, items, None, cfg)?,
             ExecPlan::FillGaps {
                 col,
@@ -629,6 +648,8 @@ fn exec_unary_input(plan: &ExecPlan) -> Option<&ExecPlan> {
         | ExecPlan::GroupBy { input, .. }
         | ExecPlan::Summarize { input, .. }
         | ExecPlan::SuppressSmallGroups { input, .. }
+        | ExecPlan::Shuffle { input, .. }
+        | ExecPlan::SuppressSmallCells { input, .. }
         | ExecPlan::Window { input, .. }
         | ExecPlan::FillGaps { input, .. }
         | ExecPlan::PivotWider { input, .. }

@@ -1596,6 +1596,21 @@ fn rewrite_exec_plan(plan: &ExecPlan, prog: &ExecProgram, stats: &mut OptStats) 
             distinct_by: distinct_by.clone(),
             mode: *mode,
         },
+        ExecPlan::Shuffle { input, seed } => ExecPlan::Shuffle {
+            input: Box::new(rewrite_exec_plan(input, prog, stats)),
+            seed: Box::new(optimize_exec_expr(seed, prog, stats)),
+        },
+        ExecPlan::SuppressSmallCells {
+            input,
+            by_cols,
+            min_k,
+            distinct_by,
+        } => ExecPlan::SuppressSmallCells {
+            input: Box::new(rewrite_exec_plan(input, prog, stats)),
+            by_cols: by_cols.clone(),
+            min_k: min_k.clone(),
+            distinct_by: distinct_by.clone(),
+        },
         ExecPlan::Window { input, items } => {
             let opt_in = rewrite_exec_plan(input, prog, stats);
             if items.is_empty() {
@@ -2038,6 +2053,21 @@ fn prune_exec_plan_derives(
             min_k: min_k.clone(),
             distinct_by: distinct_by.clone(),
             mode: *mode,
+        },
+        ExecPlan::Shuffle { input, seed } => ExecPlan::Shuffle {
+            input: Box::new(prune_exec_plan_derives(input, needed, stats)),
+            seed: Box::new((**seed).clone()),
+        },
+        ExecPlan::SuppressSmallCells {
+            input,
+            by_cols,
+            min_k,
+            distinct_by,
+        } => ExecPlan::SuppressSmallCells {
+            input: Box::new(prune_exec_plan_derives(input, None, stats)),
+            by_cols: by_cols.clone(),
+            min_k: min_k.clone(),
+            distinct_by: distinct_by.clone(),
         },
         ExecPlan::Window { input, items } => ExecPlan::Window {
             input: Box::new(prune_exec_plan_derives(input, None, stats)),

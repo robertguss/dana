@@ -144,6 +144,8 @@ pub enum ExecPrimOp {
     OptSubFloat,
     /// `Table` structural value equality (compares rows and cells ignoring hidden `group_meta`).
     TableEq,
+    /// Format a `Table` as RFC 4180 CSV text (`format_csv(tbl, sanitize_formulas: Bool)` -> `Text`).
+    FormatCsv,
     /// Promise helpers evaluated on a table value.
     PromiseUnique(Vec<Ident>),
     /// Check `all(pred)` over every row of a table.
@@ -154,6 +156,10 @@ pub enum ExecPrimOp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecHostOp {
     Core(HostOp),
+    /// Confined `WriteFiles` variant of a Core [`HostOp`] carrying explicit `private: Bool` flag.
+    WritePrivate {
+        inner: HostOp,
+    },
     /// `Args.of(list)` (spec-only synthetic Args value).
     FakeArgsOf,
     /// `args.first` -> `Option(Text)`.
@@ -353,6 +359,18 @@ pub enum ExecPlan {
         min_k: BigInt,
         distinct_by: Option<Ident>,
         mode: SuppressMode,
+    },
+    /// Deterministic seeded row permutation (`|> shuffle(seed: Int)`).
+    Shuffle {
+        input: Box<ExecPlan>,
+        seed: Box<ExecExpr>,
+    },
+    /// Row-level `k`-anonymity suppression (`|> suppress_small_cells(by: [...], min: k, [distinct_by: .id])`).
+    SuppressSmallCells {
+        input: Box<ExecPlan>,
+        by_cols: Vec<Ident>,
+        min_k: BigInt,
+        distinct_by: Option<Ident>,
     },
     Window {
         input: Box<ExecPlan>,
@@ -575,6 +593,8 @@ enum CloneBuildPlan<'a> {
     GroupBy(&'a [Ident]),
     Summarize(&'a [ExecAggItem], &'a Option<Ident>),
     SuppressSmallGroups(&'a BigInt, &'a Option<Ident>, SuppressMode),
+    Shuffle,
+    SuppressSmallCells(&'a [Ident], &'a BigInt, &'a Option<Ident>),
     Window(&'a [WindowItem]),
     FillGaps(&'a Ident, &'a BigInt, &'a [Ident], &'a [(Ident, Literal)]),
     PivotWider(&'a Ident, &'a Ident, &'a [Ident], &'a Literal),
@@ -788,6 +808,22 @@ fn run_exec_clone(initial: ExecCloneTask<'_>) -> (Vec<ExecExpr>, Vec<ExecPlan>, 
                 } => {
                     tasks.push(ExecCloneTask::BuildPlan(
                         CloneBuildPlan::SuppressSmallGroups(min_k, distinct_by, *mode),
+                    ));
+                    tasks.push(ExecCloneTask::Plan(input));
+                }
+                ExecPlan::Shuffle { input, seed } => {
+                    tasks.push(ExecCloneTask::BuildPlan(CloneBuildPlan::Shuffle));
+                    tasks.push(ExecCloneTask::Expr(seed));
+                    tasks.push(ExecCloneTask::Plan(input));
+                }
+                ExecPlan::SuppressSmallCells {
+                    input,
+                    by_cols,
+                    min_k,
+                    distinct_by,
+                } => {
+                    tasks.push(ExecCloneTask::BuildPlan(
+                        CloneBuildPlan::SuppressSmallCells(by_cols, min_k, distinct_by),
                     ));
                     tasks.push(ExecCloneTask::Plan(input));
                 }
@@ -1034,6 +1070,24 @@ fn run_exec_clone(initial: ExecCloneTask<'_>) -> (Vec<ExecExpr>, Vec<ExecPlan>, 
                             min_k: min_k.clone(),
                             distinct_by: distinct_by.clone(),
                             mode,
+                        });
+                    }
+                }
+                CloneBuildPlan::Shuffle => {
+                    if let (Some(seed), Some(input)) = (exprs.pop(), plans.pop()) {
+                        plans.push(ExecPlan::Shuffle {
+                            input: Box::new(input),
+                            seed: Box::new(seed),
+                        });
+                    }
+                }
+                CloneBuildPlan::SuppressSmallCells(by_cols, min_k, distinct_by) => {
+                    if let Some(input) = plans.pop() {
+                        plans.push(ExecPlan::SuppressSmallCells {
+                            input: Box::new(input),
+                            by_cols: by_cols.to_vec(),
+                            min_k: min_k.clone(),
+                            distinct_by: distinct_by.clone(),
                         });
                     }
                 }
@@ -1590,6 +1644,7 @@ fn push_exec_plan_children(plan: &mut ExecPlan, stack: &mut Vec<ExecDropNode>) {
         | ExecPlan::Limit { input, .. }
         | ExecPlan::GroupBy { input, .. }
         | ExecPlan::SuppressSmallGroups { input, .. }
+        | ExecPlan::SuppressSmallCells { input, .. }
         | ExecPlan::Window { input, .. }
         | ExecPlan::FillGaps { input, .. }
         | ExecPlan::PivotWider { input, .. }
@@ -1646,7 +1701,11 @@ fn push_exec_plan_children(plan: &mut ExecPlan, stack: &mut Vec<ExecDropNode>) {
                 dummy_plan(),
             )));
         }
-        ExecPlan::Pseudonymize { input, secret, .. } => {
+        ExecPlan::Pseudonymize { input, secret, .. }
+        | ExecPlan::Shuffle {
+            input,
+            seed: secret,
+        } => {
             stack.push(ExecDropNode::Plan(std::mem::replace(
                 input.as_mut(),
                 dummy_plan(),
@@ -1885,6 +1944,15 @@ impl ExecProgram {
     #[must_use]
     pub fn min_group_floor(&self) -> BigInt {
         let default_floor = BigInt::from(5u64);
+        match &self.policy {
+            None => default_floor,
+            Some(p) => p.min_group_size.clone().max(default_floor),
+        }
+    }
+
+    #[must_use]
+    pub fn min_cell_floor(&self) -> BigInt {
+        let default_floor = BigInt::from(2u64);
         match &self.policy {
             None => default_floor,
             Some(p) => p.min_group_size.clone().max(default_floor),
@@ -2231,7 +2299,9 @@ fn try_exec_expr_to_core(root: &ExecExpr) -> Option<Expr> {
                     )));
                     tasks.push(ConvTask::Plan(input));
                 }
-                ExecPlan::PivotLonger { .. } => return None,
+                ExecPlan::PivotLonger { .. }
+                | ExecPlan::Shuffle { .. }
+                | ExecPlan::SuppressSmallCells { .. } => return None,
                 ExecPlan::Crosstab {
                     input,
                     rows_col,
@@ -2744,4 +2814,57 @@ fn try_exec_expr_to_core(root: &ExecExpr) -> Option<Expr> {
         }
     }
     exprs.pop()
+}
+
+fn is_const_row_expr(re: &ExecRowExpr) -> bool {
+    match re {
+        ExecRowExpr::Lit(_) | ExecRowExpr::ConstRef(_) => true,
+        ExecRowExpr::Prim {
+            op: ExecPrimOp::Core(PrimOp::SomeVal(_)),
+            args,
+        } => args.len() == 1 && is_const_row_expr(&args[0]),
+        _ => false,
+    }
+}
+
+/// Returns `true` when a derived row expression is provably coarsened (via `.round_to(...)`,
+/// an already `bucketed` source column, or `.clamp`/optional/`if`/`??` wrappers around them).
+#[must_use]
+pub fn is_exec_row_expr_coarsened(re: &ExecRowExpr, cols: &[ColSpec]) -> bool {
+    match re {
+        ExecRowExpr::Prim {
+            op: ExecPrimOp::RoundToFloat,
+            ..
+        } => true,
+        ExecRowExpr::Prim {
+            op:
+                ExecPrimOp::ClampInt
+                | ExecPrimOp::ClampFloat
+                | ExecPrimOp::ClampDecimal
+                | ExecPrimOp::Core(PrimOp::SomeVal(_)),
+            args,
+        } => args
+            .first()
+            .is_some_and(|a| is_exec_row_expr_coarsened(a, cols)),
+        ExecRowExpr::Col(name) => cols
+            .iter()
+            .find(|c| c.name == *name)
+            .is_some_and(|c| c.bucketed),
+        ExecRowExpr::Coalesce {
+            opt_expr,
+            default_expr,
+        } => {
+            is_exec_row_expr_coarsened(opt_expr, cols)
+                && (is_exec_row_expr_coarsened(default_expr, cols)
+                    || is_const_row_expr(default_expr))
+        }
+        ExecRowExpr::IfE {
+            then_br, else_br, ..
+        } => {
+            let tc = is_exec_row_expr_coarsened(then_br, cols);
+            let ec = is_exec_row_expr_coarsened(else_br, cols);
+            (tc && ec) || (tc && is_const_row_expr(else_br)) || (ec && is_const_row_expr(then_br))
+        }
+        _ => false,
+    }
 }

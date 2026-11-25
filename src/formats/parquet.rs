@@ -2206,7 +2206,7 @@ pub fn write_parquet_bytes_with_options(
         schema: schema_elems,
         num_rows: tv.rows.len() as i64,
         row_groups,
-        created_by: Some("dana native parquet writer 0.2".to_string()),
+        created_by: Some("dana native parquet writer 0.5".to_string()),
     };
     let mut fm_w = ThriftWriter::new();
     write_file_metadata(&mut fm_w, &file_meta);
@@ -4779,7 +4779,7 @@ pub fn write_parquet_vm_table_bytes_with_options(
         schema: schema_elems,
         num_rows: total_rows as i64,
         row_groups,
-        created_by: Some("dana native parquet writer 0.4".to_string()),
+        created_by: Some("dana native parquet writer 0.5".to_string()),
     };
     let mut fm_w = ThriftWriter::new();
     write_file_metadata(&mut fm_w, &file_meta);

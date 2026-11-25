@@ -4,6 +4,7 @@
 //! over any [`BufRead`], preserving exact 1-based line numbers across multiline quoted fields
 //! and enforcing `quarantine_bad_row_table_ty` sensitivity tag propagation on `bad_rows`.
 
+use std::borrow::Cow;
 use std::fmt::{self, Write as _};
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 
@@ -1131,9 +1132,94 @@ where
     ))
 }
 
+fn is_pure_negative_decimal(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix('-') else {
+        return false;
+    };
+    if let Some((int_part, frac_part)) = rest.split_once('.') {
+        !int_part.is_empty()
+            && int_part.bytes().all(|b| b.is_ascii_digit())
+            && !frac_part.is_empty()
+            && frac_part.bytes().all(|b| b.is_ascii_digit())
+    } else {
+        !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+    }
+}
+
+/// Sanitize a CSV cell string against spreadsheet formula injection (`=`, `+`, `-`, `@`, `\t`, `\r`).
+///
+/// Pure negative decimal literals (e.g., `"-42"`, `"-3.14"`) are preserved unchanged; any other cell
+/// starting with `=`, `+`, `-`, `@`, `\t`, or `\r` — or whose `trim_start()` starts with `=`, `+`,
+/// `-`, or `@` — is prefixed with a single leading `'`.
+#[must_use]
+pub fn sanitize_csv_formula_cell(cell: &str) -> Cow<'_, str> {
+    if cell.is_empty() || is_pure_negative_decimal(cell) {
+        return Cow::Borrowed(cell);
+    }
+    let raw_trigger = matches!(
+        cell.as_bytes()[0],
+        b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r'
+    );
+    let trimmed_trigger = cell
+        .trim_start()
+        .as_bytes()
+        .first()
+        .is_some_and(|&b| matches!(b, b'=' | b'+' | b'-' | b'@'));
+    if raw_trigger || trimmed_trigger {
+        let mut out = String::with_capacity(cell.len() + 1);
+        out.push('\'');
+        out.push_str(cell);
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(cell)
+    }
+}
+
+fn push_csv_text_cell(out: &mut String, text: &str, delimiter: u8, sanitize_formulas: bool) {
+    if sanitize_formulas {
+        let san = sanitize_csv_formula_cell(text);
+        push_csv_escaped(out, &san, delimiter);
+    } else {
+        push_csv_escaped(out, text, delimiter);
+    }
+}
+
+fn push_val_csv_cell(out: &mut String, cell: &Val, delimiter: u8, sanitize_formulas: bool) {
+    match cell {
+        Val::OptNone => {}
+        Val::OptSome(inner) => push_val_csv_cell(out, inner, delimiter, sanitize_formulas),
+        Val::Text(s) => push_csv_text_cell(out, s, delimiter, sanitize_formulas),
+        Val::Bytes(bs) => match std::str::from_utf8(bs) {
+            Ok(s) => push_csv_text_cell(out, s, delimiter, sanitize_formulas),
+            Err(_) => out.push_str(&to_hex_lower(bs)),
+        },
+        Val::Unit
+        | Val::Bool(_)
+        | Val::Int(_)
+        | Val::Decimal(_)
+        | Val::Float(_)
+        | Val::Date(_)
+        | Val::Timestamp(_)
+        | Val::Duration(_) => {
+            let rendered = render_csv_cell(cell);
+            push_csv_escaped(out, &rendered, delimiter);
+        }
+        other => {
+            let rendered = render_csv_cell(other);
+            push_csv_text_cell(out, &rendered, delimiter, sanitize_formulas);
+        }
+    }
+}
+
 /// Append a single columnar batch cell directly into `line` in RFC 4180 CSV/TSV format,
 /// matching [`render_csv_cell`] + [`push_csv_escaped`] byte-for-byte with zero per-cell allocation.
-fn push_column_csv_cell(out: &mut String, col: &Column, row: usize, delimiter: u8) {
+fn push_column_csv_cell(
+    out: &mut String,
+    col: &Column,
+    row: usize,
+    delimiter: u8,
+    sanitize_formulas: bool,
+) {
     if let Some(bm) = &col.validity
         && !bm.is_valid(row)
     {
@@ -1154,13 +1240,13 @@ fn push_column_csv_cell(out: &mut String, col: &Column, row: usize, delimiter: u
         }
         ColumnData::Text { .. } => {
             if let Some(s) = col.data.text_at(row) {
-                push_csv_escaped(out, s, delimiter);
+                push_csv_text_cell(out, s, delimiter, sanitize_formulas);
             }
         }
         ColumnData::Bytes { .. } => {
             if let Some(bs) = col.data.bytes_at(row) {
                 match std::str::from_utf8(bs) {
-                    Ok(s) => push_csv_escaped(out, s, delimiter),
+                    Ok(s) => push_csv_text_cell(out, s, delimiter, sanitize_formulas),
                     Err(_) => {
                         let hex = to_hex_lower(bs);
                         out.push_str(&hex);
@@ -1174,8 +1260,7 @@ fn push_column_csv_cell(out: &mut String, col: &Column, row: usize, delimiter: u
             let _ = write!(out, "duration({})", v[row]);
         }
         ColumnData::Generic(v) => {
-            let rendered = render_csv_cell(&v[row]);
-            push_csv_escaped(out, &rendered, delimiter);
+            push_val_csv_cell(out, &v[row], delimiter, sanitize_formulas);
         }
     }
 }
@@ -1186,13 +1271,26 @@ fn push_column_csv_cell(out: &mut String, col: &Column, row: usize, delimiter: u
 /// # Errors
 /// Returns any underlying I/O error.
 pub fn write_csv_vm_table<W: Write>(writer: &mut W, vm: &VmTable, delimiter: u8) -> io::Result<()> {
+    write_csv_vm_table_with_options(writer, vm, delimiter, false)
+}
+
+/// Stream a columnar [`VmTable`] as RFC 4180 CSV/TSV with optional CSV formula sanitization.
+///
+/// # Errors
+/// Returns any underlying I/O error.
+pub fn write_csv_vm_table_with_options<W: Write>(
+    writer: &mut W,
+    vm: &VmTable,
+    delimiter: u8,
+    sanitize_formulas: bool,
+) -> io::Result<()> {
     let delim = delimiter as char;
     let mut line = String::with_capacity(256);
     for (i, c) in vm.cols.iter().enumerate() {
         if i > 0 {
             line.push(delim);
         }
-        push_csv_escaped(&mut line, &c.name, delimiter);
+        push_csv_text_cell(&mut line, &c.name, delimiter, sanitize_formulas);
     }
     line.push('\n');
     writer.write_all(line.as_bytes())?;
@@ -1210,7 +1308,7 @@ pub fn write_csv_vm_table<W: Write>(writer: &mut W, vm: &VmTable, delimiter: u8)
                         if i > 0 {
                             line.push(delim);
                         }
-                        push_column_csv_cell(&mut line, col, r, delimiter);
+                        push_column_csv_cell(&mut line, col, r, delimiter, sanitize_formulas);
                     }
                     line.push('\n');
                     writer.write_all(line.as_bytes())?;
@@ -1223,7 +1321,7 @@ pub fn write_csv_vm_table<W: Write>(writer: &mut W, vm: &VmTable, delimiter: u8)
                         if i > 0 {
                             line.push(delim);
                         }
-                        push_column_csv_cell(&mut line, col, r, delimiter);
+                        push_column_csv_cell(&mut line, col, r, delimiter, sanitize_formulas);
                     }
                     line.push('\n');
                     writer.write_all(line.as_bytes())?;
@@ -1237,8 +1335,18 @@ pub fn write_csv_vm_table<W: Write>(writer: &mut W, vm: &VmTable, delimiter: u8)
 /// Format a columnar [`VmTable`] as RFC 4180 CSV text directly from columnar batches.
 #[must_use]
 pub fn format_csv_vm_table(vm: &VmTable, delimiter: u8) -> String {
+    format_csv_vm_table_with_options(vm, delimiter, false)
+}
+
+/// Format a columnar [`VmTable`] as RFC 4180 CSV text with optional CSV formula sanitization.
+#[must_use]
+pub fn format_csv_vm_table_with_options(
+    vm: &VmTable,
+    delimiter: u8,
+    sanitize_formulas: bool,
+) -> String {
     let mut buf = Vec::new();
-    let _ = write_csv_vm_table(&mut buf, vm, delimiter);
+    let _ = write_csv_vm_table_with_options(&mut buf, vm, delimiter, sanitize_formulas);
     String::from_utf8(buf).unwrap_or_default()
 }
 
@@ -1247,13 +1355,26 @@ pub fn format_csv_vm_table(vm: &VmTable, delimiter: u8) -> String {
 /// # Errors
 /// Returns any underlying I/O error.
 pub fn write_csv_table<W: Write>(writer: &mut W, tv: &TableVal, delimiter: u8) -> io::Result<()> {
+    write_csv_table_with_options(writer, tv, delimiter, false)
+}
+
+/// Stream a [`TableVal`] as RFC 4180 CSV/TSV with optional CSV formula sanitization.
+///
+/// # Errors
+/// Returns any underlying I/O error.
+pub fn write_csv_table_with_options<W: Write>(
+    writer: &mut W,
+    tv: &TableVal,
+    delimiter: u8,
+    sanitize_formulas: bool,
+) -> io::Result<()> {
     let delim = delimiter as char;
     let mut line = String::new();
     for (i, c) in tv.cols.iter().enumerate() {
         if i > 0 {
             line.push(delim);
         }
-        push_csv_escaped(&mut line, &c.name, delimiter);
+        push_csv_text_cell(&mut line, &c.name, delimiter, sanitize_formulas);
     }
     line.push('\n');
     writer.write_all(line.as_bytes())?;
@@ -1264,8 +1385,7 @@ pub fn write_csv_table<W: Write>(writer: &mut W, tv: &TableVal, delimiter: u8) -
             if i > 0 {
                 line.push(delim);
             }
-            let rendered = render_csv_cell(cell);
-            push_csv_escaped(&mut line, &rendered, delimiter);
+            push_val_csv_cell(&mut line, cell, delimiter, sanitize_formulas);
         }
         line.push('\n');
         writer.write_all(line.as_bytes())?;
@@ -1276,8 +1396,18 @@ pub fn write_csv_table<W: Write>(writer: &mut W, tv: &TableVal, delimiter: u8) -
 /// Format a [`TableVal`] as RFC 4180 CSV text.
 #[must_use]
 pub fn format_csv_table(tv: &TableVal, delimiter: u8) -> String {
+    format_csv_table_with_options(tv, delimiter, false)
+}
+
+/// Format a [`TableVal`] as RFC 4180 CSV text with optional CSV formula sanitization.
+#[must_use]
+pub fn format_csv_table_with_options(
+    tv: &TableVal,
+    delimiter: u8,
+    sanitize_formulas: bool,
+) -> String {
     let mut buf = Vec::new();
-    let _ = write_csv_table(&mut buf, tv, delimiter);
+    let _ = write_csv_table_with_options(&mut buf, tv, delimiter, sanitize_formulas);
     String::from_utf8(buf).unwrap_or_default()
 }
 

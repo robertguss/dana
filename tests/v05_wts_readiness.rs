@@ -1830,3 +1830,943 @@ fn find_first_plan(expr: &dana::runtime::ir::ExecExpr) -> Option<&dana::runtime:
     }
     None
 }
+
+// ===========================================================================
+// 7. Slice 5.2: Private Atomic Writes (0700/0600) Across All 8 Writers
+// ===========================================================================
+
+fn check_src_expect_diag(
+    src: &str,
+    policy_src: Option<&str>,
+    expected_code: DiagCode,
+) -> TestResult<String> {
+    let mut sm = SourceMap::new();
+    let policy = match policy_src {
+        Some(ps) => {
+            let pid = sm.add_file("dana.policy", ps.to_string());
+            Some(
+                dana::check::policy::parse_policy(pid, ps)
+                    .map_err(|d| format!("policy error: {d:?}"))?,
+            )
+        }
+        None => None,
+    };
+    let fid = sm.add_file("test.dana", src.to_string());
+    let ast = parse_module(fid, src).map_err(|d| format!("parse error: {d:?}"))?;
+    match check_module(fid, ast, policy, &sm) {
+        Ok(_) => Err(format!("expected {expected_code:?}, but program checked cleanly").into()),
+        Err(ds) => {
+            if ds.iter().any(|d| d.code() == expected_code) {
+                Ok(ds
+                    .iter()
+                    .map(|d| format!("{}: {}", d.code().as_str(), d.message()))
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            } else {
+                Err(format!("expected {expected_code:?}, got diagnostics: {ds:?}").into())
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_mode(path: &Path, expected_mode: u32) -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = fs::metadata(path)?;
+    let got = meta.permissions().mode() & 0o777;
+    assert_eq!(
+        got,
+        expected_mode,
+        "expected mode {:04o} on {}, got {:04o}",
+        expected_mode,
+        path.display(),
+        got
+    );
+    Ok(())
+}
+
+#[test]
+fn v05_private_atomic_writes_0700_0600_all_writers_and_oracle_vm_parity() -> TestResult {
+    let src = r#"module PrivateAllWriters
+
+fn main(
+  pub_out: WriteFiles("priv_out/"),
+  tag_out: WriteFiles("tagged_out/", allows: [ferpa]),
+  console: Console
+) : Int
+  tbl = table
+    | k   | v  |
+    | "a" | 10 |
+    | "b" | 20 |
+  end
+  rep = Report.new("Summary") |> add_table(tbl)
+  chart = tbl |> chart_bar(x: .k, y: .v, title: "Bars")
+
+  try pub_out.write_csv("sub/a.csv", tbl, private: true)
+  try pub_out.write_parquet("sub/a.parquet", tbl, private: true)
+  try pub_out.write_xlsx("sub/a.xlsx", tbl, private: true)
+  try pub_out.write_jsonl("sub/a.jsonl", tbl, private: true)
+  try pub_out.write_html("sub/a.html", rep, private: true)
+  try pub_out.write_markdown("sub/a.md", rep, private: true)
+  try pub_out.write_svg("sub/a.svg", chart, private: true)
+  try pub_out.write_file("sub/a.txt", "first-secret-content", private: true)
+  try pub_out.write_file("sub/a.txt", "second-secret-content", private: true)
+
+  # Implicit private write when WriteFiles carries non-empty `allows` tags
+  try tag_out.write_csv("nested/implicit.csv", tbl)
+  try tag_out.write_parquet("nested/implicit.parquet", tbl)
+  console.print("ok")
+  0
+end
+"#;
+
+    let vm_dir = TempDir::new("priv_vm")?;
+    let ora_dir = TempDir::new("priv_ora")?;
+    let vm_file = vm_dir.path().join("prog.dana");
+    let ora_file = ora_dir.path().join("prog.dana");
+    fs::write(&vm_file, src)?;
+    fs::write(&ora_file, src)?;
+    let vm_fstr = vm_file.to_string_lossy().to_string();
+    let ora_fstr = ora_file.to_string_lossy().to_string();
+
+    let (vc, vo, ve) = run_dana_cmd(
+        &["run", "--allow-export", "ferpa", &vm_fstr],
+        Some(vm_dir.path()),
+    )?;
+    assert_eq!(vc, 0, "VM run failed:\nstderr={ve}\nstdout={vo}");
+    let (oc, oo, oe) = run_dana_cmd(
+        &["run", "--oracle", "--allow-export", "ferpa", &ora_fstr],
+        Some(ora_dir.path()),
+    )?;
+    assert_eq!(oc, 0, "Oracle run failed:\nstderr={oe}\nstdout={oo}");
+    assert_eq!(vo.trim(), "ok");
+    assert_eq!(oo.trim(), "ok");
+
+    let expected_files = [
+        "priv_out/sub/a.csv",
+        "priv_out/sub/a.parquet",
+        "priv_out/sub/a.xlsx",
+        "priv_out/sub/a.jsonl",
+        "priv_out/sub/a.html",
+        "priv_out/sub/a.md",
+        "priv_out/sub/a.svg",
+        "priv_out/sub/a.txt",
+        "tagged_out/nested/implicit.csv",
+        "tagged_out/nested/implicit.parquet",
+    ];
+
+    for rel in expected_files {
+        let vp = vm_dir.path().join(rel);
+        let op = ora_dir.path().join(rel);
+        assert!(vp.exists(), "missing VM output {}", vp.display());
+        assert!(op.exists(), "missing Oracle output {}", op.display());
+        assert_eq!(
+            fs::read(&vp)?,
+            fs::read(&op)?,
+            "VM vs Oracle byte mismatch for {rel}"
+        );
+        #[cfg(unix)]
+        {
+            assert_mode(&vp, 0o600)?;
+            assert_mode(&op, 0o600)?;
+        }
+    }
+
+    assert_eq!(
+        fs::read_to_string(vm_dir.path().join("priv_out/sub/a.txt"))?,
+        "second-secret-content"
+    );
+
+    #[cfg(unix)]
+    for d in [
+        "priv_out",
+        "priv_out/sub",
+        "tagged_out",
+        "tagged_out/nested",
+    ] {
+        assert_mode(&vm_dir.path().join(d), 0o700)?;
+        assert_mode(&ora_dir.path().join(d), 0o700)?;
+        for entry in fs::read_dir(vm_dir.path().join(d))? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.contains(".dana-tmp."),
+                "leftover temp file found in {d}: {name}"
+            );
+        }
+    }
+
+    // Negative static checks for invalid named arguments
+    let bad_priv = r#"module BadPriv
+fn main(out: WriteFiles("out/")) : Int
+  _r = out.write_file("a.txt", "hi", private: 123)
+  0
+end
+"#;
+    check_src_expect_diag(bad_priv, None, DiagCode::TypeError)?;
+
+    let bad_san = r#"module BadSan
+fn main(out: WriteFiles("out/")) : Int
+  t = table
+    | x |
+    | 1 |
+  end
+  _r = out.write_parquet("a.parquet", t, sanitize_formulas: true)
+  0
+end
+"#;
+    check_src_expect_diag(bad_san, None, DiagCode::TypeError)?;
+
+    Ok(())
+}
+
+// ===========================================================================
+// 8. Slice 5.2: CSV Formula Sanitization
+// ===========================================================================
+
+#[test]
+fn v05_csv_formula_sanitization_unit_writer_formatter_and_vm_oracle_parity() -> TestResult {
+    use dana::formats::csv::sanitize_csv_formula_cell;
+    use std::borrow::Cow;
+
+    // Pure negative decimals MUST remain unchanged (Borrowed)
+    for safe in [
+        "-42", "-3.14", "-0", "-0.001", "hello", "", " 42", "A=B", "foo-bar",
+    ] {
+        let got = sanitize_csv_formula_cell(safe);
+        assert_eq!(got.as_ref(), safe, "unexpected change for `{safe}`");
+        assert!(
+            matches!(got, Cow::Borrowed(_)),
+            "expected Borrowed for safe cell `{safe}`"
+        );
+    }
+
+    // All dangerous triggers MUST receive a single leading apostrophe
+    let dangerous = [
+        ("=SUM(A1)", "'=SUM(A1)"),
+        ("+123", "'+123"),
+        ("-A1", "'-A1"),
+        ("-1+1", "'-1+1"),
+        ("--5", "'--5"),
+        ("-3.14.1", "'-3.14.1"),
+        ("-", "'-"),
+        ("@cmd", "'@cmd"),
+        ("\t=1", "'\t=1"),
+        ("\r=1", "'\r=1"),
+        ("  =SUM(A1)", "'  =SUM(A1)"),
+        ("   +1", "'   +1"),
+        (" -A1", "' -A1"),
+        ("\u{0020}@calc", "'\u{0020}@calc"),
+        ("=1,\"a\",2", "'=1,\"a\",2"),
+        ("=1\n2", "'=1\n2"),
+    ];
+    for (raw, expected) in dangerous {
+        let got = sanitize_csv_formula_cell(raw);
+        assert_eq!(got.as_ref(), expected, "wrong sanitization for {raw:?}");
+    }
+
+    // End-to-end: both columnar VmTable (loaded from CSV) and TableVal (--oracle) across write_csv + format_csv
+    let input_csv = concat!(
+        "id,dec_v,flt_v,txt_cell\n",
+        "-42,-12.50,-3.5,\"=SUM(A1)\"\n",
+        "-1,0.00,-0.25,\"+123\"\n",
+        "2,1.25,2.5,\"-A1\"\n",
+        "3,3.00,4.0,\"-42\"\n",
+        "4,4.00,5.0,\"-3.14\"\n",
+        "5,5.00,6.0,\"  =1+1\"\n",
+        "6,6.00,7.0,\"@cmd\"\n",
+        "7,7.00,8.0,\"\t=1\"\n",
+        "8,8.00,9.0,\"=1,\"\"q\"\",2\"\n"
+    );
+
+    let src = r#"module CsvSanitizeE2E
+
+schema Row
+  id: Int
+  dec_v: Decimal
+  flt_v: Float
+  txt_cell: Text
+end
+
+fn main(files: ReadFiles, out: WriteFiles("csvs/"), console: Console) : Int
+  (rows, _bad) = try files.read_csv("in.csv", as: Row)
+  sorted = rows |> sort_by(.id)
+  try out.write_csv("sanitized.csv", sorted, sanitize_formulas: true)
+  try out.write_csv("raw.csv", sorted)
+  console.print(sorted.format_csv(sanitize_formulas: true))
+  console.print("---RAW---")
+  console.print(format_csv(sorted))
+  0
+end
+"#;
+
+    let vm_dir = TempDir::new("csvsan_vm")?;
+    let ora_dir = TempDir::new("csvsan_ora")?;
+    fs::write(vm_dir.path().join("in.csv"), input_csv)?;
+    fs::write(ora_dir.path().join("in.csv"), input_csv)?;
+    let vm_prog = vm_dir.path().join("prog.dana");
+    let ora_prog = ora_dir.path().join("prog.dana");
+    fs::write(&vm_prog, src)?;
+    fs::write(&ora_prog, src)?;
+    let vm_s = vm_prog.to_string_lossy().to_string();
+    let ora_s = ora_prog.to_string_lossy().to_string();
+
+    let (vc, vo, ve) = run_dana_cmd(&["run", &vm_s], Some(vm_dir.path()))?;
+    assert_eq!(vc, 0, "VM csv sanitize failed:\nstderr={ve}\nstdout={vo}");
+    let (oc, oo, oe) = run_dana_cmd(&["run", "--oracle", &ora_s], Some(ora_dir.path()))?;
+    assert_eq!(
+        oc, 0,
+        "Oracle csv sanitize failed:\nstderr={oe}\nstdout={oo}"
+    );
+    assert_eq!(vo, oo, "format_csv VM vs Oracle mismatch");
+
+    let vm_san = fs::read_to_string(vm_dir.path().join("csvs/sanitized.csv"))?;
+    let ora_san = fs::read_to_string(ora_dir.path().join("csvs/sanitized.csv"))?;
+    let vm_raw = fs::read_to_string(vm_dir.path().join("csvs/raw.csv"))?;
+    let ora_raw = fs::read_to_string(ora_dir.path().join("csvs/raw.csv"))?;
+    assert_eq!(vm_san, ora_san, "write_csv sanitized VM vs Oracle mismatch");
+    assert_eq!(vm_raw, ora_raw, "write_csv raw VM vs Oracle mismatch");
+
+    // Genuine numeric negative cells & pure negative decimal text cells stay unescaped
+    assert!(
+        vm_san.contains("-42,-12.5,-3.5,'=SUM(A1)"),
+        "got:\n{vm_san}"
+    );
+    assert!(vm_san.contains("-1,0.0,-0.25,'+123"), "got:\n{vm_san}");
+    assert!(vm_san.contains("2,1.25,2.5,'-A1"), "got:\n{vm_san}");
+    assert!(vm_san.contains("3,3.0,4,-42\n"), "got:\n{vm_san}");
+    assert!(vm_san.contains("4,4.0,5,-3.14\n"), "got:\n{vm_san}");
+    assert!(vm_san.contains("5,5.0,6,'  =1+1\n"), "got:\n{vm_san}");
+    assert!(vm_san.contains("6,6.0,7,'@cmd\n"), "got:\n{vm_san}");
+    assert!(vm_san.contains("7,7.0,8,'\t=1\n"), "got:\n{vm_san}");
+    // RFC-4180 quoting happens AFTER formula prefixing
+    assert!(
+        vm_san.contains("8,8.0,9,\"'=1,\"\"q\"\",2\""),
+        "got:\n{vm_san}"
+    );
+    // Unsanitized file keeps "=SUM(A1)" without apostrophe
+    assert!(vm_raw.contains("-42,-12.5,-3.5,=SUM(A1)"), "got:\n{vm_raw}");
+
+    // Formatters agree byte-for-byte with written CSV files
+    let parts: Vec<&str> = vo.split("---RAW---\n").collect();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(
+        parts[0].trim_end_matches('\n'),
+        vm_san.trim_end_matches('\n')
+    );
+    assert_eq!(
+        parts[1].trim_end_matches('\n'),
+        vm_raw.trim_end_matches('\n')
+    );
+
+    Ok(())
+}
+
+// ===========================================================================
+// 9. Slice 5.2: Deterministic `shuffle` & Row-Level `suppress_small_cells`
+// ===========================================================================
+
+#[test]
+fn v05_shuffle_determinism_seeds_tags_pushdown_and_oracle_vm_parity() -> TestResult {
+    let tmp = TempDir::new("shuffle_db")?;
+    let db_path = tmp.path().join("items.db");
+    let uri = sqlite_uri(&db_path);
+    let mut conn = open_connection(&uri)?;
+    conn.execute(
+        r#"CREATE TABLE "scores" ("id" INTEGER PRIMARY KEY NOT NULL, "label" TEXT NOT NULL, "secret_score" INTEGER NOT NULL)"#,
+        &[],
+    )?;
+    for id in 1i64..=16 {
+        conn.execute(
+            r#"INSERT INTO "scores" VALUES (?, ?, ?)"#,
+            &[
+                SqlParam::Int(id),
+                SqlParam::Text(format!("row_{id}")),
+                SqlParam::Int(100 - id),
+            ],
+        )?;
+    }
+    drop(conn);
+
+    // Clear order_tags via shuffle(seed:) after sort_by(.secret_score) and drop(.secret_score)
+    let src = r#"module ShuffleTest
+
+schema ScoreRow
+  id: Int
+  label: Text
+  secret_score: Int [ferpa]
+end
+
+fn main(db: ReadDB(S), console: Console) : Int
+  base = db.table(ScoreRow, from: "scores")
+    |> sort_by(.secret_score)
+    |> drop(.secret_score)
+  s42a = base |> shuffle(seed: 42)
+  s42b = base |> shuffle(seed: 42)
+  s99 = base |> shuffle(seed: 99)
+  s_neg = base |> shuffle(seed: -7)
+  assert s42a == s42b
+  console.print_table(s42a)
+  console.print("---S99---")
+  console.print_table(s99)
+  console.print("---SNEG---")
+  console.print_table(s_neg)
+  0
+end
+"#;
+
+    let out = assert_oracle_vm_parity(src, Some(("S", &uri)), false)?;
+    let full = out.join("\n");
+    let segs: Vec<&str> = full.split("---S99---").collect();
+    assert_eq!(segs.len(), 2);
+    let segs2: Vec<&str> = segs[1].split("---SNEG---").collect();
+    assert_eq!(segs2.len(), 2);
+    assert_ne!(segs[0], segs2[0], "distinct seeds 42 vs 99 should differ");
+    assert_ne!(segs2[0], segs2[1], "distinct seeds 99 vs -7 should differ");
+
+    // Extreme Int64 boundary seed parity + direct huge BigInt seed unit check
+    let max_bi = dana::core::bigint::BigInt::from(i64::MAX);
+    let huge_bi = &max_bi * &max_bi;
+    assert_eq!(
+        dana::vm::ops::sort_win::seed_from_bigint(&huge_bi),
+        dana::vm::ops::sort_win::seed_from_bigint(&huge_bi)
+    );
+    assert_ne!(
+        dana::vm::ops::sort_win::seed_from_bigint(&huge_bi),
+        dana::vm::ops::sort_win::seed_from_bigint(&max_bi)
+    );
+    let big_seed_src = r#"module BigSeedShuffle
+
+fn main(console: Console) : Int
+  t = table
+    | id |
+    | 1  |
+    | 2  |
+    | 3  |
+    | 4  |
+    | 5  |
+    | 6  |
+    | 7  |
+    | 8  |
+  end
+  console.print_table(t |> shuffle(seed: 9223372036854775807))
+  0
+end
+"#;
+    assert_oracle_vm_parity(big_seed_src, None, false)?;
+
+    // Sorting by [ferpa] col WITHOUT shuffle MUST still block public export via order_tags
+    let blocked_order_src = r#"module BlockedOrder
+
+schema ScoreRow
+  id: Int
+  secret_score: Int [ferpa]
+end
+
+fn leak(db: ReadDB(S), out: WriteFiles("pub/")) : Int
+  sorted = db.table(ScoreRow, from: "scores") |> sort_by(.secret_score) |> drop(.secret_score)
+  _r = out.write_csv("x.csv", sorted)
+  0
+end
+"#;
+    check_src_expect_diag(blocked_order_src, None, DiagCode::PrivacyError)?;
+
+    // SQL pushdown barrier: split_exec_plan_pushdown must push SourceDB -> Sort and stop at Shuffle
+    let checked = check_src(src)?;
+    let main_fn = checked.exec.find_fun("main").ok_or("missing main")?;
+    let plan = find_first_plan(&main_fn.body).ok_or("missing ExecPlan")?;
+    let split = split_exec_plan_pushdown(plan, &checked.exec, "S", SqlDialect::Sqlite, None);
+    assert!(
+        matches!(split, SplitPlan::Hybrid { .. }),
+        "expected Hybrid pushdown stopping at Shuffle barrier, got {split:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn v05_suppress_small_cells_k_anonymity_privacy_explain_and_parity() -> TestResult {
+    let tmp = TempDir::new("scells_db")?;
+    let db_path = tmp.path().join("students.db");
+    let uri = sqlite_uri(&db_path);
+    let mut conn = open_connection(&uri)?;
+    conn.execute(
+        r#"CREATE TABLE "cohort" (
+            "sid" INTEGER PRIMARY KEY NOT NULL,
+            "yr" INTEGER NOT NULL,
+            "program" TEXT NOT NULL,
+            "gpa" REAL NOT NULL,
+            "opt_gpa" REAL,
+            "dfw_flag" INTEGER NOT NULL
+        )"#,
+        &[],
+    )?;
+    // Cell (2026, "Grad"): 4 rows -> kept for min: 3
+    // Cell (2026, "Rare"): 2 rows -> dropped for min: 3
+    let rows_data = [
+        (101i64, 2026i64, "Grad", 3.12f64, Some(3.12f64), true),
+        (102, 2026, "Grad", 3.88, None, false),
+        (103, 2026, "Grad", 2.94, Some(2.94), false),
+        (104, 2026, "Grad", 3.45, Some(3.45), true),
+        (105, 2026, "Rare", 3.50, Some(3.50), false),
+        (106, 2026, "Rare", 3.60, Some(3.60), false),
+        (107, 2025, "Filtered", 2.00, None, false),
+        (108, 2025, "Filtered", 2.10, None, false),
+        (109, 2025, "Filtered", 2.20, None, false),
+    ];
+    for (sid, yr, prog, gpa, ogpa, dfw) in rows_data {
+        conn.execute(
+            r#"INSERT INTO "cohort" VALUES (?, ?, ?, ?, ?, ?)"#,
+            &[
+                SqlParam::Int(sid),
+                SqlParam::Int(yr),
+                SqlParam::Text(prog.to_string()),
+                SqlParam::Float(dana::core::syntax::Float64::from_f64(gpa)),
+                match ogpa {
+                    Some(v) => SqlParam::Float(dana::core::syntax::Float64::from_f64(v)),
+                    None => SqlParam::Null,
+                },
+                SqlParam::Bool(dfw),
+            ],
+        )?;
+    }
+    drop(conn);
+
+    // 1. Row-count k-anonymity + post-filter barrier + [ferpa] clearing on by: & round_to/bucket cols + VM == Oracle parity
+    let k_src = r#"module SuppressCellsParity
+
+schema CohortRow
+  sid: Int [pii]
+  yr: Int [ferpa]
+  program: Text [ferpa]
+  gpa: Float [ferpa]
+  opt_gpa: Float? [ferpa]
+  dfw_flag: Bool [ferpa]
+end
+
+fn main(db: ReadDB(C), console: Console) : Int
+  safe = db.table(CohortRow, from: "cohort")
+    |> where(.yr >= 2026)
+    |> derive(
+         gpa: .gpa.clamp(0.0, 4.0).round_to(0.1),
+         opt_gpa: if .opt_gpa.some?: (.opt_gpa ?? 0.0).clamp(0.0, 4.0).round_to(0.1) else: none,
+         gpa_band: bucket(.gpa, cuts: [2.5, 3.5], labels: ["low", "mid", "high"])
+       )
+    |> drop(.sid, .dfw_flag)
+    |> suppress_small_cells(by: [.yr, .program], min: 3)
+  console.print_table(safe)
+  0
+end
+"#;
+    let out = assert_oracle_vm_parity(k_src, Some(("C", &uri)), false)?;
+    let joined = out.join("\n");
+    assert!(joined.contains("Grad") && !joined.contains("Rare") && !joined.contains("Filtered"));
+
+    // Pushdown barrier + K_ANON explain output
+    let checked = check_src(k_src)?;
+    let main_fn = checked.exec.find_fun("main").ok_or("missing main")?;
+    let plan = find_first_plan(&main_fn.body).ok_or("missing ExecPlan")?;
+    let split = split_exec_plan_pushdown(plan, &checked.exec, "C", SqlDialect::Sqlite, None);
+    assert!(
+        matches!(split, SplitPlan::Hybrid { .. }),
+        "expected Hybrid pushdown stopping at SuppressSmallCells, got {split:?}"
+    );
+    let k_path = tmp.path().join("k_src.dana");
+    fs::write(&k_path, k_src)?;
+    let (ec, eo, ee) = run_dana_cmd(&["explain", &k_path.to_string_lossy()], Some(tmp.path()))?;
+    assert_eq!(ec, 0, "explain failed: {ee}");
+    assert!(
+        eo.contains("K_ANON") && eo.contains("SuppressSmallCells"),
+        "expected K_ANON in explain output:\n{eo}"
+    );
+
+    // 2. distinct_by: .student_id (with duplicates & none nulls!) VM == Oracle parity
+    let distinct_src = r#"module DistinctCells
+
+schema Rec
+  student_id: Int?
+  yr: Int [ferpa]
+  prog: Text [ferpa]
+  tag_label: Text
+end
+
+fn main(console: Console) : Int
+  rows = table
+    | student_id | yr   | prog | tag_label |
+    | 1          | 2026 | "A"  | "a1"      |
+    | 1          | 2026 | "A"  | "a2"      |
+    | 2          | 2026 | "A"  | "a3"      |
+    | none       | 2026 | "A"  | "a4"      |
+    | 10         | 2026 | "B"  | "b1"      |
+    | 11         | 2026 | "B"  | "b2"      |
+    | 12         | 2026 | "B"  | "b3"      |
+  end
+  kept = rows |> suppress_small_cells(by: [.yr, .prog], min: 3, distinct_by: .student_id)
+  console.print("kept=#{kept.count()}")
+  console.print_table(kept)
+  0
+end
+"#;
+    // Cell (2026, "A") has 4 rows but only 2 non-null distinct students (1, 2) -> dropped! Cell B has 3 -> kept!
+    let dout = assert_oracle_vm_parity(distinct_src, None, false)?;
+    assert_eq!(dout[0], "kept=3");
+
+    // 3. Static rejections: [pii], [secret], raw un-coarsened [ferpa] retained, policy floor, invalid min/by
+    let pii_non_by = r#"module PiiNonBy
+schema S
+  sid: Int [pii]
+  yr: Int [ferpa]
+end
+fn main(t: Table(S), console: Console) : Int
+  _k = t |> suppress_small_cells(by: [.yr], min: 2)
+  0
+end
+"#;
+    let diag_pii = check_src_expect_diag(pii_non_by, None, DiagCode::PrivacyError)?;
+    assert!(diag_pii.contains("E0202"));
+
+    let pii_in_by = r#"module PiiInBy
+schema S
+  sid: Int [pii]
+  yr: Int [ferpa]
+end
+fn main(t: Table(S), console: Console) : Int
+  _k = t |> suppress_small_cells(by: [.sid, .yr], min: 2)
+  0
+end
+"#;
+    let diag_pii_by = check_src_expect_diag(pii_in_by, None, DiagCode::PrivacyError)?;
+    assert!(diag_pii_by.contains("E0202"));
+
+    let secret_col = r#"module SecretCol
+schema S
+  tok: Text [secret]
+  yr: Int [ferpa]
+end
+fn main(t: Table(S), console: Console) : Int
+  _k = t |> suppress_small_cells(by: [.yr], min: 2)
+  0
+end
+"#;
+    let diag_sec = check_src_expect_diag(secret_col, None, DiagCode::PrivacyError)?;
+    assert!(diag_sec.contains("E0202"));
+
+    // Raw un-coarsened [ferpa] column (even after raw .clamp) MUST keep [ferpa] and block public export!
+    let uncoarsened_ferpa_export = r#"module UncoarsenedFerpa
+schema S
+  yr: Int [ferpa]
+  raw_count: Int [ferpa]
+end
+fn leak(t: Table(S), out: WriteFiles("pub/")) : Int
+  k = t
+    |> derive(raw_count: .raw_count.clamp(0, 10))
+    |> suppress_small_cells(by: [.yr], min: 2)
+  _r = out.write_csv("leak.csv", k)
+  0
+end
+"#;
+    let diag_ferpa = check_src_expect_diag(uncoarsened_ferpa_export, None, DiagCode::PrivacyError)?;
+    assert!(diag_ferpa.contains("E0202"));
+
+    // Policy min_group_size floor enforcement
+    let policy_10 = "version 1\nmin_group_size 10\n";
+    let below_policy = r#"module BelowPolicy
+schema S
+  yr: Int [ferpa]
+end
+fn main(t: Table(S)) : Int
+  _k = t |> suppress_small_cells(by: [.yr], min: 9)
+  0
+end
+"#;
+    check_src_expect_diag(below_policy, Some(policy_10), DiagCode::PrivacyError)?;
+
+    let min_one = r#"module MinOne
+schema S
+  yr: Int [ferpa]
+end
+fn main(t: Table(S)) : Int
+  _k = t |> suppress_small_cells(by: [.yr], min: 1)
+  0
+end
+"#;
+    check_src_expect_diag(min_one, None, DiagCode::PrivacyError)?;
+
+    let empty_by = r#"module EmptyBy
+schema S
+  yr: Int [ferpa]
+end
+fn main(t: Table(S)) : Int
+  _k = t |> suppress_small_cells(by: [], min: 2)
+  0
+end
+"#;
+    check_src_expect_diag(empty_by, None, DiagCode::TypeError)?;
+
+    Ok(())
+}
+
+// ===========================================================================
+// 10. Slice 5.2: Live E2E Verification of `examples/wts/` Pilots
+// ===========================================================================
+
+#[test]
+fn v05_wts_pilots_end_to_end_parquet_and_pg_populi_enrollments() -> TestResult {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let wts_dir = root.join("examples").join("wts");
+    let policy = wts_dir.join("dana.policy");
+    let colab_dana = wts_dir.join("export_colab_parquet.dana");
+    let retention_dana = wts_dir.join("retention_backtest.dana");
+
+    let pol_s = policy.to_string_lossy().to_string();
+    let colab_s = colab_dana.to_string_lossy().to_string();
+    let ret_s = retention_dana.to_string_lossy().to_string();
+
+    // 1. Direct CLI format --check, check --policy, and test --policy (VM & Oracle)
+    let (fc, _, fe) = run_dana_cmd(&["format", "--check", &colab_s, &ret_s], None)?;
+    assert_eq!(fc, 0, "format --check failed:\n{fe}");
+
+    let (cc, _, ce) = run_dana_cmd(&["check", "--policy", &pol_s, &colab_s, &ret_s], None)?;
+    assert_eq!(cc, 0, "check --policy failed:\n{ce}");
+
+    let (tv_c, tv_o, tv_e) = run_dana_cmd(&["test", "--policy", &pol_s, &colab_s, &ret_s], None)?;
+    assert_eq!(tv_c, 0, "VM test --policy failed:\n{tv_e}\n{tv_o}");
+
+    let (to_c, to_o, to_e) = run_dana_cmd(
+        &["test", "--oracle", "--policy", &pol_s, &colab_s, &ret_s],
+        None,
+    )?;
+    assert_eq!(to_c, 0, "Oracle test --policy failed:\n{to_e}\n{to_o}");
+
+    // 2. Live E2E `export_colab_parquet.dana` writing Zstd Parquet -> round-trip inspect + VM == Oracle
+    let raw_hdr = "sid,student_name,tid,term_name,term_start,term_end,yr,term_season,is_semester_track,primary_program,course_code,course_name,active_courses_d21,had_dfw_d21,net_oop,gap_days,prev_term_gpa,prev_cum_gpa,gpa_delta,prev_comp_pct,prior_terms,prior_dfw_rate,online_rate\n";
+    let mut raw_csv = String::from(raw_hdr);
+    for idx in 1..=10 {
+        let dfw = if idx % 3 == 0 { "true" } else { "false" };
+        let ogpa = if idx == 2 { ",," } else { "3.45,3.40,0.05" };
+        let comp = if idx == 2 { "" } else { "92.0" };
+        raw_csv.push_str(&format!(
+            "{},Student_{idx},1,2026SP,2026-01-12,2026-05-01,2026,Spring,true,Graduate,ST501,Theology,{},{},17234.0,912.0,{},{},25,0.23,0.97\n",
+            100 + idx,
+            idx + 10,
+            dfw,
+            ogpa,
+            comp,
+        ));
+    }
+    // Small rare cell (only 2 rows) -> suppressed under min: 10
+    raw_csv.push_str("901,RareA,2,2026JA,2026-01-02,2026-01-20,2026,J-Term,false,Rare Cert,CH1,History,1,false,400.0,10.0,3.1,3.1,0.0,80.0,1,0.0,0.0\n");
+    raw_csv.push_str("902,RareB,2,2026JA,2026-01-02,2026-01-20,2026,J-Term,false,Rare Cert,CH1,History,1,true,400.0,10.0,3.1,3.1,0.0,80.0,1,0.0,0.0\n");
+
+    let colab_vm_dir = TempDir::new("colab_vm")?;
+    let colab_ora_dir = TempDir::new("colab_ora")?;
+    fs::write(colab_vm_dir.path().join("colab_raw.csv"), &raw_csv)?;
+    fs::write(colab_ora_dir.path().join("colab_raw.csv"), &raw_csv)?;
+
+    let (cvm_c, cvm_o, cvm_e) = run_dana_cmd(
+        &[
+            "run",
+            "--policy",
+            &pol_s,
+            "--allow-export",
+            "ferpa",
+            &colab_s,
+        ],
+        Some(colab_vm_dir.path()),
+    )?;
+    assert_eq!(cvm_c, 0, "Colab VM run failed:\n{cvm_e}\n{cvm_o}");
+
+    let (cora_c, cora_o, cora_e) = run_dana_cmd(
+        &[
+            "run",
+            "--oracle",
+            "--policy",
+            &pol_s,
+            "--allow-export",
+            "ferpa",
+            &colab_s,
+        ],
+        Some(colab_ora_dir.path()),
+    )?;
+    assert_eq!(cora_c, 0, "Colab Oracle run failed:\n{cora_e}\n{cora_o}");
+    assert_eq!(cvm_o.trim(), "exported 10 k-anonymous rows");
+    assert_eq!(cora_o, cvm_o);
+
+    let vm_pq = colab_vm_dir
+        .path()
+        .join("colab-exports/colab_training.parquet");
+    let ora_pq = colab_ora_dir
+        .path()
+        .join("colab-exports/colab_training.parquet");
+    assert!(vm_pq.exists() && ora_pq.exists());
+    #[cfg(unix)]
+    {
+        assert_mode(&colab_vm_dir.path().join("colab-exports"), 0o700)?;
+        assert_mode(&vm_pq, 0o600)?;
+        assert_mode(&colab_ora_dir.path().join("colab-exports"), 0o700)?;
+        assert_mode(&ora_pq, 0o600)?;
+    }
+
+    let (_, vm_tbl) = dana::formats::parquet::read_parquet_file_untyped(&vm_pq, "ColabTraining")?;
+    let (_, ora_tbl) = dana::formats::parquet::read_parquet_file_untyped(&ora_pq, "ColabTraining")?;
+    assert_eq!(vm_tbl.rows.len(), 10);
+    assert_eq!(
+        dana::formats::csv::format_csv_table(&vm_tbl, b','),
+        dana::formats::csv::format_csv_table(&ora_tbl, b','),
+        "Parquet round-trip VM != Oracle"
+    );
+
+    let pq_col_names: Vec<&str> = vm_tbl.cols.iter().map(|c| c.name.as_str()).collect();
+    for dropped in [
+        "sid",
+        "student_name",
+        "tid",
+        "term_name",
+        "term_start",
+        "term_end",
+        "course_code",
+        "course_name",
+        "had_dfw_d21",
+    ] {
+        assert!(
+            !pq_col_names.contains(&dropped),
+            "column `{dropped}` should have been dropped from Parquet"
+        );
+    }
+
+    // 3. Live E2E `retention_backtest.dana` via MultiSchemaPgMock (`populi.enrollments`) VM & Oracle
+    let pg_tmp = TempDir::new("retention_pg")?;
+    let main_db = pg_tmp.path().join("main.db");
+    let populi_db = pg_tmp.path().join("populi.db");
+    {
+        let c = SqliteConn::open(&main_db.to_string_lossy(), SqliteOpenMode::ReadWriteCreate)?;
+        c.execute_batch(r#"CREATE TABLE "meta" ("k" TEXT PRIMARY KEY NOT NULL);"#)?;
+    }
+    {
+        let c = SqliteConn::open(
+            &populi_db.to_string_lossy(),
+            SqliteOpenMode::ReadWriteCreate,
+        )?;
+        c.execute_batch(
+            r#"
+            CREATE TABLE "enrollments" (
+                "student_person_id" INTEGER NOT NULL,
+                "academic_term_id" INTEGER NOT NULL,
+                "academic_term_name" TEXT NOT NULL,
+                "academic_term_start_date" TEXT NOT NULL,
+                "course_campus_name" TEXT NOT NULL,
+                "course_student_status" TEXT NOT NULL,
+                "finalized" TEXT NOT NULL,
+                "grade_abbrv" TEXT NOT NULL
+            );
+            "#,
+        )?;
+        // Term 101 ("=SUM(A1)"): 10 distinct students, 3 DFW (WITHDRAWN, finalized F, finalized D+)
+        for s in 1i64..=10 {
+            let (status, fin, grade) = match s {
+                1 => ("WITHDRAWN", "0", ""),
+                2 => ("ENROLLED", "1", "F"),
+                3 => ("ENROLLED", "1", "D+"),
+                4 => ("ENROLLED", "0", "F"), // unfinalized -> NOT DFW!
+                _ => ("ENROLLED", "1", "A"),
+            };
+            let mut st =
+                c.prepare(r#"INSERT INTO "enrollments" VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#)?;
+            st.bind_int64(1, s)?;
+            st.bind_int64(2, 101)?;
+            st.bind_text(3, "=SUM(A1)")?;
+            st.bind_text(4, "2026-01-12T00:00:00Z")?;
+            st.bind_text(5, "Online Campus")?;
+            st.bind_text(6, status)?;
+            st.bind_text(7, fin)?;
+            st.bind_text(8, grade)?;
+            while st.step()? == StepResult::Row {}
+        }
+        // Excluded rows on Term 101: NGC grade, Main Campus, bad date
+        for (sid, dt, campus, grade) in [
+            (10i64, "2026-01-12", "Online Campus", "NGC"),
+            (99i64, "2026-01-12", "Main Campus", "F"),
+            (98i64, "bad-date", "Online Campus", "A"),
+        ] {
+            let mut st =
+                c.prepare(r#"INSERT INTO "enrollments" VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#)?;
+            st.bind_int64(1, sid)?;
+            st.bind_int64(2, 101)?;
+            st.bind_text(3, "=SUM(A1)")?;
+            st.bind_text(4, dt)?;
+            st.bind_text(5, campus)?;
+            st.bind_text(6, "ENROLLED")?;
+            st.bind_text(7, "1")?;
+            st.bind_text(8, grade)?;
+            while st.step()? == StepResult::Row {}
+        }
+        // Term 102: 12 enrollments across ONLY 3 distinct students -> suppressed!
+        for i in 0i64..12 {
+            let mut st =
+                c.prepare(r#"INSERT INTO "enrollments" VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#)?;
+            st.bind_int64(1, 500 + (i % 3))?;
+            st.bind_int64(2, 102)?;
+            st.bind_text(3, "2026SU")?;
+            st.bind_text(4, "2026-05-18T00:00:00Z")?;
+            st.bind_text(5, "Online Campus")?;
+            st.bind_text(6, "ENROLLED")?;
+            st.bind_text(7, "1")?;
+            st.bind_text(8, "A")?;
+            while st.step()? == StepResult::Row {}
+        }
+    }
+
+    let pg = MultiSchemaPgMock::start(&main_db, vec![("populi".to_string(), populi_db)])?;
+    let db_arg = format!("PopuliDB={}", pg.uri);
+
+    let ret_vm_dir = TempDir::new("ret_vm")?;
+    let ret_ora_dir = TempDir::new("ret_ora")?;
+
+    let (rvm_c, rvm_o, rvm_e) = run_dana_cmd(
+        &["run", "--policy", &pol_s, "--db", &db_arg, &ret_s],
+        Some(ret_vm_dir.path()),
+    )?;
+    assert_eq!(rvm_c, 0, "Retention VM run failed:\n{rvm_e}\n{rvm_o}");
+
+    let pg_queries = pg.recorded();
+    assert!(
+        pg_queries
+            .iter()
+            .any(|q| q.sql.contains(r#"FROM "populi"."enrollments""#) && q.sql.contains("IN (")),
+        "expected parameterized pushdown FROM \"populi\".\"enrollments\", got: {pg_queries:?}"
+    );
+
+    let (rora_c, rora_o, rora_e) = run_dana_cmd(
+        &[
+            "run", "--oracle", "--policy", &pol_s, "--db", &db_arg, &ret_s,
+        ],
+        Some(ret_ora_dir.path()),
+    )?;
+    assert_eq!(
+        rora_c, 0,
+        "Retention Oracle run failed:\n{rora_e}\n{rora_o}"
+    );
+    assert_eq!(rvm_o.trim(), "exported 1 terms");
+    assert_eq!(rora_o, rvm_o);
+
+    let vm_csv_path = ret_vm_dir.path().join("exports/retention_backtest.csv");
+    let ora_csv_path = ret_ora_dir.path().join("exports/retention_backtest.csv");
+    assert!(vm_csv_path.exists() && ora_csv_path.exists());
+    #[cfg(unix)]
+    {
+        assert_mode(&ret_vm_dir.path().join("exports"), 0o700)?;
+        assert_mode(&vm_csv_path, 0o600)?;
+        assert_mode(&ret_ora_dir.path().join("exports"), 0o700)?;
+        assert_mode(&ora_csv_path, 0o600)?;
+    }
+
+    let vm_csv = fs::read_to_string(&vm_csv_path)?;
+    let ora_csv = fs::read_to_string(&ora_csv_path)?;
+    assert_eq!(vm_csv, ora_csv);
+    assert!(
+        vm_csv.contains("101,'=SUM(A1),2026-01-12,10,10,3"),
+        "expected formula-sanitized CSV row with exact DFW count 3, got:\n{vm_csv}"
+    );
+    assert!(!vm_csv.contains("2026SU") && !vm_csv.contains("102,"));
+
+    Ok(())
+}

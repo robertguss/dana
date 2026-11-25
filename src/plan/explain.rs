@@ -1181,7 +1181,7 @@ fn trace_exec_provenance(
                             name: name.clone(),
                             ty: ScalarTy::Text,
                             tags,
-                            bucketed: false,
+                            bucketed: crate::runtime::ir::is_exec_row_expr_coarsened(expr, &cols),
                             agg_kind: AggKind::Raw,
                         };
                         if let Some(slot) = cols.iter_mut().find(|c| c.name == *name) {
@@ -1420,6 +1420,74 @@ fn trace_exec_provenance(
             let cleared = before_tags.diff(&out_tt.total_tags());
             lines.push(format!(
                 "CLEAR SuppressSmallGroups(min={min_k}, mode={mode:?}): cleared {} (remaining={})",
+                fmt_tags(&cleared),
+                fmt_tags(&out_tt.total_tags())
+            ));
+            Some(out_tt)
+        }
+        ExecPlan::Shuffle { input, .. } => {
+            let tt = trace_exec_provenance(input, prog, var_tags, table_vars, lines)?;
+            if !tt.order_tags.is_empty() {
+                lines.push(format!(
+                    "CLEAR Shuffle: cleared order_tags {}",
+                    fmt_tags(&tt.order_tags)
+                ));
+            }
+            Some(TableTy {
+                cols: tt
+                    .cols
+                    .into_iter()
+                    .map(|c| ColSpec {
+                        agg_kind: AggKind::Raw,
+                        ..c
+                    })
+                    .collect(),
+                row_tags: tt.row_tags,
+                order_tags: TagSet::empty(),
+                grouped_by: None,
+                summarized: false,
+                distinct_by: None,
+            })
+        }
+        ExecPlan::SuppressSmallCells {
+            input,
+            by_cols,
+            min_k,
+            distinct_by,
+        } => {
+            let tt = trace_exec_provenance(input, prog, var_tags, table_vars, lines)?;
+            let before_tags = tt.total_tags();
+            let out_cols = tt
+                .cols
+                .into_iter()
+                .map(|c| {
+                    let clear_ferpa = by_cols.contains(&c.name) || c.bucketed;
+                    ColSpec {
+                        tags: if clear_ferpa {
+                            c.tags.remove("ferpa")
+                        } else {
+                            c.tags
+                        },
+                        agg_kind: AggKind::Raw,
+                        ..c
+                    }
+                })
+                .collect();
+            let out_tt = TableTy {
+                cols: out_cols,
+                row_tags: TagSet::empty(),
+                order_tags: tt.order_tags,
+                grouped_by: None,
+                summarized: false,
+                distinct_by: None,
+            };
+            let cleared = before_tags.diff(&out_tt.total_tags());
+            let db_str = distinct_by
+                .as_deref()
+                .map_or_else(String::new, |d| format!(", distinct_by={d}"));
+            lines.push(format!(
+                "K_ANON SuppressSmallCells(by=[{}], min={min_k}{db_str}): cleared {} (remaining={})",
+                by_cols.join(", "),
                 fmt_tags(&cleared),
                 fmt_tags(&out_tt.total_tags())
             ));
@@ -1919,6 +1987,30 @@ fn fmt_exec_plan(plan: &ExecPlan, depth: usize, out: &mut String) {
             input, min_k, mode, ..
         } => {
             let _ = writeln!(out, "SuppressSmallGroups(min={min_k}, mode={mode:?})");
+            fmt_exec_plan(input, depth + 1, out);
+        }
+        ExecPlan::Shuffle { input, seed } => {
+            if let ExecExpr::Lit(crate::core::syntax::Literal::Int(n)) = seed.as_ref() {
+                let _ = writeln!(out, "Shuffle(seed={n})");
+            } else {
+                let _ = writeln!(out, "Shuffle");
+            }
+            fmt_exec_plan(input, depth + 1, out);
+        }
+        ExecPlan::SuppressSmallCells {
+            input,
+            by_cols,
+            min_k,
+            distinct_by,
+        } => {
+            let db_str = distinct_by
+                .as_deref()
+                .map_or_else(String::new, |d| format!(", distinct_by={d}"));
+            let _ = writeln!(
+                out,
+                "K_ANON SuppressSmallCells(by=[{}], min={min_k}{db_str})",
+                by_cols.join(", ")
+            );
             fmt_exec_plan(input, depth + 1, out);
         }
         ExecPlan::Window { input, items } => {

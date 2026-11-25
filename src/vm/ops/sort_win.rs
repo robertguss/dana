@@ -1053,4 +1053,59 @@ pub fn op_crosstab(
     }
 }
 
+/// Convert an arbitrary [`BigInt`] shuffle seed deterministically to `u64`.
+#[must_use]
+pub fn seed_from_bigint(n: &BigInt) -> u64 {
+    if let Some(v) = n.to_i64() {
+        return v as u64;
+    }
+    let s = n.to_string();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in s.as_bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+#[inline]
+fn splitmix64_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Deterministic SplitMix64 Fisher-Yates shuffle shared across Oracle and VM.
+pub fn fisher_yates_shuffle<T>(items: &mut [T], seed: u64) {
+    let mut state = seed;
+    for i in (1..items.len()).rev() {
+        let j = (splitmix64_next(&mut state) % ((i as u64) + 1)) as usize;
+        items.swap(i, j);
+    }
+}
+
+/// Deterministic `Shuffle` over columnar batches with identical row ordering to Oracle.
+#[must_use]
+pub fn op_shuffle(tbl: VmTable, seed: u64, cfg: &OpExecConfig) -> VmTable {
+    let out_cols: Vec<ColSpec> = tbl
+        .cols
+        .iter()
+        .map(|c| ColSpec {
+            agg_kind: AggKind::Raw,
+            ..c.clone()
+        })
+        .collect();
+    let mut rows = tbl.to_table_val().rows;
+    for r in &mut rows {
+        r.group_meta = None;
+    }
+    fisher_yates_shuffle(&mut rows, seed);
+    VmTable {
+        batches: rows_to_batches(&out_cols, &rows, cfg.batch_size),
+        cols: out_cols,
+    }
+}
+
 const _: fn(&Val, &Val) -> bool = val_eq;

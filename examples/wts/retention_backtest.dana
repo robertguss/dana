@@ -1,0 +1,92 @@
+## Online Campus term retention/DFW backtest reading `populi.enrollments`, enforcing `min: 10` distinct-student suppression, and writing private formula-sanitized CSV.
+module RetentionBacktest
+
+schema PopuliEnrollment
+  student_person_id: Int [pii]
+  academic_term_id: Int
+  academic_term_name: Text
+  academic_term_start_date: Text
+  course_campus_name: Text
+  course_student_status: Text [ferpa]
+  finalized: Text [ferpa]
+  grade_abbrv: Text [ferpa]
+end
+
+fn compute_retention_backtest(db: ReadDB(PopuliDB)) : Table(
+  academic_term_id: Int,
+  academic_term_name: Text,
+  term_start_date: Date?,
+  enrollments: Int,
+  distinct_students: Int,
+  dfw_count: Int
+)
+  db.table(PopuliEnrollment, from: "populi.enrollments")
+    |> where(
+      .course_campus_name == "Online Campus" and .course_student_status.in?(["ENROLLED", "WITHDRAWN", "INCOMPLETE"]) and not .grade_abbrv.in?(["NGC", "PN", "WAIV", "APPR"])
+    )
+    |> derive(
+      term_start_date: .academic_term_start_date.slice(0, 10).try_parse_date,
+      is_dfw: .course_student_status == "WITHDRAWN" or (.finalized == "1" and .grade_abbrv.in?(["F", "UF", "D+", "D", "D-"]))
+    )
+    |> where(.term_start_date.some?)
+    |> group_by(.academic_term_id, .academic_term_name, .term_start_date)
+    |> summarize(
+      enrollments: count(),
+      distinct_students: count_distinct(.student_person_id),
+      dfw_count: count_if(.is_dfw)
+    )
+    |> suppress_small_groups(min: 10, distinct_by: .student_person_id)
+    |> sort_by(.term_start_date, .academic_term_id)
+end
+
+fn main(db: ReadDB(PopuliDB), out: WriteFiles("exports/"), console: Console) : Int
+  summary = compute_retention_backtest(db)
+  try out.write_csv("retention_backtest.csv", summary, private: true, sanitize_formulas: true)
+  console.print("exported #{summary.count()} terms")
+  0
+end
+
+test "retention backtest filters, computes DFW with count_if, suppresses <10 distinct students, and sanitizes CSV"
+  # Term 101: 10 distinct Online Campus students (row 11 is excluded NGC grade and row 12 is Main Campus).
+  # Term 102: 11 enrollments across only 3 distinct students -> MUST be suppressed under `distinct_by: .student_person_id`!
+  rows = table
+    | student_person_id | academic_term_id | academic_term_name | academic_term_start_date | course_campus_name | course_student_status | finalized | grade_abbrv |
+    | 1                 | 101              | "2026SP"           | "2026-01-12T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "1"       | "A"         |
+    | 2                 | 101              | "2026SP"           | "2026-01-12T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "1"       | "B"         |
+    | 3                 | 101              | "2026SP"           | "2026-01-12T00:00:00Z"   | "Online Campus"    | "WITHDRAWN"           | "0"       | ""          |
+    | 4                 | 101              | "2026SP"           | "2026-01-12T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "1"       | "F"         |
+    | 5                 | 101              | "2026SP"           | "2026-01-12T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "1"       | "D-"        |
+    | 6                 | 101              | "2026SP"           | "2026-01-12T00:00:00Z"   | "Online Campus"    | "INCOMPLETE"          | "0"       | ""          |
+    | 7                 | 101              | "2026SP"           | "2026-01-12T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "0"       | "F"         |
+    | 8                 | 101              | "2026SP"           | "2026-01-12T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "1"       | "C"         |
+    | 9                 | 101              | "2026SP"           | "2026-01-12T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "1"       | "A-"        |
+    | 10                | 101              | "2026SP"           | "2026-01-12T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "1"       | "B+"        |
+    | 10                | 101              | "2026SP"           | "2026-01-12T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "1"       | "NGC"       |
+    | 99                | 101              | "2026SP"           | "2026-01-12T00:00:00Z"   | "Main Campus"      | "ENROLLED"            | "1"       | "F"         |
+    | 201               | 102              | "2026SU"           | "2026-05-18T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "1"       | "A"         |
+    | 201               | 102              | "2026SU"           | "2026-05-18T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "1"       | "A"         |
+    | 201               | 102              | "2026SU"           | "2026-05-18T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "1"       | "A"         |
+    | 201               | 102              | "2026SU"           | "2026-05-18T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "1"       | "A"         |
+    | 202               | 102              | "2026SU"           | "2026-05-18T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "1"       | "B"         |
+    | 202               | 102              | "2026SU"           | "2026-05-18T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "1"       | "B"         |
+    | 202               | 102              | "2026SU"           | "2026-05-18T00:00:00Z"   | "Online Campus"    | "ENROLLED"            | "1"       | "B"         |
+    | 203               | 102              | "2026SU"           | "2026-05-18T00:00:00Z"   | "Online Campus"    | "WITHDRAWN"           | "0"       | ""          |
+    | 203               | 102              | "2026SU"           | "2026-05-18T00:00:00Z"   | "Online Campus"    | "WITHDRAWN"           | "0"       | ""          |
+    | 203               | 102              | "2026SU"           | "2026-05-18T00:00:00Z"   | "Online Campus"    | "WITHDRAWN"           | "0"       | ""          |
+    | 203               | 102              | "2026SU"           | "2026-05-18T00:00:00Z"   | "Online Campus"    | "WITHDRAWN"           | "0"       | ""          |
+  end
+  db = DB.in_memory(PopuliDB, {"populi.enrollments": rows})
+  summary = compute_retention_backtest(db)
+  assert summary.count() == 1
+  assert summary.sum(.enrollments) == 10
+  assert summary.sum(.distinct_students) == 10
+  assert summary.sum(.dfw_count) == 3
+
+  formula_tbl = table
+    | term      | delta |
+    | "=SUM(1)" | -5    |
+  end
+  san_csv = formula_tbl.format_csv(sanitize_formulas: true)
+  assert san_csv.contains?("'=SUM(1)")
+  assert san_csv.contains?(",-5")
+end

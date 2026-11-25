@@ -1864,4 +1864,159 @@ pub fn op_suppress_small_groups(
     }
 }
 
+fn detect_vm_col_kind(batches: &[Batch], col_idx: usize) -> AggColKind {
+    let mut kind: Option<AggColKind> = None;
+    for batch in batches {
+        if batch.active_len() == 0 {
+            continue;
+        }
+        let k = match &batch.cols[col_idx].data {
+            ColumnData::Int(_) => AggColKind::Int,
+            ColumnData::Decimal(_) => AggColKind::Decimal,
+            ColumnData::Float(_) => AggColKind::Float,
+            _ => AggColKind::Other,
+        };
+        match kind {
+            None => kind = Some(k),
+            Some(prev) if prev == k => {}
+            Some(_) => return AggColKind::Other,
+        }
+    }
+    kind.unwrap_or(AggColKind::Other)
+}
+
+/// Row-level `k`-anonymity suppression over quasi-identifier equivalence classes (`by_cols`),
+/// optionally counting distinct non-null values of `distinct_by`.
+pub fn op_suppress_small_cells(
+    tbl: VmTable,
+    by_cols: &[Ident],
+    min_k: &BigInt,
+    distinct_by: Option<&str>,
+    cfg: &OpExecConfig,
+) -> Result<VmTable, OpErr> {
+    if by_cols.is_empty() {
+        return Err(OpErr::Failed(
+            "`suppress_small_cells` requires non-empty `by:` columns".to_string(),
+        ));
+    }
+    let mut by_indices = Vec::with_capacity(by_cols.len());
+    for name in by_cols {
+        let Some(idx) = tbl.find_col_idx(name) else {
+            return Err(OpErr::Failed(format!(
+                "unknown column `.{name}` in `suppress_small_cells`"
+            )));
+        };
+        by_indices.push(idx);
+    }
+    let distinct_idx = match distinct_by {
+        Some(dn) => {
+            let Some(idx) = tbl.find_col_idx(dn) else {
+                return Err(OpErr::Failed(format!(
+                    "unknown column `.{dn}` in `suppress_small_cells(distinct_by: ...)`"
+                )));
+            };
+            Some(idx)
+        }
+        None => None,
+    };
+
+    let floor = min_k.to_usize_saturating();
+    let out_cols: Vec<ColSpec> = tbl
+        .cols
+        .iter()
+        .map(|c| {
+            let clear_ferpa = by_cols.contains(&c.name) || c.bucketed;
+            ColSpec {
+                name: c.name.clone(),
+                ty: c.ty.clone(),
+                tags: if clear_ferpa {
+                    c.tags.remove("ferpa")
+                } else {
+                    c.tags.clone()
+                },
+                bucketed: c.bucketed,
+                agg_kind: AggKind::Raw,
+            }
+        })
+        .collect();
+
+    let distinct_kind = distinct_idx
+        .map(|di| detect_vm_col_kind(&tbl.batches, di))
+        .unwrap_or(AggColKind::Other);
+    let mut hash_buckets: FastMap<u64, Vec<usize>> = FastMap::default();
+    let mut exemplars: Vec<(usize, usize)> = Vec::new();
+    let mut group_counts: Vec<usize> = Vec::new();
+    let mut group_distinct: Vec<DistinctTracker> = Vec::new();
+    let mut row_groups: Vec<usize> = Vec::with_capacity(tbl.total_rows());
+
+    for (b_idx, batch) in tbl.batches.iter().enumerate() {
+        if batch.len == 0 {
+            continue;
+        }
+        let mut observe_row = |row: usize| {
+            let h = hash_row_key(&batch.cols, &by_indices, row);
+            let candidates = hash_buckets.entry(h).or_default();
+            let found_gid = candidates.iter().copied().find(|&gid| {
+                let (eb, er) = exemplars[gid];
+                let ex_batch = &tbl.batches[eb];
+                by_indices
+                    .iter()
+                    .all(|&ci| eq_col_cells(&ex_batch.cols[ci], er, &batch.cols[ci], row))
+            });
+            let gid = if let Some(gid) = found_gid {
+                gid
+            } else {
+                let gid = exemplars.len();
+                exemplars.push((b_idx, row));
+                candidates.push(gid);
+                group_counts.push(0);
+                if distinct_idx.is_some() {
+                    group_distinct.push(DistinctTracker::new(distinct_kind));
+                }
+                gid
+            };
+            if let Some(d_idx) = distinct_idx {
+                group_distinct[gid].push_cell(&batch.cols[d_idx], row);
+            } else {
+                group_counts[gid] += 1;
+            }
+            row_groups.push(gid);
+        };
+        match &batch.selection {
+            Some(sel) => {
+                for &r_u16 in sel {
+                    observe_row(usize::from(r_u16));
+                }
+            }
+            None => {
+                for row in 0..batch.len {
+                    observe_row(row);
+                }
+            }
+        }
+    }
+
+    let rows = tbl.to_table_val().rows;
+    let mut kept_rows = Vec::new();
+    for (idx, mut row) in rows.into_iter().enumerate() {
+        let Some(&gid) = row_groups.get(idx) else {
+            continue;
+        };
+        let sz = if distinct_idx.is_some() {
+            group_distinct[gid].len()
+        } else {
+            group_counts[gid]
+        };
+        if sz >= floor {
+            row.group_meta = None;
+            kept_rows.push(row);
+        }
+    }
+
+    Ok(VmTable {
+        batches: rows_to_batches(&out_cols, &kept_rows, cfg.batch_size),
+        cols: out_cols,
+    })
+}
+
 const _: (i128, fn(&Val, &Val) -> bool) = (DEC_SCALE, val_eq);
