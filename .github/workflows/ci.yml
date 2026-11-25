@@ -10,7 +10,7 @@ env:
 
 jobs:
   linux-verify:
-    name: Linux Verification (Grammar, Clippy, Docs, Tests)
+    name: Linux Verification (Grammar, Formal, Clippy, Docs, Tests)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,6 +39,26 @@ jobs:
           make grammar
           make clean
           CC=clang make grammar
+
+      - name: Cache Lean 4 toolchain and formal build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.elan/toolchains
+            formal/.lake/build
+          key: lean-${{ runner.os }}-${{ hashFiles('formal/lean-toolchain', 'formal/lakefile.toml', 'formal/**/*.lean') }}
+          restore-keys: |
+            lean-${{ runner.os }}-${{ hashFiles('formal/lean-toolchain') }}-
+            lean-${{ runner.os }}-
+
+      - name: Install elan and verify Lean 4 formal proofs (make formal)
+        run: |
+          if [ ! -x "$HOME/.elan/bin/elan" ]; then
+            curl -sSfL https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none --no-modify-path
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          make formal
 
       - name: Run full Rust test suite and release smoke check
         run: |
