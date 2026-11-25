@@ -44,7 +44,7 @@ use crate::db::{
 use crate::formats::time::{format_iso_date, format_iso_timestamp};
 use crate::oracle::value::Val;
 use crate::runtime::ir::{
-    ExecAggItem, ExecAggOp, ExecDeriveItem, ExecExpr, ExecHostOp, ExecPlan, ExecPrimOp,
+    DedupeKeep, ExecAggItem, ExecAggOp, ExecDeriveItem, ExecExpr, ExecHostOp, ExecPlan, ExecPrimOp,
     ExecProgram, ExecRowExpr,
 };
 
@@ -233,9 +233,25 @@ pub fn split_exec_plan_pushdown(
     dialect: SqlDialect,
     lock: Option<&SchemaLockFile>,
 ) -> SplitPlan<ExecPlan> {
+    split_exec_plan_pushdown_with_table_refs(plan, prog, db_name, dialect, lock, None)
+}
+
+/// Variant of [`split_exec_plan_pushdown`] accepting resolved SQL table references
+/// (used by the SQLite driver for `--attach` namespaces and unattached `schema.table` fallbacks).
+#[must_use]
+pub fn split_exec_plan_pushdown_with_table_refs(
+    plan: &ExecPlan,
+    prog: &ExecProgram,
+    db_name: &str,
+    dialect: SqlDialect,
+    lock: Option<&SchemaLockFile>,
+    table_refs: Option<&HashMap<String, String>>,
+) -> SplitPlan<ExecPlan> {
     let ctx = ExecSplitCtx::new(prog, Some(db_name), dialect, lock);
     match split_exec_node(plan, &ctx, false, false, false) {
-        NodeSplit::Pushed(node) => SplitPlan::FullyPushed(node.into_query(dialect, None)),
+        NodeSplit::Pushed(node) => {
+            SplitPlan::FullyPushed(node.into_query_with_table_refs(dialect, None, table_refs))
+        }
         NodeSplit::Hybrid {
             pushed,
             placeholder_var,
@@ -249,7 +265,7 @@ pub fn split_exec_plan_pushdown(
                 }
             } else {
                 SplitPlan::Hybrid {
-                    pushdown: pushed.into_query(dialect, Some(reason)),
+                    pushdown: pushed.into_query_with_table_refs(dialect, Some(reason), table_refs),
                     placeholder_var,
                     local_suffix: local_plan,
                 }
@@ -359,6 +375,17 @@ pub fn bind_exec_plan_sources(plan: &ExecPlan, bindings: &HashMap<Ident, ExecPla
         ExecPlan::Distinct { input, cols } => ExecPlan::Distinct {
             input: Box::new(bind_exec_plan_sources(input, bindings)),
             cols: cols.clone(),
+        },
+        ExecPlan::DedupeBy {
+            input,
+            keys,
+            order_by,
+            keep,
+        } => ExecPlan::DedupeBy {
+            input: Box::new(bind_exec_plan_sources(input, bindings)),
+            keys: keys.clone(),
+            order_by: order_by.clone(),
+            keep: *keep,
         },
         ExecPlan::Sort { input, keys } => ExecPlan::Sort {
             input: Box::new(bind_exec_plan_sources(input, bindings)),
@@ -566,6 +593,11 @@ enum SqlExpr {
         expr: Box<SqlExpr>,
         items: Vec<SqlExpr>,
     },
+    TryParseIsoDate(Box<SqlExpr>),
+    RowNumber {
+        partition_by: Vec<SqlExpr>,
+        order_by: Vec<SqlOrderItem>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -607,6 +639,7 @@ struct SqlOrderItem {
 enum SqlQuery {
     Select {
         distinct: bool,
+        distinct_on: Vec<SqlExpr>,
         items: Vec<SqlSelectItem>,
         from: Box<SqlFrom>,
         where_clause: Option<SqlExpr>,
@@ -621,18 +654,23 @@ enum SqlQuery {
     },
 }
 
-struct SqlRenderState {
+struct SqlRenderState<'a> {
     dialect: SqlDialect,
     sql: String,
     params: Vec<SqlParamSlot>,
+    table_refs: Option<&'a HashMap<String, String>>,
 }
 
-impl SqlRenderState {
-    fn new(dialect: SqlDialect) -> Self {
+impl<'a> SqlRenderState<'a> {
+    fn with_table_refs(
+        dialect: SqlDialect,
+        table_refs: Option<&'a HashMap<String, String>>,
+    ) -> Self {
         Self {
             dialect,
             sql: String::new(),
             params: Vec::new(),
+            table_refs,
         }
     }
 
@@ -655,6 +693,7 @@ impl SqlRenderState {
         match query {
             SqlQuery::Select {
                 distinct,
+                distinct_on,
                 items,
                 from,
                 where_clause,
@@ -663,7 +702,16 @@ impl SqlRenderState {
                 limit,
             } => {
                 self.sql.push_str("SELECT ");
-                if *distinct {
+                if !distinct_on.is_empty() {
+                    self.sql.push_str("DISTINCT ON (");
+                    for (i, e) in distinct_on.iter().enumerate() {
+                        if i > 0 {
+                            self.sql.push_str(", ");
+                        }
+                        self.render_expr(e);
+                    }
+                    self.sql.push_str(") ");
+                } else if *distinct {
                     self.sql.push_str("DISTINCT ");
                 }
                 for (i, item) in items.iter().enumerate() {
@@ -740,7 +788,11 @@ impl SqlRenderState {
     fn render_from(&mut self, from: &SqlFrom) {
         match from {
             SqlFrom::Table { name } => {
-                self.sql.push_str(&quote_sql_table_ref(name));
+                if let Some(resolved) = self.table_refs.and_then(|m| m.get(name)) {
+                    self.sql.push_str(resolved);
+                } else {
+                    self.sql.push_str(&quote_sql_table_ref(name));
+                }
             }
             SqlFrom::Subquery { query, alias } => {
                 self.sql.push('(');
@@ -927,6 +979,136 @@ impl SqlRenderState {
                     self.render_expr(item);
                 }
                 self.sql.push_str("))");
+            }
+            SqlExpr::TryParseIsoDate(inner) => {
+                self.render_try_parse_iso_date(inner);
+            }
+            SqlExpr::RowNumber {
+                partition_by,
+                order_by,
+            } => {
+                self.sql.push_str("ROW_NUMBER() OVER (");
+                if !partition_by.is_empty() {
+                    self.sql.push_str("PARTITION BY ");
+                    for (i, e) in partition_by.iter().enumerate() {
+                        if i > 0 {
+                            self.sql.push_str(", ");
+                        }
+                        self.render_expr(e);
+                    }
+                    if !order_by.is_empty() {
+                        self.sql.push(' ');
+                    }
+                }
+                if !order_by.is_empty() {
+                    self.sql.push_str("ORDER BY ");
+                    for (i, o) in order_by.iter().enumerate() {
+                        if i > 0 {
+                            self.sql.push_str(", ");
+                        }
+                        self.render_expr(&o.expr);
+                        match o.dir {
+                            SortDir::Asc => self.sql.push_str(" ASC NULLS FIRST"),
+                            SortDir::Desc => self.sql.push_str(" DESC NULLS LAST"),
+                        }
+                    }
+                }
+                self.sql.push(')');
+            }
+        }
+    }
+
+    fn render_trimmed_ascii(&mut self, inner: &SqlExpr) {
+        match self.dialect {
+            SqlDialect::Sqlite => {
+                self.sql.push_str("TRIM(");
+                self.render_expr(inner);
+                self.sql.push_str(", char(32, 9, 10, 13))");
+            }
+            SqlDialect::Postgres => {
+                self.sql.push_str("BTRIM(");
+                self.render_expr(inner);
+                self.sql
+                    .push_str(", CHR(32) || CHR(9) || CHR(10) || CHR(13))");
+            }
+        }
+    }
+
+    fn render_substr_slice(&mut self, inner: &SqlExpr, start: usize, len: usize) {
+        match self.dialect {
+            SqlDialect::Sqlite => {
+                self.sql.push_str("SUBSTR(");
+                self.render_trimmed_ascii(inner);
+                let _ = write!(self.sql, ", {start}, {len})");
+            }
+            SqlDialect::Postgres => {
+                self.sql.push_str("SUBSTRING(");
+                self.render_trimmed_ascii(inner);
+                let _ = write!(self.sql, " FROM {start} FOR {len})");
+            }
+        }
+    }
+
+    fn render_try_parse_iso_date(&mut self, inner: &SqlExpr) {
+        self.sql.push_str("(CASE WHEN (");
+        self.render_trimmed_ascii(inner);
+        match self.dialect {
+            SqlDialect::Sqlite => {
+                self.sql.push_str(
+                    " GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]') THEN (CASE WHEN ((",
+                );
+            }
+            SqlDialect::Postgres => {
+                self.sql
+                    .push_str(" ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$') THEN (CASE WHEN ((");
+            }
+        }
+        self.render_substr_slice(inner, 1, 4);
+        self.sql.push_str(" <> '0000') AND (");
+        // Months with 31 days
+        self.sql.push('(');
+        self.render_substr_slice(inner, 6, 2);
+        self.sql
+            .push_str(" IN ('01','03','05','07','08','10','12') AND ");
+        self.render_substr_slice(inner, 9, 2);
+        self.sql.push_str(" >= '01' AND ");
+        self.render_substr_slice(inner, 9, 2);
+        self.sql.push_str(" <= '31')");
+        // Months with 30 days
+        self.sql.push_str(" OR (");
+        self.render_substr_slice(inner, 6, 2);
+        self.sql.push_str(" IN ('04','06','09','11') AND ");
+        self.render_substr_slice(inner, 9, 2);
+        self.sql.push_str(" >= '01' AND ");
+        self.render_substr_slice(inner, 9, 2);
+        self.sql.push_str(" <= '30')");
+        // February with proleptic Gregorian leap-year check
+        self.sql.push_str(" OR (");
+        self.render_substr_slice(inner, 6, 2);
+        self.sql.push_str(" = '02' AND ");
+        self.render_substr_slice(inner, 9, 2);
+        self.sql.push_str(" >= '01' AND ");
+        self.render_substr_slice(inner, 9, 2);
+        self.sql.push_str(" <= (CASE WHEN ((CAST(");
+        self.render_substr_slice(inner, 1, 4);
+        self.sql.push_str(" AS INTEGER) % 4 = 0 AND CAST(");
+        self.render_substr_slice(inner, 1, 4);
+        self.sql.push_str(" AS INTEGER) % 100 <> 0) OR (CAST(");
+        self.render_substr_slice(inner, 1, 4);
+        self.sql
+            .push_str(" AS INTEGER) % 400 = 0)) THEN '29' ELSE '28' END))");
+        match self.dialect {
+            SqlDialect::Sqlite => {
+                self.sql.push_str(")) THEN ");
+                self.render_trimmed_ascii(inner);
+                self.sql.push_str(" ELSE NULL END) ELSE NULL END)");
+            }
+            SqlDialect::Postgres => {
+                self.sql.push_str(")) THEN CAST(");
+                self.render_trimmed_ascii(inner);
+                self.sql.push_str(
+                    " AS DATE) ELSE CAST(NULL AS DATE) END) ELSE CAST(NULL AS DATE) END)",
+                );
             }
         }
     }
@@ -1121,7 +1303,16 @@ impl PushedNode {
     }
 
     fn into_query(self, dialect: SqlDialect, boundary_reason: Option<String>) -> SqlPushdownQuery {
-        let mut renderer = SqlRenderState::new(dialect);
+        self.into_query_with_table_refs(dialect, boundary_reason, None)
+    }
+
+    fn into_query_with_table_refs(
+        self,
+        dialect: SqlDialect,
+        boundary_reason: Option<String>,
+        table_refs: Option<&HashMap<String, String>>,
+    ) -> SqlPushdownQuery {
+        let mut renderer = SqlRenderState::with_table_refs(dialect, table_refs);
         renderer.render_query(&self.query);
         SqlPushdownQuery {
             db_name: self.db_name,
@@ -1157,6 +1348,7 @@ impl PushedNode {
         let inner = Box::new(self.query);
         self.query = SqlQuery::Select {
             distinct: false,
+            distinct_on: Vec::new(),
             items,
             from: Box::new(SqlFrom::Subquery {
                 query: inner,
@@ -1220,6 +1412,7 @@ impl PushedNode {
             db_name: db_name.to_string(),
             query: SqlQuery::Select {
                 distinct: false,
+                distinct_on: Vec::new(),
                 items,
                 from: Box::new(SqlFrom::Table {
                     name: table_name.to_string(),
@@ -1628,6 +1821,246 @@ impl PushedNode {
         Ok(self)
     }
 
+    fn apply_dedupe_by(
+        mut self,
+        keys: &[Ident],
+        order_by: &[(Ident, SortDir)],
+        keep: DedupeKeep,
+        dialect: SqlDialect,
+        order_insensitive: bool,
+    ) -> Result<Self, String> {
+        if !order_insensitive {
+            return Err("order-preserving dedupe_by requires local VM".to_string());
+        }
+        if keys.is_empty() {
+            return Err("dedupe_by requires at least one key column".to_string());
+        }
+        for k in keys {
+            let Some(spec) = self.schema.find_col(k) else {
+                return Err(format!("dedupe_by references missing key column `{k}`"));
+            };
+            if !is_dialect_exact_eq(dialect, &spec.ty) {
+                return Err(non_exact_type_reason(dialect, &spec.ty, "DedupeBy key"));
+            }
+        }
+        for (c, _) in order_by {
+            let Some(spec) = self.schema.find_col(c) else {
+                return Err(format!("dedupe_by references missing order column `{c}`"));
+            };
+            if !is_dialect_exact_ord(dialect, &spec.ty) {
+                return Err(non_exact_type_reason(
+                    dialect,
+                    &spec.ty,
+                    "DedupeBy order_by",
+                ));
+            }
+        }
+        let mut combined_cols: Vec<Ident> = keys.to_vec();
+        for (c, _) in order_by {
+            if !combined_cols.contains(c) {
+                combined_cols.push(c.clone());
+            }
+        }
+        let covers_all = self
+            .schema
+            .cols
+            .iter()
+            .all(|c| combined_cols.contains(&c.name));
+        if !(covers_all || self.keys_proven_unique(&combined_cols)) {
+            return Err(
+                "dedupe_by with non-unique tie-breaker requires local VM to preserve input tie order"
+                    .to_string(),
+            );
+        }
+
+        let effective_order: Vec<(Ident, SortDir)> = order_by
+            .iter()
+            .map(|(c, d)| {
+                let eff_dir = match (keep, d) {
+                    (DedupeKeep::First, d) => *d,
+                    (DedupeKeep::Last, SortDir::Asc) => SortDir::Desc,
+                    (DedupeKeep::Last, SortDir::Desc) => SortDir::Asc,
+                };
+                (c.clone(), eff_dir)
+            })
+            .collect();
+
+        let make_col_expr = |col_name: &str, spec: &ColSpec| -> SqlExpr {
+            let base = SqlExpr::Col {
+                table_alias: None,
+                name: col_name.to_string(),
+            };
+            if dialect == SqlDialect::Postgres && matches!(base_of_scalar(&spec.ty), ScalarTy::Text)
+            {
+                SqlExpr::CollateC(Box::new(base))
+            } else {
+                base
+            }
+        };
+
+        let key_exprs: Vec<SqlExpr> = keys
+            .iter()
+            .filter_map(|k| self.schema.find_col(k).map(|s| make_col_expr(k, s)))
+            .collect();
+        let ord_items: Vec<SqlOrderItem> = effective_order
+            .iter()
+            .filter_map(|(k, d)| {
+                self.schema.find_col(k).map(|s| SqlOrderItem {
+                    expr: make_col_expr(k, s),
+                    dir: *d,
+                })
+            })
+            .collect();
+
+        let key_tags = TagSet::union_list(
+            keys.iter()
+                .filter_map(|k| self.schema.find_col(k).map(|c| &c.tags)),
+        );
+        let ord_tags = TagSet::union_list(
+            order_by
+                .iter()
+                .filter_map(|(k, _)| self.schema.find_col(k).map(|c| &c.tags)),
+        );
+
+        match dialect {
+            SqlDialect::Postgres => {
+                let must_wrap = self.needs_wrap_for_proj
+                    || self.needs_wrap_for_filter
+                    || matches!(
+                        &self.query,
+                        SqlQuery::UnionAll { .. }
+                            | SqlQuery::Select { distinct: true, .. }
+                            | SqlQuery::Select { limit: Some(_), .. }
+                    )
+                    || matches!(
+                        &self.query,
+                        SqlQuery::Select {
+                            group_by,
+                            order_by,
+                            distinct_on,
+                            ..
+                        } if !group_by.is_empty() || !order_by.is_empty() || !distinct_on.is_empty()
+                    );
+                if must_wrap {
+                    self = self.wrap_as_subquery();
+                }
+                let mut pg_order = Vec::with_capacity(key_exprs.len() + ord_items.len());
+                for ke in &key_exprs {
+                    pg_order.push(SqlOrderItem {
+                        expr: ke.clone(),
+                        dir: SortDir::Asc,
+                    });
+                }
+                pg_order.extend(ord_items);
+                if let SqlQuery::Select {
+                    distinct_on,
+                    order_by: q_order,
+                    ..
+                } = &mut self.query
+                {
+                    *distinct_on = key_exprs;
+                    *q_order = pg_order;
+                }
+            }
+            SqlDialect::Sqlite => {
+                let mut rn_alias = self.fresh_alias("rn");
+                while self.schema.find_col(&rn_alias).is_some() {
+                    rn_alias = self.fresh_alias("rn");
+                }
+                let inner_alias = self.fresh_alias("q");
+                let win_alias = self.fresh_alias("dedupe");
+                let mut win_items: Vec<SqlSelectItem> = self
+                    .schema
+                    .cols
+                    .iter()
+                    .map(|c| SqlSelectItem {
+                        expr: SqlExpr::Col {
+                            table_alias: None,
+                            name: c.name.clone(),
+                        },
+                        alias: c.name.clone(),
+                    })
+                    .collect();
+                win_items.push(SqlSelectItem {
+                    expr: SqlExpr::RowNumber {
+                        partition_by: key_exprs,
+                        order_by: ord_items,
+                    },
+                    alias: rn_alias.clone(),
+                });
+                let win_query = SqlQuery::Select {
+                    distinct: false,
+                    distinct_on: Vec::new(),
+                    items: win_items,
+                    from: Box::new(SqlFrom::Subquery {
+                        query: Box::new(self.query),
+                        alias: inner_alias,
+                    }),
+                    where_clause: None,
+                    group_by: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                };
+                let outer_items: Vec<SqlSelectItem> = self
+                    .schema
+                    .cols
+                    .iter()
+                    .map(|c| SqlSelectItem {
+                        expr: SqlExpr::Col {
+                            table_alias: None,
+                            name: c.name.clone(),
+                        },
+                        alias: c.name.clone(),
+                    })
+                    .collect();
+                self.query = SqlQuery::Select {
+                    distinct: false,
+                    distinct_on: Vec::new(),
+                    items: outer_items,
+                    from: Box::new(SqlFrom::Subquery {
+                        query: Box::new(win_query),
+                        alias: win_alias,
+                    }),
+                    where_clause: Some(SqlExpr::Binary {
+                        op: "=",
+                        left: Box::new(SqlExpr::Col {
+                            table_alias: None,
+                            name: rn_alias,
+                        }),
+                        right: Box::new(SqlExpr::IntLit(1)),
+                    }),
+                    group_by: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                };
+            }
+        }
+
+        self.unique_keys.push(keys.to_vec());
+        for c in &mut self.schema.cols {
+            c.agg_kind = AggKind::Raw;
+        }
+        self.schema.row_tags = self
+            .schema
+            .row_tags
+            .union(&key_tags)
+            .union(&ord_tags)
+            .union(&self.schema.order_tags);
+        self.schema.grouped_by = None;
+        self.schema.summarized = false;
+        self.schema.distinct_by = None;
+        self.deterministic_order = false;
+        self.needs_wrap_for_filter = true;
+        self.needs_wrap_for_proj = true;
+        let ord_desc: Vec<String> = order_by.iter().map(|(c, d)| format!("{c}:{d:?}")).collect();
+        self.pushed_ops.push(format!(
+            "DedupeBy(keys=[{}], order=[{}], keep={keep:?})",
+            keys.join(", "),
+            ord_desc.join(", ")
+        ));
+        Ok(self)
+    }
+
     fn apply_union(left: Self, right: Self) -> Result<Self, String> {
         if left.db_name != right.db_name {
             return Err(format!(
@@ -1800,6 +2233,7 @@ impl PushedNode {
                     .collect();
                 let exists_sub = SqlQuery::Select {
                     distinct: false,
+                    distinct_on: Vec::new(),
                     items: vec![SqlSelectItem {
                         expr: SqlExpr::Param {
                             slot: SqlParamSlot::Literal(SqlParam::Int(1)),
@@ -1818,6 +2252,7 @@ impl PushedNode {
                 };
                 let q = SqlQuery::Select {
                     distinct: false,
+                    distinct_on: Vec::new(),
                     items,
                     from: Box::new(SqlFrom::Subquery {
                         query: Box::new(left.query),
@@ -1874,6 +2309,7 @@ impl PushedNode {
                 };
                 let q = SqlQuery::Select {
                     distinct: false,
+                    distinct_on: Vec::new(),
                     items,
                     from: Box::new(SqlFrom::Join {
                         left: Box::new(SqlFrom::Subquery {
@@ -4229,6 +4665,7 @@ fn exec_unary_child(plan: &ExecPlan) -> Option<&ExecPlan> {
         | ExecPlan::Derive { input, .. }
         | ExecPlan::Filter { input, .. }
         | ExecPlan::Distinct { input, .. }
+        | ExecPlan::DedupeBy { input, .. }
         | ExecPlan::Sort { input, .. }
         | ExecPlan::Limit { input, .. }
         | ExecPlan::GroupBy { input, .. }
@@ -4279,6 +4716,17 @@ fn rebuild_exec_unary(stage: &ExecPlan, new_input: ExecPlan) -> ExecPlan {
         ExecPlan::Distinct { cols, .. } => ExecPlan::Distinct {
             input: Box::new(new_input),
             cols: cols.clone(),
+        },
+        ExecPlan::DedupeBy {
+            keys,
+            order_by,
+            keep,
+            ..
+        } => ExecPlan::DedupeBy {
+            input: Box::new(new_input),
+            keys: keys.clone(),
+            order_by: order_by.clone(),
+            keep: *keep,
         },
         ExecPlan::Sort { keys, .. } => ExecPlan::Sort {
             input: Box::new(new_input),
@@ -4800,9 +5248,19 @@ fn translate_exec_row_expr(
                     x_tags,
                 ))
             }
+            (ExecPrimOp::TryParseDate, [s_re]) => {
+                let (s_e, s_ty, s_tags) = translate_exec_row_expr(s_re, schema, ctx)?;
+                if s_ty != ScalarTy::Text {
+                    return Err("try_parse_date requires non-Option Text".to_string());
+                }
+                Ok((
+                    SqlExpr::TryParseIsoDate(Box::new(s_e)),
+                    ScalarTy::Option(Box::new(ScalarTy::Date)),
+                    s_tags,
+                ))
+            }
             (
-                ExecPrimOp::TryParseDate
-                | ExecPrimOp::TryParseInt
+                ExecPrimOp::TryParseInt
                 | ExecPrimOp::TryParseDecimal
                 | ExecPrimOp::TryParseFloat
                 | ExecPrimOp::ClampFloat
@@ -4990,6 +5448,11 @@ fn exec_plan_cols_and_uqs_hint(
             if cols.is_empty() || in_cols.iter().all(|c| cols.contains(c)) {
                 uqs.push(in_cols.clone());
             }
+            Some((in_cols, uqs))
+        }
+        ExecPlan::DedupeBy { input, keys, .. } => {
+            let (in_cols, mut uqs) = exec_plan_cols_and_uqs_hint(input, ctx)?;
+            uqs.push(keys.clone());
             Some((in_cols, uqs))
         }
         ExecPlan::Redact { input, col, .. } | ExecPlan::Pseudonymize { input, col, .. } => {
@@ -5367,6 +5830,60 @@ fn split_exec_node(
             },
             NodeSplit::LocalOnly { reason } => NodeSplit::LocalOnly { reason },
         },
+        ExecPlan::DedupeBy {
+            input,
+            keys,
+            order_by,
+            keep,
+        } => {
+            let mut combined = keys.clone();
+            for (c, _) in order_by {
+                if !combined.contains(c) {
+                    combined.push(c.clone());
+                }
+            }
+            let unique_tie =
+                exec_plan_cols_and_uqs_hint(input, ctx).is_some_and(|(in_cols, uqs)| {
+                    in_cols.iter().all(|c| combined.contains(c))
+                        || uqs.iter().any(|uk| uk.iter().all(|k| combined.contains(k)))
+                });
+            let child_ord_insens = order_insensitive && unique_tie;
+            match split_exec_node(input, ctx, child_ord_insens, false, parent_has_sort) {
+                NodeSplit::Pushed(node) => {
+                    let orig = node.clone();
+                    match node.apply_dedupe_by(
+                        keys,
+                        order_by,
+                        *keep,
+                        ctx.dialect,
+                        order_insensitive,
+                    ) {
+                        Ok(next) => NodeSplit::Pushed(next),
+                        Err(reason) => NodeSplit::Hybrid {
+                            pushed: orig,
+                            placeholder_var: PLACEHOLDER.to_string(),
+                            local_plan: rebuild_exec_unary(
+                                plan,
+                                exec_placeholder_plan(PLACEHOLDER),
+                            ),
+                            reason,
+                        },
+                    }
+                }
+                NodeSplit::Hybrid {
+                    pushed,
+                    placeholder_var,
+                    local_plan,
+                    reason,
+                } => NodeSplit::Hybrid {
+                    pushed,
+                    placeholder_var,
+                    local_plan: rebuild_exec_unary(plan, local_plan),
+                    reason,
+                },
+                NodeSplit::LocalOnly { reason } => NodeSplit::LocalOnly { reason },
+            }
+        }
         ExecPlan::Distinct { input, cols } => {
             let covers_all_hint = cols.is_empty()
                 || exec_plan_cols_and_uqs_hint(input, ctx)
@@ -5874,6 +6391,36 @@ fn collect_exec_rec(
                 let child_ord = order_insensitive || exec_sort_is_total_hint(input, keys, ctx);
                 let new_in = collect_exec_rec(
                     input, ctx, child_ord, false, true, next_id, branches, reasons,
+                );
+                rebuild_exec_unary(plan, new_in)
+            }
+            ExecPlan::DedupeBy {
+                input,
+                keys,
+                order_by,
+                ..
+            } => {
+                let mut combined = keys.clone();
+                for (c, _) in order_by {
+                    if !combined.contains(c) {
+                        combined.push(c.clone());
+                    }
+                }
+                let unique_tie =
+                    exec_plan_cols_and_uqs_hint(input, ctx).is_some_and(|(in_cols, uqs)| {
+                        in_cols.iter().all(|c| combined.contains(c))
+                            || uqs.iter().any(|uk| uk.iter().all(|k| combined.contains(k)))
+                    });
+                let child_ord = order_insensitive && unique_tie;
+                let new_in = collect_exec_rec(
+                    input,
+                    ctx,
+                    child_ord,
+                    false,
+                    parent_has_sort,
+                    next_id,
+                    branches,
+                    reasons,
                 );
                 rebuild_exec_unary(plan, new_in)
             }

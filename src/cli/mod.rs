@@ -1,12 +1,12 @@
 //! Zero-crate CLI entry point for the `dana` toolchain binary.
 //!
 //! Subcommands:
-//! - `dana check [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--json] <FILE...>`
-//! - `dana run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]`
-//! - `dana dry-run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]`
-//! - `dana schema-sync --db Name=URI [--db Name2=URI2 ...] [--schemas s1,s2,...] [--out schema.lock]`
+//! - `dana check [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--json] <FILE...>`
+//! - `dana run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]`
+//! - `dana dry-run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]`
+//! - `dana schema-sync --db Name=URI [--db Name2=URI2 ...] [--attach [DB:]schema=PATH]... [--schemas s1,s2,...] [--out schema.lock]`
 //! - `dana explain [--dialect sqlite|postgres] [--schema-lock FILE] [--policy FILE] <FILE>`
-//! - `dana repl [--policy FILE] [--db Name=URI]... [--schema-lock FILE] [--show-sensitive TAGS] [--eval EXPR]`
+//! - `dana repl [--policy FILE] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--show-sensitive TAGS] [--eval EXPR]`
 //! - `dana vendor pin|verify [--dir PATH]`
 //! - `dana test [--oracle] [--policy FILE] [--filter SUBSTR] [PATH...]`
 //! - `dana format [--check] <PATH...>`
@@ -31,7 +31,7 @@ use crate::core::text::print_program;
 use crate::db::schema_lock::{
     SchemaLock, SchemaLockFile, format_schema_lock, merge_schema_lock, parse_schema_lock,
 };
-use crate::db::{SqlDialect, open_connection};
+use crate::db::{SqlDialect, open_connection, parse_attach_spec};
 use crate::formats::compress::{AutoEncodeWriter, detect_compression_path, strip_compression_ext};
 use crate::formats::fake::{FakeFormat, write_fake_rows};
 use crate::formats::infer::{InferFormat, default_schema_name_from_path, infer_schema_from_file};
@@ -45,28 +45,28 @@ use crate::runtime::{RunConfig, RunResult, run_exec_program, run_program_tests};
 use crate::syntax::{format_module, parse_module};
 use crate::vm::{VmConfig, run_exec_program_vm, run_program_tests_vm};
 
-/// Authoritative Dana Language Reference v0.5 embedded for offline `dana guide`.
+/// Authoritative Dana Language Reference v0.6 embedded for offline `dana guide`.
 pub const EMBEDDED_GUIDE: &str = include_str!("../../docs/reference/README.md");
 
 const USAGE: &str = "\
-dana — fast, private, database-native data language toolchain (v0.5)
+dana — fast, private, database-native data language toolchain (v0.6)
 
 USAGE:
   dana <COMMAND> [OPTIONS]
 
 COMMANDS:
-  check [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--json] <FILE...>
+  check [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--json] <FILE...>
       Parse, type-check, privacy-check, and verify Dana source file(s) (with offline schema.lock).
-  run [--oracle] [--oracle-steps N] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]
+  run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]
       Compile and execute a Dana program's `main` function (vectorized columnar VM + SQL pushdown
       by default; pass `--oracle` for the reference row-by-row engine).
-  dry-run [--oracle] [--oracle-steps N] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]
+  dry-run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]
       Execute strictly read-only, printing redacted WriteTable diffs and suppressing disk/DB writes.
-  schema-sync --db Name=URI [--db Name2=URI2 ...] [--schemas s1,s2,...] [--out schema.lock]
+  schema-sync --db Name=URI [--db Name2=URI2 ...] [--attach [DB:]schema=PATH]... [--schemas s1,s2,...] [--out schema.lock]
       Introspect live SQLite/PostgreSQL databases and update schema.lock while preserving sensitivity tags.
   explain [--dialect sqlite|postgres] [--schema-lock FILE] [--policy FILE] <FILE>
       Show logical/optimized plans, parameterized SQL pushdown, boundary reasons, and sensitivity provenance.
-  repl [--policy FILE] [--db Name=URI]... [--schema-lock FILE] [--show-sensitive TAGS] [--eval EXPR]
+  repl [--policy FILE] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--show-sensitive TAGS] [--eval EXPR]
       Start a safe read-only, privacy-redacted interactive REPL (or run a one-liner via `--eval`).
   vendor pin|verify [--dir PATH]
       Pin or verify SHA-256 hashes of pure-by-default vendored modules in `vendor/vendor.lock`.
@@ -408,6 +408,11 @@ fn cmd_check(args: &[String]) -> i32 {
                 eprintln!("dana check: {e}");
                 return 2;
             }
+        } else if let Some(val) = arg.strip_prefix("--attach=") {
+            if let Err(e) = crate::db::parse_attach_spec(val) {
+                eprintln!("dana check: {e}");
+                return 2;
+            }
         } else {
             match arg {
                 "--policy" => {
@@ -433,6 +438,17 @@ fn cmd_check(args: &[String]) -> i32 {
                         return 2;
                     };
                     if let Err(e) = parse_db_binding(raw) {
+                        eprintln!("dana check: {e}");
+                        return 2;
+                    }
+                }
+                "--attach" => {
+                    i += 1;
+                    let Some(raw) = args.get(i) else {
+                        eprintln!("dana check: `--attach` requires `[DB:]schema=PATH`");
+                        return 2;
+                    };
+                    if let Err(e) = crate::db::parse_attach_spec(raw) {
                         eprintln!("dana check: {e}");
                         return 2;
                     }
@@ -680,6 +696,7 @@ fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
     let mut policy_path: Option<PathBuf> = None;
     let mut lock_path: Option<PathBuf> = None;
     let mut db_bindings: HashMap<String, String> = HashMap::new();
+    let mut sqlite_attachments: Vec<(Option<String>, String, String)> = Vec::new();
     let mut allow_export = TagSet::empty();
     let mut emit_core = false;
     let mut script_path: Option<PathBuf> = None;
@@ -709,6 +726,14 @@ fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
                 Ok((name, uri)) => {
                     db_bindings.insert(name, uri);
                 }
+                Err(e) => {
+                    eprintln!("{cmd_name}: {e}");
+                    return 2;
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--attach=") {
+            match crate::db::parse_attach_spec(val) {
+                Ok(spec) => sqlite_attachments.push(spec),
                 Err(e) => {
                     eprintln!("{cmd_name}: {e}");
                     return 2;
@@ -748,6 +773,20 @@ fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
                     }
                 }
                 "--emit-core" if !dry_run => emit_core = true,
+                "--attach" => {
+                    i += 1;
+                    let Some(raw) = args.get(i) else {
+                        eprintln!("{cmd_name}: `--attach` requires `[DB:]schema=PATH`");
+                        return 2;
+                    };
+                    match crate::db::parse_attach_spec(raw) {
+                        Ok(spec) => sqlite_attachments.push(spec),
+                        Err(e) => {
+                            eprintln!("{cmd_name}: {e}");
+                            return 2;
+                        }
+                    }
+                }
                 "--policy" => {
                     i += 1;
                     let Some(p) = args.get(i) else {
@@ -877,6 +916,7 @@ fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
         live_io: true,
         fuel: oracle_steps.unwrap_or(def_cfg.fuel),
         db_bindings,
+        sqlite_attachments,
         schema_lock,
         dry_run,
         ..def_cfg
@@ -957,6 +997,7 @@ fn parse_schema_list(raw: &str) -> Result<Vec<String>, String> {
 
 fn cmd_schema_sync(args: &[String]) -> i32 {
     let mut db_specs: Vec<(String, String)> = Vec::new();
+    let mut sqlite_attachments: Vec<(Option<String>, String, String)> = Vec::new();
     let mut schemas: Vec<String> = Vec::new();
     let mut out_path = PathBuf::from("schema.lock");
     let mut i = 0;
@@ -966,6 +1007,14 @@ fn cmd_schema_sync(args: &[String]) -> i32 {
         if let Some(val) = arg.strip_prefix("--db=") {
             match parse_db_binding(val) {
                 Ok(pair) => db_specs.push(pair),
+                Err(e) => {
+                    eprintln!("dana schema-sync: {e}");
+                    return 2;
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--attach=") {
+            match parse_attach_spec(val) {
+                Ok(spec) => sqlite_attachments.push(spec),
                 Err(e) => {
                     eprintln!("dana schema-sync: {e}");
                     return 2;
@@ -997,6 +1046,20 @@ fn cmd_schema_sync(args: &[String]) -> i32 {
                     };
                     match parse_db_binding(raw) {
                         Ok(pair) => db_specs.push(pair),
+                        Err(e) => {
+                            eprintln!("dana schema-sync: {e}");
+                            return 2;
+                        }
+                    }
+                }
+                "--attach" => {
+                    i += 1;
+                    let Some(raw) = args.get(i) else {
+                        eprintln!("dana schema-sync: `--attach` requires `[DB:]schema=PATH`");
+                        return 2;
+                    };
+                    match parse_attach_spec(raw) {
+                        Ok(spec) => sqlite_attachments.push(spec),
                         Err(e) => {
                             eprintln!("dana schema-sync: {e}");
                             return 2;
@@ -1084,6 +1147,16 @@ fn cmd_schema_sync(args: &[String]) -> i32 {
                 return 1;
             }
         };
+        if conn.dialect() == SqlDialect::Sqlite {
+            for (filter, schema, path) in &sqlite_attachments {
+                if (filter.is_none() || filter.as_deref() == Some(db_name.as_str()))
+                    && let Err(e) = conn.attach_database(schema, path)
+                {
+                    eprintln!("dana schema-sync: failed attaching `{schema}` to `{db_name}`: {e}");
+                    return 1;
+                }
+            }
+        }
         let fresh = if schemas.is_empty() {
             conn.introspect_schema(db_name)
         } else {
@@ -1620,6 +1693,7 @@ fn cmd_repl(args: &[String]) -> i32 {
     let mut policy_path: Option<PathBuf> = None;
     let mut lock_path: Option<PathBuf> = None;
     let mut db_bindings: Vec<(String, String)> = Vec::new();
+    let mut sqlite_attachments: Vec<(Option<String>, String, String)> = Vec::new();
     let mut allowed_show_tags = TagSet::empty();
     let mut eval_expr: Option<String> = None;
     let mut i = 0usize;
@@ -1633,6 +1707,14 @@ fn cmd_repl(args: &[String]) -> i32 {
         } else if let Some(val) = arg.strip_prefix("--db=") {
             match parse_db_binding(val) {
                 Ok(pair) => db_bindings.push(pair),
+                Err(e) => {
+                    eprintln!("dana repl: {e}");
+                    return 2;
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--attach=") {
+            match parse_attach_spec(val) {
+                Ok(spec) => sqlite_attachments.push(spec),
                 Err(e) => {
                     eprintln!("dana repl: {e}");
                     return 2;
@@ -1680,6 +1762,20 @@ fn cmd_repl(args: &[String]) -> i32 {
                         }
                     }
                 }
+                "--attach" => {
+                    i += 1;
+                    let Some(raw) = args.get(i) else {
+                        eprintln!("dana repl: `--attach` requires `[DB:]schema=PATH`");
+                        return 2;
+                    };
+                    match parse_attach_spec(raw) {
+                        Ok(spec) => sqlite_attachments.push(spec),
+                        Err(e) => {
+                            eprintln!("dana repl: {e}");
+                            return 2;
+                        }
+                    }
+                }
                 "--show-sensitive" => {
                     i += 1;
                     let Some(ts) = args.get(i) else {
@@ -1704,7 +1800,7 @@ fn cmd_repl(args: &[String]) -> i32 {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: dana repl [--policy FILE] [--db Name=URI]... [--schema-lock FILE] [--show-sensitive TAGS] [--eval EXPR]"
+                        "usage: dana repl [--policy FILE] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--show-sensitive TAGS] [--eval EXPR]"
                     );
                     return 0;
                 }
@@ -1741,6 +1837,7 @@ fn cmd_repl(args: &[String]) -> i32 {
     let cfg = ReplConfig {
         policy,
         db_bindings,
+        sqlite_attachments,
         schema_lock,
         allowed_show_tags,
         work_dir: cwd,

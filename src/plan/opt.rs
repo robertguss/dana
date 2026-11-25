@@ -1525,6 +1525,17 @@ fn rewrite_exec_plan(plan: &ExecPlan, prog: &ExecProgram, stats: &mut OptStats) 
             input: Box::new(rewrite_exec_plan(input, prog, stats)),
             cols: cols.clone(),
         },
+        ExecPlan::DedupeBy {
+            input,
+            keys,
+            order_by,
+            keep,
+        } => ExecPlan::DedupeBy {
+            input: Box::new(rewrite_exec_plan(input, prog, stats)),
+            keys: keys.clone(),
+            order_by: order_by.clone(),
+            keep: *keep,
+        },
         ExecPlan::Sort { input, keys } => {
             let opt_in = rewrite_exec_plan(input, prog, stats);
             if keys.is_empty() {
@@ -2040,6 +2051,32 @@ fn prune_exec_plan_derives(
             input: Box::new(prune_exec_plan_derives(input, None, stats)),
             cols: cols.clone(),
         },
+        ExecPlan::DedupeBy {
+            input,
+            keys,
+            order_by,
+            keep,
+        } => {
+            let opt_in = match needed {
+                Some(req) => {
+                    let mut child_req = req.clone();
+                    for k in keys {
+                        child_req.insert(k.clone());
+                    }
+                    for (k, _) in order_by {
+                        child_req.insert(k.clone());
+                    }
+                    prune_exec_plan_derives(input, Some(&child_req), stats)
+                }
+                None => prune_exec_plan_derives(input, None, stats),
+            };
+            ExecPlan::DedupeBy {
+                input: Box::new(opt_in),
+                keys: keys.clone(),
+                order_by: order_by.clone(),
+                keep: *keep,
+            }
+        }
         ExecPlan::GroupBy { input, keys } => ExecPlan::GroupBy {
             input: Box::new(prune_exec_plan_derives(input, None, stats)),
             keys: keys.clone(),

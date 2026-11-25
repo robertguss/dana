@@ -4564,6 +4564,7 @@ impl<'a> Checker<'a> {
                     LTy::new(Ty::Table(out_tt), outer_tags),
                 )
             }
+            "dedupe_by" => self.check_dedupe_by_verb(in_plan, in_tt, outer_tags, args, span),
             "limit" => {
                 let n = match args.first() {
                     Some(CallArg::Positional(Expr {
@@ -5224,6 +5225,256 @@ impl<'a> Checker<'a> {
             },
             spec,
         ))
+    }
+
+    fn parse_dedupe_order_spec(
+        &mut self,
+        expr: &Expr,
+        in_tt: &TableTy,
+    ) -> Option<(Ident, SortDir)> {
+        match &expr.kind {
+            ExprKind::DotField(m) => {
+                if in_tt.find_col(&m.name).is_some() {
+                    Some((m.name.clone(), SortDir::Asc))
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("unknown `order_by` column `.{}` in `dedupe_by`", m.name),
+                        )
+                        .with_span(m.span),
+                    );
+                    None
+                }
+            }
+            ExprKind::Call { callee, args } if matches!(&callee.kind, ExprKind::Ident(n) if n == "asc" || n == "desc") =>
+            {
+                let ExprKind::Ident(fname) = &callee.kind else {
+                    return None;
+                };
+                let dir = if fname == "desc" {
+                    SortDir::Desc
+                } else {
+                    SortDir::Asc
+                };
+                if args.len() != 1 {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`{fname}(.col)` in `dedupe_by(order_by: ...)` expects 1 `.column` argument"),
+                        )
+                        .with_span(expr.span),
+                    );
+                    return None;
+                }
+                let Some(CallArg::Positional(Expr {
+                    kind: ExprKind::DotField(m),
+                    ..
+                })) = args.first()
+                else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`{fname}(.col)` in `dedupe_by(order_by: ...)` expects a `.column` argument"),
+                        )
+                        .with_span(expr.span),
+                    );
+                    return None;
+                };
+                if in_tt.find_col(&m.name).is_some() {
+                    Some((m.name.clone(), dir))
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("unknown `order_by` column `.{}` in `dedupe_by`", m.name),
+                        )
+                        .with_span(m.span),
+                    );
+                    None
+                }
+            }
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`dedupe_by` `order_by:` entries must be `.col`, `asc(.col)`, or `desc(.col)`",
+                    )
+                    .with_span(expr.span),
+                );
+                None
+            }
+        }
+    }
+
+    fn check_dedupe_by_verb(
+        &mut self,
+        in_plan: ExecPlan,
+        in_tt: TableTy,
+        outer_tags: TagSet,
+        args: &[CallArg],
+        span: Span,
+    ) -> (ExecExpr, LTy) {
+        let mut keys: Vec<Ident> = Vec::new();
+        let mut key_tags = TagSet::empty();
+        let mut order_by: Vec<(Ident, SortDir)> = Vec::new();
+        let mut ord_tags = TagSet::empty();
+        let mut keep = DedupeKeep::First;
+        let mut seen_order = false;
+        let mut seen_keep = false;
+        let mut saw_pos_err = false;
+
+        for arg in args {
+            match arg {
+                CallArg::Positional(Expr {
+                    kind: ExprKind::DotField(m),
+                    ..
+                }) => {
+                    if let Some(c) = in_tt.find_col(&m.name) {
+                        if keys.contains(&m.name) {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("duplicate key column `.{}` in `dedupe_by`", m.name),
+                                )
+                                .with_span(m.span),
+                            );
+                        } else {
+                            key_tags = key_tags.union(&c.tags);
+                            keys.push(m.name.clone());
+                        }
+                    } else {
+                        saw_pos_err = true;
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("unknown key column `.{}` in `dedupe_by`", m.name),
+                            )
+                            .with_span(m.span),
+                        );
+                    }
+                }
+                CallArg::Positional(e) => {
+                    saw_pos_err = true;
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`dedupe_by` positional key arguments must be `.column` references",
+                        )
+                        .with_span(e.span),
+                    );
+                }
+                CallArg::Named { name, value, .. } if name.name == "order_by" => {
+                    if seen_order {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "duplicate `order_by:` argument in `dedupe_by`",
+                            )
+                            .with_span(name.span),
+                        );
+                        continue;
+                    }
+                    seen_order = true;
+                    match &value.kind {
+                        ExprKind::List(items) => {
+                            if items.is_empty() {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        "`dedupe_by` `order_by: [...]` cannot be empty",
+                                    )
+                                    .with_span(value.span),
+                                );
+                            }
+                            for it in items {
+                                if let Some((col, dir)) = self.parse_dedupe_order_spec(it, &in_tt) {
+                                    if let Some(c) = in_tt.find_col(&col) {
+                                        ord_tags = ord_tags.union(&c.tags);
+                                    }
+                                    order_by.push((col, dir));
+                                }
+                            }
+                        }
+                        _ => {
+                            if let Some((col, dir)) = self.parse_dedupe_order_spec(value, &in_tt) {
+                                if let Some(c) = in_tt.find_col(&col) {
+                                    ord_tags = ord_tags.union(&c.tags);
+                                }
+                                order_by.push((col, dir));
+                            }
+                        }
+                    }
+                }
+                CallArg::Named { name, value, .. } if name.name == "keep" => {
+                    if seen_keep {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "duplicate `keep:` argument in `dedupe_by`",
+                            )
+                            .with_span(name.span),
+                        );
+                        continue;
+                    }
+                    seen_keep = true;
+                    match &value.kind {
+                        ExprKind::Atom(a) if a == "first" => keep = DedupeKeep::First,
+                        ExprKind::Atom(a) if a == "last" => keep = DedupeKeep::Last,
+                        _ => {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    "`dedupe_by` `keep:` must be `:first` or `:last`",
+                                )
+                                .with_span(value.span),
+                            );
+                        }
+                    }
+                }
+                CallArg::Named { name, .. } => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("unknown argument `{}:` in `dedupe_by`", name.name),
+                        )
+                        .with_span(name.span),
+                    );
+                }
+            }
+        }
+
+        if keys.is_empty() && !saw_pos_err {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    "`dedupe_by` requires at least one `.key` column argument",
+                )
+                .with_span(span),
+            );
+        }
+
+        let mut out_tt = in_tt;
+        for c in &mut out_tt.cols {
+            c.agg_kind = AggKind::Raw;
+        }
+        out_tt.row_tags = out_tt
+            .row_tags
+            .union(&key_tags)
+            .union(&ord_tags)
+            .union(&out_tt.order_tags);
+        out_tt.grouped_by = None;
+        out_tt.summarized = false;
+        out_tt.distinct_by = None;
+        (
+            ExecExpr::Rel(Box::new(ExecPlan::DedupeBy {
+                input: Box::new(in_plan),
+                keys,
+                order_by,
+                keep,
+            })),
+            LTy::new(Ty::Table(out_tt), outer_tags),
+        )
     }
 
     fn check_summarize_verb(
@@ -12280,6 +12531,11 @@ impl<'a> Checker<'a> {
                         "coarsen" => {
                             diag = diag.with_hint(
                                 "`coarsen` is a `derive(...)` column declassifier, not a general row expression; write `|> derive(out = coarsen(.col, allow: [...], other: \"...\"))`",
+                            );
+                        }
+                        "dedupe_by" => {
+                            diag = diag.with_hint(
+                                "`dedupe_by` is a table pipeline verb, not a row function; use `|> dedupe_by(.k, order_by: [desc(.ts)], keep: :first)` instead",
                             );
                         }
                         "suppress_small_groups" => {

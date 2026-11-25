@@ -356,7 +356,15 @@ fn sqlite_decl_to_pg_meta(decl: &str) -> (&'static str, &'static str, u32) {
 fn rewrite_pg_sql_to_sqlite(sql: &str) -> String {
     // 1. Replace SUBSTRING(expr FROM start FOR len) -> SUBSTR(expr, start, len)
     //    and Postgres `COLLATE "C"` -> SQLite `COLLATE BINARY`
-    let sql = sql.replace(r#"COLLATE "C""#, "COLLATE BINARY");
+    let sql = sql
+        .replace(r#"COLLATE "C""#, "COLLATE BINARY")
+        .replace("BTRIM(", "TRIM(")
+        .replace("CHR(", "CHAR(")
+        .replace(
+            "~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'",
+            "GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'",
+        )
+        .replace(" AS DATE)", " AS TEXT)");
     let mut step1 = String::with_capacity(sql.len());
     let mut i = 0;
     while i < sql.len() {

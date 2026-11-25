@@ -29,5 +29,5 @@ pub use pushdown::{
     CollectedBranchPushdown, CollectedPlanPushdowns, SplitPlan, SqlParamSlot, SqlPushdownQuery,
     bind_exec_plan_sources, collect_core_plan_pushdowns, collect_exec_plan_pushdowns,
     core_plan_db_names, describe_sql_param, exec_plan_db_names, split_core_plan_pushdown,
-    split_exec_plan_pushdown,
+    split_exec_plan_pushdown, split_exec_plan_pushdown_with_table_refs,
 };

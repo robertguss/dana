@@ -19,7 +19,7 @@ use crate::core::bigint::{BigInt, DEC_MAX, DEC_MIN, DEC_SCALE, INT64_MAX, INT64_
 use crate::core::check::{check_cap_against_policy, is_safe_relative_path, join_confined_path};
 use crate::core::syntax::*;
 use crate::db::schema_lock::{SchemaLockFile, to_snake_case};
-use crate::db::{DbError, DbRegistry, SqlDialect, SqlParam, quote_sql_ident, quote_sql_table_ref};
+use crate::db::{DbError, DbRegistry, SqlDialect, SqlParam, quote_sql_ident};
 use crate::formats::compress::{
     AutoDecodeReader, AutoEncodeWriter, CompressionKind, detect_compression_path,
     open_auto_decoded_file, strip_compression_ext,
@@ -75,6 +75,8 @@ pub struct RunConfig {
     pub pseudonymize_mode: PseudonymizeMode,
     /// Logical Dana DB name -> connection URI bindings (e.g. `"Seminary" -> "sqlite:///..."`).
     pub db_bindings: HashMap<String, String>,
+    /// SQLite `ATTACH DATABASE` specifications (`(optional db_name filter, schema, file path)`).
+    pub sqlite_attachments: Vec<(Option<String>, String, String)>,
     /// Optional offline `schema.lock` snapshot for table-name resolution and pushdown PK proofs.
     pub schema_lock: Option<SchemaLockFile>,
     /// When `true`, suppresses all live DB/filesystem mutations and prints redacted dry-run diffs.
@@ -93,6 +95,7 @@ impl Default for RunConfig {
             fuel: DEFAULT_FUEL,
             pseudonymize_mode: PseudonymizeMode::HmacSha256,
             db_bindings: HashMap::new(),
+            sqlite_attachments: Vec::new(),
             schema_lock: None,
             dry_run: false,
             https_ca_cert: None,
@@ -177,6 +180,9 @@ impl ExecWorld {
         let mut db_registry = DbRegistry::new();
         for (name, uri) in &cfg.db_bindings {
             db_registry.register(name.clone(), uri.clone());
+        }
+        for (db_filter, schema, path) in &cfg.sqlite_attachments {
+            db_registry.attach_sqlite(db_filter.clone(), schema.clone(), path.clone());
         }
         let https_ca_cert = cfg
             .https_ca_cert
@@ -550,7 +556,7 @@ fn build_constraint_self_cols(schema_tt: &TableTy) -> Vec<[ColSpec; 1]> {
         .collect()
 }
 
-fn find_fake_db_table<'a>(db: &'a FakeDBState, table_name: &str) -> Option<&'a StoredTable> {
+fn find_fake_db_table_single<'a>(db: &'a FakeDBState, table_name: &str) -> Option<&'a StoredTable> {
     if let Some(exact) = db.tables.iter().find(|t| t.table_name == table_name) {
         return Some(exact);
     }
@@ -565,6 +571,20 @@ fn find_fake_db_table<'a>(db: &'a FakeDBState, table_name: &str) -> Option<&'a S
     db.tables
         .iter()
         .find(|t| to_snake_case(&t.table_name) == target_snake)
+}
+
+fn find_fake_db_table<'a>(db: &'a FakeDBState, table_name: &str) -> Option<&'a StoredTable> {
+    if let Some(found) = find_fake_db_table_single(db, table_name) {
+        return Some(found);
+    }
+    if let Some((schema, rel)) = table_name.split_once('.')
+        && !schema.is_empty()
+        && !rel.is_empty()
+        && !rel.contains('.')
+    {
+        return find_fake_db_table_single(db, &format!("{schema}_{rel}"));
+    }
+    None
 }
 
 impl crate::vm::exec::ExecPlanBridge for Evaluator<'_> {
@@ -679,6 +699,19 @@ impl crate::vm::exec::ExecPlanBridge for Evaluator<'_> {
 
     fn schema_lock(&self) -> Option<&SchemaLockFile> {
         self.ew.schema_lock.as_ref()
+    }
+
+    fn resolve_live_table_ref(
+        &mut self,
+        db_name: &str,
+        table_name: &str,
+    ) -> Result<String, crate::vm::OpErr> {
+        let conn = self
+            .ew
+            .db_registry
+            .open(db_name)
+            .map_err(|e| crate::vm::OpErr::Stopped(map_db_err_to_bug(e)))?;
+        Ok(conn.resolve_table_sql_ref(table_name))
     }
 
     fn exec_live_sql_batches(
@@ -4407,23 +4440,20 @@ impl<'a> Evaluator<'a> {
                             .and_then(|l| l.find_db(db))
                             .and_then(|d| d.resolve_table(table_name).ok())
                             .map_or_else(|| table_name.clone(), |t| t.name.clone());
+                        let conn = match self.ew.db_registry.open(db) {
+                            Ok(c) => c,
+                            Err(e) => return EvalOut::Stopped(map_db_err_to_bug(e)),
+                        };
+                        let table_sql = conn.resolve_table_sql_ref(&effective_table);
                         let cols_sql: Vec<String> = schema
                             .cols
                             .iter()
                             .map(|c| quote_sql_ident(&c.name))
                             .collect();
                         let sql = if cols_sql.is_empty() {
-                            format!("SELECT 1 FROM {}", quote_sql_table_ref(&effective_table))
+                            format!("SELECT 1 FROM {table_sql}")
                         } else {
-                            format!(
-                                "SELECT {} FROM {}",
-                                cols_sql.join(", "),
-                                quote_sql_table_ref(&effective_table)
-                            )
-                        };
-                        let conn = match self.ew.db_registry.open(db) {
-                            Ok(c) => c,
-                            Err(e) => return EvalOut::Stopped(map_db_err_to_bug(e)),
+                            format!("SELECT {} FROM {table_sql}", cols_sql.join(", "))
                         };
                         match conn.query_rows(&sql, &[], schema) {
                             Ok(tv) => EvalOut::Ok(Val::Table(tv)),
@@ -4713,6 +4743,90 @@ impl<'a> Evaluator<'a> {
                 }
                 EvalOut::Ok(Val::Table(TableVal {
                     cols: tv.cols,
+                    rows: out_rows,
+                }))
+            }
+            ExecPlan::DedupeBy {
+                keys,
+                order_by,
+                keep,
+                ..
+            } => {
+                if keys.is_empty() {
+                    return EvalOut::Failed(
+                        "dedupe_by requires at least one key column".to_string(),
+                    );
+                }
+                let mut key_idxs = Vec::with_capacity(keys.len());
+                for k in keys {
+                    let Some(idx) = tv.cols.iter().position(|c| c.name == *k) else {
+                        return EvalOut::Failed(format!("dedupe_by: missing column `{k}`"));
+                    };
+                    key_idxs.push(idx);
+                }
+                let mut order_specs = Vec::with_capacity(order_by.len());
+                for (c, dir) in order_by {
+                    let Some(idx) = tv.cols.iter().position(|cs| cs.name == *c) else {
+                        return EvalOut::Failed(format!("dedupe_by: missing order column `{c}`"));
+                    };
+                    order_specs.push((idx, *dir));
+                }
+                let mut seen: HashMap<u64, Vec<usize>> = HashMap::new();
+                for (ri, r) in tv.rows.iter().enumerate() {
+                    let key_vals: Vec<Val> =
+                        key_idxs.iter().map(|&ki| r.cells[ki].clone()).collect();
+                    let h = hash_val_slice(&key_vals);
+                    let bucket = seen.entry(h).or_default();
+                    if let Some(slot) = bucket.iter_mut().find(|&&mut wi| {
+                        key_idxs
+                            .iter()
+                            .all(|&ki| val_eq(&tv.rows[wi].cells[ki], &r.cells[ki]))
+                    }) {
+                        let wi = *slot;
+                        let mut ord = std::cmp::Ordering::Equal;
+                        for &(ci, dir) in &order_specs {
+                            let c_ord = val_cmp(&r.cells[ci], &tv.rows[wi].cells[ci]);
+                            let directed = match dir {
+                                SortDir::Asc => c_ord,
+                                SortDir::Desc => c_ord.reverse(),
+                            };
+                            if directed != std::cmp::Ordering::Equal {
+                                ord = directed;
+                                break;
+                            }
+                        }
+                        let replace = match keep {
+                            DedupeKeep::First => ord == std::cmp::Ordering::Less,
+                            DedupeKeep::Last => ord != std::cmp::Ordering::Less,
+                        };
+                        if replace {
+                            *slot = ri;
+                        }
+                    } else {
+                        bucket.push(ri);
+                    }
+                }
+                let mut win_indices: Vec<usize> = seen.into_values().flatten().collect();
+                win_indices.sort_unstable();
+                let mut rows_opt: Vec<Option<TableRow>> = tv.rows.into_iter().map(Some).collect();
+                let out_rows: Vec<TableRow> = win_indices
+                    .into_iter()
+                    .filter_map(|i| {
+                        let mut row = rows_opt.get_mut(i)?.take()?;
+                        row.group_meta = None;
+                        Some(row)
+                    })
+                    .collect();
+                let out_cols = tv
+                    .cols
+                    .into_iter()
+                    .map(|mut c| {
+                        c.agg_kind = AggKind::Raw;
+                        c
+                    })
+                    .collect();
+                EvalOut::Ok(Val::Table(TableVal {
+                    cols: out_cols,
                     rows: out_rows,
                 }))
             }
@@ -5599,6 +5713,7 @@ fn unary_plan_input(plan: &ExecPlan) -> Option<&ExecPlan> {
         | ExecPlan::Derive { input, .. }
         | ExecPlan::Filter { input, .. }
         | ExecPlan::Distinct { input, .. }
+        | ExecPlan::DedupeBy { input, .. }
         | ExecPlan::Sort { input, .. }
         | ExecPlan::Limit { input, .. }
         | ExecPlan::GroupBy { input, .. }
@@ -6507,7 +6622,11 @@ pub(crate) fn slice_text(s: &str, start: i64, len: i64) -> String {
 }
 
 pub(crate) fn try_parse_date_text(s: &str) -> Val {
-    match parse_iso_date(s.trim()) {
+    let trimmed = s.trim_matches([' ', '\t', '\n', '\r']);
+    if trimmed.starts_with("0000-") {
+        return Val::OptNone;
+    }
+    match parse_iso_date(trimmed) {
         Ok(days) => Val::OptSome(Box::new(Val::Date(BigInt::from(days)))),
         Err(_) => Val::OptNone,
     }

@@ -587,6 +587,7 @@ fn bench_w3_sqlite_pushdown_privacy_vm_and_oracle() -> TestResult {
     let mut conn = SqliteDriver::open(&SqliteUri {
         path: db_path.to_string_lossy().into_owned(),
         read_only: false,
+        attachments: Vec::new(),
     })?;
     let ddl = r#"
         CREATE TABLE "StudentEnrollment" (

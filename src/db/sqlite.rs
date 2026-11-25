@@ -25,19 +25,21 @@ use super::{
     ColumnarBatchBuilder, DbConnection, DbError, SqlDialect, SqlParam, SqliteUri, UpsertDiff,
     compute_upsert_diff, decimal_from_i64, format_decimal_canonical, make_table_row,
     parse_decimal_from_f64, parse_iso_timestamp_flexible, quote_sql_ident, quote_sql_table_ref,
+    validate_sqlite_attach_schema,
 };
 
 /// Safe SQLite driver implementing [`DbConnection`].
 #[derive(Debug)]
 pub struct SqliteDriver {
     conn: SqliteConn,
+    attached_schemas: Vec<String>,
 }
 
 impl SqliteDriver {
     /// Open a SQLite database from a parsed [`SqliteUri`].
     ///
     /// # Errors
-    /// Returns [`DbError::Connection`] if opening fails.
+    /// Returns [`DbError::Connection`] if opening or attaching secondary databases fails.
     pub fn open(uri: &SqliteUri) -> Result<Self, DbError> {
         let mode = if uri.read_only {
             SqliteOpenMode::ReadOnly
@@ -45,7 +47,14 @@ impl SqliteDriver {
             SqliteOpenMode::ReadWriteCreate
         };
         let conn = SqliteConn::open(&uri.path, mode).map_err(map_conn_err)?;
-        Ok(Self { conn })
+        let mut driver = Self {
+            conn,
+            attached_schemas: Vec::new(),
+        };
+        for (schema, path) in &uri.attachments {
+            driver.attach_database(schema, path)?;
+        }
+        Ok(driver)
     }
 
     /// Open a fresh private in-memory SQLite database.
@@ -54,13 +63,19 @@ impl SqliteDriver {
     /// Returns [`DbError::Connection`] if opening fails.
     pub fn open_in_memory() -> Result<Self, DbError> {
         let conn = SqliteConn::open_in_memory().map_err(map_conn_err)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            attached_schemas: Vec::new(),
+        })
     }
 
     /// Wrap an already-opened [`SqliteConn`].
     #[must_use]
     pub const fn from_conn(conn: SqliteConn) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            attached_schemas: Vec::new(),
+        }
     }
 
     /// Borrow the underlying safe [`SqliteConn`].
@@ -75,6 +90,96 @@ impl SqliteDriver {
     /// Returns [`DbError::Query`] if any statement fails.
     pub fn execute_batch(&mut self, sql: &str) -> Result<(), DbError> {
         self.conn.execute_batch(sql).map_err(map_query_err)
+    }
+
+    fn is_attached_schema(&mut self, schema: &str) -> bool {
+        if self
+            .attached_schemas
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(schema))
+        {
+            return true;
+        }
+        let Ok(mut stmt) = self.conn.prepare("PRAGMA database_list") else {
+            return false;
+        };
+        while let Ok(StepResult::Row) = stmt.step() {
+            if let Ok(db_alias) = stmt.column_text(1)
+                && db_alias.eq_ignore_ascii_case(schema)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn main_object_exists(&mut self, name: &str) -> bool {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT 1 FROM main.sqlite_master WHERE type IN ('table', 'view') AND name = ? LIMIT 1",
+        ) else {
+            return false;
+        };
+        if stmt.bind_text(1, name).is_err() {
+            return false;
+        }
+        matches!(stmt.step(), Ok(StepResult::Row))
+    }
+
+    fn introspect_namespace(
+        &mut self,
+        schema_name: Option<&str>,
+    ) -> Result<Vec<LockedTable>, DbError> {
+        let master_sql = match schema_name {
+            Some(s) => format!(
+                "SELECT name FROM {}.sqlite_master                  WHERE type = 'table' AND name NOT LIKE 'sqlite_%'                  ORDER BY name",
+                quote_sql_ident(s)
+            ),
+            None => "SELECT name FROM main.sqlite_master                      WHERE type = 'table' AND name NOT LIKE 'sqlite_%'                      ORDER BY name"
+                .to_string(),
+        };
+        let mut table_names = Vec::new();
+        {
+            let mut stmt = self.conn.prepare(&master_sql).map_err(map_query_err)?;
+            while stmt.step().map_err(map_query_err)? == StepResult::Row {
+                table_names.push(stmt.column_text(0).map_err(map_query_err)?);
+            }
+        }
+
+        let mut tables = Vec::with_capacity(table_names.len());
+        for tname in table_names {
+            let pragma_sql = match schema_name {
+                Some(s) => format!(
+                    "PRAGMA {}.table_info({})",
+                    quote_sql_ident(s),
+                    quote_sql_ident(&tname)
+                ),
+                None => format!("PRAGMA main.table_info({})", quote_sql_ident(&tname)),
+            };
+            let mut stmt = self.conn.prepare(&pragma_sql).map_err(map_query_err)?;
+            let mut cols = Vec::new();
+            while stmt.step().map_err(map_query_err)? == StepResult::Row {
+                let col_name = stmt.column_text(1).map_err(map_query_err)?;
+                let declared_ty = stmt.column_text(2).map_err(map_query_err)?;
+                let notnull = stmt.column_int64(3) != 0;
+                let pk = stmt.column_int64(5) > 0;
+                cols.push(LockedCol {
+                    name: col_name,
+                    ty: map_sqlite_declared_type(&declared_ty),
+                    nullable: !notnull && !pk,
+                    pk,
+                    tags: TagSet::empty(),
+                });
+            }
+            let emitted_name = match schema_name {
+                Some(s) => format!("{s}.{tname}"),
+                None => tname,
+            };
+            tables.push(LockedTable {
+                name: emitted_name,
+                cols,
+            });
+        }
+        Ok(tables)
     }
 }
 
@@ -329,42 +434,39 @@ impl DbConnection for SqliteDriver {
     }
 
     fn introspect_schema(&mut self, db_name: &str) -> Result<LockedDb, DbError> {
-        let mut table_names = Vec::new();
+        let mut tables = self.introspect_namespace(None)?;
+        let attached = self.attached_schemas.clone();
+        for s in attached {
+            tables.extend(self.introspect_namespace(Some(&s))?);
+        }
+        Ok(LockedDb {
+            name: db_name.to_string(),
+            dialect: SqlDialect::Sqlite,
+            tables,
+        })
+    }
+
+    fn introspect_schema_with_schemas(
+        &mut self,
+        db_name: &str,
+        schemas: &[String],
+    ) -> Result<LockedDb, DbError> {
+        if schemas.is_empty() {
+            return self.introspect_schema(db_name);
+        }
+        let mut tables = Vec::new();
+        if schemas
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("main") || s.eq_ignore_ascii_case("public"))
         {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "SELECT name FROM sqlite_master \
-                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
-                     ORDER BY name",
-                )
-                .map_err(map_query_err)?;
-            while stmt.step().map_err(map_query_err)? == StepResult::Row {
-                table_names.push(stmt.column_text(0).map_err(map_query_err)?);
+            tables.extend(self.introspect_namespace(None)?);
+        }
+        let attached = self.attached_schemas.clone();
+        for s in attached {
+            if schemas.iter().any(|req| req == &s) {
+                tables.extend(self.introspect_namespace(Some(&s))?);
             }
         }
-
-        let mut tables = Vec::with_capacity(table_names.len());
-        for tname in table_names {
-            let pragma_sql = format!("PRAGMA table_info({})", quote_sql_ident(&tname));
-            let mut stmt = self.conn.prepare(&pragma_sql).map_err(map_query_err)?;
-            let mut cols = Vec::new();
-            while stmt.step().map_err(map_query_err)? == StepResult::Row {
-                let col_name = stmt.column_text(1).map_err(map_query_err)?;
-                let declared_ty = stmt.column_text(2).map_err(map_query_err)?;
-                let notnull = stmt.column_int64(3) != 0;
-                let pk = stmt.column_int64(5) > 0;
-                cols.push(LockedCol {
-                    name: col_name,
-                    ty: map_sqlite_declared_type(&declared_ty),
-                    nullable: !notnull && !pk,
-                    pk,
-                    tags: TagSet::empty(),
-                });
-            }
-            tables.push(LockedTable { name: tname, cols });
-        }
-
         Ok(LockedDb {
             name: db_name.to_string(),
             dialect: SqlDialect::Sqlite,
@@ -394,7 +496,7 @@ impl DbConnection for SqliteDriver {
                 ))
             })?;
 
-        let quoted_table = quote_sql_table_ref(table);
+        let quoted_table = self.resolve_table_sql_ref(table);
         let quoted_cols: Vec<String> = data.cols.iter().map(|c| quote_sql_ident(&c.name)).collect();
         let quoted_key = quote_sql_ident(key_col);
 
@@ -485,5 +587,48 @@ impl DbConnection for SqliteDriver {
         bind_params(&mut stmt, params)?;
         while stmt.step().map_err(map_query_err)? == StepResult::Row {}
         Ok(self.conn.changes())
+    }
+
+    fn attach_database(&mut self, schema: &str, path: &str) -> Result<(), DbError> {
+        validate_sqlite_attach_schema(schema)?;
+        if self
+            .attached_schemas
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(schema))
+        {
+            return Err(DbError::Connection(format!(
+                "duplicate SQLite attach schema `{schema}`"
+            )));
+        }
+        let sql = format!("ATTACH DATABASE ? AS {}", quote_sql_ident(schema));
+        let mut stmt = self.conn.prepare(&sql).map_err(map_conn_err)?;
+        bind_params(&mut stmt, &[SqlParam::Text(path.to_string())])?;
+        while stmt.step().map_err(map_conn_err)? == StepResult::Row {}
+        self.attached_schemas.push(schema.to_string());
+        Ok(())
+    }
+
+    fn resolve_table_sql_ref(&mut self, table: &str) -> String {
+        if let Some((schema, rel)) = table.split_once('.')
+            && !schema.is_empty()
+            && !rel.is_empty()
+            && !rel.contains('.')
+        {
+            if schema.eq_ignore_ascii_case("main")
+                || schema.eq_ignore_ascii_case("temp")
+                || self.is_attached_schema(schema)
+            {
+                return format!("{}.{}", quote_sql_ident(schema), quote_sql_ident(rel));
+            }
+            if self.main_object_exists(table) {
+                return quote_sql_ident(table);
+            }
+            let flat = format!("{schema}_{rel}");
+            if self.main_object_exists(&flat) {
+                return quote_sql_ident(&flat);
+            }
+            return quote_sql_table_ref(table);
+        }
+        quote_sql_ident(table)
     }
 }

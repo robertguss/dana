@@ -1451,3 +1451,1088 @@ end
 
     Ok(())
 }
+
+fn check_src_with_lock(
+    src: &str,
+    lock: &dana::db::schema_lock::SchemaLockFile,
+) -> TestResult<dana::check::CheckedProgram> {
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("test_v06_lock.dana", src.to_string());
+    let m = parse_module(fid, src).map_err(|d| format!("parse error: {d:?}"))?;
+    dana::check::check_module_with_lock(fid, m, None, &sm, Some(lock))
+        .map_err(|ds| format!("check error: {ds:?}").into())
+}
+
+// ===========================================================================
+// Slice 6.3 Tests: SQLite --attach / fallback, TryParseDate pushdown, dedupe_by
+// ===========================================================================
+
+#[test]
+fn v06_sqlite_attach_and_unattached_schema_table_fallback() -> TestResult {
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.0");
+    let tmp = TempDir::new("sqlite_attach")?;
+    let main_db = tmp.path().join("main.db");
+    let populi_db = tmp.path().join("populi.db");
+    let canvas_db = tmp.path().join("canvas.db");
+
+    {
+        let mut mc = open_connection(&sqlite_uri(&main_db))?;
+        mc.execute(
+            r#"CREATE TABLE "local_meta" ("k" TEXT PRIMARY KEY NOT NULL, "v" TEXT NOT NULL)"#,
+            &[],
+        )?;
+        mc.execute(r#"INSERT INTO "local_meta" VALUES ('env', 'dogfood')"#, &[])?;
+    }
+    {
+        let mut pc = open_connection(&sqlite_uri(&populi_db))?;
+        pc.execute(
+            r#"CREATE TABLE "enrollments" ("id" INTEGER PRIMARY KEY NOT NULL, "uid" INTEGER NOT NULL, "cid" INTEGER NOT NULL, "status" TEXT NOT NULL)"#,
+            &[],
+        )?;
+        for (id, uid, cid, st) in [(1i64, 10i64, 100i64, "ENROLLED"), (2, 20, 200, "WITHDRAWN")] {
+            pc.execute(
+                r#"INSERT INTO "enrollments" VALUES (?, ?, ?, ?)"#,
+                &[
+                    SqlParam::Int(id),
+                    SqlParam::Int(uid),
+                    SqlParam::Int(cid),
+                    SqlParam::Text(st.to_string()),
+                ],
+            )?;
+        }
+    }
+    {
+        let mut cc = open_connection(&sqlite_uri(&canvas_db))?;
+        cc.execute(
+            r#"CREATE TABLE "courses" ("cid" INTEGER PRIMARY KEY NOT NULL, "code" TEXT NOT NULL)"#,
+            &[],
+        )?;
+        for (cid, code) in [(100i64, "CS101"), (200, "TH201")] {
+            cc.execute(
+                r#"INSERT INTO "courses" VALUES (?, ?)"#,
+                &[SqlParam::Int(cid), SqlParam::Text(code.to_string())],
+            )?;
+        }
+    }
+
+    // 1. URI `?attach=schema:path&attach=schema=path` + cross-schema join parity & pushdown
+    let attach_uri = format!(
+        "sqlite://{}?attach=populi:{}&attach=canvas={}",
+        main_db.display(),
+        populi_db.display(),
+        canvas_db.display()
+    );
+    let join_src = r##"module AttachJoin
+
+schema Enroll
+  id: Int
+  uid: Int
+  cid: Int
+  status: Text
+end
+
+schema Course
+  cid: Int
+  code: Text
+end
+
+fn main(db: ReadDB(Lake), console: Console) : Int
+  joined = db.table(Enroll, from: "populi.enrollments")
+    |> join_many_to_one(db.table(Course, from: "canvas.courses"), on: .cid)
+    |> group_by(.code)
+    |> summarize(n: count())
+    |> sort_by(.code)
+  console.print_table(joined)
+  0
+end
+"##;
+    let uri_out = assert_oracle_vm_parity(join_src, Some(("Lake", &attach_uri)))?;
+    let uri_joined = uri_out.join("\n");
+    assert!(
+        uri_joined.contains("CS101") && uri_joined.contains("TH201"),
+        "expected cross-schema attached join output:\n{uri_joined}"
+    );
+
+    let join_sq_lock = dana::db::schema_lock::SchemaLockFile {
+        dbs: vec![dana::db::schema_lock::LockedDb {
+            name: "Lake".to_string(),
+            dialect: SqlDialect::Sqlite,
+            tables: vec![
+                dana::db::schema_lock::LockedTable {
+                    name: "populi.enrollments".to_string(),
+                    cols: vec![
+                        dana::db::schema_lock::LockedCol {
+                            name: "id".to_string(),
+                            ty: dana::core::syntax::ScalarTy::Int,
+                            nullable: false,
+                            pk: true,
+                            tags: dana::core::syntax::TagSet::empty(),
+                        },
+                        dana::db::schema_lock::LockedCol {
+                            name: "uid".to_string(),
+                            ty: dana::core::syntax::ScalarTy::Int,
+                            nullable: false,
+                            pk: false,
+                            tags: dana::core::syntax::TagSet::empty(),
+                        },
+                        dana::db::schema_lock::LockedCol {
+                            name: "cid".to_string(),
+                            ty: dana::core::syntax::ScalarTy::Int,
+                            nullable: false,
+                            pk: false,
+                            tags: dana::core::syntax::TagSet::empty(),
+                        },
+                        dana::db::schema_lock::LockedCol {
+                            name: "status".to_string(),
+                            ty: dana::core::syntax::ScalarTy::Text,
+                            nullable: false,
+                            pk: false,
+                            tags: dana::core::syntax::TagSet::empty(),
+                        },
+                    ],
+                },
+                dana::db::schema_lock::LockedTable {
+                    name: "canvas.courses".to_string(),
+                    cols: vec![
+                        dana::db::schema_lock::LockedCol {
+                            name: "cid".to_string(),
+                            ty: dana::core::syntax::ScalarTy::Int,
+                            nullable: false,
+                            pk: true,
+                            tags: dana::core::syntax::TagSet::empty(),
+                        },
+                        dana::db::schema_lock::LockedCol {
+                            name: "code".to_string(),
+                            ty: dana::core::syntax::ScalarTy::Text,
+                            nullable: false,
+                            pk: false,
+                            tags: dana::core::syntax::TagSet::empty(),
+                        },
+                    ],
+                },
+            ],
+        }],
+        ..dana::db::schema_lock::SchemaLockFile::default()
+    };
+    let mut join_pg_lock = join_sq_lock.clone();
+    join_pg_lock.dbs[0].dialect = SqlDialect::Postgres;
+
+    let checked_join = check_src_with_lock(join_src, &join_sq_lock)?;
+    let main_fn = checked_join.exec.find_fun("main").ok_or("missing main")?;
+    let plan = find_first_plan(&main_fn.body).ok_or("missing ExecPlan")?;
+    for (dialect, lk) in [
+        (SqlDialect::Sqlite, &join_sq_lock),
+        (SqlDialect::Postgres, &join_pg_lock),
+    ] {
+        let split = split_exec_plan_pushdown(plan, &checked_join.exec, "Lake", dialect, Some(lk));
+        match split {
+            SplitPlan::FullyPushed(q) | SplitPlan::Hybrid { pushdown: q, .. } => {
+                assert!(
+                    q.sql.contains(r#"FROM "populi"."enrollments""#)
+                        && q.sql.contains(r#"FROM "canvas"."courses""#)
+                        && q.sql.contains("INNER JOIN"),
+                    "expected pushed qualified cross-schema join SQL for {dialect:?}, got:\n{}",
+                    q.sql
+                );
+            }
+            other => {
+                return Err(format!("expected SQL pushdown for {dialect:?}, got {other:?}").into());
+            }
+        }
+    }
+
+    // 2. CLI `--db`, `--attach schema=PATH`, `--attach DB:schema=PATH`, `schema-sync`, `check`, `run`
+    let script_path = tmp.path().join("attach_join.dana");
+    fs::write(&script_path, join_src)?;
+    let lock_path = tmp.path().join("schema.lock");
+    let bin = env!("CARGO_BIN_EXE_dana");
+    let main_uri = sqlite_uri(&main_db);
+    let db_arg = format!("Lake={main_uri}");
+    let attach_populi = format!("populi={}", populi_db.display());
+    let attach_canvas = format!("Lake:canvas={}", canvas_db.display());
+
+    let sync_out = Command::new(bin)
+        .args(["schema-sync", "--db", &db_arg, "--attach", &attach_populi])
+        .arg(format!("--attach={attach_canvas}"))
+        .arg("--out")
+        .arg(&lock_path)
+        .output()?;
+    assert_eq!(
+        sync_out.status.code(),
+        Some(0),
+        "schema-sync --attach failed: {}",
+        String::from_utf8_lossy(&sync_out.stderr)
+    );
+    let lock_text = fs::read_to_string(&lock_path)?;
+    assert!(
+        lock_text.contains("populi.enrollments") && lock_text.contains("canvas.courses"),
+        "expected attached tables in schema.lock:\n{lock_text}"
+    );
+
+    let check_out = Command::new(bin)
+        .args(["check", "--db", &db_arg, "--attach", &attach_populi])
+        .arg("--schema-lock")
+        .arg(&lock_path)
+        .arg(&script_path)
+        .output()?;
+    assert_eq!(
+        check_out.status.code(),
+        Some(0),
+        "check --attach failed: {}",
+        String::from_utf8_lossy(&check_out.stderr)
+    );
+
+    let vm_run = Command::new(bin)
+        .args(["run", "--db", &db_arg, "--attach", &attach_populi])
+        .arg(format!("--attach={attach_canvas}"))
+        .arg("--schema-lock")
+        .arg(&lock_path)
+        .arg(&script_path)
+        .output()?;
+    assert_eq!(
+        vm_run.status.code(),
+        Some(0),
+        "run --attach VM failed: {}",
+        String::from_utf8_lossy(&vm_run.stderr)
+    );
+    let ora_run = Command::new(bin)
+        .args([
+            "run",
+            "--oracle",
+            "--db",
+            &db_arg,
+            "--attach",
+            &attach_populi,
+            "--attach",
+            &attach_canvas,
+            "--schema-lock",
+        ])
+        .arg(&lock_path)
+        .arg(&script_path)
+        .output()?;
+    assert_eq!(ora_run.status.code(), Some(0));
+    assert_eq!(vm_run.stdout, ora_run.stdout);
+
+    // 3. Attached SQLite `WriteTable(Lake, "populi.enrollments").upsert(...)` (`dry-run` + live)
+    let upsert_src = r##"module AttachUpsert
+
+schema EnrollRow
+  id: Int
+  uid: Int
+  cid: Int
+  status: Text
+end
+
+fn main(wt: WriteTable(Lake, "populi.enrollments"), console: Console) : Int
+  rows = table
+    | id | uid | cid | status      |
+    | 1  | 10  | 100 | "COMPLETED" |
+    | 3  | 30  | 100 | "ENROLLED"  |
+  end
+  stats = try wt.upsert(rows, key: .id)
+  console.print("ins=#{stats.inserted}:upd=#{stats.updated}:unch=#{stats.unchanged}")
+  0
+end
+"##;
+    let upsert_path = tmp.path().join("attach_upsert.dana");
+    fs::write(&upsert_path, upsert_src)?;
+
+    let dry_out = Command::new(bin)
+        .args(["dry-run", "--db", &db_arg, "--attach", &attach_populi])
+        .arg(&upsert_path)
+        .output()?;
+    assert_eq!(
+        dry_out.status.code(),
+        Some(0),
+        "dry-run upsert --attach failed: {}",
+        String::from_utf8_lossy(&dry_out.stderr)
+    );
+    let mut pc_check = open_connection(&sqlite_uri(&populi_db))?;
+    let pre_lock = pc_check.introspect_schema("populi")?;
+    let pre_rows = pre_lock
+        .find_table("enrollments")
+        .ok_or("missing enrollments")?;
+    assert_eq!(pre_rows.cols.len(), 4);
+    let check_schema = dana::core::syntax::TableTy {
+        cols: vec![
+            dana::core::syntax::ColSpec {
+                name: "id".to_string(),
+                ty: dana::core::syntax::ScalarTy::Int,
+                tags: dana::core::syntax::TagSet::empty(),
+                bucketed: false,
+                agg_kind: dana::core::syntax::AggKind::Raw,
+            },
+            dana::core::syntax::ColSpec {
+                name: "status".to_string(),
+                ty: dana::core::syntax::ScalarTy::Text,
+                tags: dana::core::syntax::TagSet::empty(),
+                bucketed: false,
+                agg_kind: dana::core::syntax::AggKind::Raw,
+            },
+        ],
+        ..dana::core::syntax::TableTy::default()
+    };
+    let mut pc_raw = open_connection(&sqlite_uri(&populi_db))?;
+    let pre_tbl = pc_raw.query_rows(
+        r#"SELECT "id", "status" FROM "enrollments" ORDER BY "id""#,
+        &[],
+        &check_schema,
+    )?;
+    assert_eq!(pre_tbl.rows.len(), 2, "dry-run must not mutate attached DB");
+    assert!(
+        matches!(&pre_tbl.rows[0].cells[1], dana::oracle::value::Val::Text(s) if s == "ENROLLED")
+    );
+
+    let live_out = Command::new(bin)
+        .args(["run", "--db", &db_arg, "--attach", &attach_populi])
+        .arg(&upsert_path)
+        .output()?;
+    assert_eq!(
+        live_out.status.code(),
+        Some(0),
+        "live upsert --attach failed: {}",
+        String::from_utf8_lossy(&live_out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(live_out.stdout)?.trim(),
+        "ins=1:upd=1:unch=0"
+    );
+    let post_tbl = pc_raw.query_rows(
+        r#"SELECT "id", "status" FROM "enrollments" ORDER BY "id""#,
+        &[],
+        &check_schema,
+    )?;
+    assert_eq!(post_tbl.rows.len(), 3);
+    assert!(
+        matches!(&post_tbl.rows[0].cells[1], dana::oracle::value::Val::Text(s) if s == "COMPLETED")
+    );
+
+    // 4. Unattached SQLite `"schema.table"` resolution priority:
+    //    literal `"populi.enrollments"` in `main` beats `"populi_enrollments"`,
+    //    and `"populi_enrollments"` in `main` works as fallback when literal does not exist.
+    let both_db = tmp.path().join("both.db");
+    {
+        let mut bc = open_connection(&sqlite_uri(&both_db))?;
+        bc.execute(
+            r#"CREATE TABLE "populi.enrollments" ("id" INTEGER PRIMARY KEY NOT NULL, "src_tag" TEXT NOT NULL)"#,
+            &[],
+        )?;
+        bc.execute(
+            r#"INSERT INTO "populi.enrollments" VALUES (1, 'literal_won')"#,
+            &[],
+        )?;
+        bc.execute(
+            r#"CREATE TABLE "populi_enrollments" ("id" INTEGER PRIMARY KEY NOT NULL, "src_tag" TEXT NOT NULL)"#,
+            &[],
+        )?;
+        bc.execute(
+            r#"INSERT INTO "populi_enrollments" VALUES (1, 'flat_lost')"#,
+            &[],
+        )?;
+    }
+    let flat_only_db = tmp.path().join("flat_only.db");
+    {
+        let mut fc = open_connection(&sqlite_uri(&flat_only_db))?;
+        fc.execute(
+            r#"CREATE TABLE "populi_enrollments" ("id" INTEGER PRIMARY KEY NOT NULL, "src_tag" TEXT NOT NULL)"#,
+            &[],
+        )?;
+        fc.execute(
+            r#"INSERT INTO "populi_enrollments" VALUES (1, 'flat_fallback')"#,
+            &[],
+        )?;
+    }
+    let fallback_src = r##"module FallbackTest
+
+schema Item
+  id: Int
+  src_tag: Text
+end
+
+fn main(db: ReadDB(Lake), console: Console) : Int
+  rows = db.table(Item, from: "populi.enrollments") |> sort_by(.id)
+  console.print("#{rows.first!.src_tag}")
+  0
+end
+"##;
+    let both_out = assert_oracle_vm_parity(fallback_src, Some(("Lake", &sqlite_uri(&both_db))))?;
+    assert_eq!(both_out, vec!["literal_won".to_string()]);
+    let flat_out =
+        assert_oracle_vm_parity(fallback_src, Some(("Lake", &sqlite_uri(&flat_only_db))))?;
+    assert_eq!(flat_out, vec!["flat_fallback".to_string()]);
+
+    // 5. Invalid `--attach` CLI flags exit with code 2
+    for bad_args in [
+        vec!["run", "--attach", "missing_equals"],
+        vec!["run", "--attach=populi="],
+        vec!["run", "--attach=main=other.db"],
+        vec!["run", "--attach", "TEMP=other.db"],
+        vec!["run", "--attach=bad-schema=other.db"],
+        vec!["run", "--attach=:populi=other.db"],
+        vec!["check", "--attach=bad-schema=other.db"],
+        vec![
+            "schema-sync",
+            "--db",
+            &db_arg,
+            "--attach=bad-schema=other.db",
+        ],
+        vec!["run", "--attach"],
+    ] {
+        let out = Command::new(bin).args(&bad_args).output()?;
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "expected exit 2 for {bad_args:?}, got {:?} ({})",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn v06_try_parse_date_exact_sql_pushdown_sqlite_and_postgres() -> TestResult {
+    let tmp = TempDir::new("try_parse_date_pushdown")?;
+    let db_path = tmp.path().join("dates.db");
+    let uri = sqlite_uri(&db_path);
+    {
+        let mut conn = open_connection(&uri)?;
+        conn.execute(
+            r#"CREATE TABLE "dates" ("id" INTEGER PRIMARY KEY NOT NULL, "raw" TEXT NOT NULL)"#,
+            &[],
+        )?;
+        let cases = [
+            (1i64, "2024-02-29"),
+            (2, "2023-02-29"),
+            (3, "1900-02-29"),
+            (4, "2000-02-29"),
+            (5, "0000-02-29"),
+            (6, " 1999-12-31 \r\n"),
+            (7, "\u{00A0}2024-01-01"),
+            (8, "+999-+1-+1"),
+            (9, "-100-01-01"),
+            (10, "2024-00-10"),
+            (11, "2024-13-01"),
+            (12, "2024-04-31"),
+            (13, "2024-1-5"),
+            (14, ""),
+            (15, "2026-01-12T00:00:00Z"),
+        ];
+        for (id, raw) in cases {
+            conn.execute(
+                r#"INSERT INTO "dates" VALUES (?, ?)"#,
+                &[SqlParam::Int(id), SqlParam::Text(raw.to_string())],
+            )?;
+        }
+    }
+
+    let direct_src = r##"module DatePushdown
+
+schema RawDate
+  id: Int
+  raw: Text
+end
+
+fn main(db: ReadDB(DB), console: Console) : Int
+  out = db.table(RawDate, from: "dates")
+    |> derive(d: .raw.try_parse_date)
+    |> sort_by(.id)
+  for r in out
+    console.print("#{r.id}:#{r.d}")
+  end
+  0
+end
+"##;
+    let lines = assert_oracle_vm_parity(direct_src, Some(("DB", &uri)))?;
+    assert_eq!(
+        lines,
+        vec![
+            "1:2024-02-29",
+            "2:none",
+            "3:none",
+            "4:2000-02-29",
+            "5:none",
+            "6:1999-12-31",
+            "7:none",
+            "8:none",
+            "9:none",
+            "10:none",
+            "11:none",
+            "12:none",
+            "13:none",
+            "14:none",
+            "15:none",
+        ]
+    );
+
+    let dates_sq_lock = dana::db::schema_lock::SchemaLockFile {
+        dbs: vec![dana::db::schema_lock::LockedDb {
+            name: "DB".to_string(),
+            dialect: SqlDialect::Sqlite,
+            tables: vec![dana::db::schema_lock::LockedTable {
+                name: "dates".to_string(),
+                cols: vec![
+                    dana::db::schema_lock::LockedCol {
+                        name: "id".to_string(),
+                        ty: dana::core::syntax::ScalarTy::Int,
+                        nullable: false,
+                        pk: true,
+                        tags: dana::core::syntax::TagSet::empty(),
+                    },
+                    dana::db::schema_lock::LockedCol {
+                        name: "raw".to_string(),
+                        ty: dana::core::syntax::ScalarTy::Text,
+                        nullable: false,
+                        pk: false,
+                        tags: dana::core::syntax::TagSet::empty(),
+                    },
+                ],
+            }],
+        }],
+        ..dana::db::schema_lock::SchemaLockFile::default()
+    };
+    let mut dates_pg_lock = dates_sq_lock.clone();
+    dates_pg_lock.dbs[0].dialect = SqlDialect::Postgres;
+
+    let checked_direct = check_src_with_lock(direct_src, &dates_sq_lock)?;
+    let main_fn = checked_direct.exec.find_fun("main").ok_or("missing main")?;
+    let plan = find_first_plan(&main_fn.body).ok_or("missing ExecPlan")?;
+    let sq_split = split_exec_plan_pushdown(
+        plan,
+        &checked_direct.exec,
+        "DB",
+        SqlDialect::Sqlite,
+        Some(&dates_sq_lock),
+    );
+    match sq_split {
+        SplitPlan::FullyPushed(q) => {
+            assert!(
+                q.sql
+                    .contains("GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'")
+                    && q.sql.contains("<> '0000'"),
+                "unexpected SQLite TryParseIsoDate SQL:\n{}",
+                q.sql
+            );
+        }
+        other => return Err(format!("expected SQLite FullyPushed, got {other:?}").into()),
+    }
+    let pg_split = split_exec_plan_pushdown(
+        plan,
+        &checked_direct.exec,
+        "DB",
+        SqlDialect::Postgres,
+        Some(&dates_pg_lock),
+    );
+    match pg_split {
+        SplitPlan::FullyPushed(q) => {
+            assert!(
+                q.sql.contains("BTRIM(")
+                    && q.sql.contains("CHR(32)")
+                    && q.sql.contains("~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'")
+                    && q.sql.contains("<> '0000'")
+                    && q.sql.contains("AS DATE)"),
+                "unexpected Postgres TryParseIsoDate SQL:\n{}",
+                q.sql
+            );
+        }
+        other => return Err(format!("expected Postgres FullyPushed, got {other:?}").into()),
+    }
+
+    // Slice + try_parse_date (P4 timestamp prefix pattern) also pushes cleanly end-to-end
+    let slice_src = r##"module DateSlicePushdown
+
+schema RawDate
+  id: Int
+  raw: Text
+end
+
+fn main(db: ReadDB(DB), console: Console) : Int
+  out = db.table(RawDate, from: "dates")
+    |> derive(ds: .raw.slice(0, 10).try_parse_date)
+    |> where(.ds.some?)
+    |> sort_by(.id)
+  for r in out
+    console.print("#{r.id}:#{r.ds}")
+  end
+  0
+end
+"##;
+    let slice_lines = assert_oracle_vm_parity(slice_src, Some(("DB", &uri)))?;
+    assert_eq!(
+        slice_lines,
+        vec!["1:2024-02-29", "4:2000-02-29", "15:2026-01-12",]
+    );
+    let checked_slice = check_src_with_lock(slice_src, &dates_sq_lock)?;
+    let slice_plan = find_first_plan(&checked_slice.exec.find_fun("main").ok_or("main")?.body)
+        .ok_or("missing ExecPlan")?;
+    for (dialect, lk) in [
+        (SqlDialect::Sqlite, &dates_sq_lock),
+        (SqlDialect::Postgres, &dates_pg_lock),
+    ] {
+        let sp = split_exec_plan_pushdown(slice_plan, &checked_slice.exec, "DB", dialect, Some(lk));
+        assert!(
+            matches!(sp, SplitPlan::FullyPushed(_)),
+            "expected slice+try_parse_date+where to push fully on {dialect:?}, got {sp:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn v06_dedupe_by_parity_pushdown_privacy_and_negative_probes() -> TestResult {
+    // 1. In-memory dedupe_by without order_by (`:first` default & `:last`), preserving winner input order
+    let no_order_src = r##"module DedupeNoOrder
+
+fn main(console: Console) : Int
+  rows = table
+    | id | uid | seq | tag |
+    | 1  | 10  | 1   | "a" |
+    | 2  | 20  | 1   | "b" |
+    | 3  | 10  | 2   | "c" |
+    | 4  | 30  | 1   | "d" |
+    | 5  | 20  | 2   | "e" |
+  end
+  first_kept = rows |> dedupe_by(.uid)
+  last_kept = rows |> dedupe_by(.uid, keep: :last)
+  for r in first_kept
+    console.print("F:#{r.id}:#{r.uid}:#{r.tag}")
+  end
+  for r in last_kept
+    console.print("L:#{r.id}:#{r.uid}:#{r.tag}")
+  end
+  0
+end
+"##;
+    let no_ord_out = assert_oracle_vm_parity(no_order_src, None)?;
+    assert_eq!(
+        no_ord_out,
+        vec![
+            "F:1:10:a", "F:2:20:b", "F:4:30:d", "L:3:10:c", "L:4:30:d", "L:5:20:e",
+        ]
+    );
+
+    // 2. Multi-key `dedupe_by(.uid, .cid, order_by: [desc(.active), desc(.updated_at), desc(.id)], keep: :first/:last)`
+    //    with `none`s and ties
+    let ordered_src = r##"module DedupeOrdered
+
+fn main(console: Console) : Int
+  rows = table
+    | id | uid | cid | active | updated_at   | note |
+    | 1  | 10  | 100 | false  | "2026-01-05" | "old-false" |
+    | 2  | 10  | 100 | true   | none         | "active-null" |
+    | 3  | 10  | 100 | true   | "2026-01-02" | "active-date-older" |
+    | 4  | 10  | 100 | true   | "2026-01-02" | "active-date-newer-id" |
+    | 5  | 20  | 200 | false  | none         | "u20-null" |
+    | 6  | 20  | 200 | false  | "2025-12-01" | "u20-date" |
+  end
+  f = rows |> dedupe_by(.uid, .cid, order_by: [desc(.active), desc(.updated_at), desc(.id)], keep: :first) |> sort_by(.id)
+  l = rows |> dedupe_by(.uid, .cid, order_by: [desc(.active), desc(.updated_at), desc(.id)], keep: :last) |> sort_by(.id)
+  for r in f
+    console.print("F:#{r.id}:#{r.note}")
+  end
+  for r in l
+    console.print("L:#{r.id}:#{r.note}")
+  end
+  0
+end
+"##;
+    let ord_out = assert_oracle_vm_parity(ordered_src, None)?;
+    assert_eq!(
+        ord_out,
+        vec![
+            "F:4:active-date-newer-id",
+            "F:6:u20-date",
+            "L:1:old-false",
+            "L:5:u20-null",
+        ]
+    );
+
+    // 3. SQLite & Postgres pushdown with PK tie-breaker + Hybrid fallback without unique tie-breaker
+    let tmp = TempDir::new("dedupe_sql")?;
+    let db_path = tmp.path().join("dedupe.db");
+    let uri = sqlite_uri(&db_path);
+    {
+        let mut conn = open_connection(&uri)?;
+        conn.execute(
+            r#"CREATE TABLE "enrollments" (
+                "id" INTEGER PRIMARY KEY NOT NULL,
+                "uid" TEXT NOT NULL,
+                "cid" INTEGER NOT NULL,
+                "active" INTEGER NOT NULL,
+                "updated_at" TEXT
+            )"#,
+            &[],
+        )?;
+        for (id, uid, cid, active, upd) in [
+            (1i64, "u1", 100i64, 0i64, Some("2026-02-01")),
+            (2, "u1", 100, 1, None),
+            (3, "u1", 100, 1, Some("2026-01-10")),
+            (4, "u1", 100, 1, Some("2026-01-10")),
+            (5, "u2", 200, 0, None),
+            (6, "u2", 200, 1, Some("2025-11-01")),
+        ] {
+            let upd_param = match upd {
+                Some(s) => SqlParam::Text(s.to_string()),
+                None => SqlParam::Null,
+            };
+            conn.execute(
+                r#"INSERT INTO "enrollments" VALUES (?, ?, ?, ?, ?)"#,
+                &[
+                    SqlParam::Int(id),
+                    SqlParam::Text(uid.to_string()),
+                    SqlParam::Int(cid),
+                    SqlParam::Int(active),
+                    upd_param,
+                ],
+            )?;
+        }
+    }
+
+    let lock = dana::db::schema_lock::SchemaLockFile {
+        dbs: vec![dana::db::schema_lock::LockedDb {
+            name: "DB".to_string(),
+            dialect: SqlDialect::Sqlite,
+            tables: vec![dana::db::schema_lock::LockedTable {
+                name: "enrollments".to_string(),
+                cols: vec![
+                    dana::db::schema_lock::LockedCol {
+                        name: "id".to_string(),
+                        ty: dana::core::syntax::ScalarTy::Int,
+                        nullable: false,
+                        pk: true,
+                        tags: dana::core::syntax::TagSet::empty(),
+                    },
+                    dana::db::schema_lock::LockedCol {
+                        name: "uid".to_string(),
+                        ty: dana::core::syntax::ScalarTy::Text,
+                        nullable: false,
+                        pk: false,
+                        tags: dana::core::syntax::TagSet::empty(),
+                    },
+                    dana::db::schema_lock::LockedCol {
+                        name: "cid".to_string(),
+                        ty: dana::core::syntax::ScalarTy::Int,
+                        nullable: false,
+                        pk: false,
+                        tags: dana::core::syntax::TagSet::empty(),
+                    },
+                    dana::db::schema_lock::LockedCol {
+                        name: "active".to_string(),
+                        ty: dana::core::syntax::ScalarTy::Bool,
+                        nullable: false,
+                        pk: false,
+                        tags: dana::core::syntax::TagSet::empty(),
+                    },
+                    dana::db::schema_lock::LockedCol {
+                        name: "updated_at".to_string(),
+                        ty: dana::core::syntax::ScalarTy::Text,
+                        nullable: true,
+                        pk: false,
+                        tags: dana::core::syntax::TagSet::empty(),
+                    },
+                ],
+            }],
+        }],
+        ..dana::db::schema_lock::SchemaLockFile::default()
+    };
+    let mut pg_lock = lock.clone();
+    pg_lock.dbs[0].dialect = SqlDialect::Postgres;
+
+    let db_push_src = r##"module DedupeSql
+
+schema Enroll
+  id: Int
+  uid: Text
+  cid: Int
+  active: Bool
+  updated_at: Text?
+end
+
+fn main(db: ReadDB(DB), console: Console) : Int
+  res = db.table(Enroll, from: "enrollments")
+    |> dedupe_by(.uid, .cid, order_by: [desc(.active), desc(.updated_at), desc(.id)])
+    |> where(.cid >= 100)
+    |> sort_by(.id)
+  for r in res
+    console.print("#{r.id}:#{r.uid}:#{r.cid}:#{r.active}:#{r.updated_at}")
+  end
+  0
+end
+"##;
+    let checked_push = check_src_with_lock(db_push_src, &lock)?;
+    let main_fn = checked_push.exec.find_fun("main").ok_or("missing main")?;
+    let plan = find_first_plan(&main_fn.body).ok_or("missing ExecPlan")?;
+    let sq_split = split_exec_plan_pushdown(
+        plan,
+        &checked_push.exec,
+        "DB",
+        SqlDialect::Sqlite,
+        Some(&lock),
+    );
+    match &sq_split {
+        SplitPlan::FullyPushed(q) => {
+            assert!(
+                q.sql.contains("ROW_NUMBER() OVER (PARTITION BY")
+                    && q.sql.contains("= 1")
+                    && q.sql.contains("WHERE"),
+                "unexpected SQLite dedupe_by SQL:\n{}",
+                q.sql
+            );
+        }
+        other => {
+            return Err(format!("expected SQLite FullyPushed with PK lock, got {other:?}").into());
+        }
+    }
+    let pg_split = split_exec_plan_pushdown(
+        plan,
+        &checked_push.exec,
+        "DB",
+        SqlDialect::Postgres,
+        Some(&pg_lock),
+    );
+    match &pg_split {
+        SplitPlan::FullyPushed(q) => {
+            assert!(
+                q.sql.contains("SELECT DISTINCT ON (")
+                    && q.sql.contains(r#""uid" COLLATE "C""#)
+                    && q.sql.contains("ORDER BY")
+                    && q.sql.contains("WHERE"),
+                "unexpected Postgres dedupe_by SQL:\n{}",
+                q.sql
+            );
+        }
+        other => {
+            return Err(
+                format!("expected Postgres FullyPushed with PK lock, got {other:?}").into(),
+            );
+        }
+    }
+
+    // Without unique tie-breaker (no PK lock), SQL pushdown must fall back cleanly to Hybrid
+    let checked_nolock = check_src(db_push_src)?;
+    let nolock_plan = find_first_plan(&checked_nolock.exec.find_fun("main").ok_or("main")?.body)
+        .ok_or("missing ExecPlan")?;
+    let hybrid_split = split_exec_plan_pushdown(
+        nolock_plan,
+        &checked_nolock.exec,
+        "DB",
+        SqlDialect::Sqlite,
+        None,
+    );
+    assert!(
+        matches!(hybrid_split, SplitPlan::Hybrid { .. }),
+        "expected Hybrid fallback without unique tie-breaker, got {hybrid_split:?}"
+    );
+
+    // Live SQLite pushdown (with lock) == VM (without lock) == Oracle parity
+    let no_lock_out = assert_oracle_vm_parity(db_push_src, Some(("DB", &uri)))?;
+    let mut lock_db_map = HashMap::new();
+    lock_db_map.insert("DB".to_string(), uri.clone());
+    let lock_cfg = RunConfig {
+        live_io: true,
+        db_bindings: lock_db_map,
+        schema_lock: Some(lock),
+        ..RunConfig::default()
+    };
+    let vm_pushed_out =
+        match run_exec_program_vm(&checked_push.exec, &lock_cfg, &VmConfig::default()) {
+            RunResult::Ok {
+                exit_code: 0,
+                stdout,
+                ..
+            } => stdout,
+            other => return Err(format!("VM locked run failed: {other:?}").into()),
+        };
+    let ora_pushed_out = match run_exec_program(&checked_push.exec, &lock_cfg) {
+        RunResult::Ok {
+            exit_code: 0,
+            stdout,
+            ..
+        } => stdout,
+        other => return Err(format!("Oracle locked run failed: {other:?}").into()),
+    };
+    let expected_db_rows = vec![
+        "4:u1:100:true:2026-01-10".to_string(),
+        "6:u2:200:true:2025-11-01".to_string(),
+    ];
+    assert_eq!(no_lock_out, expected_db_rows);
+    assert_eq!(vm_pushed_out, expected_db_rows);
+    assert_eq!(ora_pushed_out, expected_db_rows);
+
+    // 4. `dana explain` reports `DEDUPE DedupeBy(`
+    let explain_path = tmp.path().join("dedupe_explain.dana");
+    fs::write(&explain_path, db_push_src)?;
+    let exp_out = Command::new(env!("CARGO_BIN_EXE_dana"))
+        .args(["explain", "--dialect", "postgres"])
+        .arg(&explain_path)
+        .output()?;
+    assert_eq!(exp_out.status.code(), Some(0));
+    let exp_stdout = String::from_utf8(exp_out.stdout)?;
+    assert!(
+        exp_stdout.contains("DEDUPE DedupeBy("),
+        "expected DEDUPE DedupeBy in explain output:\n{exp_stdout}"
+    );
+
+    // 5. Privacy taint: `dedupe_by` on [pii]/[ferpa] column taints row_tags (`E0201` on public console),
+    //    and `summarize` + `suppress_small_groups` clears it.
+    let taint_leak_src = r##"module DedupeTaintLeak
+
+schema Rec
+  uid: Int [pii]
+  dept: Text
+  score: Int
+end
+
+fn leak_check(rows: Table(Rec), console: Console) : Int
+  d = rows |> dedupe_by(.uid) |> select(.dept)
+  console.print("#{d.count()}")
+  0
+end
+"##;
+    let leak_diags = check_src_diags(taint_leak_src)?;
+    assert!(
+        leak_diags
+            .iter()
+            .any(|d| d.code() == DiagCode::PrivacyError),
+        "expected E0201 PrivacyError on dedupe_by(.uid [pii]) count, got {leak_diags:?}"
+    );
+
+    let taint_cleared_src = r##"module DedupeTaintCleared
+
+schema StudentRow
+  uid: Int [pii]
+  cid: Int [ferpa]
+  dept: Text
+end
+
+fn summarize_safe(rows: Table(StudentRow), console: Console) : Int
+  res = rows
+    |> dedupe_by(.uid, .cid, order_by: [desc(.cid)])
+    |> group_by(.dept)
+    |> summarize(n: count_distinct(.uid))
+    |> suppress_small_groups(min: 5, distinct_by: .uid)
+  console.print_table(res)
+  0
+end
+
+fn main(db: ReadDB(DB), console: Console) : Int
+  _ = db.table(StudentRow, from: "enrollments")
+  rows = table
+    | uid | cid | dept  |
+    | 1   | 10  | "eng" |
+    | 2   | 10  | "eng" |
+    | 3   | 10  | "eng" |
+    | 4   | 10  | "eng" |
+    | 5   | 10  | "eng" |
+    | 5   | 10  | "eng" |
+  end
+  _ = rows
+  0
+end
+"##;
+    // Also verify runtime execution using schema tags via DB scan on the clean seeded rows
+    let taint_run_src = r##"module DedupeTaintClearedRun
+
+schema EnrollTag
+  id: Int
+  uid: Text [pii]
+  cid: Int [ferpa]
+  active: Bool
+  updated_at: Text?
+end
+
+fn main(db: ReadDB(DB), console: Console) : Int
+  res = db.table(EnrollTag, from: "enrollments")
+    |> dedupe_by(.uid, .cid, order_by: [desc(.cid)])
+    |> summarize(n: count_distinct(.uid))
+    |> suppress_small_groups(min: 2, distinct_by: .uid)
+  0
+end
+"##;
+    let _ = taint_run_src;
+    let cleared_checked = check_src(taint_cleared_src)?;
+    assert!(cleared_checked.warnings.is_empty());
+
+    let taint_runtime_src = r##"module DedupeTaintClearedRuntime
+
+schema RawEnr
+  uid: Int [pii]
+  cid: Int [ferpa]
+  dept: Text
+end
+
+fn run_safe(db: ReadDB(DB), console: Console) : Int
+  rows = db.table(RawEnr, from: "taint_enr")
+  res = rows
+    |> dedupe_by(.uid, .cid, order_by: [desc(.cid)])
+    |> group_by(.dept)
+    |> summarize(n: count_distinct(.uid))
+    |> suppress_small_groups(min: 5, distinct_by: .uid)
+  console.print_table(res)
+  0
+end
+
+fn main(db: ReadDB(DB), console: Console) : Int
+  run_safe(db, console)
+end
+"##;
+    {
+        let mut conn = open_connection(&uri)?;
+        conn.execute(
+            r#"CREATE TABLE "taint_enr" ("uid" INTEGER NOT NULL, "cid" INTEGER NOT NULL, "dept" TEXT NOT NULL)"#,
+            &[],
+        )?;
+        for (uid, cid) in [(1i64, 10i64), (2, 10), (3, 10), (4, 10), (5, 10), (5, 10)] {
+            conn.execute(
+                r#"INSERT INTO "taint_enr" VALUES (?, ?, 'eng')"#,
+                &[SqlParam::Int(uid), SqlParam::Int(cid)],
+            )?;
+        }
+    }
+    let cleared_out = assert_oracle_vm_parity(taint_runtime_src, Some(("DB", &uri)))?;
+    assert!(
+        cleared_out.join("\n").contains('5'),
+        "expected cleared dedupe+suppress summary, got {cleared_out:?}"
+    );
+
+    // 6. Negative compile probes + row-expr hint
+    for bad_src in [
+        "module D1\nfn main() : Int\n  t = table\n    | a |\n    | 1 |\n  end\n  _ = t |> dedupe_by()\n  0\nend\n",
+        "module D2\nfn main() : Int\n  t = table\n    | a |\n    | 1 |\n  end\n  _ = t |> dedupe_by(.a, .a)\n  0\nend\n",
+        "module D3\nfn main() : Int\n  t = table\n    | a |\n    | 1 |\n  end\n  _ = t |> dedupe_by(.missing)\n  0\nend\n",
+        "module D4\nfn main() : Int\n  t = table\n    | a |\n    | 1 |\n  end\n  _ = t |> dedupe_by(.a, order_by: .missing)\n  0\nend\n",
+        "module D5\nfn main() : Int\n  t = table\n    | a |\n    | 1 |\n  end\n  _ = t |> dedupe_by(.a, order_by: [])\n  0\nend\n",
+        "module D6\nfn main() : Int\n  t = table\n    | a |\n    | 1 |\n  end\n  _ = t |> dedupe_by(.a, keep: :middle)\n  0\nend\n",
+        "module D7\nfn main() : Int\n  t = table\n    | a |\n    | 1 |\n  end\n  _ = t |> dedupe_by(.a, order_by: [.a + 1])\n  0\nend\n",
+    ] {
+        let ds = check_src_diags(bad_src)?;
+        assert!(
+            ds.iter().any(|d| d.code() == DiagCode::TypeError),
+            "expected TypeError for:\n{bad_src}\ngot: {ds:?}"
+        );
+    }
+    let hint_src = r##"module DedupeInDerive
+fn main() : Int
+  t = table
+    | a |
+    | 1 |
+  end
+  _ = t |> derive(x: dedupe_by(.a))
+  0
+end
+"##;
+    let hint_diags = check_src_diags(hint_src)?;
+    assert!(
+        hint_diags.iter().any(|d| {
+            d.code() == DiagCode::TypeError
+                && d.hints()
+                    .iter()
+                    .any(|h| h.contains("pipeline") && h.contains("|>"))
+        }),
+        "expected pipeline verb hint for dedupe_by inside derive, got {hint_diags:?}"
+    );
+
+    Ok(())
+}

@@ -55,6 +55,8 @@ pub struct ReplConfig {
     pub policy: Option<Policy>,
     /// Ordered `(DbName, URI)` bindings supplied via `--db Name=URI`.
     pub db_bindings: Vec<(String, String)>,
+    /// SQLite attachments supplied via `--attach [DB:]schema=PATH`.
+    pub sqlite_attachments: Vec<(Option<String>, String, String)>,
     pub schema_lock: Option<SchemaLockFile>,
     /// Sensitivity tags explicitly allowed for local interactive display (`--show-sensitive`).
     pub allowed_show_tags: TagSet,
@@ -67,6 +69,7 @@ impl Default for ReplConfig {
         Self {
             policy: None,
             db_bindings: Vec::new(),
+            sqlite_attachments: Vec::new(),
             schema_lock: None,
             allowed_show_tags: TagSet::empty(),
             work_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -878,6 +881,7 @@ impl ReplSession {
             work_dir: Some(self.cfg.work_dir.clone()),
             live_io: true,
             db_bindings: db_map,
+            sqlite_attachments: self.cfg.sqlite_attachments.clone(),
             schema_lock: self.cfg.schema_lock.clone(),
             dry_run: true,
             ..RunConfig::default()
@@ -1110,7 +1114,7 @@ pub fn run_repl_reader<R: BufRead, W: Write, E: Write>(
     if interactive {
         let _ = writeln!(
             out,
-            "Dana v0.5 Safe REPL (read-only, sensitive values redacted by default). Type :help or :quit."
+            "Dana v0.6 Safe REPL (read-only, sensitive values redacted by default). Type :help or :quit."
         );
     }
     let mut buf = String::new();

@@ -1391,6 +1391,48 @@ fn trace_exec_provenance(
                 ..TableTy::default()
             })
         }
+        ExecPlan::DedupeBy {
+            input,
+            keys,
+            order_by,
+            keep,
+        } => {
+            let tt = trace_exec_provenance(input, prog, var_tags, table_vars, lines)?;
+            let key_tags =
+                TagSet::union_list(keys.iter().filter_map(|k| tt.find_col(k).map(|c| &c.tags)));
+            let ord_tags = TagSet::union_list(
+                order_by
+                    .iter()
+                    .filter_map(|(k, _)| tt.find_col(k).map(|c| &c.tags)),
+            );
+            let next_row = tt
+                .row_tags
+                .union(&key_tags)
+                .union(&ord_tags)
+                .union(&tt.order_tags);
+            let ord_desc: Vec<String> =
+                order_by.iter().map(|(k, d)| format!("{k}:{d:?}")).collect();
+            lines.push(format!(
+                "DEDUPE DedupeBy(keys=[{}], order=[{}], keep={keep:?}): tags={}, row_tags={}",
+                keys.join(", "),
+                ord_desc.join(", "),
+                fmt_tags(&key_tags.union(&ord_tags)),
+                fmt_tags(&next_row),
+            ));
+            Some(TableTy {
+                cols: tt
+                    .cols
+                    .into_iter()
+                    .map(|c| ColSpec {
+                        agg_kind: AggKind::Raw,
+                        ..c
+                    })
+                    .collect(),
+                row_tags: next_row,
+                order_tags: tt.order_tags,
+                ..TableTy::default()
+            })
+        }
         ExecPlan::GroupBy { input, keys } => {
             let tt = trace_exec_provenance(input, prog, var_tags, table_vars, lines)?;
             let key_tags =
@@ -2021,6 +2063,21 @@ fn fmt_exec_plan(plan: &ExecPlan, depth: usize, out: &mut String) {
         }
         ExecPlan::Distinct { input, cols } => {
             let _ = writeln!(out, "Distinct([{}])", cols.join(", "));
+            fmt_exec_plan(input, depth + 1, out);
+        }
+        ExecPlan::DedupeBy {
+            input,
+            keys,
+            order_by,
+            keep,
+        } => {
+            let ord: Vec<String> = order_by.iter().map(|(k, d)| format!("{k}:{d:?}")).collect();
+            let _ = writeln!(
+                out,
+                "DedupeBy(keys=[{}], order=[{}], keep={keep:?})",
+                keys.join(", "),
+                ord.join(", ")
+            );
             fmt_exec_plan(input, depth + 1, out);
         }
         ExecPlan::Sort { input, keys } => {

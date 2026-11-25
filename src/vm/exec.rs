@@ -16,7 +16,7 @@ use crate::core::syntax::{
     Program, ScalarTy, TableTy, TagSet, Ty,
 };
 use crate::db::schema_lock::SchemaLockFile;
-use crate::db::{SqlDialect, SqlParam, quote_sql_ident, quote_sql_table_ref};
+use crate::db::{SqlDialect, SqlParam, quote_sql_ident};
 use crate::oracle::eval::{PrimResult, RuntimeError, eval_literal, eval_prim_op};
 use crate::oracle::value::{
     Bug, CapHandle, ClosureVal, EnvEntry, EnvList, ReportVal, TableRow, TableVal, Val,
@@ -26,7 +26,9 @@ use crate::oracle::world::{
     ExecReport, FakeConsoleState, FakeDBState, FakeFilesState, FakeHttpsState, Outcome,
     StoredTable, World, extract_report,
 };
-use crate::plan::{SplitPlan, optimize_exec_plan, optimize_program, split_exec_plan_pushdown};
+use crate::plan::{
+    SplitPlan, optimize_exec_plan, optimize_program, split_exec_plan_pushdown_with_table_refs,
+};
 use crate::runtime::exec::{
     EvalProgramResult, RunConfig, RunResult, TestOutcome, eval_exec_entry_with_engine,
     eval_pure_exec_call, run_exec_program_with_engine, run_program_tests_with_engine,
@@ -39,8 +41,8 @@ use crate::vm::ops::agg::{
 };
 use crate::vm::ops::join::op_hash_join;
 use crate::vm::ops::sort_win::{
-    op_crosstab, op_distinct, op_fill_gaps, op_pivot_longer, op_pivot_wider, op_shuffle, op_sort,
-    op_window, seed_from_bigint,
+    op_crosstab, op_dedupe_by, op_distinct, op_fill_gaps, op_pivot_longer, op_pivot_wider,
+    op_shuffle, op_sort, op_window, seed_from_bigint,
 };
 use crate::vm::ops::{
     OpErr, OpExecConfig, VmMode, VmTable, op_derive_bucket, op_derive_coarsen, op_derive_col_expr,
@@ -139,6 +141,10 @@ pub trait ExecPlanBridge {
     /// Return the optional offline [`SchemaLockFile`] configured for this run.
     fn schema_lock(&self) -> Option<&SchemaLockFile>;
 
+    /// Resolve a Dana `from: "..."` table name for live `db_name` (handling SQLite `--attach`
+    /// namespaces and unattached `schema.table` / `schema_table` fallbacks).
+    fn resolve_live_table_ref(&mut self, db_name: &str, table_name: &str) -> Result<String, OpErr>;
+
     /// Execute a parameterized SQL query against live logical database `db_name` and stream
     /// results directly into `batch_size`-row columnar batches.
     fn exec_live_sql_batches(
@@ -216,6 +222,25 @@ pub fn eval_exec_plan_vm(
     Ok(Val::Columnar(Arc::new(out_tbl)))
 }
 
+fn collect_exec_source_db_tables<'a>(plan: &'a ExecPlan, out: &mut Vec<&'a str>) {
+    let mut stack = vec![plan];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            ExecPlan::SourceDB { table_name, .. } => out.push(table_name.as_str()),
+            ExecPlan::SourceExpr(_) => {}
+            ExecPlan::Join { left, right, .. } | ExecPlan::Union { left, right } => {
+                stack.push(right);
+                stack.push(left);
+            }
+            other => {
+                if let Some(child) = exec_unary_input(other) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+}
+
 fn collect_exec_source_db_caps<'a>(plan: &'a ExecPlan, out: &mut Vec<&'a ExecExpr>) {
     let mut stack = vec![plan];
     while let Some(cur) = stack.pop() {
@@ -273,8 +298,31 @@ fn eval_exec_plan_to_table(
                 }
             }
             if all_same_live && let Some((db_name, dialect)) = single_live {
-                let split =
-                    split_exec_plan_pushdown(plan, prog, &db_name, dialect, bridge.schema_lock());
+                let table_refs_opt = if dialect == SqlDialect::Sqlite {
+                    let mut tnames = Vec::new();
+                    collect_exec_source_db_tables(plan, &mut tnames);
+                    let mut map = HashMap::new();
+                    for table_name in tnames {
+                        let effective = bridge
+                            .schema_lock()
+                            .and_then(|l| l.find_db(&db_name))
+                            .and_then(|d| d.resolve_table(table_name).ok())
+                            .map_or_else(|| table_name.to_string(), |t| t.name.clone());
+                        let resolved_ref = bridge.resolve_live_table_ref(&db_name, &effective)?;
+                        map.insert(table_name.to_string(), resolved_ref);
+                    }
+                    Some(map)
+                } else {
+                    None
+                };
+                let split = split_exec_plan_pushdown_with_table_refs(
+                    plan,
+                    prog,
+                    &db_name,
+                    dialect,
+                    bridge.schema_lock(),
+                    table_refs_opt.as_ref(),
+                );
                 match split {
                     SplitPlan::FullyPushed(q) => {
                         let params = q
@@ -379,19 +427,16 @@ fn eval_exec_plan_to_table(
                     .and_then(|l| l.find_db(&db_name))
                     .and_then(|d| d.resolve_table(table_name).ok())
                     .map_or_else(|| table_name.clone(), |t| t.name.clone());
+                let table_sql = bridge.resolve_live_table_ref(&db_name, &effective_table)?;
                 let cols_sql: Vec<String> = schema
                     .cols
                     .iter()
                     .map(|c| quote_sql_ident(&c.name))
                     .collect();
                 let sql = if cols_sql.is_empty() {
-                    format!("SELECT 1 FROM {}", quote_sql_table_ref(&effective_table))
+                    format!("SELECT 1 FROM {table_sql}")
                 } else {
-                    format!(
-                        "SELECT {} FROM {}",
-                        cols_sql.join(", "),
-                        quote_sql_table_ref(&effective_table)
-                    )
+                    format!("SELECT {} FROM {table_sql}", cols_sql.join(", "))
                 };
                 bridge.exec_live_sql_batches(&db_name, &sql, &[], schema, cfg.batch_size)?
             } else {
@@ -544,6 +589,12 @@ fn eval_exec_plan_to_table(
                 t
             }
             ExecPlan::Distinct { cols, .. } => op_distinct(cur, cols, cfg)?,
+            ExecPlan::DedupeBy {
+                keys,
+                order_by,
+                keep,
+                ..
+            } => op_dedupe_by(cur, keys, order_by, *keep, cfg)?,
             ExecPlan::Sort { keys, .. } => op_sort(cur, keys, cfg),
             ExecPlan::Limit { n, .. } => {
                 let lim = n.to_u64().unwrap_or(0) as usize;
@@ -678,6 +729,7 @@ fn exec_unary_input(plan: &ExecPlan) -> Option<&ExecPlan> {
         | ExecPlan::Derive { input, .. }
         | ExecPlan::Filter { input, .. }
         | ExecPlan::Distinct { input, .. }
+        | ExecPlan::DedupeBy { input, .. }
         | ExecPlan::Sort { input, .. }
         | ExecPlan::Limit { input, .. }
         | ExecPlan::GroupBy { input, .. }

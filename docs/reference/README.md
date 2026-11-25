@@ -1,6 +1,6 @@
-# Dana Language Reference, v0.5
+# Dana Language Reference, v0.6
 
-**Version 0.5 (pre-1.0).** This is the complete, authoritative language reference for Dana,
+**Version 0.6 (pre-1.0).** This is the complete, authoritative language reference for Dana,
 embedded directly into `dana guide` for human authors and AI coding agents.
 
 Every rule is illustrated with real syntax checked by Dana's 0-conflict IELR(1) grammar
@@ -163,8 +163,8 @@ immediately before a closing delimiter, `.`, `|>`, or any binary operator other 
    values of different numeric types (`Int + Decimal`, `Decimal + Float`, `Int / Float`) is a
    **compile error**. Convert explicitly:
    - On `Int`: `.to_decimal` -> `Decimal`, `.to_float` -> `Float`, `.abs` -> `Int`.
-   - On `Decimal`: `.to_float` -> `Float`, `.abs` -> `Decimal`, `.round(n)` -> `Decimal`.
-   - On `Float`: `.abs` -> `Float`, `.round(n)` -> `Float`.
+   - On `Decimal`: `.to_float` -> `Float`, `.abs` -> `Decimal`, `.round(n, [mode: :half_away | :half_even])` -> `Decimal`, `.ceil` / `.floor` / `.trunc` / `.to_int` -> `Int` (traps on `DomainError` if out of 64-bit `Int` range).
+   - On `Float`: `.abs` -> `Float`, `.round(n, [mode: :half_away | :half_even])` -> `Float`, `.ceil` / `.floor` / `.trunc` / `.to_int` -> `Int` (traps on `DomainError` on `NaN`, infinite, or out-of-range inputs).
    - There is intentionally **no** `.to_decimal` on `Float` (keep exact money/financial values
      as `Decimal` from the schema boundary).
 3. **Scalar text, numeric, parsing & time helpers** (available both in normal expressions and
@@ -177,10 +177,10 @@ immediately before a closing delimiter, `.`, `|>`, or any binary operator other 
      `.try_parse_date : Date?`, `.try_parse_int : Int?`, `.try_parse_decimal : Decimal?`,
      `.try_parse_float : Float?`.
    - **Numeric bounding & quantization:** `.clamp(lo, hi)` (on `Int`/`Decimal`/`Float`;
-     traps on `DomainError` if `lo > hi` or `NaN` bounds) and `.round_to(step)` (on `Float`;
-     quantizes to multiples of `step > 0` with IEEE-754 ties-away-from-zero; traps on
-     `step <= 0` or non-finite inputs). Inside `derive(...)`, `.round_to(...)` marks the
-     resulting column as coarsened (`bucketed = true`).
+     traps on `DomainError` if `lo > hi` or `NaN` bounds) and `.round_to(step, [mode: :half_away | :half_even])`
+     (on `Float`; quantizes to multiples of `step > 0` with `:half_away` [default] or
+     `:half_even` banker's rounding; traps on `step <= 0` or non-finite inputs). Inside `derive(...)`,
+     `.round_to(...)` marks the resulting column as coarsened (`bucketed = true`).
    - **List membership:** `val.in?(list) : Bool` works across `Bool`, `Int`, `Decimal`, `Float`,
      `Text`, `Date`, `Timestamp`, `Duration`, and `Option(T)` (returning `false` when `none`).
    - `Date` / `Timestamp`: `date_trunc(.d, :month)` (also `:year`, `:day`, `:hour`, `:minute`),
@@ -304,8 +304,8 @@ end
 
 - Immutable binding: `x = expr`. Mutable variable (required before reassigning): `var x = 0`
   (optionally typed: `var d: Decimal = 5.0`).
-- **Inline `if` expression** (uses `:` and **no `end`**; valid inside `derive`/`where` too):
-  `if cond: a else if cond2: b else: c`.
+- **Inline `if` expression** (uses `:` and **no `end`**; valid across multiple lines and inside `derive`/`where`):
+  `if cond:\n  a\nelse if cond2:\n  b\nelse:\n  c`.
 - **Block `if` statement/expression** (no `:`, closed by `end`): `if cond \n ... \n else \n ... \n end`.
 - **Pattern matching `case ... end`:** matches constructors (`Ok(v)`, `Error(e)`, `Some(x)`,
   `None`), literals, lists (`[]`, `[p]`, `[a, b]`), tuples, and wildcard `_`.
@@ -343,7 +343,8 @@ local stages in parallel 2,048-row columnar batches.
 ### 6.1 Markdown Table Literals
 
 Literal tables use Markdown pipe syntax with normal Dana expressions in cells (including
-`none`, which automatically widens that column to `T?`):
+`none`, which automatically widens that column to `T?`; columns containing only `none`
+adopt the target `T?` type from a surrounding parameter, return, or binding annotation):
 
 <!-- dana-example: fragment -->
 ```dana
@@ -362,10 +363,11 @@ end
 | `select` | `select(.a, alias: .old_b)` — Keep/reorder/alias columns (at least one). Does NOT taint `row_tags`. |
 | `drop` | `drop(.a, .b)` — Remove columns (cannot drop all columns). |
 | `rename` | `rename(new_name: .old_name, ...)` — Rename columns in place. |
-| `derive` | `derive(x: expr, y: bucket(...))` — Add or replace computed columns (pure row exprs & pure UDFs). |
+| `derive` | `derive(x: expr, y: bucket(...), z: coarsen(...))` — Add or replace computed columns (pure row exprs, audited coarseners, & pure UDFs). |
 | `sort_by` | `sort_by(.a, .b)` — Deterministic **stable** ascending sort (`none` sorts first). Adds key tags to `order_tags`. |
 | `sort_desc` | `sort_desc(.a, .b)` — Deterministic **stable** descending sort (`none` sorts last). Adds key tags to `order_tags`. |
 | `distinct` | `distinct(.a, .b)` or `distinct()` — Deduplicate rows. Adds key tags to `row_tags`. |
+| `dedupe_by` | `dedupe_by(.k1, ..., [order_by: [asc/desc(.col)], keep: :first | :last])` — Deterministic keyed deduplication keeping `:first` (default) or `:last` row per key tuple (`order_by:` defaults to input order). Adds key and `order_by` tags to `row_tags`. |
 | `limit` | `limit(n)` — Keep first `n` rows (constant non-negative integer). Folds `order_tags` into `row_tags`. |
 | `group_by` | `group_by(.a, .b)` — Set grouping keys for `summarize`. Adds key tags to `row_tags`. |
 | `summarize` | `summarize(n: count(), avg: mean(.x), ...)` — Aggregate per group (or whole table if ungrouped). |
@@ -399,8 +401,9 @@ descending by `.total_amount` with ties broken ascending by `.category`.
 | `percentile(.col, 0.95)` | `Float?` | **No** (stays tagged — order statistic) |
 | `min(.col)`, `max(.col)`, `first(.col)`, `last(.col)` | `T?` | **No** (stays tagged — extreme/single-row) |
 
-Post-aggregate coalescing works directly inside `summarize`:
-`summarize(base_mean: mean(.latency_ms) ?? 0.0, base_sd: stddev(.latency_ms) ?? 1.0)`.
+Post-aggregate expressions (including coalescing and arithmetic over aggregates) work directly
+inside `summarize`:
+`summarize(base_mean: mean(.latency_ms) ?? 0.0, active_rate: count_if(.active).to_decimal / count().to_decimal)`.
 
 ### 6.4 Window Functions Inside `window(...)`
 
@@ -574,10 +577,10 @@ There is no unguarded manual `declassify` escape hatch. Use Dana's audited decla
    HMAC-SHA256 hex token (`Text`), requiring a `Secret(...)` capability. Clears **`[pii]`**
    only (non-PII tags like `[health]` or `[counseling]` remain tracked). Identical keys produce
    identical tokens, so downstream joins on pseudonymized IDs still match 100%.
-3. **`bucket(.col, cuts: [c1, c2, ...], labels: ["l0", "l1", "l2", ...])`** and **`.round_to(step)`**
-   (inside `derive`) — Coarsen sensitive values into intervals or step multiples (`bucketed = true`).
-   Both stay tagged on individual rows and clear `[ferpa]` / group tags only once protected by
-   `suppress_small_groups` or `suppress_small_cells`.
+3. **`bucket(.col, cuts: [c1, c2, ...], labels: ["l0", "l1", "l2", ...])`**, **`coarsen(.col, allow: ["a", "b"], other: "Other")`** (`Text`/`Text?`), and **`.round_to(step, [mode:])`**
+   (inside `derive`) — Coarsen sensitive values into intervals, an allowlisted category + fallback label,
+   or step multiples (`bucketed = true`). All three stay tagged on individual rows and clear
+   `[ferpa]` / group tags only once protected by `suppress_small_groups` or `suppress_small_cells`.
 4. **`suppress_small_groups(min: k, distinct_by: .id)`** (optional `mode: :drop` [default] or
    `mode: :mask`):
    - Must immediately follow `summarize(...)`.
@@ -692,9 +695,15 @@ and destructure the 2-tuple:
 
 ```text
 (rows, bad) = try files.read_csv("data/in.csv", as: MySchema)          # .csv/.tsv, auto .gz/.zst
+rows        = try files.read_csv("data/in.csv", as: MySchema, on_bad_rows: :error, coerce_integral_floats: true)
 (rows, bad) = try files.read_jsonl("data/in.jsonl.gz", as: MySchema)   # auto .gz/.zst
 (rows, bad) = try files.read_xlsx("data/book.xlsx", sheet: "Gifts", as: MySchema)
 ```
+
+`read_csv` accepts `on_bad_rows: :quarantine` (default, returning `(rows, bad_rows)` and warning
+when a non-`_` `bad_rows` binding is left uninspected) or `:error` (returning `Result(Table(S), Text)`
+directly with privacy-redacted row diagnostics), plus `coerce_integral_floats: true|false` (default
+`false`; `true` accepts integral tokens like `"1"` for `Float` columns).
 
 **Direct Parquet reader** returns `Result(Table(S), Text)` (no quarantine tuple — binary typed
 Parquet enforces schema types directly; supports `UNCOMPRESSED`, `SNAPPY`, `GZIP`, `ZSTD`,
@@ -723,22 +732,26 @@ writer accepts optional `private: Bool` (default `false`); whenever `private: tr
 
 ### 8.2 Databases, `schema.lock` & SQL Pushdown
 
-Bind databases at runtime with `--db Name=URI` (e.g., `--db Seminary=sqlite:///path/to/db.sqlite`
-or `--db Seminary=postgres://user:pass@host:5432/db`) or env var `DANA_DB_<NAME>`.
+Bind databases at runtime with `--db Name=URI` (e.g., `--db Seminary=sqlite:///path/to/db.sqlite?attach=populi:/path/to/populi.db`
+or `--db Seminary=postgres://user:pass@host:5432/db`) plus `--attach [DB:]schema=PATH` for SQLite
+secondary databases, or env var `DANA_DB_<NAME>`.
 
 - **Typed scan with automatic SQL pushdown:** `db.table(Schema)` (or schema-qualified
-  `db.table(Schema, from: "populi.enrollments")` for PostgreSQL schemas & multi-schema
-  `WriteTable(Db, "schema.table")`) returns `Table(Schema)` directly (not a `Result`).
-  Eligible `where`, `select`, `drop`, `rename`, `derive` (including `bucket`, `.lower`/`.upper`/
-  `.slice`, `.in?`, `Int`/`Decimal` `.clamp`), `join_*`, `distinct`, `group_by`/`summarize`
-  (including `count_if`), `sort_by`, and `limit` prefixes compile automatically into 100%
-  parameterized SQL (`?` on SQLite, `$1..$n` on PostgreSQL) and stream 2,048-row batches into
-  the columnar VM (`shuffle` and `suppress_small_cells` act as local VM boundaries). To get
-  live runtime SQL pushdown inside a helper function, pass `db: ReadDB(MyDb)` and start the
-  pipeline with `db.table(Schema) |> ...` (passing `db.table(Schema)` into a `Table(Schema)`
-  parameter materializes the scan before the call). Inspect pushdown boundaries with
-  `dana explain --dialect sqlite|postgres FILE`.
-- **Offline `schema.lock`:** Run `dana schema-sync --db Seminary=... [--schemas s1,s2,...] --out schema.lock` to
+  `db.table(Schema, from: "populi.enrollments")` for PostgreSQL schemas, `--attach`ed SQLite
+  databases, or multi-schema `WriteTable(Db, "schema.table")`) returns `Table(Schema)` directly
+  (not a `Result`). Unattached SQLite databases also fall back from `"schema.table"` to literal
+  `"schema.table"` then flattened `"schema_table"` in `main`. Eligible `where`, `select`, `drop`,
+  `rename`, `derive` (including `bucket`, `coarsen`, `.lower`/`.upper`/`.slice`, `.in?`,
+  `Int`/`Decimal` `.clamp`, exact proleptic Gregorian `.try_parse_date`), `join_*`, `distinct`,
+  `dedupe_by` (`ROW_NUMBER()` on SQLite; `DISTINCT ON` on PostgreSQL when key/order uniquely
+  identifies rows), `group_by`/`summarize` (including `count_if`), `sort_by`, and `limit`
+  prefixes compile automatically into 100% parameterized SQL (`?` on SQLite, `$1..$n` on PostgreSQL)
+  and stream 2,048-row batches into the columnar VM (`shuffle` and `suppress_small_cells` act as
+  local VM boundaries). To get live runtime SQL pushdown inside a helper function, pass
+  `db: ReadDB(MyDb)` and start the pipeline with `db.table(Schema) |> ...` (passing `db.table(Schema)`
+  into a `Table(Schema)` parameter materializes the scan before the call). Inspect pushdown
+  boundaries with `dana explain --dialect sqlite|postgres FILE`.
+- **Offline `schema.lock`:** Run `dana schema-sync --db Seminary=... [--attach [DB:]schema=PATH]... [--schemas s1,s2,...] --out schema.lock` to
   snapshot table schemas while preserving human-authored `[pii]`/`[ferpa]` annotations. `dana check`
   verifies every `db.table(Schema)` and `WriteTable.upsert(...)` offline against `schema.lock`.
 - **Typed upsert & `dana dry-run`:** `stats = try db_write.upsert(rows, key: .student_id)`
@@ -995,18 +1008,19 @@ interactive session:
 ### 11.3 CLI Reference
 
 ```sh
-dana check [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--json] <FILE...>
-dana run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]
-dana dry-run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]
-dana test [--oracle] [--policy FILE] [--filter SUBSTR] [PATH...]
+dana check [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--json] <FILE...>
+dana run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]
+dana dry-run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]
+dana test [--oracle] [--oracle-steps N] [--policy FILE] [--filter SUBSTR] [PATH...]
 dana explain [--dialect sqlite|postgres] [--schema-lock FILE] [--policy FILE] <FILE>
-dana schema-sync --db Name=URI [--db Name2=URI2 ...] [--schemas s1,s2,...] [--out schema.lock]
-dana repl [--policy FILE] [--db Name=URI]... [--schema-lock FILE] [--show-sensitive TAGS] [--eval EXPR]
+dana schema-sync --db Name=URI [--db Name2=URI2 ...] [--attach [DB:]schema=PATH]... [--schemas s1,s2,...] [--out schema.lock]
+dana repl [--policy FILE] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--show-sensitive TAGS] [--eval EXPR]
 dana vendor pin|verify [--dir PATH]
 dana format [--check] <PATH...>
 dana infer-schema <DATA_FILE> [--name Schema] [--sample-rows N] [--format csv|tsv|jsonl|parquet|xlsx]
 dana fake <FILE.dana> [--schema Name] [--rows N] [--seed S] [--format csv|tsv|jsonl] [--out PATH]
 dana guide [SECTION]
+dana --version | -V
 ```
 
 ---

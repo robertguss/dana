@@ -14,6 +14,8 @@ pub mod agg;
 pub mod join;
 pub mod sort_win;
 
+pub use sort_win::op_dedupe_by;
+
 use crate::core::syntax::{AggKind, ColSpec, Literal, ScalarTy, TagSet};
 use crate::formats::crypto::hmac_sha256_pseudonym;
 use crate::oracle::eval::{eval_literal, pseudonymize_token};

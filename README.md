@@ -7,19 +7,20 @@ long-running systems and living services, Dana is built for databases, ETL pipel
 operational and financial analytics, practical statistics, and clean reporting—fast by
 default, batteries included, and safe around sensitive data like PII and FERPA records.
 
-> **Status: Dana v0.5 (pre-1.0) — WTS-Readiness, Multi-Schema PostgreSQL Interop, Atomic FERPA Exports, CSV Formula Sanitization & Row-Level k-Anonymity Complete (`v1.0` GA held for production soak).**
+> **Status: Dana v0.6 (pre-1.0) — Exact Numerics, CSV Quarantine/Coercion Polish, `coarsen`, SQLite `--attach`, Exact `try_parse_date` Pushdown & `dedupe_by` Complete (`v1.0` GA held for production soak).**
 > Dana's 0-conflict Bison IELR(1) executable grammar (`make grammar`), Lean 4 formal core with
 > soundness & non-interference proofs (`make formal`), **Zero-Crate Rust** compiler, 2,048-row
 > vectorized columnar VM with pure-UDF bytecode inlining, direct streaming-columnar CSV/TSV &
 > Apache Parquet I/O into `Val::Columnar(Arc<VmTable>)` (6.0×–11.4× faster and 6.7×–11.4× lower
 > peak RSS than `v0.3.0`, outperforming Pandas by 3.9×–6.9× across all 4 workloads and beating
 > Polars on W2 500k×50k Parquet join, W3 SQLite pushdown, and W4 Zstd Parquet + Stats + HTML5
-> report), embedded SQLite + native PostgreSQL v3.0 SQL pushdown runtime, native Excel (`.xlsx`),
+> report), embedded SQLite (with `--attach` / `?attach=`) + native PostgreSQL v3.0 SQL pushdown
+> runtime (including `dedupe_by`, `coarsen`, and exact `try_parse_date`), native Excel (`.xlsx`),
 > capability-gated HTTPS, columnar `Stats` & `profile()`, standalone SVG/HTML/Markdown reporting,
 > safe read-only `dana repl`, SHA-256 hash-pinned `vendor/` modules, 12-parser zero-crate fuzzer
 > + adversarial privacy hardening suite, and prospective 4-model / 2-family AI learnability gate
 > (`24/24` strict pass, `0` privacy leaks) are complete and verified. `v1.0` GA is intentionally
-> held for pre-1.0 ergonomics/formatter polish and production soak.
+> held for production soak.
 
 ## Why Dana
 
@@ -106,7 +107,7 @@ end
 Build the zero-crate toolchain (`cargo build --release`) and run Dana directly:
 
 ```sh
-# Print the embedded Dana v0.5 Language Reference (or a specific section)
+# Print the embedded Dana v0.6 Language Reference (or a specific section)
 dana guide
 dana guide Privacy
 
@@ -132,7 +133,7 @@ dana repl --db Seminary=sqlite:///path/to/seminary.db
 
 ## Documentation & Benchmarks
 
-- [Dana Language Reference v0.5](docs/reference/README.md): complete language, privacy, I/O,
+- [Dana Language Reference v0.6](docs/reference/README.md): complete language, privacy, I/O,
   stats, charts, REPL, and CLI reference (embedded into `dana guide`), with every example
   parsed by the [0-conflict Bison IELR(1) grammar](grammar/README.md) (`make grammar`) and
   type-checked under `dana check`.
@@ -166,8 +167,8 @@ dana repl --db Seminary=sqlite:///path/to/seminary.db
 
 ```sh
 make check-all   # 0-conflict Bison grammar + Lean 4 proofs + Rust fmt/clippy/doc/test suite
-make test-v05    # run v0.5 WTS-readiness suite (Postgres multi-schema, stdlib, FERPA exports, pilots)
-make check-v05   # full v0.5 gate: check-all + 12-parser fuzzer + differential soak/privacy + learnability harness
+make test-v06    # run v0.6 dogfood hardening suite (numerics, CSV, coarsen, SQLite attach, date pushdown, dedupe_by)
+make check-v06   # full v0.6 gate: check-all + 12-parser fuzzer + differential soak/privacy + learnability harness
 ```
 
 ## License

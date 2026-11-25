@@ -101,7 +101,13 @@ pub fn parse_iso_date(s: &str) -> Result<i64, ParseFormatError> {
         )));
     }
     let b = s.as_bytes();
-    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+    if b.len() != 10
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !b[0..4].iter().all(u8::is_ascii_digit)
+        || !b[5..7].iter().all(u8::is_ascii_digit)
+        || !b[8..10].iter().all(u8::is_ascii_digit)
+    {
         return Err(ParseFormatError::new(format!(
             "invalid ISO date `{s}` (expected YYYY-MM-DD)"
         )));

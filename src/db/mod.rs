@@ -85,6 +85,67 @@ impl SslMode {
 pub struct SqliteUri {
     pub path: String,
     pub read_only: bool,
+    pub attachments: Vec<(String, String)>,
+}
+
+/// Validate a SQLite `ATTACH DATABASE ... AS schema` alias (`[A-Za-z_][A-Za-z0-9_]*`,
+/// excluding reserved `"main"` and `"temp"` namespaces).
+///
+/// # Errors
+/// Returns [`DbError::InvalidUri`] if the schema identifier is invalid or reserved.
+pub fn validate_sqlite_attach_schema(schema: &str) -> Result<(), DbError> {
+    let mut chars = schema.chars();
+    let Some(first) = chars.next() else {
+        return Err(DbError::InvalidUri(
+            "SQLite attach schema name cannot be empty".to_string(),
+        ));
+    };
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(DbError::InvalidUri(format!(
+            "invalid SQLite attach schema name `{schema}` (expected ASCII identifier `[A-Za-z_][A-Za-z0-9_]*`)"
+        )));
+    }
+    if schema.eq_ignore_ascii_case("main") || schema.eq_ignore_ascii_case("temp") {
+        return Err(DbError::InvalidUri(format!(
+            "SQLite attach schema name `{schema}` is reserved (`main`/`temp` cannot be attached)"
+        )));
+    }
+    Ok(())
+}
+
+/// Parse a CLI `--attach [DB:]schema=PATH` specification.
+///
+/// # Errors
+/// Returns [`DbError::InvalidUri`] if syntax, schema identifier, or path is invalid.
+pub fn parse_attach_spec(raw: &str) -> Result<(Option<String>, String, String), DbError> {
+    let Some((lhs, path)) = raw.split_once('=') else {
+        return Err(DbError::InvalidUri(format!(
+            "invalid `--attach` argument `{raw}` (expected `[DB:]schema=PATH`)"
+        )));
+    };
+    if path.is_empty() {
+        return Err(DbError::InvalidUri(format!(
+            "empty SQLite file path in `--attach` argument `{raw}`"
+        )));
+    }
+    if let Some((db_name, schema)) = lhs.split_once(':') {
+        if db_name.is_empty() || schema.contains(':') {
+            return Err(DbError::InvalidUri(format!(
+                "invalid `--attach` target `{lhs}` in `{raw}` (expected `[DB:]schema=PATH`)"
+            )));
+        }
+        validate_sqlite_attach_schema(schema)?;
+        Ok((
+            Some(db_name.to_string()),
+            schema.to_string(),
+            path.to_string(),
+        ))
+    } else {
+        validate_sqlite_attach_schema(lhs)?;
+        Ok((None, lhs.to_string(), path.to_string()))
+    }
 }
 
 /// Parsed PostgreSQL connection URI.
@@ -220,6 +281,7 @@ fn parse_sqlite_uri(rest: &str) -> Result<SqliteUri, DbError> {
         return Ok(SqliteUri {
             path: ":memory:".to_string(),
             read_only: false,
+            attachments: Vec::new(),
         });
     }
     let (path_part, query_part) = match rest.split_once('?') {
@@ -238,6 +300,7 @@ fn parse_sqlite_uri(rest: &str) -> Result<SqliteUri, DbError> {
         ));
     }
     let mut read_only = false;
+    let mut attachments = Vec::new();
     if let Some(q) = query_part {
         for pair in q.split('&') {
             if pair.is_empty() {
@@ -250,12 +313,28 @@ fn parse_sqlite_uri(rest: &str) -> Result<SqliteUri, DbError> {
                 || (key == "read_only" && val.eq_ignore_ascii_case("true"))
             {
                 read_only = true;
+            } else if key == "attach" {
+                let Some(sep) = val.find([':', '=']) else {
+                    return Err(DbError::InvalidUri(format!(
+                        "invalid sqlite `attach` query `{val}` (expected `schema:path` or `schema=path`)"
+                    )));
+                };
+                let schema = &val[..sep];
+                let attach_path = &val[sep + 1..];
+                validate_sqlite_attach_schema(schema)?;
+                if attach_path.is_empty() {
+                    return Err(DbError::InvalidUri(format!(
+                        "empty path in sqlite `attach` query `{val}`"
+                    )));
+                }
+                attachments.push((schema.to_string(), attach_path.to_string()));
             }
         }
     }
     Ok(SqliteUri {
         path: decoded_path,
         read_only,
+        attachments,
     })
 }
 
@@ -630,6 +709,22 @@ pub trait DbConnection {
     /// # Errors
     /// Returns [`DbError`] on prepare, bind, or execution failure.
     fn execute(&mut self, sql: &str, params: &[SqlParam]) -> Result<u64, DbError>;
+
+    /// Attach a secondary SQLite database file as schema namespace `schema`.
+    ///
+    /// # Errors
+    /// Returns [`DbError::InvalidUri`] on non-SQLite drivers or connection failure.
+    fn attach_database(&mut self, schema: &str, path: &str) -> Result<(), DbError> {
+        let _ = (schema, path);
+        Err(DbError::InvalidUri(
+            "ATTACH DATABASE is only supported on SQLite connections".to_string(),
+        ))
+    }
+
+    /// Resolve a Dana `from: "..."` table name to its properly quoted SQL relation reference.
+    fn resolve_table_sql_ref(&mut self, table: &str) -> String {
+        quote_sql_table_ref(table)
+    }
 }
 
 /// Registry managing logical Dana database names, URI bindings, `DANA_DB_<UPPER>` environment
@@ -638,6 +733,7 @@ pub trait DbConnection {
 pub struct DbRegistry {
     bindings: HashMap<String, String>,
     connections: HashMap<String, Box<dyn DbConnection>>,
+    sqlite_attachments: Vec<(Option<String>, String, String)>,
 }
 
 impl fmt::Debug for DbRegistry {
@@ -666,6 +762,23 @@ impl DbRegistry {
         self.bindings.insert(name, uri.into());
     }
 
+    /// Register a SQLite `ATTACH DATABASE` mapping (globally when `db_name` is `None`,
+    /// or scoped to logical database `db_name`).
+    pub fn attach_sqlite(
+        &mut self,
+        db_name: Option<String>,
+        schema: impl Into<String>,
+        path: impl Into<String>,
+    ) {
+        if let Some(ref target) = db_name {
+            self.connections.remove(target);
+        } else {
+            self.connections.clear();
+        }
+        self.sqlite_attachments
+            .push((db_name, schema.into(), path.into()));
+    }
+
     /// Resolve a logical database name from explicit bindings or `DANA_DB_<UPPER>` env var.
     ///
     /// # Errors
@@ -692,7 +805,14 @@ impl DbRegistry {
     pub fn open(&mut self, db_name: &str) -> Result<&mut (dyn DbConnection + 'static), DbError> {
         if !self.connections.contains_key(db_name) {
             let uri = self.resolve_uri(db_name)?;
-            let conn = open_connection(&uri)?;
+            let mut conn = open_connection(&uri)?;
+            if conn.dialect() == SqlDialect::Sqlite {
+                for (filter, schema, path) in &self.sqlite_attachments {
+                    if filter.is_none() || filter.as_deref() == Some(db_name) {
+                        conn.attach_database(schema, path)?;
+                    }
+                }
+            }
             self.connections.insert(db_name.to_string(), conn);
         }
         self.connections

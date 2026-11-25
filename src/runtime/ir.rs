@@ -342,6 +342,13 @@ impl ExecDeriveItem {
     }
 }
 
+/// Tie-breaking rule for first-class [`ExecPlan::DedupeBy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DedupeKeep {
+    First,
+    Last,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExecPlan {
     SourceExpr(Box<ExecExpr>),
@@ -373,6 +380,12 @@ pub enum ExecPlan {
     Distinct {
         input: Box<ExecPlan>,
         cols: Vec<Ident>,
+    },
+    DedupeBy {
+        input: Box<ExecPlan>,
+        keys: Vec<Ident>,
+        order_by: Vec<(Ident, SortDir)>,
+        keep: DedupeKeep,
     },
     Sort {
         input: Box<ExecPlan>,
@@ -634,6 +647,7 @@ enum CloneBuildPlan<'a> {
     Derive(&'a [ExecDeriveItem]),
     Filter,
     Distinct(&'a [Ident]),
+    DedupeBy(&'a [Ident], &'a [(Ident, SortDir)], DedupeKeep),
     Sort(&'a [(Ident, SortDir)]),
     Limit(&'a BigInt),
     Join(JoinKind, &'a JoinOn, &'a Suffixes),
@@ -800,6 +814,17 @@ fn run_exec_clone(initial: ExecCloneTask<'_>) -> (Vec<ExecExpr>, Vec<ExecPlan>, 
                 }
                 ExecPlan::Distinct { input, cols } => {
                     tasks.push(ExecCloneTask::BuildPlan(CloneBuildPlan::Distinct(cols)));
+                    tasks.push(ExecCloneTask::Plan(input));
+                }
+                ExecPlan::DedupeBy {
+                    input,
+                    keys,
+                    order_by,
+                    keep,
+                } => {
+                    tasks.push(ExecCloneTask::BuildPlan(CloneBuildPlan::DedupeBy(
+                        keys, order_by, *keep,
+                    )));
                     tasks.push(ExecCloneTask::Plan(input));
                 }
                 ExecPlan::Sort { input, keys } => {
@@ -1058,6 +1083,16 @@ fn run_exec_clone(initial: ExecCloneTask<'_>) -> (Vec<ExecExpr>, Vec<ExecPlan>, 
                         plans.push(ExecPlan::Distinct {
                             input: Box::new(input),
                             cols: cols.to_vec(),
+                        });
+                    }
+                }
+                CloneBuildPlan::DedupeBy(keys, order_by, keep) => {
+                    if let Some(input) = plans.pop() {
+                        plans.push(ExecPlan::DedupeBy {
+                            input: Box::new(input),
+                            keys: keys.to_vec(),
+                            order_by: order_by.to_vec(),
+                            keep,
                         });
                     }
                 }
@@ -1705,6 +1740,7 @@ fn push_exec_plan_children(plan: &mut ExecPlan, stack: &mut Vec<ExecDropNode>) {
         | ExecPlan::Drop { input, .. }
         | ExecPlan::Rename { input, .. }
         | ExecPlan::Distinct { input, .. }
+        | ExecPlan::DedupeBy { input, .. }
         | ExecPlan::Sort { input, .. }
         | ExecPlan::Limit { input, .. }
         | ExecPlan::GroupBy { input, .. }
@@ -2370,7 +2406,8 @@ fn try_exec_expr_to_core(root: &ExecExpr) -> Option<Expr> {
                 }
                 ExecPlan::PivotLonger { .. }
                 | ExecPlan::Shuffle { .. }
-                | ExecPlan::SuppressSmallCells { .. } => return None,
+                | ExecPlan::SuppressSmallCells { .. }
+                | ExecPlan::DedupeBy { .. } => return None,
                 ExecPlan::Crosstab {
                     input,
                     rows_col,

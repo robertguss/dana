@@ -1,8 +1,8 @@
 [package]
 name = "dana"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
-description = "Dana v0.5 (pre-1.0) — zero-crate AI-first data language compiler, vectorized columnar VM, streaming columnar CSV/Parquet I/O, SQL pushdown, privacy checker, and differential oracle"
+description = "Dana v0.6 (pre-1.0) — zero-crate AI-first data language compiler, vectorized columnar VM, streaming columnar CSV/Parquet I/O, SQL pushdown, privacy checker, and differential oracle"
 license = "MIT OR Apache-2.0"
 
 # Non-Negotiable Engineering Rule 1: Zero external Rust crates.

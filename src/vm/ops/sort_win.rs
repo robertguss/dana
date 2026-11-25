@@ -15,8 +15,9 @@ use crate::oracle::value::{
     Bug, TableRow, Val, render_decimal, render_public_val, unwrap_numeric_float, val_cmp, val_eq,
     val_list_cmp, val_lt, val_to_float,
 };
+use crate::runtime::ir::DedupeKeep;
 use crate::vm::batch::{Batch, rows_to_batches};
-use crate::vm::key::{KeyTuple, eq_col_cells, hash_row_key};
+use crate::vm::key::{KeyTuple, cmp_col_cells, eq_col_cells, hash_row_key};
 use crate::vm::ops::{OpErr, OpExecConfig, VmMode, VmTable};
 
 /// Stable deterministic `Sort` over columnar batches using zero-allocation columnar
@@ -175,6 +176,119 @@ pub fn op_distinct(tbl: VmTable, cols: &[Ident], cfg: &OpExecConfig) -> Result<V
             }
             out_batches.push(nb);
         }
+    }
+
+    Ok(VmTable {
+        cols: out_cols,
+        batches: out_batches,
+    })
+}
+
+/// O(N) Hash `DedupeBy` preserving winning rows in original input batch/row order.
+pub fn op_dedupe_by(
+    tbl: VmTable,
+    keys: &[Ident],
+    order_by: &[(Ident, SortDir)],
+    keep: DedupeKeep,
+    _cfg: &OpExecConfig,
+) -> Result<VmTable, OpErr> {
+    let out_cols: Vec<ColSpec> = tbl
+        .cols
+        .iter()
+        .map(|c| ColSpec {
+            agg_kind: AggKind::Raw,
+            ..c.clone()
+        })
+        .collect();
+
+    if keys.is_empty() {
+        return Err(OpErr::Failed(
+            "dedupe_by requires at least one key column".to_string(),
+        ));
+    }
+    let mut key_idxs = Vec::with_capacity(keys.len());
+    for k in keys {
+        let Some(idx) = tbl.find_col_idx(k) else {
+            return Err(OpErr::Failed(format!("dedupe_by: missing column `{k}`")));
+        };
+        key_idxs.push(idx);
+    }
+    let mut order_specs = Vec::with_capacity(order_by.len());
+    for (c, dir) in order_by {
+        let Some(idx) = tbl.find_col_idx(c) else {
+            return Err(OpErr::Failed(format!(
+                "dedupe_by: missing order column `{c}`"
+            )));
+        };
+        order_specs.push((idx, *dir));
+    }
+
+    let mut winners: HashMap<u64, Vec<(u32, u16)>> = HashMap::new();
+    for (bi, b) in tbl.batches.iter().enumerate() {
+        let active = b.active_indices();
+        for &r_u16 in &active {
+            let ri = usize::from(r_u16);
+            let h = hash_row_key(&b.cols, &key_idxs, ri);
+            let bucket = winners.entry(h).or_default();
+            if let Some(slot) = bucket.iter_mut().find(|&&mut (pbi, pri_u16)| {
+                let pb = &tbl.batches[pbi as usize];
+                let pri = usize::from(pri_u16);
+                key_idxs
+                    .iter()
+                    .all(|&ki| eq_col_cells(&pb.cols[ki], pri, &b.cols[ki], ri))
+            }) {
+                let (wbi, wri_u16) = *slot;
+                let wb = &tbl.batches[wbi as usize];
+                let wri = usize::from(wri_u16);
+                let mut ord = Ordering::Equal;
+                for &(ci, dir) in &order_specs {
+                    let c_ord = cmp_col_cells(&b.cols[ci], ri, &wb.cols[ci], wri);
+                    let directed = match dir {
+                        SortDir::Asc => c_ord,
+                        SortDir::Desc => c_ord.reverse(),
+                    };
+                    if directed != Ordering::Equal {
+                        ord = directed;
+                        break;
+                    }
+                }
+                let replace = match keep {
+                    DedupeKeep::First => ord == Ordering::Less,
+                    DedupeKeep::Last => ord != Ordering::Less,
+                };
+                if replace {
+                    *slot = (bi as u32, r_u16);
+                }
+            } else {
+                bucket.push((bi as u32, r_u16));
+            }
+        }
+    }
+
+    let mut per_batch: Vec<Vec<u16>> = vec![Vec::new(); tbl.batches.len()];
+    for bucket in winners.into_values() {
+        for (bi, r_u16) in bucket {
+            per_batch[bi as usize].push(r_u16);
+        }
+    }
+    let mut out_batches = Vec::with_capacity(tbl.batches.len());
+    for (bi, b) in tbl.batches.into_iter().enumerate() {
+        let mut kept = std::mem::take(&mut per_batch[bi]);
+        if kept.is_empty() {
+            continue;
+        }
+        kept.sort_unstable();
+        let mut nb = Batch {
+            cols: b.cols,
+            len: b.len,
+            selection: Some(kept),
+            group_meta: None,
+        }
+        .compact();
+        for (c, spec) in nb.cols.iter_mut().zip(&out_cols) {
+            c.spec = spec.clone();
+        }
+        out_batches.push(nb);
     }
 
     Ok(VmTable {
