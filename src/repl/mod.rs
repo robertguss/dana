@@ -1110,7 +1110,7 @@ pub fn run_repl_reader<R: BufRead, W: Write, E: Write>(
     if interactive {
         let _ = writeln!(
             out,
-            "Dana v0.2 Safe REPL (read-only, sensitive values redacted by default). Type :help or :quit."
+            "Dana v0.3 Safe REPL (read-only, sensitive values redacted by default). Type :help or :quit."
         );
     }
     let mut buf = String::new();

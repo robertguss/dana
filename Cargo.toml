@@ -1,8 +1,8 @@
 [package]
 name = "dana"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
-description = "Dana Core IR v0.1 verifier, canonical wire codec, and naive differential reference oracle"
+description = "Dana v0.3 (pre-1.0) — zero-crate AI-first data language compiler, vectorized columnar VM, SQL pushdown, privacy checker, and differential oracle"
 license = "MIT OR Apache-2.0"
 
 # Non-Negotiable Engineering Rule 1: Zero external Rust crates.

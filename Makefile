@@ -2,7 +2,7 @@ CC ?= gcc
 BISON ?= bison
 CFLAGS ?= -std=c17 -Wall -Wextra -Werror -O2
 
-.PHONY: grammar formal oracle test-parser-parity test-examples test-db test-phase4 test-diff check-all clean
+.PHONY: grammar formal oracle test-parser-parity test-examples test-db test-phase4 test-diff fuzz-parsers fuzz-soak soak learnability bench check-all check-v03 clean
 
 build/dana.tab.c build/dana.tab.h: grammar/dana.y
 	mkdir -p build
@@ -58,7 +58,24 @@ test-phase4:
 test-diff:
 	cargo test --test differential_vm --test differential_sql --test differential_lean
 
+fuzz-parsers:
+	cargo test --release --test fuzz_parsers -- --nocapture
+
+fuzz-soak:
+	cargo test --release --test hardening_soak_privacy -- --nocapture
+
+soak:
+	DANA_SOAK_CASES=10000 cargo test --release --test hardening_soak_privacy -- --nocapture
+
+learnability:
+	cargo test --test learnability_harness -- --nocapture
+
+bench:
+	cargo build --release && python3 benchmarks/run_benchmarks.py
+
 check-all: grammar formal oracle
+
+check-v03: grammar formal oracle fuzz-parsers fuzz-soak learnability
 
 clean:
 	rm -rf build

@@ -7,14 +7,17 @@ long-running systems and living services, Dana is built for databases, ETL pipel
 operational and financial analytics, practical statistics, and clean reporting—fast by
 default, batteries included, and safe around sensitive data like PII and FERPA records.
 
-> **Status: Dana v0.3 (pre-1.0) — Hardening, Lockstep Reference & End-to-End Benchmarks.**
+> **Status: Dana v0.3 (pre-1.0) — Phase 5 Complete (Hardening, End-to-End Benchmarks & 24/24 Multi-Model AI Learnability Gate).**
 > Dana's 0-conflict Bison IELR(1) executable grammar (`make grammar`), Lean 4 formal core with
 > soundness & non-interference proofs (`make formal`), **Zero-Crate Rust** compiler, 2,048-row
 > vectorized columnar VM with pure-UDF bytecode inlining, embedded SQLite + native PostgreSQL
 > v3.0 SQL pushdown runtime, native Parquet & Excel (`.xlsx`) codecs, capability-gated HTTPS,
 > `Stats` analytics, standalone SVG/HTML/Markdown reporting, safe read-only `dana repl`,
-> SHA-256 hash-pinned `vendor/` modules, and 12-parser zero-crate fuzzer + adversarial privacy
-> hardening suite are complete and verified.
+> SHA-256 hash-pinned `vendor/` modules, 12-parser zero-crate fuzzer + adversarial privacy
+> hardening suite, end-to-end Python/Pandas/Polars benchmarks, and prospective 4-model /
+> 2-family AI learnability gate (`24/24` strict pass, `0` privacy leaks) are complete and
+> verified. `v1.0` GA is intentionally held for streaming-columnar CSV/Parquet I/O, pre-1.0
+> ergonomics polish, and production soak.
 
 ## Why Dana
 
@@ -133,6 +136,12 @@ dana repl --db Seminary=sqlite:///path/to/seminary.db
   benchmarks comparing Dana v0.3 against Python stdlib/`sqlite3`, Pandas, and Polars across
   CSV+UDF ETL, 500k×50k columnar Parquet joins, 250k-row SQLite pushdown + FERPA privacy, and
   200k-row Zstd Parquet stats & HTML reporting (with exact output parity assertions).
+- [AI Learnability Evaluation v0.3](docs/evals/learnability-v0.3-results.md)
+  ([Prospective Protocol](docs/evals/learnability-v0.3.md)): blind 4-model / 2-family
+  evaluation (`claude-sonnet-5-5`, `claude-haiku-5-5`, `gemini-4-neon`, `gemini-4-argon`)
+  writing 6 unseen pipelines solely from `dana guide` — **24/24 (100%)** Stage 2 strict pass,
+  **21/24 (87.5%)** Stage 1 first-shot functional pass, **0** privacy/policy leaks, and
+  **100%** canonical formatting compliance.
 - [Ten Sample Programs](examples/README.md): realistic `.dana` scripts across higher ed,
   SaaS, fintech, DevOps logs, healthcare, and exploratory statistics.
 - [Design Charter v1](docs/CHARTER.md): locked-in design pillars, non-goals, and principles.
@@ -150,6 +159,7 @@ dana repl --db Seminary=sqlite:///path/to/seminary.db
 
 ```sh
 make check-all   # 0-conflict Bison grammar + Lean 4 proofs + Rust fmt/clippy/doc/test suite
+make check-v03   # full v0.3 gate: check-all + 12-parser fuzzer + differential soak/privacy + learnability harness
 ```
 
 ## License
