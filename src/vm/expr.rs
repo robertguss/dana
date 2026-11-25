@@ -12,15 +12,17 @@ use std::collections::{HashMap, HashSet};
 use crate::core::bigint::BigInt;
 use crate::core::syntax::{BugKind, ColSpec, Expr, Float64, Ident, PrimOp, Program, RowExpr};
 use crate::formats::time::{
-    date_trunc_date, date_trunc_timestamp_duration, date_trunc_timestamp_unit,
+    DecimalIntKind, date_trunc_date, date_trunc_timestamp_duration, date_trunc_timestamp_unit,
     format_timestamp_in_tz, local_date_in_tz, months_between_days, round_decimal_bigint,
+    round_decimal_even_bigint,
 };
 use crate::oracle::eval::{PrimResult, eval_literal, eval_prim_op};
 use crate::oracle::value::{Bug, Val, float_order_key, render_decimal};
 use crate::runtime::exec::{
-    bigint_to_slice_bound, clamp_decimal_val, clamp_float_val, clamp_int_bigint, eval_in_list,
-    round_to_float_val, slice_text, try_parse_date_text, try_parse_decimal_text,
-    try_parse_float_text, try_parse_int_text,
+    bigint_to_slice_bound, clamp_decimal_val, clamp_float_val, clamp_int_bigint,
+    decimal_to_int_checked, eval_in_list, float_to_int_checked, round_float_val,
+    round_to_float_even_val, round_to_float_val, slice_text, try_parse_date_text,
+    try_parse_decimal_text, try_parse_float_text, try_parse_int_text,
 };
 use crate::runtime::ir::{ExecExpr, ExecPrimOp, ExecProgram, ExecRowExpr};
 use crate::vm::batch::{Batch, Column, ColumnData, NullBitmap};
@@ -1854,6 +1856,47 @@ fn eval_vec_prim(
                 return Ok(RegVal::Float(out));
             }
         }
+        (
+            fop @ (ExecPrimOp::CeilFloat | ExecPrimOp::FloorFloat | ExecPrimOp::TruncFloat),
+            &[ra],
+        ) => {
+            if let RegVal::Float(vs) = &regs[ra] {
+                let (op_fn, name): (fn(f64) -> f64, &str) = match fop {
+                    ExecPrimOp::CeilFloat => (f64::ceil, "ceil"),
+                    ExecPrimOp::FloorFloat => (f64::floor, "floor"),
+                    _ => (f64::trunc, "trunc"),
+                };
+                let mut out = vec![0i64; batch_len];
+                for &l in active {
+                    let i = usize::from(l);
+                    let n = float_to_int_checked(Float64::from_bits(vs[i]), op_fn, name)
+                        .map_err(|bug| RowEvalErr::Stopped { lane: i, bug })?;
+                    out[i] = n.to_i64().unwrap_or(0);
+                }
+                return Ok(RegVal::Int(out));
+            }
+        }
+        (
+            dop @ (ExecPrimOp::CeilDecimal | ExecPrimOp::FloorDecimal | ExecPrimOp::TruncDecimal),
+            &[ra],
+        ) => {
+            if let RegVal::Decimal(vs) = &regs[ra] {
+                let kind = match dop {
+                    ExecPrimOp::CeilDecimal => DecimalIntKind::Ceil,
+                    ExecPrimOp::FloorDecimal => DecimalIntKind::Floor,
+                    _ => DecimalIntKind::Trunc,
+                };
+                let mut out = vec![0i64; batch_len];
+                for &l in active {
+                    let i = usize::from(l);
+                    let d = BigInt::from(vs[i]);
+                    let n = decimal_to_int_checked(&d, kind)
+                        .map_err(|bug| RowEvalErr::Stopped { lane: i, bug })?;
+                    out[i] = n.to_i64().unwrap_or(0);
+                }
+                return Ok(RegVal::Int(out));
+            }
+        }
 
         // ---- Boolean Logic ----
         (ExecPrimOp::Core(PrimOp::NotBool), &[ra]) => {
@@ -2103,15 +2146,21 @@ fn eval_vec_prim(
                 }
             }
         }
-        (ExecPrimOp::RoundToFloat, &[ra, rb]) => {
+        (rop @ (ExecPrimOp::RoundToFloat | ExecPrimOp::RoundToFloatEven), &[ra, rb]) => {
             if let (RegVal::Float(xs), RegVal::Broadcast(Val::Float(step_v))) =
                 (&regs[ra], &regs[rb])
             {
+                let even = matches!(rop, ExecPrimOp::RoundToFloatEven);
                 let mut out = vec![0u64; batch_len];
                 for &l in active {
                     let i = usize::from(l);
-                    let res = round_to_float_val(Float64::from_bits(xs[i]), *step_v)
-                        .map_err(|bug| RowEvalErr::Stopped { lane: i, bug })?;
+                    let x = Float64::from_bits(xs[i]);
+                    let res = if even {
+                        round_to_float_even_val(x, *step_v)
+                    } else {
+                        round_to_float_val(x, *step_v)
+                    }
+                    .map_err(|bug| RowEvalErr::Stopped { lane: i, bug })?;
                     out[i] = res.bits;
                 }
                 return Ok(RegVal::Float(out));
@@ -2689,14 +2738,15 @@ pub fn eval_scalar_exec_prim(
             _ => Err(RowEvalErr::Failed("AbsInt requires Int".to_string())),
         },
         ExecPrimOp::RoundFloat => match args {
-            [Val::Float(a), Val::Int(p)] => {
-                let places = p.to_i64().unwrap_or(0).clamp(0, 15) as i32;
-                let factor = 10f64.powi(places);
-                let r = (a.to_f64() * factor).round() / factor;
-                Ok(Val::Float(Float64::from_f64(r)))
-            }
+            [Val::Float(a), Val::Int(p)] => Ok(Val::Float(round_float_val(*a, p, false))),
             _ => Err(RowEvalErr::Failed(
                 "RoundFloat requires (Float, Int)".to_string(),
+            )),
+        },
+        ExecPrimOp::RoundFloatEven => match args {
+            [Val::Float(a), Val::Int(p)] => Ok(Val::Float(round_float_val(*a, p, true))),
+            _ => Err(RowEvalErr::Failed(
+                "RoundFloatEven requires (Float, Int)".to_string(),
             )),
         },
         ExecPrimOp::RoundDecimal => match args {
@@ -2707,6 +2757,42 @@ pub fn eval_scalar_exec_prim(
             _ => Err(RowEvalErr::Failed(
                 "RoundDecimal requires (Decimal, Int)".to_string(),
             )),
+        },
+        ExecPrimOp::RoundDecimalEven => match args {
+            [Val::Decimal(d), Val::Int(p)] => {
+                let places = p.to_i64().unwrap_or(0);
+                Ok(Val::Decimal(round_decimal_even_bigint(d, places)))
+            }
+            _ => Err(RowEvalErr::Failed(
+                "RoundDecimalEven requires (Decimal, Int)".to_string(),
+            )),
+        },
+        ExecPrimOp::CeilFloat | ExecPrimOp::FloorFloat | ExecPrimOp::TruncFloat => match args {
+            [Val::Float(a)] => {
+                let (op_fn, name): (fn(f64) -> f64, &str) = match op {
+                    ExecPrimOp::CeilFloat => (f64::ceil, "ceil"),
+                    ExecPrimOp::FloorFloat => (f64::floor, "floor"),
+                    _ => (f64::trunc, "trunc"),
+                };
+                float_to_int_checked(*a, op_fn, name)
+                    .map(Val::Int)
+                    .map_err(|bug| RowEvalErr::Stopped { lane, bug })
+            }
+            _ => Err(RowEvalErr::Failed(format!("{op:?} requires Float"))),
+        },
+        ExecPrimOp::CeilDecimal | ExecPrimOp::FloorDecimal | ExecPrimOp::TruncDecimal => match args
+        {
+            [Val::Decimal(d)] => {
+                let kind = match op {
+                    ExecPrimOp::CeilDecimal => DecimalIntKind::Ceil,
+                    ExecPrimOp::FloorDecimal => DecimalIntKind::Floor,
+                    _ => DecimalIntKind::Trunc,
+                };
+                decimal_to_int_checked(d, kind)
+                    .map(Val::Int)
+                    .map_err(|bug| RowEvalErr::Stopped { lane, bug })
+            }
+            _ => Err(RowEvalErr::Failed(format!("{op:?} requires Decimal"))),
         },
         ExecPrimOp::IntToFloat => match args {
             [Val::Int(n)] => Ok(Val::Float(
@@ -3011,6 +3097,14 @@ pub fn eval_scalar_exec_prim(
                 .map_err(|bug| RowEvalErr::Stopped { lane, bug }),
             _ => Err(RowEvalErr::Failed(
                 "RoundToFloat requires (Float, Float)".to_string(),
+            )),
+        },
+        ExecPrimOp::RoundToFloatEven => match args {
+            [Val::Float(x), Val::Float(step)] => round_to_float_even_val(*x, *step)
+                .map(Val::Float)
+                .map_err(|bug| RowEvalErr::Stopped { lane, bug }),
+            _ => Err(RowEvalErr::Failed(
+                "RoundToFloatEven requires (Float, Float)".to_string(),
             )),
         },
         _ => Err(RowEvalErr::Failed(format!(

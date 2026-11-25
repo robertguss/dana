@@ -47,7 +47,15 @@ pub enum ExecPrimOp {
     AbsDecimal,
     AbsInt,
     RoundFloat,
+    RoundFloatEven,
     RoundDecimal,
+    RoundDecimalEven,
+    CeilFloat,
+    FloorFloat,
+    TruncFloat,
+    CeilDecimal,
+    FloorDecimal,
+    TruncDecimal,
     IntToFloat,
     DecToFloat,
     // Formatting / string interpolation conversions
@@ -70,6 +78,7 @@ pub enum ExecPrimOp {
     ClampFloat,
     ClampDecimal,
     RoundToFloat,
+    RoundToFloatEven,
     // Temporal ops
     DateTruncUnit(String),
     DateTruncDuration,
@@ -286,12 +295,38 @@ pub enum ExecDeriveItem {
         name: Ident,
         expr: Box<ExecRowExpr>,
     },
+    SummaryCol {
+        name: Ident,
+        expr: Box<ExecRowExpr>,
+        agg_kind: AggKind,
+    },
     BucketCol {
         name: Ident,
         source: Ident,
         cuts: Vec<Literal>,
         labels: Vec<String>,
     },
+}
+
+impl ExecDeriveItem {
+    /// Column name written by this derive item.
+    #[must_use]
+    pub fn target_name(&self) -> &Ident {
+        match self {
+            Self::ColExpr { name, .. }
+            | Self::SummaryCol { name, .. }
+            | Self::BucketCol { name, .. } => name,
+        }
+    }
+
+    /// Embedded row expression for `ColExpr` or `SummaryCol`, or `None` for `BucketCol`.
+    #[must_use]
+    pub fn col_expr(&self) -> Option<&ExecRowExpr> {
+        match self {
+            Self::ColExpr { expr, .. } | Self::SummaryCol { expr, .. } => Some(expr),
+            Self::BucketCol { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -739,7 +774,7 @@ fn run_exec_clone(initial: ExecCloneTask<'_>) -> (Vec<ExecExpr>, Vec<ExecPlan>, 
                 ExecPlan::Derive { input, items } => {
                     tasks.push(ExecCloneTask::BuildPlan(CloneBuildPlan::Derive(items)));
                     for it in items.iter().rev() {
-                        if let ExecDeriveItem::ColExpr { expr, .. } = it {
+                        if let Some(expr) = it.col_expr() {
                             tasks.push(ExecCloneTask::Row(expr));
                         }
                     }
@@ -943,10 +978,7 @@ fn run_exec_clone(initial: ExecCloneTask<'_>) -> (Vec<ExecExpr>, Vec<ExecPlan>, 
                     }
                 }
                 CloneBuildPlan::Derive(items) => {
-                    let row_count = items
-                        .iter()
-                        .filter(|it| matches!(it, ExecDeriveItem::ColExpr { .. }))
-                        .count();
+                    let row_count = items.iter().filter(|it| it.col_expr().is_some()).count();
                     let start = rows.len().saturating_sub(row_count);
                     let mut row_vals = rows.split_off(start).into_iter();
                     if let Some(input) = plans.pop() {
@@ -958,6 +990,15 @@ fn run_exec_clone(initial: ExecCloneTask<'_>) -> (Vec<ExecExpr>, Vec<ExecPlan>, 
                                         citems.push(ExecDeriveItem::ColExpr {
                                             name: name.clone(),
                                             expr: Box::new(re),
+                                        });
+                                    }
+                                }
+                                ExecDeriveItem::SummaryCol { name, agg_kind, .. } => {
+                                    if let Some(re) = row_vals.next() {
+                                        citems.push(ExecDeriveItem::SummaryCol {
+                                            name: name.clone(),
+                                            expr: Box::new(re),
+                                            agg_kind: *agg_kind,
                                         });
                                     }
                                 }
@@ -1662,11 +1703,15 @@ fn push_exec_plan_children(plan: &mut ExecPlan, stack: &mut Vec<ExecDropNode>) {
                 dummy_plan(),
             )));
             for it in std::mem::take(items) {
-                if let ExecDeriveItem::ColExpr { mut expr, .. } = it {
-                    stack.push(ExecDropNode::Row(std::mem::replace(
-                        expr.as_mut(),
-                        ExecRowExpr::Lit(Literal::Unit),
-                    )));
+                match it {
+                    ExecDeriveItem::ColExpr { mut expr, .. }
+                    | ExecDeriveItem::SummaryCol { mut expr, .. } => {
+                        stack.push(ExecDropNode::Row(std::mem::replace(
+                            expr.as_mut(),
+                            ExecRowExpr::Lit(Literal::Unit),
+                        )));
+                    }
+                    ExecDeriveItem::BucketCol { .. } => {}
                 }
             }
         }
@@ -2193,7 +2238,7 @@ fn try_exec_expr_to_core(root: &ExecExpr) -> Option<Expr> {
                 ExecPlan::Derive { input, items } => {
                     tasks.push(ConvTask::BuildPlan(BuildPlanOp::Derive(items)));
                     for it in items.iter().rev() {
-                        if let ExecDeriveItem::ColExpr { expr, .. } = it {
+                        if let Some(expr) = it.col_expr() {
                             tasks.push(ConvTask::Row(expr));
                         }
                     }
@@ -2366,20 +2411,18 @@ fn try_exec_expr_to_core(root: &ExecExpr) -> Option<Expr> {
                     });
                 }
                 BuildPlanOp::Derive(items) => {
-                    let row_count = items
-                        .iter()
-                        .filter(|it| matches!(it, ExecDeriveItem::ColExpr { .. }))
-                        .count();
+                    let row_count = items.iter().filter(|it| it.col_expr().is_some()).count();
                     let mut row_vals = pop_n(&mut rows, row_count)?.into_iter();
                     let input = Box::new(plans.pop()?);
                     let mut citems = Vec::with_capacity(items.len());
                     for item in items {
                         match item {
-                            ExecDeriveItem::ColExpr { name, .. } => {
+                            ExecDeriveItem::ColExpr { name, .. }
+                            | ExecDeriveItem::SummaryCol { name, .. } => {
                                 citems.push(DeriveItem::ColExpr {
                                     name: name.clone(),
                                     expr: Box::new(row_vals.next()?),
-                                })
+                                });
                             }
                             ExecDeriveItem::BucketCol {
                                 name,
@@ -2833,7 +2876,7 @@ fn is_const_row_expr(re: &ExecRowExpr) -> bool {
 pub fn is_exec_row_expr_coarsened(re: &ExecRowExpr, cols: &[ColSpec]) -> bool {
     match re {
         ExecRowExpr::Prim {
-            op: ExecPrimOp::RoundToFloat,
+            op: ExecPrimOp::RoundToFloat | ExecPrimOp::RoundToFloatEven,
             ..
         } => true,
         ExecRowExpr::Prim {

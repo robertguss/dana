@@ -540,12 +540,12 @@ call_arg
 /* Inline and block `if` expressions */
 
 if_inline_expr
-    : IF pipe_expr COLON expr opt_nls if_inline_tail
+    : IF pipe_expr COLON opt_nls expr opt_nls if_inline_tail
     ;
 
 if_inline_tail
-    : ELSE COLON expr
-    | ELSE IF pipe_expr COLON expr opt_nls if_inline_tail
+    : ELSE COLON opt_nls expr
+    | ELSE IF pipe_expr COLON opt_nls expr opt_nls if_inline_tail
     ;
 
 if_block_expr

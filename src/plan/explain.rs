@@ -1078,34 +1078,54 @@ fn trace_exec_provenance(
             })
         }
         ExecPlan::Drop { input, cols } => {
+            let is_summary_drop = matches!(
+                input.as_ref(),
+                ExecPlan::Derive { items, .. }
+                    if items.iter().any(|it| matches!(it, ExecDeriveItem::SummaryCol { .. }))
+            );
             let tt = trace_exec_provenance(input, prog, var_tags, table_vars, lines)?;
-            let dropped: Vec<String> = tt
-                .cols
-                .iter()
-                .filter(|c| cols.contains(&c.name) && !c.tags.is_empty())
-                .map(|c| format!("{}:{}", c.name, fmt_tags(&c.tags)))
-                .collect();
-            if !dropped.is_empty() {
-                lines.push(format!(
-                    "DROP_COL Drop([{}]): removed tagged cols [{}]",
-                    cols.join(", "),
-                    dropped.join(", ")
-                ));
+            if !is_summary_drop {
+                let dropped: Vec<String> = tt
+                    .cols
+                    .iter()
+                    .filter(|c| cols.contains(&c.name) && !c.tags.is_empty())
+                    .map(|c| format!("{}:{}", c.name, fmt_tags(&c.tags)))
+                    .collect();
+                if !dropped.is_empty() {
+                    lines.push(format!(
+                        "DROP_COL Drop([{}]): removed tagged cols [{}]",
+                        cols.join(", "),
+                        dropped.join(", ")
+                    ));
+                }
             }
             let out_cols = tt
                 .cols
                 .into_iter()
                 .filter(|c| !cols.contains(&c.name))
-                .map(|c| ColSpec {
-                    agg_kind: AggKind::Raw,
-                    ..c
+                .map(|c| {
+                    if is_summary_drop {
+                        c
+                    } else {
+                        ColSpec {
+                            agg_kind: AggKind::Raw,
+                            ..c
+                        }
+                    }
                 })
                 .collect();
+            let grouped_by = if is_summary_drop { tt.grouped_by } else { None };
             Some(TableTy {
                 cols: out_cols,
                 row_tags: tt.row_tags,
                 order_tags: tt.order_tags,
-                ..TableTy::default()
+                grouped_by,
+                summarized: is_summary_drop && tt.summarized,
+                distinct_by: if is_summary_drop {
+                    tt.distinct_by
+                } else {
+                    None
+                },
             })
         }
         ExecPlan::Rename { input, pairs } => {
@@ -1159,12 +1179,21 @@ fn trace_exec_provenance(
         }
         ExecPlan::Derive { input, items } => {
             let tt = trace_exec_provenance(input, prog, var_tags, table_vars, lines)?;
+            let keep_agg = items
+                .iter()
+                .any(|it| matches!(it, ExecDeriveItem::SummaryCol { .. }));
             let mut cols: Vec<ColSpec> = tt
                 .cols
                 .into_iter()
-                .map(|c| ColSpec {
-                    agg_kind: AggKind::Raw,
-                    ..c
+                .map(|c| {
+                    if keep_agg {
+                        c
+                    } else {
+                        ColSpec {
+                            agg_kind: AggKind::Raw,
+                            ..c
+                        }
+                    }
                 })
                 .collect();
             for item in items {
@@ -1183,6 +1212,31 @@ fn trace_exec_provenance(
                             tags,
                             bucketed: crate::runtime::ir::is_exec_row_expr_coarsened(expr, &cols),
                             agg_kind: AggKind::Raw,
+                        };
+                        if let Some(slot) = cols.iter_mut().find(|c| c.name == *name) {
+                            *slot = new_col;
+                        } else {
+                            cols.push(new_col);
+                        }
+                    }
+                    ExecDeriveItem::SummaryCol {
+                        name,
+                        expr,
+                        agg_kind,
+                    } => {
+                        let tags = exec_row_expr_tags(expr, &cols, prog, var_tags);
+                        if !tags.is_empty() {
+                            lines.push(format!(
+                                "PROPAGATE Summarize({name}): inherited tags {}",
+                                fmt_tags(&tags)
+                            ));
+                        }
+                        let new_col = ColSpec {
+                            name: name.clone(),
+                            ty: ScalarTy::Text,
+                            tags,
+                            bucketed: crate::runtime::ir::is_exec_row_expr_coarsened(expr, &cols),
+                            agg_kind: *agg_kind,
                         };
                         if let Some(slot) = cols.iter_mut().find(|c| c.name == *name) {
                             *slot = new_col;
@@ -1928,13 +1982,7 @@ fn fmt_exec_plan(plan: &ExecPlan, depth: usize, out: &mut String) {
             fmt_exec_plan(input, depth + 1, out);
         }
         ExecPlan::Derive { input, items } => {
-            let names: Vec<&str> = items
-                .iter()
-                .map(|it| match it {
-                    ExecDeriveItem::ColExpr { name, .. }
-                    | ExecDeriveItem::BucketCol { name, .. } => name.as_str(),
-                })
-                .collect();
+            let names: Vec<&str> = items.iter().map(|it| it.target_name().as_str()).collect();
             let _ = writeln!(out, "Derive([{}])", names.join(", "));
             fmt_exec_plan(input, depth + 1, out);
         }

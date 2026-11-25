@@ -731,8 +731,8 @@ impl<'a> Formatter<'a> {
                 else_expr,
             } => {
                 let c = self.render_expr(cond, level);
-                let t = self.render_expr(then_expr, level);
                 let saved_c_idx = self.c_idx;
+                let t = self.render_expr(then_expr, level);
                 let mut single = format!("if {c}: {t}");
                 for (ec, et) in else_ifs {
                     let _ = write!(
@@ -749,17 +749,37 @@ impl<'a> Formatter<'a> {
                 } else {
                     self.c_idx = saved_c_idx;
                     let pad = " ".repeat((level + 1) * 2);
-                    let mut out = format!("if {c}: {t}");
+                    let branch_pad = " ".repeat((level + 2) * 2);
+                    let c_before_t = self.c_idx;
+                    let t_l1 = self.render_expr(then_expr, level + 1);
+                    let mut out = if t_l1.contains('\n') {
+                        self.c_idx = c_before_t;
+                        let t_l2 = self.render_expr(then_expr, level + 2);
+                        format!("if {c}:\n{branch_pad}{t_l2}")
+                    } else {
+                        format!("if {c}: {t_l1}")
+                    };
                     for (ec, et) in else_ifs {
-                        let _ = write!(
-                            out,
-                            "\n{pad}else if {}: {}",
-                            self.render_expr(ec, level + 1),
-                            self.render_expr(et, level + 1)
-                        );
+                        let ec_s = self.render_expr(ec, level + 1);
+                        let c_before_et = self.c_idx;
+                        let et_l1 = self.render_expr(et, level + 1);
+                        if et_l1.contains('\n') {
+                            self.c_idx = c_before_et;
+                            let et_l2 = self.render_expr(et, level + 2);
+                            let _ = write!(out, "\n{pad}else if {ec_s}:\n{branch_pad}{et_l2}");
+                        } else {
+                            let _ = write!(out, "\n{pad}else if {ec_s}: {et_l1}");
+                        }
                     }
-                    let e_multi = self.render_expr(else_expr, level + 1);
-                    let _ = write!(out, "\n{pad}else: {e_multi}");
+                    let c_before_e = self.c_idx;
+                    let e_l1 = self.render_expr(else_expr, level + 1);
+                    if e_l1.contains('\n') {
+                        self.c_idx = c_before_e;
+                        let e_l2 = self.render_expr(else_expr, level + 2);
+                        let _ = write!(out, "\n{pad}else:\n{branch_pad}{e_l2}");
+                    } else {
+                        let _ = write!(out, "\n{pad}else: {e_l1}");
+                    }
                     out
                 }
             }

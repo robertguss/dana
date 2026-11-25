@@ -78,6 +78,8 @@ COMMANDS:
       Infer a typed Dana schema from CSV/TSV/JSONL/Parquet/XLSX (supports .gz and .zst transparently).
   fake <FILE.dana> [--schema Name] [--rows N] [--seed S] [--format csv|tsv|jsonl] [--out PATH]
       Generate deterministic synthetic constraint-satisfying test data.
+  --version, -V
+      Show the `dana` toolchain version.
   help, --help, -h
       Show this help message.
 ";
@@ -93,6 +95,10 @@ pub fn run_cli(args: &[String]) -> i32 {
     match cmd.as_str() {
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
+            0
+        }
+        "--version" | "-V" => {
+            println!("dana v{}", env!("CARGO_PKG_VERSION"));
             0
         }
         "guide" => cmd_guide(rest),

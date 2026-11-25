@@ -1361,16 +1361,20 @@ const fn exec_prim_op_may_stop(op: &ExecPrimOp) -> bool {
         | ExecPrimOp::ClampInt
         | ExecPrimOp::ClampFloat
         | ExecPrimOp::ClampDecimal
-        | ExecPrimOp::RoundToFloat => true,
+        | ExecPrimOp::RoundToFloat
+        | ExecPrimOp::RoundToFloatEven
+        | ExecPrimOp::CeilFloat
+        | ExecPrimOp::FloorFloat
+        | ExecPrimOp::TruncFloat
+        | ExecPrimOp::CeilDecimal
+        | ExecPrimOp::FloorDecimal
+        | ExecPrimOp::TruncDecimal => true,
         _ => false,
     }
 }
 
 fn may_stop_exec_derive_item(item: &ExecDeriveItem) -> bool {
-    match item {
-        ExecDeriveItem::ColExpr { expr, .. } => may_stop_exec_row_expr(expr),
-        ExecDeriveItem::BucketCol { .. } => false,
-    }
+    item.col_expr().is_some_and(may_stop_exec_row_expr)
 }
 
 fn exec_row_expr_cols(re: &ExecRowExpr, out: &mut HashSet<Ident>) {
@@ -1782,11 +1786,7 @@ fn push_or_fuse_exec_filter(input: &ExecPlan, pred: ExecRowExpr, stats: &mut Opt
             inner.as_ref(),
             ExecPlan::GroupBy { .. } | ExecPlan::Summarize { .. }
         ) && items.iter().all(|it| {
-            let target = match it {
-                ExecDeriveItem::ColExpr { name, .. } | ExecDeriveItem::BucketCol { name, .. } => {
-                    name
-                }
-            };
+            let target = it.target_name();
             !pred_cols.contains(target) && !may_stop_exec_derive_item(it)
         }) =>
         {
@@ -1949,15 +1949,15 @@ fn prune_exec_plan_derives(
             let mut live = req.clone();
             let mut keep_flags = vec![false; items.len()];
             for (idx, it) in items.iter().enumerate().rev() {
-                let target = match it {
-                    ExecDeriveItem::ColExpr { name, .. }
-                    | ExecDeriveItem::BucketCol { name, .. } => name,
-                };
+                let target = it.target_name();
                 if live.contains(target) || may_stop_exec_derive_item(it) {
                     keep_flags[idx] = true;
                     live.remove(target);
                     match it {
-                        ExecDeriveItem::ColExpr { expr, .. } => exec_row_expr_cols(expr, &mut live),
+                        ExecDeriveItem::ColExpr { expr, .. }
+                        | ExecDeriveItem::SummaryCol { expr, .. } => {
+                            exec_row_expr_cols(expr, &mut live);
+                        }
                         ExecDeriveItem::BucketCol { source, .. } => {
                             live.insert(source.clone());
                         }

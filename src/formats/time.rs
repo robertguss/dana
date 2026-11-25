@@ -524,6 +524,68 @@ pub fn round_decimal_bigint(val: &BigInt, places: i64) -> BigInt {
     }
 }
 
+/// Round a `10^-18`-scaled [`BigInt`] decimal to `places` decimal digits (half to even).
+#[must_use]
+pub fn round_decimal_even_bigint(val: &BigInt, places: i64) -> BigInt {
+    let p = places.clamp(0, 18) as u32;
+    if p == 18 {
+        return val.clone();
+    }
+    let exp = 18 - p;
+    let factor_i128 = 10i128.pow(exp);
+    let factor = BigInt::from(factor_i128);
+    let half = BigInt::from(factor_i128 / 2);
+    let abs = val.abs();
+    let Some((q, r)) = abs.div_rem_euclid(&factor) else {
+        return BigInt::ZERO;
+    };
+    let round_up = if r > half {
+        true
+    } else if r < half {
+        false
+    } else {
+        q.rem_euclid(&BigInt::from(2i64))
+            .is_some_and(|rem| !rem.is_zero())
+    };
+    let q_adj = if round_up { &q + &BigInt::one() } else { q };
+    let mag = &q_adj * &factor;
+    if val.is_negative() { -mag } else { mag }
+}
+
+/// Rounding mode for converting a `10^-18`-scaled [`BigInt`] decimal to an integer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecimalIntKind {
+    Ceil,
+    Floor,
+    Trunc,
+}
+
+/// Convert a `10^-18`-scaled [`BigInt`] decimal to an integer according to `kind` (ceil, floor, or trunc toward zero).
+#[must_use]
+pub fn decimal_to_int_bigint(val: &BigInt, kind: DecimalIntKind) -> BigInt {
+    let scale = BigInt::from(DEC_SCALE);
+    let Some((q, r)) = val.div_rem_euclid(&scale) else {
+        return BigInt::ZERO;
+    };
+    match kind {
+        DecimalIntKind::Floor => q,
+        DecimalIntKind::Ceil => {
+            if r.is_zero() {
+                q
+            } else {
+                &q + &BigInt::one()
+            }
+        }
+        DecimalIntKind::Trunc => {
+            if val.is_negative() && !r.is_zero() {
+                &q + &BigInt::one()
+            } else {
+                q
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RFC 8536 TZif v1/v2/v3 Parser, POSIX TZ Footer Evaluator & `in_tz`
 // ---------------------------------------------------------------------------

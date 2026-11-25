@@ -4749,7 +4749,16 @@ fn translate_exec_row_expr(
                 | ExecPrimOp::TryParseDecimal
                 | ExecPrimOp::TryParseFloat
                 | ExecPrimOp::ClampFloat
-                | ExecPrimOp::RoundToFloat,
+                | ExecPrimOp::RoundToFloat
+                | ExecPrimOp::RoundToFloatEven
+                | ExecPrimOp::RoundFloatEven
+                | ExecPrimOp::RoundDecimalEven
+                | ExecPrimOp::CeilFloat
+                | ExecPrimOp::FloorFloat
+                | ExecPrimOp::TruncFloat
+                | ExecPrimOp::CeilDecimal
+                | ExecPrimOp::FloorDecimal
+                | ExecPrimOp::TruncDecimal,
                 _,
             ) => Err(format!("op `{op:?}` requires local VM")),
             (other, _) => Err(format!(
@@ -4903,10 +4912,7 @@ fn exec_plan_cols_and_uqs_hint(
         ExecPlan::Derive { input, items } => {
             let (mut cols, mut uqs) = exec_plan_cols_and_uqs_hint(input, ctx)?;
             for it in items {
-                let name = match it {
-                    ExecDeriveItem::ColExpr { name, .. }
-                    | ExecDeriveItem::BucketCol { name, .. } => name,
-                };
+                let name = it.target_name();
                 if cols.contains(name) {
                     uqs.retain(|uk| !uk.contains(name));
                 } else {
@@ -5012,7 +5018,13 @@ fn split_exec_node(
             }
         }
         ExecPlan::Drop { input, cols } => {
-            match split_exec_node(input, ctx, order_insensitive, false, parent_has_sort) {
+            match split_exec_node(
+                input,
+                ctx,
+                order_insensitive,
+                parent_is_suppress,
+                parent_has_sort,
+            ) {
                 NodeSplit::Pushed(node) => match node.apply_drop(cols) {
                     Ok(next) => NodeSplit::Pushed(next),
                     Err(reason) => NodeSplit::LocalOnly { reason },
@@ -5088,14 +5100,25 @@ fn split_exec_node(
             }
         }
         ExecPlan::Derive { input, items } => {
-            match split_exec_node(input, ctx, order_insensitive, false, parent_has_sort) {
+            match split_exec_node(
+                input,
+                ctx,
+                order_insensitive,
+                parent_is_suppress,
+                parent_has_sort,
+            ) {
                 NodeSplit::Pushed(node) => {
                     let orig = node.clone();
                     let mut cur = node;
                     let mut names = Vec::with_capacity(items.len());
                     for item in items {
                         match item {
-                            ExecDeriveItem::ColExpr { name, expr } => {
+                            ExecDeriveItem::ColExpr { name, expr }
+                            | ExecDeriveItem::SummaryCol { name, expr, .. } => {
+                                let ak = match item {
+                                    ExecDeriveItem::SummaryCol { agg_kind, .. } => *agg_kind,
+                                    _ => AggKind::Raw,
+                                };
                                 match translate_exec_row_expr(expr, &cur.schema, ctx) {
                                     Ok((sql_e, sty, tags)) => {
                                         let spec = ColSpec {
@@ -5103,7 +5126,7 @@ fn split_exec_node(
                                             ty: sty,
                                             tags,
                                             bucketed: false,
-                                            agg_kind: AggKind::Raw,
+                                            agg_kind: ak,
                                         };
                                         cur = cur.apply_derive_single(name, sql_e, spec);
                                         names.push(name.clone());

@@ -270,3 +270,31 @@ fn wts_examples_parse_and_format_idempotently() -> Result<(), String> {
     }
     Ok(())
 }
+
+#[test]
+fn multiline_if_inline_parses_and_formats_idempotently() -> Result<(), String> {
+    let src = "\
+module MultilineIfInline
+
+fn test_branch(n: Int) : Text
+  out = if n > 10:
+      if n > 20: \"very_high\"
+        else: \"high\"
+    else if n > 0:
+      if n % 2 == 0: \"even\"
+        else: \"odd\"
+    else: \"non_pos\"
+  out
+end
+";
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("multiline_if_inline.dana", src);
+    let m1 = parse_module(fid, src).map_err(|d| dana::base::render_diagnostic(&d, &sm))?;
+    let f1 = format_module(&m1);
+    let mut sm2 = SourceMap::new();
+    let fid2 = sm2.add_file("multiline_if_inline_fmt.dana", &f1);
+    let m2 = parse_module(fid2, &f1).map_err(|d| dana::base::render_diagnostic(&d, &sm2))?;
+    let f2 = format_module(&m2);
+    assert_eq!(f1, f2, "multiline if-inline formatting must be idempotent");
+    Ok(())
+}

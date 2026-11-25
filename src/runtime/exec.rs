@@ -39,9 +39,10 @@ use crate::formats::parquet::{
     write_parquet_bytes, write_parquet_vm_table_bytes,
 };
 use crate::formats::time::{
-    date_trunc_date, date_trunc_timestamp_duration, date_trunc_timestamp_unit, format_iso_date,
-    format_iso_timestamp, format_timestamp_in_tz, local_date_in_tz, months_between_days,
-    parse_decimal_i128, parse_iso_date, round_decimal_bigint,
+    DecimalIntKind, date_trunc_date, date_trunc_timestamp_duration, date_trunc_timestamp_unit,
+    decimal_to_int_bigint, format_iso_date, format_iso_timestamp, format_timestamp_in_tz,
+    local_date_in_tz, months_between_days, parse_decimal_i128, parse_iso_date,
+    round_decimal_bigint, round_decimal_even_bigint,
 };
 use crate::formats::xlsx::{read_xlsx_bytes_with_schema, write_xlsx_sheets};
 use crate::net::{HttpsClientConfig, JsonResponse, ParsedHttpsUrl, https_get_json};
@@ -1744,12 +1745,15 @@ impl<'a> Evaluator<'a> {
             },
             ExecPrimOp::RoundFloat => match args {
                 [Val::Float(a), Val::Int(p)] => {
-                    let places = p.to_i64().unwrap_or(0).clamp(0, 15) as i32;
-                    let factor = 10f64.powi(places);
-                    let r = (a.to_f64() * factor).round() / factor;
-                    EvalOut::Ok(Val::Float(Float64::from_f64(r)))
+                    EvalOut::Ok(Val::Float(round_float_val(*a, p, false)))
                 }
                 _ => EvalOut::Failed("RoundFloat requires (Float, Int)".to_string()),
+            },
+            ExecPrimOp::RoundFloatEven => match args {
+                [Val::Float(a), Val::Int(p)] => {
+                    EvalOut::Ok(Val::Float(round_float_val(*a, p, true)))
+                }
+                _ => EvalOut::Failed("RoundFloatEven requires (Float, Int)".to_string()),
             },
             ExecPrimOp::RoundDecimal => match args {
                 [Val::Decimal(d), Val::Int(p)] => {
@@ -1758,6 +1762,45 @@ impl<'a> Evaluator<'a> {
                 }
                 _ => EvalOut::Failed("RoundDecimal requires (Decimal, Int)".to_string()),
             },
+            ExecPrimOp::RoundDecimalEven => match args {
+                [Val::Decimal(d), Val::Int(p)] => {
+                    let places = p.to_i64().unwrap_or(0);
+                    EvalOut::Ok(Val::Decimal(round_decimal_even_bigint(d, places)))
+                }
+                _ => EvalOut::Failed("RoundDecimalEven requires (Decimal, Int)".to_string()),
+            },
+            ExecPrimOp::CeilFloat | ExecPrimOp::FloorFloat | ExecPrimOp::TruncFloat => {
+                match args {
+                    [Val::Float(a)] => {
+                        let (op_fn, name): (fn(f64) -> f64, &str) = match op {
+                            ExecPrimOp::CeilFloat => (f64::ceil, "ceil"),
+                            ExecPrimOp::FloorFloat => (f64::floor, "floor"),
+                            _ => (f64::trunc, "trunc"),
+                        };
+                        match float_to_int_checked(*a, op_fn, name) {
+                            Ok(n) => EvalOut::Ok(Val::Int(n)),
+                            Err(bug) => EvalOut::Stopped(bug),
+                        }
+                    }
+                    _ => EvalOut::Failed(format!("{op:?} requires Float")),
+                }
+            }
+            ExecPrimOp::CeilDecimal | ExecPrimOp::FloorDecimal | ExecPrimOp::TruncDecimal => {
+                match args {
+                    [Val::Decimal(d)] => {
+                        let kind = match op {
+                            ExecPrimOp::CeilDecimal => DecimalIntKind::Ceil,
+                            ExecPrimOp::FloorDecimal => DecimalIntKind::Floor,
+                            _ => DecimalIntKind::Trunc,
+                        };
+                        match decimal_to_int_checked(d, kind) {
+                            Ok(n) => EvalOut::Ok(Val::Int(n)),
+                            Err(bug) => EvalOut::Stopped(bug),
+                        }
+                    }
+                    _ => EvalOut::Failed(format!("{op:?} requires Decimal")),
+                }
+            }
             ExecPrimOp::IntToFloat => match args {
                 [Val::Int(n)] => EvalOut::Ok(Val::Float(Float64::from_f64(
                     n.to_i64().unwrap_or(0) as f64,
@@ -1851,6 +1894,13 @@ impl<'a> Evaluator<'a> {
                     Err(bug) => EvalOut::Stopped(bug),
                 },
                 _ => EvalOut::Failed("RoundToFloat requires (Float, Float)".to_string()),
+            },
+            ExecPrimOp::RoundToFloatEven => match args {
+                [Val::Float(x), Val::Float(step)] => match round_to_float_even_val(*x, *step) {
+                    Ok(v) => EvalOut::Ok(Val::Float(v)),
+                    Err(bug) => EvalOut::Stopped(bug),
+                },
+                _ => EvalOut::Failed("RoundToFloatEven requires (Float, Float)".to_string()),
             },
             ExecPrimOp::DateTruncUnit(unit) => match args {
                 [Val::Date(d)] => match date_trunc_date(d.to_i64().unwrap_or(0), unit) {
@@ -4449,6 +4499,37 @@ impl<'a> Evaluator<'a> {
                                 }
                             }
                         }
+                        ExecDeriveItem::SummaryCol {
+                            name,
+                            expr,
+                            agg_kind,
+                        } => {
+                            let existing_idx = tv.cols.iter().position(|c| c.name == *name);
+                            let mut new_vals = Vec::with_capacity(tv.rows.len());
+                            for row in &tv.rows {
+                                match self.eval_row_expr(expr, &tv.cols, &row.cells, env) {
+                                    EvalOut::Ok(v) => new_vals.push(v),
+                                    other => return other,
+                                }
+                            }
+                            if let Some(idx) = existing_idx {
+                                tv.cols[idx].agg_kind = *agg_kind;
+                                for (row, v) in tv.rows.iter_mut().zip(new_vals) {
+                                    row.cells[idx] = v;
+                                }
+                            } else {
+                                tv.cols.push(ColSpec {
+                                    name: name.clone(),
+                                    ty: ScalarTy::Unit,
+                                    tags: TagSet::empty(),
+                                    bucketed: false,
+                                    agg_kind: *agg_kind,
+                                });
+                                for (row, v) in tv.rows.iter_mut().zip(new_vals) {
+                                    row.cells.push(v);
+                                }
+                            }
+                        }
                         ExecDeriveItem::BucketCol {
                             name,
                             source,
@@ -6406,7 +6487,70 @@ pub(crate) fn clamp_float_val(x: Float64, lo: Float64, hi: Float64) -> Result<Fl
     Ok(Float64::from_f64(xf.clamp(lof, hif)))
 }
 
+pub(crate) fn round_float_val(a: Float64, places: &BigInt, even: bool) -> Float64 {
+    let xf = a.to_f64();
+    if !xf.is_finite() || xf.abs() >= 4_503_599_627_370_496.0 {
+        return a;
+    }
+    let p = places.to_i64().unwrap_or(0).clamp(0, 15) as i32;
+    let factor = 10f64.powi(p);
+    let scaled = xf * factor;
+    if !scaled.is_finite() {
+        return a;
+    }
+    let rounded = if even {
+        scaled.round_ties_even()
+    } else {
+        scaled.round()
+    };
+    let r = rounded / factor;
+    Float64::from_f64(if r == 0.0 { 0.0 } else { r })
+}
+
+pub(crate) fn float_to_int_checked(
+    x: Float64,
+    op_fn: fn(f64) -> f64,
+    op_name: &str,
+) -> Result<BigInt, Bug> {
+    const MIN_I64_F64: f64 = -9_223_372_036_854_775_808.0;
+    const EXCL_MAX_I64_F64: f64 = 9_223_372_036_854_775_808.0;
+    let xf = x.to_f64();
+    if !xf.is_finite() {
+        return Err(Bug {
+            kind: BugKind::OutsideBoundary,
+            message: format!("DomainError: {op_name} input is non-finite ({xf})"),
+        });
+    }
+    let v = op_fn(xf);
+    if !(MIN_I64_F64..EXCL_MAX_I64_F64).contains(&v) {
+        return Err(Bug {
+            kind: BugKind::IntOverflow,
+            message: format!("Int64 overflow in `{op_name}` converting {xf}"),
+        });
+    }
+    Ok(BigInt::from(v as i64))
+}
+
+pub(crate) fn decimal_to_int_checked(d: &BigInt, kind: DecimalIntKind) -> Result<BigInt, Bug> {
+    let n = decimal_to_int_bigint(d, kind);
+    if !n.in_int64_range() {
+        return Err(Bug {
+            kind: BugKind::IntOverflow,
+            message: format!("Int64 overflow converting Decimal `{}`", render_decimal(d)),
+        });
+    }
+    Ok(n)
+}
+
 pub(crate) fn round_to_float_val(x: Float64, step: Float64) -> Result<Float64, Bug> {
+    round_to_float_impl(x, step, false)
+}
+
+pub(crate) fn round_to_float_even_val(x: Float64, step: Float64) -> Result<Float64, Bug> {
+    round_to_float_impl(x, step, true)
+}
+
+fn round_to_float_impl(x: Float64, step: Float64, even: bool) -> Result<Float64, Bug> {
     let xf = x.to_f64();
     let sf = step.to_f64();
     if !sf.is_finite() || sf <= 0.0 {
@@ -6421,7 +6565,12 @@ pub(crate) fn round_to_float_val(x: Float64, step: Float64) -> Result<Float64, B
             message: format!("DomainError: round_to input is non-finite ({xf})"),
         });
     }
-    let q = (xf / sf).round() * sf;
+    let ratio = xf / sf;
+    let q = (if even {
+        ratio.round_ties_even()
+    } else {
+        ratio.round()
+    }) * sf;
     if !q.is_finite() {
         return Err(Bug {
             kind: BugKind::OutsideBoundary,

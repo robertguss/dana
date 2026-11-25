@@ -1,0 +1,29 @@
+# Positive test: multiline inline `if cond:\n  ...\nelse if ...:\n  ...\nelse:\n  ...` expressions.
+fn classify_nested(n: Int) : Text
+  label = if n > 10:
+    "huge"
+  else if n > 0:
+    if n % 2 == 0:
+      "even_pos"
+    else:
+      "odd_pos"
+  else:
+    "non_pos"
+
+  tbl = table
+    | id | x |
+    | 1  | 15 |
+    | 2  | 4 |
+    | 3  | -1 |
+  end
+    |> derive(
+      tier: if .x > 10:
+        "high"
+      else if .x > 0:
+        "mid"
+      else:
+        "low"
+    )
+
+  label
+end

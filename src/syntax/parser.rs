@@ -1427,6 +1427,7 @@ impl Parser {
         let start = self.expect(&TokenKind::KwIf)?;
         let cond = self.parse_pipe_expr()?;
         self.expect(&TokenKind::Colon)?;
+        self.skip_newlines();
         let then_expr = self.parse_expr()?;
         self.skip_newlines();
 
@@ -1437,11 +1438,13 @@ impl Parser {
                 self.advance();
                 let c = self.parse_pipe_expr()?;
                 self.expect(&TokenKind::Colon)?;
+                self.skip_newlines();
                 let t = self.parse_expr()?;
                 self.skip_newlines();
                 else_ifs.push((c, t));
             } else {
                 self.expect(&TokenKind::Colon)?;
+                self.skip_newlines();
                 let else_expr = self.parse_expr()?;
                 let span = start.merge(else_expr.span);
                 return Ok(Expr {

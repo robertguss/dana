@@ -3347,12 +3347,46 @@ impl<'a> Checker<'a> {
                 }
 
                 // Table structural equality (ignoring hidden `group_meta`, coercing literal schemas).
-                if let (Ty::Table(ltt), Ty::Table(_)) = (&llty.ty, &rlty.ty) {
+                if let (Ty::Table(ltt), Ty::Table(rtt)) = (&llty.ty, &rlty.ty) {
                     if !ltt.cols.is_empty() {
-                        rex = ExecExpr::Prim {
-                            op: ExecPrimOp::TableCoerce(ltt.clone()),
-                            args: vec![rex],
+                        let resolved_cols: Vec<ColSpec> = ltt
+                            .cols
+                            .iter()
+                            .map(|lc| {
+                                let resolved_ty =
+                                    match (&lc.ty, rtt.find_col(&lc.name).map(|rc| &rc.ty)) {
+                                        (
+                                            ScalarTy::Option(li),
+                                            Some(rty @ ScalarTy::Option(ri)),
+                                        ) if matches!(li.as_ref(), ScalarTy::Unit)
+                                            && !matches!(ri.as_ref(), ScalarTy::Unit) =>
+                                        {
+                                            rty.clone()
+                                        }
+                                        _ => lc.ty.clone(),
+                                    };
+                                ColSpec {
+                                    ty: resolved_ty,
+                                    ..lc.clone()
+                                }
+                            })
+                            .collect();
+                        let target_tt = TableTy {
+                            cols: resolved_cols,
+                            ..ltt.clone()
                         };
+                        if target_tt.cols != ltt.cols {
+                            lex = ExecExpr::Prim {
+                                op: ExecPrimOp::TableCoerce(target_tt.clone()),
+                                args: vec![lex],
+                            };
+                        }
+                        if target_tt.cols != rtt.cols {
+                            rex = ExecExpr::Prim {
+                                op: ExecPrimOp::TableCoerce(target_tt),
+                                args: vec![rex],
+                            };
+                        }
                     }
                     let eq_ex = ExecExpr::Prim {
                         op: ExecPrimOp::TableEq,
@@ -4961,6 +4995,7 @@ impl<'a> Checker<'a> {
             }
         }
 
+        let group_key_cols = out_cols.clone();
         let mut agg_items = Vec::new();
         let mut post_derives: Vec<ExecDeriveItem> = Vec::new();
         let mut post_drops: Vec<Ident> = Vec::new();
@@ -4977,57 +5012,74 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             };
-            // Support post-aggregate coalesce: `base_mean: mean(.p95_ms) ?? 0.0`!
-            if let ExprKind::Binary {
-                op: BinOp::Coalesce,
-                lhs,
-                rhs,
-            } = &value.kind
-            {
-                let tmp_col = self.fresh("agg");
+            if is_direct_agg_call(value) {
                 if let Some((item, spec, dk)) =
-                    self.check_agg_call(&tmp_col, lhs, &in_tt, &base_ctx, env)
+                    self.check_agg_call(&name.name, value, &in_tt, &base_ctx, env)
                 {
                     if distinct_key.is_none() {
                         distinct_key = dk;
                     }
-                    let inner_ty = match &spec.ty {
-                        ScalarTy::Option(t) => t.as_ref().clone(),
-                        other => other.clone(),
-                    };
-                    let inner_ty_ty = inner_ty.to_ty();
-                    let (def_re, _, def_tags) =
-                        self.check_row_expr(rhs, &out_cols, env, Some(&inner_ty_ty), false);
-                    let final_spec = ColSpec {
-                        name: name.name.clone(),
-                        ty: inner_ty,
-                        tags: spec.tags.union(&def_tags),
-                        bucketed: false,
-                        agg_kind: spec.agg_kind,
-                    };
                     agg_items.push(item);
-                    post_derives.push(ExecDeriveItem::ColExpr {
-                        name: name.name.clone(),
-                        expr: Box::new(ExecRowExpr::Coalesce {
-                            opt_expr: Box::new(ExecRowExpr::Col(tmp_col.clone())),
-                            default_expr: Box::new(def_re),
-                        }),
-                    });
-                    post_drops.push(tmp_col);
-                    out_cols.push(final_spec);
+                    upsert_col(&mut out_cols, spec);
                 }
                 continue;
             }
 
-            if let Some((item, spec, dk)) =
-                self.check_agg_call(&name.name, value, &in_tt, &base_ctx, env)
-            {
-                if distinct_key.is_none() {
-                    distinct_key = dk;
-                }
-                agg_items.push(item);
-                out_cols.push(spec);
+            let mut extracted_specs: Vec<ColSpec> = Vec::new();
+            let rewritten = self.extract_post_agg_calls(
+                value,
+                &in_tt,
+                &base_ctx,
+                env,
+                &mut agg_items,
+                &mut distinct_key,
+                &mut extracted_specs,
+                &mut post_drops,
+            );
+            let mut expr_cols = group_key_cols.clone();
+            expr_cols.extend(extracted_specs.iter().cloned());
+            let (re, re_ty, re_tags) =
+                self.check_row_expr(&rewritten, &expr_cols, env, None, false);
+            let scalar_ty = re_ty.to_scalar_ty().unwrap_or_else(|| {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("summary expression `{}` must have a scalar type", name.name),
+                    )
+                    .with_span(value.span),
+                );
+                ScalarTy::Unit
+            });
+            let mut blending_budget = base_ctx.clone();
+            for s in &extracted_specs {
+                blending_budget = blending_budget.union(&s.tags);
             }
+            let has_non_blending = extracted_specs
+                .iter()
+                .any(|s| s.agg_kind == AggKind::NonBlending);
+            let has_blending = extracted_specs
+                .iter()
+                .any(|s| s.agg_kind == AggKind::Blending);
+            let final_agg_kind = if has_non_blending || !re_tags.is_subset(&blending_budget) {
+                AggKind::NonBlending
+            } else if has_blending {
+                AggKind::Blending
+            } else {
+                AggKind::Raw
+            };
+            let final_spec = ColSpec {
+                name: name.name.clone(),
+                ty: scalar_ty,
+                tags: re_tags,
+                bucketed: false,
+                agg_kind: final_agg_kind,
+            };
+            post_derives.push(ExecDeriveItem::SummaryCol {
+                name: name.name.clone(),
+                expr: Box::new(re),
+                agg_kind: final_agg_kind,
+            });
+            upsert_col(&mut out_cols, final_spec);
         }
 
         if agg_items.is_empty() {
@@ -6947,64 +6999,18 @@ impl<'a> Checker<'a> {
                     LTy::new(Ty::Duration, rlty.tags),
                 );
             }
-            if member.name == "to_decimal" {
-                return (
-                    ExecExpr::Prim {
-                        op: ExecPrimOp::Core(PrimOp::IntToDec),
-                        args: vec![rex],
-                    },
-                    LTy::new(Ty::Decimal, rlty.tags),
-                );
-            }
-            if member.name == "to_float" {
-                return (
-                    ExecExpr::Prim {
-                        op: ExecPrimOp::IntToFloat,
-                        args: vec![rex],
-                    },
-                    LTy::new(Ty::Float, rlty.tags),
-                );
-            }
-            if member.name == "abs" {
-                return (
-                    ExecExpr::Prim {
-                        op: ExecPrimOp::AbsInt,
-                        args: vec![rex],
-                    },
-                    rlty,
-                );
-            }
         }
-
-        // Scalar properties (`abs`, `trim`, `ascii_lowercase`, `empty?`, `some?`, `none?`).
+        // Scalar properties (`abs`, `ceil`, `floor`, `trunc`, `to_int`, `to_float`, `to_decimal`, `trim`, ...).
+        if let Some((op, out_ty)) = numeric_prop_op(&rlty.ty, member.name.as_str()) {
+            return (
+                ExecExpr::Prim {
+                    op,
+                    args: vec![rex],
+                },
+                LTy::new(out_ty, rlty.tags),
+            );
+        }
         match (&rlty.ty, member.name.as_str()) {
-            (Ty::Float, "abs") => {
-                return (
-                    ExecExpr::Prim {
-                        op: ExecPrimOp::AbsFloat,
-                        args: vec![rex],
-                    },
-                    rlty,
-                );
-            }
-            (Ty::Decimal, "abs") => {
-                return (
-                    ExecExpr::Prim {
-                        op: ExecPrimOp::AbsDecimal,
-                        args: vec![rex],
-                    },
-                    rlty,
-                );
-            }
-            (Ty::Decimal, "to_float") => {
-                return (
-                    ExecExpr::Prim {
-                        op: ExecPrimOp::DecToFloat,
-                        args: vec![rex],
-                    },
-                    LTy::new(Ty::Float, rlty.tags),
-                );
-            }
             (Ty::Text, prop) if text_prop_op(prop).is_some() => {
                 if let Some((op, out_ty)) = text_prop_op(prop) {
                     return (
@@ -9376,6 +9382,19 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
+            (ty, prop @ ("ceil" | "floor" | "trunc" | "to_int"))
+                if args.is_empty() && numeric_prop_op(ty, prop).is_some() =>
+            {
+                if let Some((op, out_ty)) = numeric_prop_op(ty, prop) {
+                    return (
+                        ExecExpr::Prim {
+                            op,
+                            args: vec![rex],
+                        },
+                        LTy::new(out_ty, rlty.tags),
+                    );
+                }
+            }
             (Ty::Text, "contains?" | "starts_with?" | "ends_with?") => {
                 let (key, op) = match member.name.as_str() {
                     "contains?" => ("sub", ExecPrimOp::Core(PrimOp::ContainsText)),
@@ -9507,7 +9526,8 @@ impl<'a> Checker<'a> {
                 return (rex, rlty);
             }
             (Ty::Float, "round_to") => {
-                if let Some(step_e) = extract_one_arg(args, "step") {
+                let (step_opt, half_even) = self.parse_round_to_args(args, span);
+                if let Some(step_e) = step_opt {
                     let (sex, slty) =
                         self.check_expr(step_e, env, Some(&Ty::Float), pc, scope, ret_ctx);
                     if slty.ty != Ty::Float {
@@ -9522,21 +9542,19 @@ impl<'a> Checker<'a> {
                             .with_span(step_e.span),
                         );
                     }
+                    let op = if half_even {
+                        ExecPrimOp::RoundToFloatEven
+                    } else {
+                        ExecPrimOp::RoundToFloat
+                    };
                     return (
                         ExecExpr::Prim {
-                            op: ExecPrimOp::RoundToFloat,
+                            op,
                             args: vec![rex, sex],
                         },
                         LTy::new(Ty::Float, rlty.tags.union(&slty.tags)),
                     );
                 }
-                self.diags.push(
-                    Diagnostic::error(
-                        DiagCode::TypeError,
-                        "`Float.round_to` expects 1 `Float` argument (`step:`)",
-                    )
-                    .with_span(span),
-                );
                 return (rex, rlty);
             }
             (Ty::Timestamp, "in_tz" | "date_in_tz") => {
@@ -9565,34 +9583,36 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
-            (Ty::Float, "round") => {
-                let (pex, plty) = match args.first() {
-                    Some(CallArg::Positional(e)) => {
-                        self.check_expr(e, env, Some(&Ty::Int), pc, scope, ret_ctx)
+            (Ty::Float | Ty::Decimal, "round") => {
+                let is_dec = rlty.ty == Ty::Decimal;
+                let (places_opt, half_even) = self.parse_round_args(args, span);
+                let (pex, plty) = if let Some(pe) = places_opt {
+                    let (e, l) = self.check_expr(pe, env, Some(&Ty::Int), pc, scope, ret_ctx);
+                    if l.ty != Ty::Int {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("`.round` places must be `Int`, found `{:?}`", l.ty),
+                            )
+                            .with_span(pe.span),
+                        );
                     }
-                    _ => (ExecExpr::Lit(Literal::int(0i64)), LTy::public(Ty::Int)),
+                    (e, l)
+                } else {
+                    (ExecExpr::Lit(Literal::int(0i64)), LTy::public(Ty::Int))
+                };
+                let op = match (is_dec, half_even) {
+                    (false, false) => ExecPrimOp::RoundFloat,
+                    (false, true) => ExecPrimOp::RoundFloatEven,
+                    (true, false) => ExecPrimOp::RoundDecimal,
+                    (true, true) => ExecPrimOp::RoundDecimalEven,
                 };
                 return (
                     ExecExpr::Prim {
-                        op: ExecPrimOp::RoundFloat,
+                        op,
                         args: vec![rex, pex],
                     },
-                    LTy::new(Ty::Float, rlty.tags.union(&plty.tags)),
-                );
-            }
-            (Ty::Decimal, "round") => {
-                let (pex, plty) = match args.first() {
-                    Some(CallArg::Positional(e)) => {
-                        self.check_expr(e, env, Some(&Ty::Int), pc, scope, ret_ctx)
-                    }
-                    _ => (ExecExpr::Lit(Literal::int(0i64)), LTy::public(Ty::Int)),
-                };
-                return (
-                    ExecExpr::Prim {
-                        op: ExecPrimOp::RoundDecimal,
-                        args: vec![rex, pex],
-                    },
-                    LTy::new(Ty::Decimal, rlty.tags.union(&plty.tags)),
+                    LTy::new(rlty.ty, rlty.tags.union(&plty.tags)),
                 );
             }
             (Ty::List(el), "append") => {
@@ -10758,7 +10778,13 @@ impl<'a> Checker<'a> {
 
         let mut cols = Vec::with_capacity(ncols);
         for (ci, h) in headers.iter().enumerate() {
-            let mut ty = col_tys[ci].clone().unwrap_or(ScalarTy::Text);
+            let mut ty = col_tys[ci].clone().unwrap_or_else(|| {
+                if col_has_none[ci] {
+                    ScalarTy::Unit
+                } else {
+                    ScalarTy::Text
+                }
+            });
             if col_has_none[ci] {
                 ty = ensure_option_scalar(&ty);
             }
@@ -10854,6 +10880,12 @@ impl<'a> Checker<'a> {
         if args.is_empty()
             && rty == Ty::Text
             && let Some((op, out_ty)) = text_prop_op(member)
+        {
+            return Some((ExecRowExpr::Prim { op, args: vec![re] }, out_ty, rtags));
+        }
+        if args.is_empty()
+            && matches!(member, "ceil" | "floor" | "trunc" | "to_int")
+            && let Some((op, out_ty)) = numeric_prop_op(&rty, member)
         {
             return Some((ExecRowExpr::Prim { op, args: vec![re] }, out_ty, rtags));
         }
@@ -11070,14 +11102,8 @@ impl<'a> Checker<'a> {
                     );
                     return Some((re, rty, rtags));
                 }
-                let Some(step_e) = extract_one_arg(args, "step") else {
-                    self.diags.push(
-                        Diagnostic::error(
-                            DiagCode::TypeError,
-                            "`Float.round_to` expects 1 `Float` argument (`step:`)",
-                        )
-                        .with_span(call_span),
-                    );
+                let (step_opt, half_even) = self.parse_round_to_args(args, call_span);
+                let Some(step_e) = step_opt else {
                     return Some((re, Ty::Float, rtags));
                 };
                 let (sre, sty, stags) =
@@ -11091,9 +11117,14 @@ impl<'a> Checker<'a> {
                         .with_span(step_e.span),
                     );
                 }
+                let pop = if half_even {
+                    ExecPrimOp::RoundToFloatEven
+                } else {
+                    ExecPrimOp::RoundToFloat
+                };
                 Some((
                     ExecRowExpr::Prim {
-                        op: ExecPrimOp::RoundToFloat,
+                        op: pop,
                         args: vec![re, sre],
                     },
                     Ty::Float,
@@ -11101,20 +11132,42 @@ impl<'a> Checker<'a> {
                 ))
             }
             "round" => {
-                let (are, _, atags) = match args.first() {
-                    Some(CallArg::Positional(a0)) => {
-                        self.check_row_expr(a0, cols, outer_env, Some(&Ty::Int), allow_dot_self)
+                if !matches!(rty, Ty::Float | Ty::Decimal) {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`.round` requires `Float` or `Decimal`, found `{rty:?}`"),
+                        )
+                        .with_span(recv_span),
+                    );
+                    return Some((re, rty, rtags));
+                }
+                let (places_opt, half_even) = self.parse_round_args(args, call_span);
+                let (are, _, atags) = if let Some(a0) = places_opt {
+                    let (e, ty, tg) =
+                        self.check_row_expr(a0, cols, outer_env, Some(&Ty::Int), allow_dot_self);
+                    if ty != Ty::Int {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("`.round` places must be `Int`, found `{ty:?}`"),
+                            )
+                            .with_span(a0.span),
+                        );
                     }
-                    _ => (
+                    (e, ty, tg)
+                } else {
+                    (
                         ExecRowExpr::Lit(Literal::int(0i64)),
                         Ty::Int,
                         TagSet::empty(),
-                    ),
+                    )
                 };
-                let pop = if rty == Ty::Decimal {
-                    ExecPrimOp::RoundDecimal
-                } else {
-                    ExecPrimOp::RoundFloat
+                let pop = match (rty == Ty::Decimal, half_even) {
+                    (false, false) => ExecPrimOp::RoundFloat,
+                    (false, true) => ExecPrimOp::RoundFloatEven,
+                    (true, false) => ExecPrimOp::RoundDecimal,
+                    (true, true) => ExecPrimOp::RoundDecimalEven,
                 };
                 Some((
                     ExecRowExpr::Prim {
@@ -12714,6 +12767,7 @@ fn scalar_ty_coercible(src: &ScalarTy, dst: &ScalarTy) -> bool {
         return true;
     }
     match (src, dst) {
+        (ScalarTy::Option(s), ScalarTy::Option(_)) if matches!(s.as_ref(), ScalarTy::Unit) => true,
         (ScalarTy::Option(s), ScalarTy::Option(d)) => scalar_ty_coercible(s, d),
         (s, ScalarTy::Option(d)) => scalar_ty_coercible(s, d),
         (ScalarTy::Int, ScalarTy::Decimal | ScalarTy::Float)
@@ -12790,6 +12844,9 @@ fn row_property(re: ExecRowExpr, ty: &Ty, prop: &str) -> Option<(ExecRowExpr, Ty
     if let (Ty::Text, Some((op, out_ty))) = (ty, text_prop_op(prop)) {
         return Some((ExecRowExpr::Prim { op, args: vec![re] }, out_ty));
     }
+    if let Some((op, out_ty)) = numeric_prop_op(ty, prop) {
+        return Some((ExecRowExpr::Prim { op, args: vec![re] }, out_ty));
+    }
     match (ty, prop) {
         (Ty::Option(_), "some?") => Some((
             ExecRowExpr::Prim {
@@ -12804,48 +12861,6 @@ fn row_property(re: ExecRowExpr, ty: &Ty, prop: &str) -> Option<(ExecRowExpr, Ty
                 args: vec![re],
             },
             Ty::Bool,
-        )),
-        (Ty::Int, "to_decimal") => Some((
-            ExecRowExpr::Prim {
-                op: ExecPrimOp::Core(PrimOp::IntToDec),
-                args: vec![re],
-            },
-            Ty::Decimal,
-        )),
-        (Ty::Int, "to_float") => Some((
-            ExecRowExpr::Prim {
-                op: ExecPrimOp::IntToFloat,
-                args: vec![re],
-            },
-            Ty::Float,
-        )),
-        (Ty::Int, "abs") => Some((
-            ExecRowExpr::Prim {
-                op: ExecPrimOp::AbsInt,
-                args: vec![re],
-            },
-            Ty::Int,
-        )),
-        (Ty::Float, "abs") => Some((
-            ExecRowExpr::Prim {
-                op: ExecPrimOp::AbsFloat,
-                args: vec![re],
-            },
-            Ty::Float,
-        )),
-        (Ty::Decimal, "abs") => Some((
-            ExecRowExpr::Prim {
-                op: ExecPrimOp::AbsDecimal,
-                args: vec![re],
-            },
-            Ty::Decimal,
-        )),
-        (Ty::Decimal, "to_float") => Some((
-            ExecRowExpr::Prim {
-                op: ExecPrimOp::DecToFloat,
-                args: vec![re],
-            },
-            Ty::Float,
         )),
         _ => None,
     }
@@ -13017,6 +13032,522 @@ fn rewrite_promise_self(expr: &Expr, self_var: &str, is_table: bool) -> Expr {
             span: sp,
         },
         _ => expr.clone(),
+    }
+}
+
+fn numeric_prop_op(ty: &Ty, prop: &str) -> Option<(ExecPrimOp, Ty)> {
+    match (ty, prop) {
+        (Ty::Int, "to_decimal") => Some((ExecPrimOp::Core(PrimOp::IntToDec), Ty::Decimal)),
+        (Ty::Int, "to_float") => Some((ExecPrimOp::IntToFloat, Ty::Float)),
+        (Ty::Int, "abs") => Some((ExecPrimOp::AbsInt, Ty::Int)),
+        (Ty::Float, "abs") => Some((ExecPrimOp::AbsFloat, Ty::Float)),
+        (Ty::Float, "ceil") => Some((ExecPrimOp::CeilFloat, Ty::Int)),
+        (Ty::Float, "floor") => Some((ExecPrimOp::FloorFloat, Ty::Int)),
+        (Ty::Float, "trunc" | "to_int") => Some((ExecPrimOp::TruncFloat, Ty::Int)),
+        (Ty::Decimal, "abs") => Some((ExecPrimOp::AbsDecimal, Ty::Decimal)),
+        (Ty::Decimal, "to_float") => Some((ExecPrimOp::DecToFloat, Ty::Float)),
+        (Ty::Decimal, "ceil") => Some((ExecPrimOp::CeilDecimal, Ty::Int)),
+        (Ty::Decimal, "floor") => Some((ExecPrimOp::FloorDecimal, Ty::Int)),
+        (Ty::Decimal, "trunc" | "to_int") => Some((ExecPrimOp::TruncDecimal, Ty::Int)),
+        _ => None,
+    }
+}
+
+const AGG_FN_NAMES: &[&str] = &[
+    "count",
+    "count_if",
+    "count_distinct",
+    "sum",
+    "mean",
+    "avg",
+    "median",
+    "stddev",
+    "variance",
+    "percentile",
+    "min",
+    "max",
+    "first",
+    "last",
+];
+
+fn is_direct_agg_call(expr: &Expr) -> bool {
+    matches!(
+        &expr.kind,
+        ExprKind::Call { callee, .. }
+            if matches!(&callee.kind, ExprKind::Ident(n) if AGG_FN_NAMES.contains(&n.as_str()))
+    )
+}
+
+impl Checker<'_> {
+    fn parse_round_mode_atom(&mut self, value: &Expr) -> bool {
+        match &value.kind {
+            ExprKind::Atom(a) if a == "half_away" => false,
+            ExprKind::Atom(a) if a == "half_even" => true,
+            ExprKind::Atom(other) => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!(
+                            "unknown rounding mode `:{other}` (expected `:half_away` or `:half_even`)"
+                        ),
+                    )
+                    .with_span(value.span),
+                );
+                false
+            }
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`mode:` must be `:half_away` or `:half_even`",
+                    )
+                    .with_span(value.span),
+                );
+                false
+            }
+        }
+    }
+
+    fn parse_round_args<'a>(
+        &mut self,
+        args: &'a [CallArg],
+        call_span: Span,
+    ) -> (Option<&'a Expr>, bool) {
+        let mut places: Option<&'a Expr> = None;
+        let mut half_even = false;
+        let mut seen_mode = false;
+        for arg in args {
+            match arg {
+                CallArg::Positional(e) => {
+                    if places.is_some() {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`.round` accepts at most 1 positional `Int` argument and optional `mode:`",
+                            )
+                            .with_span(e.span),
+                        );
+                    } else {
+                        places = Some(e);
+                    }
+                }
+                CallArg::Named { name, value, span } if name.name == "mode" => {
+                    if seen_mode {
+                        self.diags.push(
+                            Diagnostic::error(DiagCode::TypeError, "duplicate `mode:` argument")
+                                .with_span(*span),
+                        );
+                    }
+                    seen_mode = true;
+                    half_even = self.parse_round_mode_atom(value);
+                }
+                CallArg::Named { name, span, .. } => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("unexpected named argument `{}:` in `.round`", name.name),
+                        )
+                        .with_span(*span),
+                    );
+                }
+            }
+        }
+        let _ = call_span;
+        (places, half_even)
+    }
+
+    fn parse_round_to_args<'a>(
+        &mut self,
+        args: &'a [CallArg],
+        call_span: Span,
+    ) -> (Option<&'a Expr>, bool) {
+        let mut step: Option<&'a Expr> = None;
+        let mut half_even = false;
+        let mut seen_mode = false;
+        for arg in args {
+            match arg {
+                CallArg::Positional(e) => {
+                    if step.is_some() {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`Float.round_to` accepts 1 `step` argument and optional `mode:`",
+                            )
+                            .with_span(e.span),
+                        );
+                    } else {
+                        step = Some(e);
+                    }
+                }
+                CallArg::Named { name, value, span } if name.name == "step" => {
+                    if step.is_some() {
+                        self.diags.push(
+                            Diagnostic::error(DiagCode::TypeError, "duplicate `step:` argument")
+                                .with_span(*span),
+                        );
+                    } else {
+                        step = Some(value);
+                    }
+                }
+                CallArg::Named { name, value, span } if name.name == "mode" => {
+                    if seen_mode {
+                        self.diags.push(
+                            Diagnostic::error(DiagCode::TypeError, "duplicate `mode:` argument")
+                                .with_span(*span),
+                        );
+                    }
+                    seen_mode = true;
+                    half_even = self.parse_round_mode_atom(value);
+                }
+                CallArg::Named { name, span, .. } => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("unexpected named argument `{}:` in `.round_to`", name.name),
+                        )
+                        .with_span(*span),
+                    );
+                }
+            }
+        }
+        if step.is_none() {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    "`Float.round_to` expects 1 `Float` argument (`step:`) and optional `mode:`",
+                )
+                .with_span(call_span),
+            );
+        }
+        (step, half_even)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "recursively extracts nested aggregate calls inside summarize post-expressions"
+    )]
+    fn extract_post_agg_calls(
+        &mut self,
+        expr: &Expr,
+        in_tt: &TableTy,
+        base_ctx: &TagSet,
+        env: &HashMap<Ident, VarBinding>,
+        agg_items: &mut Vec<ExecAggItem>,
+        distinct_key: &mut Option<Ident>,
+        extracted_specs: &mut Vec<ColSpec>,
+        post_drops: &mut Vec<Ident>,
+    ) -> Expr {
+        if is_direct_agg_call(expr) {
+            let tmp_col = self.fresh("agg");
+            if let Some((item, spec, dk)) =
+                self.check_agg_call(&tmp_col, expr, in_tt, base_ctx, env)
+            {
+                if distinct_key.is_none() {
+                    *distinct_key = dk;
+                }
+                agg_items.push(item);
+                extracted_specs.push(spec);
+                post_drops.push(tmp_col.clone());
+            }
+            return Expr {
+                kind: ExprKind::DotField(ast::SpannedName::new(tmp_col, expr.span)),
+                span: expr.span,
+            };
+        }
+        let sp = expr.span;
+        let kind = match &expr.kind {
+            ExprKind::Call { callee, args } => ExprKind::Call {
+                callee: Box::new(self.extract_post_agg_calls(
+                    callee,
+                    in_tt,
+                    base_ctx,
+                    env,
+                    agg_items,
+                    distinct_key,
+                    extracted_specs,
+                    post_drops,
+                )),
+                args: args
+                    .iter()
+                    .map(|a| match a {
+                        CallArg::Positional(e) => CallArg::Positional(self.extract_post_agg_calls(
+                            e,
+                            in_tt,
+                            base_ctx,
+                            env,
+                            agg_items,
+                            distinct_key,
+                            extracted_specs,
+                            post_drops,
+                        )),
+                        CallArg::Named { name, value, span } => CallArg::Named {
+                            name: name.clone(),
+                            value: self.extract_post_agg_calls(
+                                value,
+                                in_tt,
+                                base_ctx,
+                                env,
+                                agg_items,
+                                distinct_key,
+                                extracted_specs,
+                                post_drops,
+                            ),
+                            span: *span,
+                        },
+                    })
+                    .collect(),
+            },
+            ExprKind::Field { receiver, member } => ExprKind::Field {
+                receiver: Box::new(self.extract_post_agg_calls(
+                    receiver,
+                    in_tt,
+                    base_ctx,
+                    env,
+                    agg_items,
+                    distinct_key,
+                    extracted_specs,
+                    post_drops,
+                )),
+                member: member.clone(),
+            },
+            ExprKind::Unary { op, expr: inner } => ExprKind::Unary {
+                op: *op,
+                expr: Box::new(self.extract_post_agg_calls(
+                    inner,
+                    in_tt,
+                    base_ctx,
+                    env,
+                    agg_items,
+                    distinct_key,
+                    extracted_specs,
+                    post_drops,
+                )),
+            },
+            ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
+                op: *op,
+                lhs: Box::new(self.extract_post_agg_calls(
+                    lhs,
+                    in_tt,
+                    base_ctx,
+                    env,
+                    agg_items,
+                    distinct_key,
+                    extracted_specs,
+                    post_drops,
+                )),
+                rhs: Box::new(self.extract_post_agg_calls(
+                    rhs,
+                    in_tt,
+                    base_ctx,
+                    env,
+                    agg_items,
+                    distinct_key,
+                    extracted_specs,
+                    post_drops,
+                )),
+            },
+            ExprKind::Paren(inner) => ExprKind::Paren(Box::new(self.extract_post_agg_calls(
+                inner,
+                in_tt,
+                base_ctx,
+                env,
+                agg_items,
+                distinct_key,
+                extracted_specs,
+                post_drops,
+            ))),
+            ExprKind::Tuple(elems) => ExprKind::Tuple(
+                elems
+                    .iter()
+                    .map(|e| {
+                        self.extract_post_agg_calls(
+                            e,
+                            in_tt,
+                            base_ctx,
+                            env,
+                            agg_items,
+                            distinct_key,
+                            extracted_specs,
+                            post_drops,
+                        )
+                    })
+                    .collect(),
+            ),
+            ExprKind::List(elems) => ExprKind::List(
+                elems
+                    .iter()
+                    .map(|e| {
+                        self.extract_post_agg_calls(
+                            e,
+                            in_tt,
+                            base_ctx,
+                            env,
+                            agg_items,
+                            distinct_key,
+                            extracted_specs,
+                            post_drops,
+                        )
+                    })
+                    .collect(),
+            ),
+            ExprKind::Map(entries) => ExprKind::Map(
+                entries
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            self.extract_post_agg_calls(
+                                k,
+                                in_tt,
+                                base_ctx,
+                                env,
+                                agg_items,
+                                distinct_key,
+                                extracted_specs,
+                                post_drops,
+                            ),
+                            self.extract_post_agg_calls(
+                                v,
+                                in_tt,
+                                base_ctx,
+                                env,
+                                agg_items,
+                                distinct_key,
+                                extracted_specs,
+                                post_drops,
+                            ),
+                        )
+                    })
+                    .collect(),
+            ),
+            ExprKind::Index { target, index } => ExprKind::Index {
+                target: Box::new(self.extract_post_agg_calls(
+                    target,
+                    in_tt,
+                    base_ctx,
+                    env,
+                    agg_items,
+                    distinct_key,
+                    extracted_specs,
+                    post_drops,
+                )),
+                index: Box::new(self.extract_post_agg_calls(
+                    index,
+                    in_tt,
+                    base_ctx,
+                    env,
+                    agg_items,
+                    distinct_key,
+                    extracted_specs,
+                    post_drops,
+                )),
+            },
+            ExprKind::InterpText { parts, multiline } => ExprKind::InterpText {
+                parts: parts
+                    .iter()
+                    .map(|p| match p {
+                        ast::InterpPart::Literal { value, raw } => ast::InterpPart::Literal {
+                            value: value.clone(),
+                            raw: raw.clone(),
+                        },
+                        ast::InterpPart::Expr(ex) => {
+                            ast::InterpPart::Expr(self.extract_post_agg_calls(
+                                ex,
+                                in_tt,
+                                base_ctx,
+                                env,
+                                agg_items,
+                                distinct_key,
+                                extracted_specs,
+                                post_drops,
+                            ))
+                        }
+                    })
+                    .collect(),
+                multiline: *multiline,
+            },
+            ExprKind::IfInline {
+                cond,
+                then_expr,
+                else_ifs,
+                else_expr,
+            } => ExprKind::IfInline {
+                cond: Box::new(self.extract_post_agg_calls(
+                    cond,
+                    in_tt,
+                    base_ctx,
+                    env,
+                    agg_items,
+                    distinct_key,
+                    extracted_specs,
+                    post_drops,
+                )),
+                then_expr: Box::new(self.extract_post_agg_calls(
+                    then_expr,
+                    in_tt,
+                    base_ctx,
+                    env,
+                    agg_items,
+                    distinct_key,
+                    extracted_specs,
+                    post_drops,
+                )),
+                else_ifs: else_ifs
+                    .iter()
+                    .map(|(ec, et)| {
+                        (
+                            self.extract_post_agg_calls(
+                                ec,
+                                in_tt,
+                                base_ctx,
+                                env,
+                                agg_items,
+                                distinct_key,
+                                extracted_specs,
+                                post_drops,
+                            ),
+                            self.extract_post_agg_calls(
+                                et,
+                                in_tt,
+                                base_ctx,
+                                env,
+                                agg_items,
+                                distinct_key,
+                                extracted_specs,
+                                post_drops,
+                            ),
+                        )
+                    })
+                    .collect(),
+                else_expr: Box::new(self.extract_post_agg_calls(
+                    else_expr,
+                    in_tt,
+                    base_ctx,
+                    env,
+                    agg_items,
+                    distinct_key,
+                    extracted_specs,
+                    post_drops,
+                )),
+            },
+            ExprKind::Int(_)
+            | ExprKind::Decimal(_)
+            | ExprKind::Date(_)
+            | ExprKind::Timestamp(_)
+            | ExprKind::Text { .. }
+            | ExprKind::Atom(_)
+            | ExprKind::Bool(_)
+            | ExprKind::None
+            | ExprKind::Ident(_)
+            | ExprKind::CapName(_)
+            | ExprKind::Underscore
+            | ExprKind::DotField(_)
+            | ExprKind::DotSelf
+            | ExprKind::IfBlock { .. }
+            | ExprKind::Case { .. }
+            | ExprKind::Lambda { .. }
+            | ExprKind::TableLit { .. } => expr.kind.clone(),
+        };
+        Expr { kind, span: sp }
     }
 }
 
