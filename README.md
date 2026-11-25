@@ -102,6 +102,22 @@ fn by_program(students: Table(Student), apps: Table(Application))
 end
 ```
 
+## Install
+
+Download prebuilt release archives (`x86_64-linux` / `aarch64-macos`) from
+[GitHub Releases](https://github.com/robertguss/dana/releases), or build from source with
+Rust 1.90+ and the system C libraries behind `src/ffi/` (`zlib`, `zstd`, `sqlite3`, `openssl`):
+
+```sh
+# macOS (Apple Silicon / Intel)
+brew install pkg-config openssl@3 zstd
+cargo install --git https://github.com/robertguss/dana --tag v0.6.1
+
+# Ubuntu / Debian
+sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev libzstd-dev zlib1g-dev
+cargo install --git https://github.com/robertguss/dana --tag v0.6.1
+```
+
 ## Quickstart CLI
 
 Build the zero-crate toolchain (`cargo build --release`) and run Dana directly:

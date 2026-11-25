@@ -1473,7 +1473,11 @@ fn trace_exec_provenance(
             distinct_key,
         } => {
             let tt = trace_exec_provenance(input, prog, var_tags, table_vars, lines)?;
-            let group_keys = tt.grouped_by.clone().unwrap_or_default();
+            let group_keys = if tt.summarized {
+                Vec::new()
+            } else {
+                tt.grouped_by.clone().unwrap_or_default()
+            };
             let dk_tags = distinct_key
                 .as_deref()
                 .and_then(|dk| tt.find_col(dk).map(|c| c.tags.clone()))

@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-verify:
+    name: Linux Verification (Grammar, Clippy, Docs, Tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system build and C FFI prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison clang pkg-config libssl-dev libsqlite3-dev libzstd-dev zlib1g-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Enforce zero external Rust dependencies
+        run: test "$(cargo tree --depth 1 | wc -l)" -eq 1
+
+      - name: Check formatting, clippy, and rustdoc
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+
+      - name: Verify 0-conflict Bison grammar (GCC and Clang)
+        run: |
+          make grammar
+          make clean
+          CC=clang make grammar
+
+      - name: Run full Rust test suite and release smoke check
+        run: |
+          cargo test --all-targets
+          cargo build --release
+          ./target/release/dana --version
+          ./target/release/dana format --check examples/wts/
+
+  postgres-live:
+    name: Live PostgreSQL 16 Verification
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: dana
+          POSTGRES_PASSWORD: dana_ci
+          POSTGRES_DB: dana_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U dana -d dana_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install C FFI development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev libsqlite3-dev libzstd-dev zlib1g-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run live PostgreSQL 16 driver and differential pushdown tests
+        env:
+          DANA_TEST_POSTGRES_URL: postgres://dana:dana_ci@127.0.0.1:5432/dana_test?sslmode=disable
+        run: |
+          cargo test --test db_drivers -- postgres_live_server_opt_in --nocapture
+          cargo test --test differential_sql -- live_postgres_differential_pushdown --ignored --nocapture
+
+  macos-verify:
+    name: macOS ARM64 Verification
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Homebrew prerequisites
+        run: brew install pkg-config openssl@3 zstd
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Build, clippy, and test on macOS
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/openssl@3/lib/pkgconfig:/opt/homebrew/opt/zstd/lib/pkgconfig
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo test --test unit_tests --test v06_dogfood_fixes --test db_drivers --test examples_e2e
+          cargo build --release
+          ./target/release/dana --version

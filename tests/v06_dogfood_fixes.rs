@@ -1469,7 +1469,7 @@ fn check_src_with_lock(
 
 #[test]
 fn v06_sqlite_attach_and_unattached_schema_table_fallback() -> TestResult {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.0");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.1");
     let tmp = TempDir::new("sqlite_attach")?;
     let main_db = tmp.path().join("main.db");
     let populi_db = tmp.path().join("populi.db");
@@ -1626,17 +1626,82 @@ end
     ] {
         let split = split_exec_plan_pushdown(plan, &checked_join.exec, "Lake", dialect, Some(lk));
         match split {
-            SplitPlan::FullyPushed(q) | SplitPlan::Hybrid { pushdown: q, .. } => {
+            SplitPlan::FullyPushed(q) => {
                 assert!(
                     q.sql.contains(r#"FROM "populi"."enrollments""#)
                         && q.sql.contains(r#"FROM "canvas"."courses""#)
-                        && q.sql.contains("INNER JOIN"),
-                    "expected pushed qualified cross-schema join SQL for {dialect:?}, got:\n{}",
+                        && q.sql.contains("INNER JOIN")
+                        && q.sql.contains("GROUP BY")
+                        && q.sql.contains("ORDER BY"),
+                    "expected FullyPushed qualified cross-schema join aggregate SQL for {dialect:?}, got:\n{}",
                     q.sql
                 );
             }
             other => {
-                return Err(format!("expected SQL pushdown for {dialect:?}, got {other:?}").into());
+                return Err(format!(
+                    "expected FullyPushed SQL pushdown for {dialect:?}, got {other:?}"
+                )
+                .into());
+            }
+        }
+    }
+
+    let join_dedupe_src = r##"module AttachJoinDedupe
+
+schema Enroll
+  id: Int
+  uid: Int
+  cid: Int
+  status: Text
+end
+
+schema Course
+  cid: Int
+  code: Text
+end
+
+fn main(db: ReadDB(Lake), console: Console) : Int
+  joined = db.table(Enroll, from: "populi.enrollments")
+    |> join_many_to_one(db.table(Course, from: "canvas.courses"), on: .cid)
+    |> dedupe_by(.uid, order_by: [desc(.id)])
+    |> sort_by(.uid)
+  console.print_table(joined)
+  0
+end
+"##;
+    let checked_join_dedupe = check_src_with_lock(join_dedupe_src, &join_sq_lock)?;
+    let jd_plan = find_first_plan(
+        &checked_join_dedupe
+            .exec
+            .find_fun("main")
+            .ok_or("main")?
+            .body,
+    )
+    .ok_or("missing ExecPlan")?;
+    for (dialect, lk, expect_frag) in [
+        (SqlDialect::Sqlite, &join_sq_lock, "ROW_NUMBER() OVER"),
+        (SqlDialect::Postgres, &join_pg_lock, "SELECT DISTINCT ON"),
+    ] {
+        let jd_split = split_exec_plan_pushdown(
+            jd_plan,
+            &checked_join_dedupe.exec,
+            "Lake",
+            dialect,
+            Some(lk),
+        );
+        match jd_split {
+            SplitPlan::FullyPushed(q) => {
+                assert!(
+                    q.sql.contains("INNER JOIN") && q.sql.contains(expect_frag),
+                    "expected FullyPushed join+dedupe SQL for {dialect:?}, got:\n{}",
+                    q.sql
+                );
+            }
+            other => {
+                return Err(format!(
+                    "expected FullyPushed join+dedupe SQL for {dialect:?}, got {other:?}"
+                )
+                .into());
             }
         }
     }
@@ -2533,6 +2598,191 @@ end
         }),
         "expected pipeline verb hint for dedupe_by inside derive, got {hint_diags:?}"
     );
+
+    Ok(())
+}
+
+#[test]
+fn v061_chained_summarize_and_bound_groupby_parity() -> TestResult {
+    // 1. Inline & bound chained summarize + bound group_by variable (VM == Oracle parity)
+    let chained_src = r##"module ChainedSummarize
+
+fn main(console: Console) : Int
+  rows = table
+    | id | yr   | val |
+    | 1  | 2024 | 10  |
+    | 2  | 2024 | 20  |
+    | 3  | 2025 | 30  |
+    | 4  | 2025 | 40  |
+    | 5  | 2025 | 50  |
+  end
+
+  inline_min = (rows
+    |> group_by(.yr)
+    |> summarize(n: count())
+    |> summarize(min_k: min(.n), max_k: max(.n))).first!.min_k
+
+  grouped_counts = rows
+    |> group_by(.yr)
+    |> summarize(n: count())
+  bound_agg = grouped_counts |> summarize(min_k: min(.n), max_k: max(.n))
+  bound_row = bound_agg.first!
+
+  grouped_only = rows |> group_by(.yr)
+  by_year = grouped_only |> summarize(n: count(), tot: sum(.val)) |> sort_by(.yr)
+  first_yr = by_year.first!
+
+  console.print("inline=#{inline_min ?? 0} bound=#{bound_row.min_k ?? 0}:#{bound_row.max_k ?? 0} yr=#{first_yr.yr}:#{first_yr.n}:#{first_yr.tot}")
+  0
+end
+"##;
+    let chained_out = assert_oracle_vm_parity(chained_src, None)?;
+    assert_eq!(chained_out, vec!["inline=2 bound=2:3 yr=2024:2:30"]);
+
+    // 2. Verify Core IR lowering produces valid Lean-checked Core IR for chained summarize
+    let core_src = r##"module ChainedCore
+
+fn calc(t: Table(yr: Int, val: Int))
+  t |> group_by(.yr) |> summarize(n: count()) |> summarize(min_k: min(.n))
+end
+
+fn main(console: Console) : Int
+  t = table
+    | yr   | val |
+    | 2024 | 10  |
+    | 2024 | 20  |
+    | 2025 | 30  |
+  end
+  console.print_table(calc(t))
+  0
+end
+"##;
+    let checked_core = check_src(core_src)?;
+    let lowered = dana::lower::lower_program(checked_core)
+        .map_err(|d| format!("lower_program failed: {d:?}"))?;
+    assert!(
+        lowered.verified_core.is_some(),
+        "expected chained group_by |> summarize |> summarize to lower to verified Core IR v0.1"
+    );
+    let core_out = assert_oracle_vm_parity(core_src, None)?;
+    assert!(
+        core_out.join("\n").contains("min_k") && core_out.join("\n").contains('1'),
+        "unexpected ChainedCore output: {core_out:?}"
+    );
+
+    // 3. Privacy: suppress_small_groups right after group_by |> summarize stays valid,
+    //    while inserting an extra group_by before suppress_small_groups is rejected.
+    let valid_priv_src = r##"module ValidSuppressAfterGroupSummarize
+
+schema Item
+  id: Int [pii]
+  yr: Int
+end
+
+fn pub_check(rows: Table(Item)) : Int
+  s = rows
+    |> group_by(.yr)
+    |> summarize(n: count_distinct(.id))
+    |> suppress_small_groups(min: 5, distinct_by: .id)
+  s.count()
+end
+
+fn main() : Int
+  0
+end
+"##;
+    let priv_checked = check_src(valid_priv_src)?;
+    assert!(priv_checked.warnings.is_empty());
+
+    let bad_priv_src = r##"module RejectReGroupedBeforeSuppress
+
+schema Item
+  id: Int [pii]
+  yr: Int
+end
+
+fn pub_check(rows: Table(Item)) : Int
+  s = rows
+    |> group_by(.yr)
+    |> summarize(n: count())
+    |> group_by(.yr)
+    |> suppress_small_groups(min: 5)
+  s.count()
+end
+
+fn main() : Int
+  0
+end
+"##;
+    let bad_diags = check_src_diags(bad_priv_src)?;
+    assert!(
+        bad_diags.iter().any(|d| d.code() == DiagCode::PrivacyError),
+        "expected PrivacyError after re-grouping summarized table, got {bad_diags:?}"
+    );
+
+    // 4. SQLite & Postgres pushdown + live SQLite == Oracle parity for chained summarize
+    let tmp = TempDir::new("chained_sum_sql")?;
+    let db_path = tmp.path().join("chained.db");
+    let uri = sqlite_uri(&db_path);
+    {
+        let mut conn = open_connection(&uri)?;
+        conn.execute(
+            r#"CREATE TABLE "events" ("id" INTEGER PRIMARY KEY NOT NULL, "yr" INTEGER NOT NULL)"#,
+            &[],
+        )?;
+        for (id, yr) in [(1i64, 2024i64), (2, 2024), (3, 2025), (4, 2025), (5, 2025)] {
+            conn.execute(
+                r#"INSERT INTO "events" VALUES (?, ?)"#,
+                &[SqlParam::Int(id), SqlParam::Int(yr)],
+            )?;
+        }
+    }
+    let db_src = r##"module ChainedSummarizeSql
+
+schema EventRow
+  id: Int
+  yr: Int
+end
+
+fn main(db: ReadDB(DB), console: Console) : Int
+  res = db.table(EventRow, from: "events")
+    |> group_by(.yr)
+    |> summarize(n: count())
+    |> summarize(min_k: min(.n))
+  console.print("#{res.first!.min_k ?? 0}")
+  0
+end
+"##;
+    let checked_db = check_src(db_src)?;
+    let db_plan = find_first_plan(&checked_db.exec.find_fun("main").ok_or("main")?.body)
+        .ok_or("missing ExecPlan")?;
+    for dialect in [SqlDialect::Sqlite, SqlDialect::Postgres] {
+        let split = split_exec_plan_pushdown(db_plan, &checked_db.exec, "DB", dialect, None);
+        match split {
+            SplitPlan::FullyPushed(q) => {
+                assert!(
+                    q.sql.contains("MIN(") && q.sql.contains("GROUP BY"),
+                    "expected FullyPushed chained summarize SQL for {dialect:?}, got:\n{}",
+                    q.sql
+                );
+            }
+            other => {
+                return Err(format!(
+                    "expected FullyPushed chained summarize for {dialect:?}, got {other:?}"
+                )
+                .into());
+            }
+        }
+    }
+    let db_out = assert_oracle_vm_parity(db_src, Some(("DB", &uri)))?;
+    assert_eq!(db_out, vec!["2"]);
+
+    // 5. CLI --version prints `dana v0.6.1`
+    let ver = Command::new(env!("CARGO_BIN_EXE_dana"))
+        .arg("--version")
+        .output()?;
+    assert_eq!(ver.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.1");
 
     Ok(())
 }

@@ -3148,6 +3148,77 @@ fn core_sort_is_total_hint(plan: &Plan, keys: &[(Ident, SortDir)], ctx: &CoreSpl
     false
 }
 
+fn join_cols_and_uqs_hint(
+    kind: JoinKind,
+    l_cols: Vec<Ident>,
+    l_uqs: Vec<Vec<Ident>>,
+    r_cols: &[Ident],
+    r_uqs: &[Vec<Ident>],
+    on: &JoinOn,
+    suffixes: Option<&(Ident, Ident)>,
+) -> Option<(Vec<Ident>, Vec<Vec<Ident>>)> {
+    if matches!(kind, JoinKind::Semi | JoinKind::Anti) {
+        return Some((l_cols, l_uqs));
+    }
+    let same_keys: &[Ident] = match on {
+        JoinOn::SameKeys(ks) => ks,
+        JoinOn::Pairs(_) => &[],
+    };
+    let r_kept: Vec<Ident> = r_cols
+        .iter()
+        .filter(|rc| !same_keys.contains(rc))
+        .cloned()
+        .collect();
+    let has_collision = l_cols.iter().any(|lc| r_kept.contains(lc));
+    let (out_cols, l_renames): (Vec<Ident>, HashMap<Ident, Ident>) = if !has_collision {
+        let mut combined = l_cols;
+        combined.extend(r_kept);
+        (combined, HashMap::new())
+    } else if let Some((sl, sr)) = suffixes {
+        let mut ren = HashMap::new();
+        let mut combined: Vec<Ident> = l_cols
+            .iter()
+            .map(|c| {
+                if r_kept.contains(c) {
+                    let nc = format!("{c}{sl}");
+                    ren.insert(c.clone(), nc.clone());
+                    nc
+                } else {
+                    c.clone()
+                }
+            })
+            .collect();
+        for c in &r_kept {
+            if l_cols.contains(c) {
+                combined.push(format!("{c}{sr}"));
+            } else {
+                combined.push(c.clone());
+            }
+        }
+        (combined, ren)
+    } else {
+        return None;
+    };
+    let r_join_keys: Vec<Ident> = match on {
+        JoinOn::SameKeys(ks) => ks.clone(),
+        JoinOn::Pairs(ps) => ps.iter().map(|(_, r)| r.clone()).collect(),
+    };
+    let right_is_unique = r_uqs
+        .iter()
+        .any(|uk| uk.iter().all(|k| r_join_keys.contains(k)));
+    let mut out_uqs = Vec::new();
+    if right_is_unique {
+        for uk in l_uqs {
+            out_uqs.push(
+                uk.into_iter()
+                    .map(|k| l_renames.get(&k).cloned().unwrap_or(k))
+                    .collect(),
+            );
+        }
+    }
+    Some((out_cols, out_uqs))
+}
+
 fn core_plan_cols_and_uqs_hint(
     plan: &Plan,
     ctx: &CoreSplitCtx<'_>,
@@ -3260,63 +3331,7 @@ fn core_plan_cols_and_uqs_hint(
                 return Some((l_cols, l_uqs));
             }
             let (r_cols, r_uqs) = core_plan_cols_and_uqs_hint(right, ctx)?;
-            let same_keys: &[Ident] = match on {
-                JoinOn::SameKeys(ks) => ks,
-                JoinOn::Pairs(_) => &[],
-            };
-            let r_kept: Vec<Ident> = r_cols
-                .iter()
-                .filter(|rc| !same_keys.contains(rc))
-                .cloned()
-                .collect();
-            let has_collision = l_cols.iter().any(|lc| r_kept.contains(lc));
-            let (out_cols, l_renames): (Vec<Ident>, HashMap<Ident, Ident>) = if !has_collision {
-                let mut combined = l_cols.clone();
-                combined.extend(r_kept);
-                (combined, HashMap::new())
-            } else if let Some((sl, sr)) = suffixes {
-                let mut ren = HashMap::new();
-                let mut combined: Vec<Ident> = l_cols
-                    .iter()
-                    .map(|c| {
-                        if r_kept.contains(c) {
-                            let nc = format!("{c}{sl}");
-                            ren.insert(c.clone(), nc.clone());
-                            nc
-                        } else {
-                            c.clone()
-                        }
-                    })
-                    .collect();
-                for c in &r_kept {
-                    if l_cols.contains(c) {
-                        combined.push(format!("{c}{sr}"));
-                    } else {
-                        combined.push(c.clone());
-                    }
-                }
-                (combined, ren)
-            } else {
-                return None;
-            };
-            let r_join_keys: Vec<Ident> = match on {
-                JoinOn::SameKeys(ks) => ks.clone(),
-                JoinOn::Pairs(ps) => ps.iter().map(|(_, r)| r.clone()).collect(),
-            };
-            let right_is_unique = r_uqs
-                .iter()
-                .any(|uk| uk.iter().all(|k| r_join_keys.contains(k)));
-            let mut out_uqs = Vec::new();
-            if right_is_unique {
-                for uk in l_uqs {
-                    out_uqs.push(
-                        uk.into_iter()
-                            .map(|k| l_renames.get(&k).cloned().unwrap_or(k))
-                            .collect(),
-                    );
-                }
-            }
-            Some((out_cols, out_uqs))
+            join_cols_and_uqs_hint(*kind, l_cols, l_uqs, &r_cols, &r_uqs, on, suffixes.as_ref())
         }
         Plan::Union { left, .. } => {
             let (cols, _) = core_plan_cols_and_uqs_hint(left, ctx)?;
@@ -5471,6 +5486,20 @@ fn exec_plan_cols_and_uqs_hint(
             let mut out_cols = gks.clone();
             out_cols.extend(aggs.iter().map(|a| a.name.clone()));
             Some((out_cols, vec![gks]))
+        }
+        ExecPlan::Join {
+            kind,
+            left,
+            right,
+            on,
+            suffixes,
+        } => {
+            let (l_cols, l_uqs) = exec_plan_cols_and_uqs_hint(left, ctx)?;
+            if matches!(kind, JoinKind::Semi | JoinKind::Anti) {
+                return Some((l_cols, l_uqs));
+            }
+            let (r_cols, r_uqs) = exec_plan_cols_and_uqs_hint(right, ctx)?;
+            join_cols_and_uqs_hint(*kind, l_cols, l_uqs, &r_cols, &r_uqs, on, suffixes.as_ref())
         }
         ExecPlan::Union { left, .. } => {
             let (cols, _) = exec_plan_cols_and_uqs_hint(left, ctx)?;

@@ -4622,6 +4622,8 @@ impl<'a> Checker<'a> {
                 let mut out_tt = in_tt;
                 out_tt.row_tags = out_tt.row_tags.union(&key_tags);
                 out_tt.grouped_by = Some(keys.clone());
+                out_tt.summarized = false;
+                out_tt.distinct_by = None;
                 (
                     ExecExpr::Rel(Box::new(ExecPlan::GroupBy {
                         input: Box::new(in_plan),
@@ -5486,7 +5488,11 @@ impl<'a> Checker<'a> {
         span: Span,
         env: &HashMap<Ident, VarBinding>,
     ) -> (ExecExpr, LTy) {
-        let group_keys = in_tt.grouped_by.clone().unwrap_or_default();
+        let group_keys = if in_tt.summarized {
+            Vec::new()
+        } else {
+            in_tt.grouped_by.clone().unwrap_or_default()
+        };
         let mut out_cols = Vec::new();
         let mut base_ctx = in_tt.row_tags.clone();
         for gk in &group_keys {
@@ -5599,8 +5605,23 @@ impl<'a> Checker<'a> {
             );
         }
 
+        let summarize_in = if !group_keys.is_empty() && !matches!(in_plan, ExecPlan::GroupBy { .. })
+        {
+            ExecPlan::GroupBy {
+                input: Box::new(in_plan),
+                keys: group_keys.clone(),
+            }
+        } else if group_keys.is_empty() && in_tt.summarized {
+            ExecPlan::GroupBy {
+                input: Box::new(in_plan),
+                keys: Vec::new(),
+            }
+        } else {
+            in_plan
+        };
+
         let mut plan = ExecPlan::Summarize {
-            input: Box::new(in_plan),
+            input: Box::new(summarize_in),
             aggs: agg_items,
             distinct_key: distinct_key.clone(),
         };
