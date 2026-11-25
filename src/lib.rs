@@ -3,7 +3,8 @@
 //! - `syntax`: lexer, parser (100% Bison IELR(1) parity), Surface AST, and canonical formatter
 //! - `check`: `dana.policy` parser, module resolver, structural Table + privacy/capability checker
 //! - `lower`: surface-to-execution IR & Core IR v0.1 verifier bridge
-//! - `ffi`: audited RAII FFI wrappers around allowlisted system `zlib` and `libzstd`
+//! - `ffi`: audited RAII FFI wrappers around allowlisted system `zlib`, `libzstd`, `sqlite3`, and OpenSSL TLS
+//! - `db`: SQLite and native PostgreSQL v3.0 drivers, offline `schema.lock`, and privacy-redacted dry-run diffs
 //! - `formats`: built-in calendar/TZif temporal math, HMAC-SHA256, streaming CSV/TSV, JSON/JSONL, schema inference & fake data generation
 //! - `plan`: relational query optimizer (filter fusion, predicate pushdown, dead-derive pruning) & plan explainer
 //! - `vm`: 2,048-row vectorized columnar batch VM, compiled row bytecode (inlined pure UDFs), & deterministic parallel runner
@@ -20,6 +21,8 @@ pub mod check;
 pub mod cli;
 #[forbid(unsafe_code)]
 pub mod core;
+#[forbid(unsafe_code)]
+pub mod db;
 pub mod ffi;
 #[forbid(unsafe_code)]
 pub mod formats;
