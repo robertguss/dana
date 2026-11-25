@@ -345,8 +345,8 @@ end
 | `drop` | `drop(.a, .b)` — Remove columns (cannot drop all columns). |
 | `rename` | `rename(new_name: .old_name, ...)` — Rename columns in place. |
 | `derive` | `derive(x: expr, y: bucket(...))` — Add or replace computed columns (pure row exprs & pure UDFs). |
-| `sort_by` | `sort_by(.a, .b)` — Deterministic ascending sort (`none` sorts first). Adds key tags to `order_tags`. |
-| `sort_desc` | `sort_desc(.a, .b)` — Deterministic descending sort. Adds key tags to `order_tags`. |
+| `sort_by` | `sort_by(.a, .b)` — Deterministic **stable** ascending sort (`none` sorts first). Adds key tags to `order_tags`. |
+| `sort_desc` | `sort_desc(.a, .b)` — Deterministic **stable** descending sort (`none` sorts last). Adds key tags to `order_tags`. |
 | `distinct` | `distinct(.a, .b)` or `distinct()` — Deduplicate rows. Adds key tags to `row_tags`. |
 | `limit` | `limit(n)` — Keep first `n` rows (constant non-negative integer). Folds `order_tags` into `row_tags`. |
 | `group_by` | `group_by(.a, .b)` — Set grouping keys for `summarize`. Adds key tags to `row_tags`. |
@@ -360,6 +360,10 @@ end
 | `union` | `union(other)` — Concatenate two tables with identical column names and types (unions tags). |
 | `redact` | `redact(.col)` — Replace column with `"[REDACTED]"` (`Text`), clearing `col_tags(.col)`. |
 | `pseudonymize` | `pseudonymize(.col, key: secret)` — Keyed HMAC-SHA256 `Text` token, clearing `[pii]`. |
+
+Both `sort_by` and `sort_desc` are deterministic **stable** sorts, so chaining them produces
+exact mixed-direction tie-breaks: `|> sort_by(.category) |> sort_desc(.total_amount)` sorts
+descending by `.total_amount` with ties broken ascending by `.category`.
 
 ### 6.3 Aggregates Inside `summarize(...)`
 
@@ -386,7 +390,12 @@ Supported window calls in `window(out_col: ..., over: [.g1, ...], order: .t)` (a
 - `rank(.col) : Int` — Competition rank within partition.
 - `lag(.col, n) : T?` and `lead(.col, n) : T?` — Value `n` rows before/after (offset defaults to `1`).
 - `running_sum(.col) : Int | Decimal | Float` — Cumulative sum up to current row.
-- `rolling_mean(.col, rows: k) : Float?` (or `rolling_mean(.col, k)`) — Trailing `k`-row moving average.
+- `rolling_mean(.col, rows: k) : Float?` (or `rolling_mean(.col, k)`) — Trailing `k`-row moving
+  average within each partition (inclusive of the current row). On leading partial windows
+  (`< k` rows), averages the available leading rows (e.g., for `rows: 3`, row 1 averages row 1
+  and row 2 averages rows 1–2) rather than returning `none`. `none` values inside the window are
+  skipped (excluded from numerator and denominator); returns `none` only when all rows in the
+  window are `none`.
 - Compound delta subtraction: `delta: .students - lag(.students, 1) : Int? | Decimal? | Float?`.
 
 ### 6.5 `pivot_longer`, `pivot_wider`, `fill_gaps` & `crosstab`
@@ -420,11 +429,11 @@ test "pivot_longer and pivot_wider round-trip cleanly"
 
   back = long
     |> pivot_wider(
-         names_from: .quarter,
-         values_from: .revenue,
-         columns: ["q1", "q2", "q3"],
-         fill: 0.00
-       )
+      names_from: .quarter,
+      values_from: .revenue,
+      columns: ["q1", "q2", "q3"],
+      fill: 0.00
+    )
   assert back.first!.q2 == 120.00
 end
 ```
@@ -579,13 +588,10 @@ fn safe_summary(encounters: Table(Encounter))
   encounters
     |> select(.patient_id, .department, .age_years, .stay_days)
     |> derive(
-         age_band: bucket(.age_years, cuts: [18, 45, 65], labels: ["0-17", "18-44", "45-64", "65+"])
-       )
+      age_band: bucket(.age_years, cuts: [18, 45, 65], labels: ["0-17", "18-44", "45-64", "65+"])
+    )
     |> group_by(.department, .age_band)
-    |> summarize(
-         patients: count_distinct(.patient_id),
-         avg_stay: mean(.stay_days)
-       )
+    |> summarize(patients: count_distinct(.patient_id), avg_stay: mean(.stay_days))
     |> suppress_small_groups(min: 10, distinct_by: .patient_id)
     |> sort_desc(.patients)
 end
@@ -820,18 +826,20 @@ fn main(files: ReadFiles, out: WriteFiles("reports/"), console: Console) : Int
 
   scatter = rows
     |> chart_scatter(
-         x: .hours,
-         y: .score,
-         color: .group,
-         trendline: model,
-         title: "Hours vs. Score (r = #{r.round(3)}, rho = #{rho.round(3)})"
-       )
+      x: .hours,
+      y: .score,
+      color: .group,
+      trendline: model,
+      title: "Hours vs. Score (r = #{r.round(3)}, rho = #{rho.round(3)})"
+    )
   hist = rows |> chart_histogram(x: .score, bins: 12, title: "Score Distribution")
 
   console.print_chart(hist)
 
   report = Report.new("Study Summary")
-    |> add_summary("Slope=#{model.slope.round(4)}, R^2=#{model.r_squared.round(3)}, Welch p=#{ab.p_value.round(4)}")
+    |> add_summary(
+      "Slope=#{model.slope.round(4)}, R^2=#{model.r_squared.round(3)}, Welch p=#{ab.p_value.round(4)}"
+    )
     |> add_chart(scatter)
     |> add_chart(hist)
     |> add_table(flagged |> where(.outlier?))
@@ -859,10 +867,16 @@ production code is a compile error):
 | --- | --- | --- |
 | `Files.in_memory({"a.csv": "..."}).read_only` | `ReadFiles` | Serves in-memory CSV/TSV/JSONL fixtures |
 | `DB.in_memory(DbName, {Schema1: tbl1, ...})` | `ReadDB(DbName)` | Serves typed in-memory tables |
-| `Console.fake()` | `Console` | `.printed_lines`, `.printed_errors`, `.printed_tables` |
+| `Console.fake()` | `Console` | `.printed_lines : List(Text)`, `.printed_errors : List(Text)`, `.printed_tables : List(Table)` |
 | `Https.fake("host", responses: {"https://host/...": "{...}"}, allows: [pii])` | `HttpsAllow` | Returns stubbed JSON responses (`allows:` optional) |
 | `Secret.fake("test-key")` | `Secret` | Deterministic test secret for `pseudonymize` / HTTPS |
 | `Args.of(["a.csv", "b.csv"])` | `Args` | Supplies CLI args to `main(...)` in tests |
+
+`Console.fake()` inspection fields are `List(...)` values (`console.printed_lines : List(Text)`
+captures stdout from `print`, `print_table`, `print_chart`, and `print_profile`;
+`console.printed_errors : List(Text)` captures `error`; `console.printed_tables : List(Table)`
+captures tables passed to `print_table`). Use `List` properties `.size` (or `.len`), `.empty?`,
+`.first`, and `.first!` — **not** `.count()` (`.count()` is a `Table` method).
 
 <!-- dana-example: file -->
 ```dana
@@ -1005,6 +1019,14 @@ dana guide [SECTION]
     structured values.
 12. **Sibling `dana.policy` auto-discovery:** `dana check` and `dana run` automatically load a
     `dana.policy` in the same directory as the `.dana` file unless overridden with `--policy`.
+13. **`Table` methods/properties vs. `|>` pipeline verbs:** `.count()`, `.empty?`, `.first!`,
+    `.profile()`, `.sum(.col)`, `.mean(.col)`, and `.stddev(.col)` are `Table` methods/properties,
+    not `|>` pipeline verbs — call `tbl.count()` (or bind the pipeline first, e.g.,
+    `hot = tbl |> where(.outlier?)` then `hot.count()`), not `tbl |> count()`. On `List` values
+    (such as `console.printed_tables`), use `.size`, `.empty?`, `.first`, or `.first!` — not `.count()`.
+14. **`pseudonymize` and `redact` are `|>` table pipeline verbs (not row functions):** Pipe them
+    directly (`tbl |> pseudonymize(.col, key: secret) |> redact(.notes)`) instead of calling them
+    inside `derive(...)`. Only `bucket(.col, cuts: [...], labels: [...])` is called inside `derive(...)`.
 
 ---
 

@@ -3586,13 +3586,39 @@ impl<'a> Checker<'a> {
         let (mut cur_ex, mut cur_lty) = self.check_expr(base, env, None, pc, scope, ret_ctx);
         while let Some((stage_rhs, stage_span, lhs_span)) = stages.pop() {
             let ExprKind::Call { callee, args } = &stage_rhs.kind else {
-                self.diags.push(
-                    Diagnostic::error(
-                        DiagCode::TypeError,
-                        "right-hand side of `|>` must be a call",
-                    )
-                    .with_span(stage_rhs.span),
-                );
+                let mut diag = Diagnostic::error(
+                    DiagCode::TypeError,
+                    "right-hand side of `|>` must be a call",
+                )
+                .with_span(stage_rhs.span);
+                if matches!(&cur_lty.ty, Ty::Table(_))
+                    && let ExprKind::Ident(name) = &stage_rhs.kind
+                {
+                    match name.as_str() {
+                        "empty?" => {
+                            diag = diag.with_hint(
+                                "`.empty?` is a `Table` property, not a `|>` pipeline verb; access `tbl.empty?` instead",
+                            );
+                        }
+                        "first!" => {
+                            diag = diag.with_hint(
+                                "`.first!` is a `Table` property, not a `|>` pipeline verb; access `tbl.first!` instead",
+                            );
+                        }
+                        "first" => {
+                            diag = diag.with_hint(
+                                "`Table` has property `.first!` (not a `|>` pipeline verb); access `tbl.first!` instead",
+                            );
+                        }
+                        "count" | "profile" => {
+                            diag = diag.with_hint(format!(
+                                "`.{name}()` is a `Table` method, not a `|>` pipeline verb; call `tbl.{name}()` instead"
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                self.diags.push(diag);
                 continue;
             };
             let ExprKind::Ident(verb) = &callee.kind else {
@@ -4708,13 +4734,45 @@ impl<'a> Checker<'a> {
                 )
             }
             _ => {
-                self.diags.push(
-                    Diagnostic::error(
-                        DiagCode::TypeError,
-                        format!("unknown table pipeline verb `{verb}`"),
-                    )
-                    .with_span(span),
-                );
+                let mut diag = Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!("unknown table pipeline verb `{verb}`"),
+                )
+                .with_span(span);
+                match verb {
+                    "count" => {
+                        diag = diag.with_hint(
+                            "`.count()` is a `Table` method, not a `|>` pipeline verb; call `tbl.count()` instead (or bind the pipeline result first)",
+                        );
+                    }
+                    "empty?" => {
+                        diag = diag.with_hint(
+                            "`.empty?` is a `Table` property, not a `|>` pipeline verb; access `tbl.empty?` without `()` instead",
+                        );
+                    }
+                    "first!" => {
+                        diag = diag.with_hint(
+                            "`.first!` is a `Table` property, not a `|>` pipeline verb; access `tbl.first!` without `()` instead",
+                        );
+                    }
+                    "first" => {
+                        diag = diag.with_hint(
+                            "`Table` has property `.first!` (not a `|>` pipeline verb or `.first`); access `tbl.first!` without `()` instead (check `tbl.empty?` first if it may be empty)",
+                        );
+                    }
+                    "profile" => {
+                        diag = diag.with_hint(
+                            "`.profile()` is a `Table` method, not a `|>` pipeline verb; call `tbl.profile()` instead",
+                        );
+                    }
+                    "sum" | "mean" | "stddev" => {
+                        diag = diag.with_hint(format!(
+                            "`.{verb}(.col)` is a `Table` method, not a `|>` pipeline verb; call `tbl.{verb}(.col)` or use `|> summarize(...)` instead"
+                        ));
+                    }
+                    _ => {}
+                }
+                self.diags.push(diag);
                 (
                     ExecExpr::Rel(Box::new(in_plan)),
                     LTy::new(Ty::Table(in_tt), outer_tags),
@@ -8847,13 +8905,17 @@ impl<'a> Checker<'a> {
             _ => {}
         }
 
-        self.diags.push(
-            Diagnostic::error(
-                DiagCode::TypeError,
-                format!("unknown method `.{}(...)`", member.name),
-            )
-            .with_span(span),
-        );
+        let mut diag = Diagnostic::error(
+            DiagCode::TypeError,
+            format!("unknown method `.{}(...)`", member.name),
+        )
+        .with_span(span);
+        if matches!(&rlty.ty, Ty::List(_)) && member.name == "count" {
+            diag = diag.with_hint(
+                "`List` has no `.count()` method; use `.size` (or `.len`) to get the number of elements",
+            );
+        }
+        self.diags.push(diag);
         (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit))
     }
 
@@ -10542,10 +10604,37 @@ impl<'a> Checker<'a> {
                         );
                     }
                 }
-                self.diags.push(
-                    Diagnostic::error(DiagCode::TypeError, "unsupported call in row expression")
-                        .with_span(expr.span),
-                );
+                let mut diag = match &callee.kind {
+                    ExprKind::Ident(fname) => Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("unsupported call `{fname}(...)` in row expression"),
+                    ),
+                    _ => {
+                        Diagnostic::error(DiagCode::TypeError, "unsupported call in row expression")
+                    }
+                }
+                .with_span(expr.span);
+                if let ExprKind::Ident(fname) = &callee.kind {
+                    match fname.as_str() {
+                        "pseudonymize" => {
+                            diag = diag.with_hint(
+                                "`pseudonymize` is a table pipeline verb, not a row function; use `|> pseudonymize(.col, key: secret)` instead of calling it inside `derive(...)`",
+                            );
+                        }
+                        "redact" => {
+                            diag = diag.with_hint(
+                                "`redact` is a table pipeline verb, not a row function; use `|> redact(.col)` instead of calling it inside `derive(...)`",
+                            );
+                        }
+                        "suppress_small_groups" => {
+                            diag = diag.with_hint(
+                                "`suppress_small_groups` is a table pipeline verb, not a row function; pipe it directly after `summarize(...)` as `|> suppress_small_groups(min: k, distinct_by: .id)`",
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                self.diags.push(diag);
                 (ExecRowExpr::Lit(Literal::Unit), Ty::Unit, TagSet::empty())
             }
             ExprKind::IfInline {

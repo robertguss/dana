@@ -82,17 +82,19 @@ fn by_program(students: Table(Student), apps: Table(Application))
   promise unique(.program)
   promise all(.applicants >= 5)
 
+  # Filter & select push down to SQLite / Postgres SQL; join_one fails loudly on duplicate keys;
+  # suppress_small_groups declassifies [pii]/[ferpa] once k >= 5 distinct students.
   students
     |> where(.enrolled_year == 2026 and .active?)
-    |> select(.id, .program, .gpa)                      # pushes down to SQLite / Postgres SQL
-    |> join_one(apps, on: left.id == right.student_id)  # fails loudly on duplicate keys
+    |> select(.id, .program, .gpa)
+    |> join_one(apps, on: left.id == right.student_id)
     |> group_by(.program)
     |> summarize(
-         applicants: count_distinct(.id),
-         avg_gpa: mean(.gpa),
-         total_requested: sum(.requested)
-       )
-    |> suppress_small_groups(min: 5, distinct_by: .id)  # declassifies [pii]/[ferpa] once k >= 5
+      applicants: count_distinct(.id),
+      avg_gpa: mean(.gpa),
+      total_requested: sum(.requested)
+    )
+    |> suppress_small_groups(min: 5, distinct_by: .id)
     |> sort_desc(.total_requested)
 end
 ```

@@ -27,7 +27,7 @@ use dana::formats::parquet::{
 use dana::lower::lower_program;
 use dana::oracle::value::{TableRow, TableVal, Val};
 use dana::runtime::{RunConfig, RunResult, run_exec_program, run_program_tests};
-use dana::syntax::parse_module;
+use dana::syntax::{format_module, parse_module};
 use dana::vm::{VmConfig, run_exec_program_vm, run_program_tests_vm};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -266,6 +266,45 @@ fn reference_and_readme_file_examples_pass_dana_check() -> TestResult {
     assert!(
         total_inline_tests >= 4,
         "expected embedded doc example tests to run, ran {total_inline_tests}"
+    );
+    Ok(())
+}
+
+#[test]
+fn reference_and_readme_file_examples_match_dana_format_check() -> TestResult {
+    let root = repo_root();
+    let docs = ["docs/reference/README.md", "README.md"];
+    let mut total_blocks = 0usize;
+
+    for rel in docs {
+        let path = root.join(rel);
+        let text = fs::read_to_string(&path)?;
+        let blocks = extract_file_examples(&text);
+        assert!(
+            !blocks.is_empty(),
+            "{rel}: expected at least one `<!-- dana-example: file -->` block"
+        );
+
+        for (line_no, code) in blocks {
+            total_blocks += 1;
+            let label = format!("{rel}:{line_no}");
+            let mut sm = SourceMap::new();
+            let fid = sm.add_file(label.clone(), code.clone());
+            let module = parse_module(fid, &code)
+                .map_err(|d| format!("{label} failed to parse:\n{}", render_diagnostic(&d, &sm)))?;
+            let formatted = format_module(&module);
+            assert_eq!(
+                formatted,
+                code,
+                "{label} does not match `dana format --check`:\n{}",
+                dana::cli::render_format_diff(&code, &formatted)
+            );
+        }
+    }
+
+    assert!(
+        total_blocks >= 8,
+        "expected at least 8 file examples across docs/reference/README.md and README.md, found {total_blocks}"
     );
     Ok(())
 }

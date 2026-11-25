@@ -191,6 +191,7 @@ fn cmd_format(args: &[String]) -> i32 {
             any_diff = true;
             if check_only {
                 eprintln!("would reformat {}", path.display());
+                eprint!("{}", render_format_diff(&src, &formatted));
             } else if let Err(e) = fs::write(&path, formatted) {
                 eprintln!("dana format: cannot write `{}`: {e}", path.display());
                 return 2;
@@ -198,6 +199,188 @@ fn cmd_format(args: &[String]) -> i32 {
         }
     }
     if check_only && any_diff { 1 } else { 0 }
+}
+
+const MAX_FORMAT_DIFF_LINES: usize = 40;
+const MAX_LCS_CELLS: usize = 250_000;
+
+#[derive(Clone, Copy)]
+enum FormatDiffOp {
+    Equal(usize, usize),
+    Delete(usize),
+    Insert(usize),
+}
+
+/// Render a compact, line-numbered diff between an unformatted file (`actual`) and its
+/// canonical `dana format` output (`expected`), capped cleanly at 40 changed lines.
+#[must_use]
+pub fn render_format_diff(actual: &str, expected: &str) -> String {
+    if actual == expected {
+        return String::new();
+    }
+
+    let a_lines: Vec<&str> = actual.lines().collect();
+    let b_lines: Vec<&str> = expected.lines().collect();
+    if a_lines == b_lines {
+        if !actual.ends_with('\n') && expected.ends_with('\n') {
+            return "  (missing trailing newline)\n".to_string();
+        }
+        if actual.contains("\r\n") && !expected.contains("\r\n") {
+            return "  (CRLF line endings; canonical format uses LF)\n".to_string();
+        }
+        return "  (trailing newline/whitespace differs)\n".to_string();
+    }
+
+    let mut prefix = 0usize;
+    while prefix < a_lines.len() && prefix < b_lines.len() && a_lines[prefix] == b_lines[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while suffix < a_lines.len() - prefix
+        && suffix < b_lines.len() - prefix
+        && a_lines[a_lines.len() - 1 - suffix] == b_lines[b_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let a_mid = &a_lines[prefix..a_lines.len() - suffix];
+    let b_mid = &b_lines[prefix..b_lines.len() - suffix];
+    let ops = compute_format_diff_ops(a_mid, b_mid, prefix);
+
+    let total_changed = ops
+        .iter()
+        .filter(|op| !matches!(op, FormatDiffOp::Equal(_, _)))
+        .count();
+    let num_w = a_lines.len().max(b_lines.len()).max(1).to_string().len();
+
+    let mut out = String::new();
+    let mut printed = 0usize;
+    let mut idx = 0usize;
+    let mut cur_a = prefix + 1;
+    let mut cur_b = prefix + 1;
+
+    while idx < ops.len() && printed < MAX_FORMAT_DIFF_LINES {
+        match ops[idx] {
+            FormatDiffOp::Equal(al, bl) => {
+                cur_a = al + 1;
+                cur_b = bl + 1;
+                idx += 1;
+            }
+            FormatDiffOp::Delete(_) | FormatDiffOp::Insert(_) => {
+                let hunk_a_start = cur_a;
+                let hunk_b_start = cur_b;
+                let mut dels = Vec::new();
+                let mut ins = Vec::new();
+                while idx < ops.len() {
+                    match ops[idx] {
+                        FormatDiffOp::Delete(al) => {
+                            dels.push(al);
+                            cur_a = al + 1;
+                            idx += 1;
+                        }
+                        FormatDiffOp::Insert(bl) => {
+                            ins.push(bl);
+                            cur_b = bl + 1;
+                            idx += 1;
+                        }
+                        FormatDiffOp::Equal(_, _) => break,
+                    }
+                }
+                let _ = writeln!(
+                    out,
+                    "  @@ -{hunk_a_start},{} +{hunk_b_start},{} @@",
+                    dels.len(),
+                    ins.len()
+                );
+                for ln in dels {
+                    if printed >= MAX_FORMAT_DIFF_LINES {
+                        break;
+                    }
+                    let _ = writeln!(out, "  {ln:>num_w$} - {}", a_lines[ln - 1]);
+                    printed += 1;
+                }
+                for ln in ins {
+                    if printed >= MAX_FORMAT_DIFF_LINES {
+                        break;
+                    }
+                    let _ = writeln!(out, "  {ln:>num_w$} + {}", b_lines[ln - 1]);
+                    printed += 1;
+                }
+            }
+        }
+    }
+
+    if total_changed > printed {
+        let more = total_changed - printed;
+        let noun = if more == 1 { "line" } else { "lines" };
+        let _ = writeln!(out, "  ... ({more} more differing {noun})");
+    } else if !actual.ends_with('\n') && expected.ends_with('\n') {
+        out.push_str("  (missing trailing newline)\n");
+    }
+
+    out
+}
+
+fn compute_format_diff_ops(a_mid: &[&str], b_mid: &[&str], prefix: usize) -> Vec<FormatDiffOp> {
+    let m = a_mid.len();
+    let n = b_mid.len();
+    if m.saturating_mul(n) <= MAX_LCS_CELLS {
+        let stride = n + 1;
+        let mut dp = vec![0u32; (m + 1) * stride];
+        for i in (0..m).rev() {
+            for j in (0..n).rev() {
+                dp[i * stride + j] = if a_mid[i] == b_mid[j] {
+                    dp[(i + 1) * stride + (j + 1)] + 1
+                } else {
+                    dp[(i + 1) * stride + j].max(dp[i * stride + (j + 1)])
+                };
+            }
+        }
+        let mut ops = Vec::with_capacity(m.max(n));
+        let mut i = 0usize;
+        let mut j = 0usize;
+        while i < m && j < n {
+            if a_mid[i] == b_mid[j] {
+                ops.push(FormatDiffOp::Equal(prefix + i + 1, prefix + j + 1));
+                i += 1;
+                j += 1;
+            } else if dp[(i + 1) * stride + j] >= dp[i * stride + (j + 1)] {
+                ops.push(FormatDiffOp::Delete(prefix + i + 1));
+                i += 1;
+            } else {
+                ops.push(FormatDiffOp::Insert(prefix + j + 1));
+                j += 1;
+            }
+        }
+        while i < m {
+            ops.push(FormatDiffOp::Delete(prefix + i + 1));
+            i += 1;
+        }
+        while j < n {
+            ops.push(FormatDiffOp::Insert(prefix + j + 1));
+            j += 1;
+        }
+        return ops;
+    }
+
+    // Linear-space fallback for very large differing spans.
+    let mut ops = Vec::with_capacity(m + n);
+    let shared = m.min(n);
+    for k in 0..shared {
+        if a_mid[k] == b_mid[k] {
+            ops.push(FormatDiffOp::Equal(prefix + k + 1, prefix + k + 1));
+        } else {
+            ops.push(FormatDiffOp::Delete(prefix + k + 1));
+            ops.push(FormatDiffOp::Insert(prefix + k + 1));
+        }
+    }
+    for k in shared..m {
+        ops.push(FormatDiffOp::Delete(prefix + k + 1));
+    }
+    for k in shared..n {
+        ops.push(FormatDiffOp::Insert(prefix + k + 1));
+    }
+    ops
 }
 
 fn cmd_check(args: &[String]) -> i32 {

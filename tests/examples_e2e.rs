@@ -1586,3 +1586,319 @@ end
     assert_eq!(s_o, dana::core::print_report(&vm_po));
     Ok(())
 }
+
+#[test]
+fn e0201_table_method_as_pipeline_verb_emits_actionable_hints() -> Result<(), String> {
+    let cases: &[(&str, &str, &[&str])] = &[
+        (
+            "pipe_count",
+            r#"
+module PipeCount
+
+schema Row
+  x: Int
+end
+
+fn f(tbl: Table(Row)) : Int
+  tbl |> count()
+end
+"#,
+            &["E0201", ".count()", "Table` method", "tbl.count()"],
+        ),
+        (
+            "pipe_profile",
+            r#"
+module PipeProfile
+
+schema Row
+  x: Int
+end
+
+fn f(tbl: Table(Row))
+  tbl |> profile()
+end
+"#,
+            &["E0201", ".profile()", "Table` method", "tbl.profile()"],
+        ),
+        (
+            "pipe_empty_call",
+            r#"
+module PipeEmptyCall
+
+schema Row
+  x: Int
+end
+
+fn f(tbl: Table(Row)) : Bool
+  tbl |> empty?()
+end
+"#,
+            &["E0201", ".empty?", "Table` property", "tbl.empty?"],
+        ),
+        (
+            "pipe_empty_bare",
+            r#"
+module PipeEmptyBare
+
+schema Row
+  x: Int
+end
+
+fn f(tbl: Table(Row)) : Bool
+  tbl |> empty?
+end
+"#,
+            &["E0201", ".empty?", "Table` property", "tbl.empty?"],
+        ),
+        (
+            "pipe_first_bang_call",
+            r#"
+module PipeFirstBang
+
+schema Row
+  x: Int
+end
+
+fn f(tbl: Table(Row))
+  tbl |> first!()
+end
+"#,
+            &["E0201", ".first!", "Table` property", "tbl.first!"],
+        ),
+        (
+            "pipe_first_call",
+            r#"
+module PipeFirst
+
+schema Row
+  x: Int
+end
+
+fn f(tbl: Table(Row))
+  tbl |> first()
+end
+"#,
+            &["E0201", ".first!", "tbl.first!"],
+        ),
+        (
+            "list_printed_tables_count_hint",
+            r#"
+module ListCountHint
+
+test "console printed_tables count hint"
+  c = Console.fake()
+  assert c.printed_tables.count() == 0
+end
+"#,
+            &["E0201", ".size"],
+        ),
+    ];
+
+    for (name, src, expected_substrings) in cases {
+        let mut sm = SourceMap::new();
+        let fid = sm.add_file(format!("{name}.dana"), (*src).to_string());
+        let module = parse_module(fid, src)
+            .map_err(|d| format!("{name} parse error:\n{}", render_diagnostic(&d, &sm)))?;
+        let Err(diags) = check_module(fid, module, None, &sm) else {
+            return Err(format!("{name} unexpectedly passed type checking"));
+        };
+        assert!(
+            diags.iter().any(|d| d.code() == DiagCode::TypeError),
+            "{name}: expected E0201 TypeError, got {diags:?}"
+        );
+        let rendered: String = diags.iter().map(|d| render_diagnostic(d, &sm)).collect();
+        for needle in *expected_substrings {
+            assert!(
+                rendered.contains(needle),
+                "{name}: expected rendered diagnostic to contain `{needle}`, got:\n{rendered}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn e0201_pipeline_declassifier_inside_derive_emits_actionable_hints() -> Result<(), String> {
+    let cases: &[(&str, &str, &[&str])] = &[
+        (
+            "derive_pseudonymize",
+            r#"
+module DerivePseudonymize
+
+schema Patient
+  id: Int [pii]
+end
+
+fn f(t: Table(Patient), k: Secret("k"))
+  t |> derive(id: pseudonymize(.id, key: k))
+end
+"#,
+            &[
+                "E0201",
+                "pseudonymize(...)",
+                "|> pseudonymize(.col, key: secret)",
+                "derive(...)",
+            ],
+        ),
+        (
+            "derive_redact",
+            r#"
+module DeriveRedact
+
+schema Patient
+  notes: Text [health]
+end
+
+fn f(t: Table(Patient))
+  t |> derive(notes: redact(.notes))
+end
+"#,
+            &["E0201", "redact(...)", "|> redact(.col)", "derive(...)"],
+        ),
+        (
+            "derive_suppress_small_groups",
+            r#"
+module DeriveSuppress
+
+schema Patient
+  id: Int [pii]
+end
+
+fn f(t: Table(Patient))
+  t |> derive(n: suppress_small_groups(min: 5, distinct_by: .id))
+end
+"#,
+            &[
+                "E0201",
+                "suppress_small_groups(...)",
+                "|> suppress_small_groups(",
+            ],
+        ),
+    ];
+
+    for (name, src, expected_substrings) in cases {
+        let mut sm = SourceMap::new();
+        let fid = sm.add_file(format!("{name}.dana"), (*src).to_string());
+        let module = parse_module(fid, src)
+            .map_err(|d| format!("{name} parse error:\n{}", render_diagnostic(&d, &sm)))?;
+        let Err(diags) = check_module(fid, module, None, &sm) else {
+            return Err(format!("{name} unexpectedly passed type checking"));
+        };
+        assert!(
+            diags.iter().any(|d| d.code() == DiagCode::TypeError),
+            "{name}: expected E0201 TypeError, got {diags:?}"
+        );
+        let rendered: String = diags.iter().map(|d| render_diagnostic(d, &sm)).collect();
+        for needle in *expected_substrings {
+            assert!(
+                rendered.contains(needle),
+                "{name}: expected rendered diagnostic to contain `{needle}`, got:\n{rendered}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_format_check_prints_compact_line_numbered_diff_and_caps_huge_diffs() -> Result<(), String> {
+    let tmp_dir = std::env::temp_dir().join(format!("dana_fmt_diff_{}", std::process::id()));
+    fs::create_dir_all(&tmp_dir).map_err(|e| format!("mkdir: {e}"))?;
+    let file_path = tmp_dir.join("unformatted.dana");
+
+    let unformatted = "\
+module UnformattedDemo
+
+schema Item
+  cat: Text
+  val: Int
+end
+
+fn summarize_items(items: Table(Item))
+  items
+    |> group_by(.cat)
+    |> summarize(
+         total: sum(.val),
+         n: count(),
+         avg_val: mean(.val)
+       )
+end
+";
+    fs::write(&file_path, unformatted).map_err(|e| format!("write: {e}"))?;
+
+    let dana_bin = env!("CARGO_BIN_EXE_dana");
+    let check_out = std::process::Command::new(dana_bin)
+        .args(["format", "--check"])
+        .arg(&file_path)
+        .output()
+        .map_err(|e| format!("spawn dana format --check: {e}"))?;
+
+    let stderr = String::from_utf8_lossy(&check_out.stderr).into_owned();
+    assert_eq!(
+        check_out.status.code(),
+        Some(1),
+        "expected exit code 1 on unformatted file, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("would reformat"),
+        "expected `would reformat` header on stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("@@"),
+        "expected hunk header on stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("12 -          total: sum(.val),"),
+        "expected line-numbered `-` line on stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("12 +       total: sum(.val),")
+            || stderr.contains(
+                "11 +     |> summarize(total: sum(.val), n: count(), avg_val: mean(.val))"
+            ),
+        "expected line-numbered `+` line on stderr:\n{stderr}"
+    );
+
+    // Format in place, then verify `--check` exits 0 with empty stderr.
+    let fmt_out = std::process::Command::new(dana_bin)
+        .arg("format")
+        .arg(&file_path)
+        .output()
+        .map_err(|e| format!("spawn dana format: {e}"))?;
+    assert_eq!(fmt_out.status.code(), Some(0));
+
+    let recheck_out = std::process::Command::new(dana_bin)
+        .args(["format", "--check"])
+        .arg(&file_path)
+        .output()
+        .map_err(|e| format!("spawn dana format --check after format: {e}"))?;
+    assert_eq!(recheck_out.status.code(), Some(0));
+    assert!(recheck_out.stderr.is_empty());
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+
+    // Verify diff cap on a large mismatch (>40 changed lines) and missing-newline edge case.
+    let actual_big: String = (1..=60).map(|i| format!("  bad_{i} = {i}\n")).collect();
+    let expected_big: String = (1..=60).map(|i| format!("  good_{i} = {i}\n")).collect();
+    let big_diff = dana::cli::render_format_diff(&actual_big, &expected_big);
+    assert!(
+        big_diff.contains("more differing lines)"),
+        "expected cap indicator for huge diff:\n{big_diff}"
+    );
+    let diff_marker_lines = big_diff
+        .lines()
+        .filter(|l| l.contains(" - ") || l.contains(" + "))
+        .count();
+    assert_eq!(
+        diff_marker_lines, 40,
+        "expected diff to cap at 40 changed lines, got {diff_marker_lines}:\n{big_diff}"
+    );
+
+    let nl_diff = dana::cli::render_format_diff("module A", "module A\n");
+    assert!(
+        nl_diff.contains("missing trailing newline"),
+        "expected missing trailing newline hint, got:\n{nl_diff}"
+    );
+    assert!(dana::cli::render_format_diff("module A\n", "module A\n").is_empty());
+
+    Ok(())
+}
