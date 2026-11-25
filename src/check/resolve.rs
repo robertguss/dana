@@ -348,11 +348,35 @@ fn load_recursive(
         };
         let rel = module_path_to_rel(&u.path);
         let local_path = base_dir.join(&rel);
-        let vendor_path = base_dir.join("vendor").join(&rel);
-        let (chosen_path, dep_origin) = if local_path.is_file() {
-            (local_path, ModuleOrigin::Local)
+        let vendor_root = base_dir.join("vendor");
+        let vendor_path = vendor_root.join(&rel);
+        // Any import path starting with `Vendor.*` maps into `base_dir/vendor/...` and MUST
+        // stay `ModuleOrigin::Vendor` (never `ModuleOrigin::Local`) so `vendor/vendor.lock`
+        // SHA-256 pinning and vendor restrictions cannot be bypassed via `use Vendor.<Mod>`.
+        let (chosen_path, dep_origin, vendor_rel) = if let Ok(stripped) = rel.strip_prefix("vendor")
+        {
+            if local_path.is_file() {
+                (local_path, ModuleOrigin::Vendor, stripped.to_path_buf())
+            } else if vendor_path.is_file() {
+                (vendor_path, ModuleOrigin::Vendor, rel.clone())
+            } else {
+                diags.push(
+                    Diagnostic::error(
+                        DiagCode::ResolveError,
+                        format!(
+                            "cannot find vendored module `{dep_name}` (searched `{}` and `{}`)",
+                            local_path.display(),
+                            vendor_path.display()
+                        ),
+                    )
+                    .with_span(u.span),
+                );
+                continue;
+            }
+        } else if local_path.is_file() {
+            (local_path, ModuleOrigin::Local, PathBuf::new())
         } else if vendor_path.is_file() {
-            (vendor_path, ModuleOrigin::Vendor)
+            (vendor_path, ModuleOrigin::Vendor, rel.clone())
         } else {
             diags.push(
                 Diagnostic::error(
@@ -367,12 +391,42 @@ fn load_recursive(
             );
             continue;
         };
+        if dep_origin == ModuleOrigin::Vendor {
+            // Reject symlinks anywhere along `vendor/<vendor_rel>` (matching `verify_vendor_dir`).
+            let mut probe = vendor_root.clone();
+            let mut has_symlink = fs::symlink_metadata(&probe)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            for comp in vendor_rel.components() {
+                probe.push(comp);
+                if fs::symlink_metadata(&probe)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    has_symlink = true;
+                    break;
+                }
+            }
+            if has_symlink {
+                diags.push(
+                    Diagnostic::error(
+                        DiagCode::ResolveError,
+                        format!(
+                            "symlinks are forbidden inside vendor directory: `{}`",
+                            chosen_path.display()
+                        ),
+                    )
+                    .with_span(u.span),
+                );
+                continue;
+            }
+        }
         match fs::read(&chosen_path) {
             Ok(bytes) => {
                 if dep_origin == ModuleOrigin::Vendor {
-                    let rel_posix = crate::check::vendor::rel_path_to_posix(&rel);
+                    let rel_posix = crate::check::vendor::rel_path_to_posix(&vendor_rel);
                     if let Err(msg) = crate::check::vendor::verify_vendor_module(
-                        &base_dir.join("vendor"),
+                        &vendor_root,
                         &dep_name,
                         &rel_posix,
                         &bytes,

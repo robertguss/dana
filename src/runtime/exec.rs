@@ -196,6 +196,18 @@ pub fn run_exec_program(prog: &ExecProgram, cfg: &RunConfig) -> RunResult {
     run_exec_program_with_engine(prog, cfg, None)
 }
 
+/// Evaluate a named entry function of a lowered [`ExecProgram`] on the reference row-by-row
+/// engine (`--oracle`), returning its typed runtime [`Val`] and static [`LTy`].
+#[must_use]
+pub fn eval_exec_entry(
+    prog: &ExecProgram,
+    entry_name: &str,
+    prebound: &[(Ident, Val)],
+    cfg: &RunConfig,
+) -> EvalProgramResult {
+    eval_exec_entry_with_engine(prog, entry_name, prebound, cfg, None)
+}
+
 /// Execute `main(...)` of a lowered [`ExecProgram`] on either the reference engine (`vm_cfg = None`)
 /// or the vectorized columnar batch VM (`vm_cfg = Some(...)`).
 #[must_use]
@@ -4220,6 +4232,9 @@ fn eval_join(
         }
         right_keep.push(ri);
         let mut c = rc.clone();
+        if is_left {
+            c.ty = crate::core::check::ensure_option_scalar(&c.ty);
+        }
         if left_names.contains(c.name.as_str())
             && let Some((_, rs)) = suffixes
         {

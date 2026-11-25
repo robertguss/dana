@@ -182,20 +182,7 @@ impl PostgresDriver {
     fn read_message(&mut self) -> Result<(u8, Vec<u8>), DbError> {
         let mut hdr = [0u8; 5];
         self.read_exact_buffered(&mut hdr)?;
-        let tag = hdr[0];
-        let len_i32 = i32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]);
-        if len_i32 < 4 {
-            return Err(DbError::Protocol(format!(
-                "invalid PostgreSQL frame length {len_i32} for tag `{}`",
-                tag as char
-            )));
-        }
-        let body_len = (len_i32 - 4) as usize;
-        if body_len > MAX_WIRE_MESSAGE_BYTES {
-            return Err(DbError::Protocol(format!(
-                "PostgreSQL frame length {body_len} exceeds limit {MAX_WIRE_MESSAGE_BYTES}"
-            )));
-        }
+        let (tag, body_len) = parse_pg_frame_header(hdr)?;
         let mut body = vec![0u8; body_len];
         if body_len > 0 {
             self.read_exact_buffered(&mut body)?;
@@ -888,6 +875,162 @@ fn negotiate_tls(mut tcp: TcpStream, uri: &PostgresUri) -> Result<(PgTransport, 
 // Wire Frame Helpers & OID Decoding
 // ===========================================================================
 
+fn parse_pg_frame_header(hdr: [u8; 5]) -> Result<(u8, usize), DbError> {
+    let tag = hdr[0];
+    let len_i32 = i32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]);
+    if len_i32 < 4 {
+        return Err(DbError::Protocol(format!(
+            "invalid PostgreSQL frame length {len_i32} for tag `{}`",
+            tag as char
+        )));
+    }
+    let body_len = (len_i32 - 4) as usize;
+    if body_len > MAX_WIRE_MESSAGE_BYTES {
+        return Err(DbError::Protocol(format!(
+            "PostgreSQL frame length {body_len} exceeds limit {MAX_WIRE_MESSAGE_BYTES}"
+        )));
+    }
+    Ok((tag, body_len))
+}
+
+/// Parse a single tagged PostgreSQL v3.0 wire frame (`tag: u8 || len: i32_be || payload`)
+/// from an in-memory byte slice, reusing the exact production header validation.
+///
+/// # Errors
+/// Returns [`DbError::Protocol`] if the buffer is shorter than 5 bytes, the declared frame length
+/// is `< 4` or exceeds `MAX_WIRE_MESSAGE_BYTES`, or the payload is truncated.
+pub fn parse_pg_wire_frame(bytes: &[u8]) -> Result<(u8, Vec<u8>), DbError> {
+    if bytes.len() < 5 {
+        return Err(DbError::Protocol(
+            "truncated PostgreSQL wire frame header".to_string(),
+        ));
+    }
+    let hdr = [bytes[0], bytes[1], bytes[2], bytes[3], bytes[4]];
+    let (tag, body_len) = parse_pg_frame_header(hdr)?;
+    if bytes.len() - 5 < body_len {
+        return Err(DbError::Protocol(format!(
+            "truncated PostgreSQL wire frame body (expected {body_len} bytes, got {})",
+            bytes.len() - 5
+        )));
+    }
+    Ok((tag, bytes[5..5 + body_len].to_vec()))
+}
+
+/// Safe in-process fuzz entrypoint exercising every PostgreSQL v3.0 message payload parser,
+/// SCRAM/Base64/interval/bytea parser, and binary/text OID cell decoder across all Dana
+/// [`ScalarTy`]s and PostgreSQL OIDs.
+pub fn fuzz_decode_pg_payload(tag: u8, payload: &[u8]) {
+    const ALL_OIDS: &[u32] = &[
+        0,
+        oid::BOOL,
+        oid::BYTEA,
+        oid::INT2,
+        oid::INT4,
+        oid::INT8,
+        oid::FLOAT4,
+        oid::FLOAT8,
+        oid::TEXT,
+        oid::VARCHAR,
+        oid::BPCHAR,
+        oid::DATE,
+        oid::TIMESTAMP,
+        oid::TIMESTAMPTZ,
+        oid::INTERVAL,
+        oid::NUMERIC,
+        999_999,
+    ];
+    let all_tys = [
+        ScalarTy::Unit,
+        ScalarTy::Bool,
+        ScalarTy::Int,
+        ScalarTy::Decimal,
+        ScalarTy::Float,
+        ScalarTy::Text,
+        ScalarTy::Bytes,
+        ScalarTy::Date,
+        ScalarTy::Timestamp,
+        ScalarTy::Duration,
+        ScalarTy::Data("FuzzAdt".to_string()),
+    ];
+
+    if let Ok(fields) = parse_row_description(payload) {
+        for f in fields.iter().take(8) {
+            for ty in &all_tys {
+                let _ = oid_compatible_with_scalar(f.type_oid, ty);
+            }
+        }
+        let cols: Vec<crate::core::syntax::ColSpec> = fields
+            .iter()
+            .take(8)
+            .enumerate()
+            .map(|(idx, f)| crate::core::syntax::ColSpec {
+                name: f.name.clone(),
+                ty: all_tys[idx % all_tys.len()].clone(),
+                tags: TagSet::empty(),
+                bucketed: false,
+                agg_kind: crate::core::syntax::AggKind::Raw,
+            })
+            .collect();
+        let expected = TableTy {
+            cols,
+            ..TableTy::default()
+        };
+        let _ = validate_pg_schema(&fields, &expected);
+    }
+
+    if let Ok(cells) = parse_data_row(payload) {
+        for (idx, cell) in cells.iter().take(8).enumerate() {
+            if let Some(raw) = cell {
+                let oid_val = ALL_OIDS[idx % ALL_OIDS.len()];
+                let ty = &all_tys[idx % all_tys.len()];
+                let _ = decode_pg_binary(oid_val, raw, "fuzz_col", ty);
+                let _ = decode_pg_text(oid_val, raw, "fuzz_col", ty);
+                let field_bin = PgFieldDesc {
+                    name: "fuzz_col".to_string(),
+                    type_oid: oid_val,
+                    format_code: 1,
+                };
+                let _ = decode_pg_cell(
+                    &field_bin,
+                    Some(raw),
+                    "fuzz_col",
+                    &ScalarTy::Option(Box::new(ty.clone())),
+                );
+            }
+        }
+    }
+
+    let _ = parse_error_response(payload);
+    let _ = parse_param_status(payload);
+    let _ = parse_cstr_list(payload);
+    let cmd = parse_single_cstr(payload);
+    let _ = parse_command_complete_rows(&cmd);
+
+    if tag == b'R' && payload.len() >= 4 {
+        let rest = &payload[4..];
+        let _ = parse_cstr_list(rest);
+        if let Ok(s) = std::str::from_utf8(rest) {
+            let _ = parse_scram_server_first(s, "clientnonce");
+            let _ = verify_scram_server_final(s, &[0u8; 32]);
+        }
+    }
+
+    if let Ok(s) = std::str::from_utf8(payload) {
+        let _ = parse_scram_server_first(s, "clientnonce");
+        let _ = verify_scram_server_final(s, &[0u8; 32]);
+        let _ = base64_decode(s);
+        let _ = parse_pg_interval_text(s, "fuzz_col");
+        let _ = decode_pg_bytea_text(s, "fuzz_col");
+    }
+
+    let sel_oid = ALL_OIDS[usize::from(tag) % ALL_OIDS.len()];
+    for ty in &all_tys {
+        let _ = decode_pg_binary(sel_oid, payload, "fuzz_col", ty);
+        let _ = decode_pg_text(sel_oid, payload, "fuzz_col", ty);
+    }
+    let _ = decode_pg_binary(oid::INTERVAL, payload, "fuzz_col", &ScalarTy::Duration);
+}
+
 fn push_cstr(buf: &mut Vec<u8>, s: &str) -> Result<(), DbError> {
     if s.as_bytes().contains(&0) {
         return Err(DbError::Protocol(
@@ -1002,7 +1145,7 @@ fn parse_row_description(bytes: &[u8]) -> Result<Vec<PgFieldDesc>, DbError> {
         )));
     }
     let mut pos = 2usize;
-    let mut fields = Vec::with_capacity(count as usize);
+    let mut fields = Vec::with_capacity((count as usize).min(bytes.len() / 19));
     for _ in 0..count {
         let Some(rel_nul) = bytes[pos..].iter().position(|&b| b == 0) else {
             return Err(DbError::Protocol(
@@ -1045,7 +1188,7 @@ fn parse_data_row(bytes: &[u8]) -> Result<Vec<Option<&[u8]>>, DbError> {
         )));
     }
     let mut pos = 2usize;
-    let mut out = Vec::with_capacity(count as usize);
+    let mut out = Vec::with_capacity((count as usize).min(bytes.len() / 4));
     for _ in 0..count {
         if pos + 4 > bytes.len() {
             return Err(DbError::Protocol(
@@ -1062,13 +1205,18 @@ fn parse_data_row(bytes: &[u8]) -> Result<Vec<Option<&[u8]>>, DbError> {
             )));
         } else {
             let ulen = len as usize;
-            if pos + ulen > bytes.len() {
+            let Some(end) = pos.checked_add(ulen) else {
+                return Err(DbError::Protocol(
+                    "DataRow field length overflow".to_string(),
+                ));
+            };
+            if end > bytes.len() {
                 return Err(DbError::Protocol(
                     "truncated DataRow field payload".to_string(),
                 ));
             }
-            out.push(Some(&bytes[pos..pos + ulen]));
-            pos += ulen;
+            out.push(Some(&bytes[pos..end]));
+            pos = end;
         }
     }
     Ok(out)
@@ -1290,7 +1438,10 @@ fn decode_pg_binary(
             let pg_us = i64::from_be_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]);
-            Ok(Val::Timestamp(BigInt::from(pg_us + PG_EPOCH_MICROS)))
+            let unix_us = pg_us.checked_add(PG_EPOCH_MICROS).ok_or_else(|| {
+                DbError::TypeConversion(format!("column `{col_name}` binary TIMESTAMP overflow"))
+            })?;
+            Ok(Val::Timestamp(BigInt::from(unix_us)))
         }
         ScalarTy::Duration => {
             if bytes.len() == 16 && type_oid == oid::INTERVAL {
@@ -1303,7 +1454,18 @@ fn decode_pg_binary(
                 let months = i64::from(i32::from_be_bytes([
                     bytes[12], bytes[13], bytes[14], bytes[15],
                 ]));
-                let total = us + days * MICROS_PER_DAY + months * 30 * MICROS_PER_DAY;
+                let days_us = days.checked_mul(MICROS_PER_DAY);
+                let months_us = months
+                    .checked_mul(30)
+                    .and_then(|m| m.checked_mul(MICROS_PER_DAY));
+                let total = days_us
+                    .and_then(|d| us.checked_add(d))
+                    .and_then(|acc| months_us.and_then(|m| acc.checked_add(m)))
+                    .ok_or_else(|| {
+                        DbError::TypeConversion(format!(
+                            "column `{col_name}` binary INTERVAL overflow"
+                        ))
+                    })?;
                 Ok(Val::Duration(BigInt::from(total)))
             } else if bytes.len() == 8 {
                 let us = i64::from_be_bytes([
@@ -1444,32 +1606,57 @@ fn parse_pg_interval_text(s: &str, col_name: &str) -> Result<i64, DbError> {
                 DbError::TypeConversion(format!("column `{col_name}` invalid interval `{s}`"))
             })?;
             let sec_us = parse_seconds_to_micros(comps[2], col_name)?;
-            let mag = h * MICROS_PER_HOUR + m * MICROS_PER_MINUTE + sec_us;
-            total_us += if neg { -mag } else { mag };
+            let h_us = h.checked_mul(MICROS_PER_HOUR);
+            let m_us = m.checked_mul(MICROS_PER_MINUTE);
+            let mag = h_us
+                .and_then(|hu| m_us.and_then(|mu| hu.checked_add(mu)))
+                .and_then(|acc| acc.checked_add(sec_us))
+                .ok_or_else(|| {
+                    DbError::TypeConversion(format!("column `{col_name}` interval overflow `{s}`"))
+                })?;
+            let signed_mag = if neg {
+                mag.checked_neg().ok_or_else(|| {
+                    DbError::TypeConversion(format!("column `{col_name}` interval overflow `{s}`"))
+                })?
+            } else {
+                mag
+            };
+            total_us = total_us.checked_add(signed_mag).ok_or_else(|| {
+                DbError::TypeConversion(format!("column `{col_name}` interval overflow `{s}`"))
+            })?;
         } else if let Some(unit) = parts.next() {
             let unit_l = unit.to_ascii_lowercase();
-            if unit_l.starts_with("day") {
+            let delta = if unit_l.starts_with("day") {
                 let d: i64 = tok.parse().map_err(|_| {
                     DbError::TypeConversion(format!("column `{col_name}` invalid interval `{s}`"))
                 })?;
-                total_us += d * MICROS_PER_DAY;
+                d.checked_mul(MICROS_PER_DAY).ok_or_else(|| {
+                    DbError::TypeConversion(format!("column `{col_name}` interval overflow `{s}`"))
+                })?
             } else if unit_l.starts_with("hour") {
                 let h: i64 = tok.parse().map_err(|_| {
                     DbError::TypeConversion(format!("column `{col_name}` invalid interval `{s}`"))
                 })?;
-                total_us += h * MICROS_PER_HOUR;
+                h.checked_mul(MICROS_PER_HOUR).ok_or_else(|| {
+                    DbError::TypeConversion(format!("column `{col_name}` interval overflow `{s}`"))
+                })?
             } else if unit_l.starts_with("min") {
                 let m: i64 = tok.parse().map_err(|_| {
                     DbError::TypeConversion(format!("column `{col_name}` invalid interval `{s}`"))
                 })?;
-                total_us += m * MICROS_PER_MINUTE;
+                m.checked_mul(MICROS_PER_MINUTE).ok_or_else(|| {
+                    DbError::TypeConversion(format!("column `{col_name}` interval overflow `{s}`"))
+                })?
             } else if unit_l.starts_with("sec") {
-                total_us += parse_seconds_to_micros(tok, col_name)?;
+                parse_seconds_to_micros(tok, col_name)?
             } else {
                 return Err(DbError::TypeConversion(format!(
                     "column `{col_name}` unsupported interval unit `{unit}` in `{s}`"
                 )));
-            }
+            };
+            total_us = total_us.checked_add(delta).ok_or_else(|| {
+                DbError::TypeConversion(format!("column `{col_name}` interval overflow `{s}`"))
+            })?;
         } else {
             return Err(DbError::TypeConversion(format!(
                 "column `{col_name}` invalid interval `{s}`"
@@ -1500,8 +1687,19 @@ fn parse_seconds_to_micros(s: &str, col_name: &str) -> Result<i64, DbError> {
     for _ in frac_s.len()..6 {
         frac_us *= 10;
     }
-    let mag = whole * MICROS_PER_SECOND + frac_us;
-    Ok(if neg { -mag } else { mag })
+    let mag = whole
+        .checked_mul(MICROS_PER_SECOND)
+        .and_then(|w| w.checked_add(frac_us))
+        .ok_or_else(|| {
+            DbError::TypeConversion(format!("column `{col_name}` seconds overflow `{s}`"))
+        })?;
+    if neg {
+        mag.checked_neg().ok_or_else(|| {
+            DbError::TypeConversion(format!("column `{col_name}` seconds overflow `{s}`"))
+        })
+    } else {
+        Ok(mag)
+    }
 }
 
 fn decode_utf8_cell(cell: Option<&[u8]>, name: &str) -> Result<String, DbError> {

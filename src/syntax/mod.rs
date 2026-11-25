@@ -10,5 +10,5 @@ pub mod token;
 pub use ast::*;
 pub use fmt::format_module;
 pub use lexer::{LexOutput, lex, lex_bytes};
-pub use parser::{parse_fragment, parse_module};
+pub use parser::{parse_fragment, parse_fragment_bytes, parse_module, parse_module_bytes};
 pub use token::{Comment, Token, TokenKind};

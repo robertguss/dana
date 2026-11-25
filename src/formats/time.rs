@@ -497,14 +497,16 @@ impl TzData {
             return parse_tzif_body(&bytes[44..v2_start], &hdr1, false, None);
         }
 
-        if bytes.len() < v2_start + 44 || &bytes[v2_start..v2_start + 4] != b"TZif" {
+        let body2_start = v2_start
+            .checked_add(44)
+            .ok_or_else(|| ParseFormatError::new("TZif v2 header offset overflow"))?;
+        if bytes.len() < body2_start || &bytes[v2_start..v2_start + 4] != b"TZif" {
             return Err(ParseFormatError::new(
                 "missing or invalid TZif v2/v3 header",
             ));
         }
-        let hdr2 = read_tzif_header(&bytes[v2_start..v2_start + 44])?;
+        let hdr2 = read_tzif_header(&bytes[v2_start..body2_start])?;
         let body2_len = tzif_body_len(&hdr2, true)?;
-        let body2_start = v2_start + 44;
         let body2_end = body2_start
             .checked_add(body2_len)
             .ok_or_else(|| ParseFormatError::new("TZif v2 body size overflow"))?;
@@ -718,7 +720,9 @@ fn parse_posix_tz(s: &str) -> Result<PosixTzRule, ParseFormatError> {
     let mut rest = skip_posix_tz_name(s)?;
     let (std_posix_offset, after_std) = parse_posix_offset(rest)?;
     // POSIX TZ offset sign is inverted relative to ISO-8601 (`EST5` => UTC-5 => `-18000`s).
-    let std_offset_secs = -std_posix_offset;
+    let std_offset_secs = std_posix_offset
+        .checked_neg()
+        .ok_or_else(|| ParseFormatError::new("POSIX TZ standard offset overflow"))?;
     rest = after_std;
     if rest.is_empty() {
         return Ok(PosixTzRule {
@@ -729,10 +733,16 @@ fn parse_posix_tz(s: &str) -> Result<PosixTzRule, ParseFormatError> {
 
     rest = skip_posix_tz_name(rest)?;
     let (dst_offset_secs, after_dst) = if rest.starts_with(',') || rest.is_empty() {
-        (std_offset_secs + 3600, rest)
+        let dst = std_offset_secs
+            .checked_add(3600)
+            .ok_or_else(|| ParseFormatError::new("POSIX TZ DST offset overflow"))?;
+        (dst, rest)
     } else {
         let (dst_posix, tail) = parse_posix_offset(rest)?;
-        (-dst_posix, tail)
+        let dst = dst_posix
+            .checked_neg()
+            .ok_or_else(|| ParseFormatError::new("POSIX TZ DST offset overflow"))?;
+        (dst, tail)
     };
     rest = after_dst;
     let Some(after_comma) = rest.strip_prefix(',') else {
@@ -915,14 +925,20 @@ fn eval_posix_tz(rule: &PosixTzRule, utc_secs: i64) -> i32 {
     let Some((dst_offset_secs, start, end)) = rule.dst else {
         return rule.std_offset_secs;
     };
-    let approx_days = (utc_secs + i64::from(rule.std_offset_secs)).div_euclid(86_400);
+    let approx_days = utc_secs
+        .saturating_add(i64::from(rule.std_offset_secs))
+        .div_euclid(86_400);
     let (year, _, _) = civil_from_days(approx_days);
 
     // Start transition occurs in standard time; end transition occurs in DST time.
-    let start_utc = posix_rule_day_of_year(year, start.date) * 86_400 + start.time_secs
-        - i64::from(rule.std_offset_secs);
-    let end_utc = posix_rule_day_of_year(year, end.date) * 86_400 + end.time_secs
-        - i64::from(dst_offset_secs);
+    let start_utc = posix_rule_day_of_year(year, start.date)
+        .saturating_mul(86_400)
+        .saturating_add(start.time_secs)
+        .saturating_sub(i64::from(rule.std_offset_secs));
+    let end_utc = posix_rule_day_of_year(year, end.date)
+        .saturating_mul(86_400)
+        .saturating_add(end.time_secs)
+        .saturating_sub(i64::from(dst_offset_secs));
 
     let in_dst = if start_utc < end_utc {
         // Northern Hemisphere (e.g., March -> November).

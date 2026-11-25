@@ -584,15 +584,16 @@ impl<'a> Formatter<'a> {
                 stages.push(rhs);
                 let first = self.render_expr(stages[0], level);
                 let pipe_pad = " ".repeat((level + 1) * 2);
-                if stages.len() == 2 {
+                if stages.len() == 2
+                    && !self.has_comment_between(stages[0].span.end, stages[1].span.start)
+                {
+                    let saved_c_idx = self.c_idx;
                     let second = self.render_expr(stages[1], level + 1);
                     let single = format!("{first} |> {second}");
-                    if single.len() <= LINE_WIDTH
-                        && !single.contains('\n')
-                        && !self.has_comment_between(stages[0].span.end, stages[1].span.start)
-                    {
+                    if single.len() <= LINE_WIDTH && !single.contains('\n') {
                         return single;
                     }
+                    self.c_idx = saved_c_idx;
                 }
                 let mut out = first;
                 for stage in &stages[1..] {
@@ -672,20 +673,28 @@ impl<'a> Formatter<'a> {
                             let has_internal_comment = args
                                 .iter()
                                 .any(|a| self.has_comment_between(callee_end, a.span().start));
-                            let rendered_inline: Vec<String> = args
-                                .iter()
-                                .map(|a| self.render_call_arg(a, level + 1))
-                                .collect();
-                            let inline_args = rendered_inline.join(", ");
-                            let last_line_len = out.rsplit('\n').next().map_or(out.len(), str::len);
-                            if !has_internal_comment
-                                && last_line_len + inline_args.len() + 2 <= LINE_WIDTH
-                                && !inline_args.contains('\n')
-                            {
-                                out.push('(');
-                                out.push_str(&inline_args);
-                                out.push(')');
-                            } else {
+                            let mut fitted_inline = false;
+                            if !has_internal_comment {
+                                let saved_c_idx = self.c_idx;
+                                let rendered_inline: Vec<String> = args
+                                    .iter()
+                                    .map(|a| self.render_call_arg(a, level + 1))
+                                    .collect();
+                                let inline_args = rendered_inline.join(", ");
+                                let last_line_len =
+                                    out.rsplit('\n').next().map_or(out.len(), str::len);
+                                if last_line_len + inline_args.len() + 2 <= LINE_WIDTH
+                                    && !inline_args.contains('\n')
+                                {
+                                    out.push('(');
+                                    out.push_str(&inline_args);
+                                    out.push(')');
+                                    fitted_inline = true;
+                                } else {
+                                    self.c_idx = saved_c_idx;
+                                }
+                            }
+                            if !fitted_inline {
                                 let pad = " ".repeat((level + 1) * 2);
                                 let close_pad = " ".repeat(level * 2);
                                 out.push_str("(\n");
@@ -723,7 +732,7 @@ impl<'a> Formatter<'a> {
             } => {
                 let c = self.render_expr(cond, level);
                 let t = self.render_expr(then_expr, level);
-                let e = self.render_expr(else_expr, level);
+                let saved_c_idx = self.c_idx;
                 let mut single = format!("if {c}: {t}");
                 for (ec, et) in else_ifs {
                     let _ = write!(
@@ -733,10 +742,12 @@ impl<'a> Formatter<'a> {
                         self.render_expr(et, level)
                     );
                 }
+                let e = self.render_expr(else_expr, level);
                 let _ = write!(single, " else: {e}");
                 if single.len() <= LINE_WIDTH && !single.contains('\n') {
                     single
                 } else {
+                    self.c_idx = saved_c_idx;
                     let pad = " ".repeat((level + 1) * 2);
                     let mut out = format!("if {c}: {t}");
                     for (ec, et) in else_ifs {
@@ -747,7 +758,8 @@ impl<'a> Formatter<'a> {
                             self.render_expr(et, level + 1)
                         );
                     }
-                    let _ = write!(out, "\n{pad}else: {e}");
+                    let e_multi = self.render_expr(else_expr, level + 1);
+                    let _ = write!(out, "\n{pad}else: {e_multi}");
                     out
                 }
             }

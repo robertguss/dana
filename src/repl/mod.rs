@@ -686,15 +686,12 @@ impl ReplSession {
             &run_cfg,
             &self.cfg.vm_cfg,
         ) {
-            EvalProgramResult::Ok { val, ret_lty, .. } => match val.as_ref() {
-                Val::Profile(pv) => ReplOutput::Info(render_profile_terminal(pv)),
-                other => ReplOutput::Info(format_repl_value(
-                    other,
-                    &ret_lty,
-                    &self.cfg.allowed_show_tags,
-                    &lowered.exec.struct_layouts,
-                )),
-            },
+            EvalProgramResult::Ok { val, ret_lty, .. } => ReplOutput::Info(format_repl_value(
+                &val,
+                &ret_lty,
+                &self.cfg.allowed_show_tags,
+                &lowered.exec.struct_layouts,
+            )),
             EvalProgramResult::Stopped { bug, .. } => {
                 ReplOutput::Error(format!("runtime stop ({:?}): {}", bug.kind, bug.message))
             }
@@ -1348,9 +1345,11 @@ pub fn format_repl_value(
         return format_repl_table(tv, tt, &lty.tags, allowed_show_tags);
     }
 
-    // Profiles already redact every tagged column inside `ProfileVal`.
-    if let Val::Profile(pv) = val {
-        let unallowed = lty.tags.diff(allowed_show_tags);
+    // Profiles redact every tagged column inside `ProfileVal`, AND if `Ty::Profile(ptags)` carries
+    // table-level `row_tags` (e.g. after filtering on a sensitive column), redact the entire
+    // profile summary so filtered row counts cannot leak.
+    if let (Val::Profile(pv), Ty::Profile(ptags)) = (val, &lty.ty) {
+        let unallowed = lty.tags.union(ptags).diff(allowed_show_tags);
         if !unallowed.is_empty() {
             return redact_tags(&unallowed);
         }

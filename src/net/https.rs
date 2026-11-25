@@ -203,6 +203,9 @@ pub struct HttpsClientConfig {
     pub timeout_secs: u64,
 }
 
+/// Type alias for [`HttpsClientConfig`].
+pub type HttpsConfig = HttpsClientConfig;
+
 impl Default for HttpsClientConfig {
     fn default() -> Self {
         Self {
@@ -289,7 +292,24 @@ pub fn https_get_bytes(
     tls.flush()
         .map_err(|e| HttpsError::new(format!("HTTPS request flush failed: {e}")))?;
 
-    let mut reader = BufReader::new(tls);
+    parse_http_response_from_reader(tls, cfg)
+}
+
+/// Parse an HTTP/1.1 response from any [`Read`] stream, enforcing header budget, 2xx status
+/// (rejecting redirects), `Content-Length` / `Transfer-Encoding: chunked` framing, body byte
+/// caps, and transparent `gzip` decompression.
+///
+/// Reused directly by [`https_get_bytes`] and [`https_get_json`] so in-process fuzzing exercises
+/// the exact production HTTP/1.1 decoder.
+///
+/// # Errors
+/// Returns [`HttpsError`] on malformed framing, header/body cap violations, redirects or non-2xx
+/// status codes, conflicting `Content-Length`, or invalid/oversized gzip payloads.
+pub fn parse_http_response_from_reader<R: Read>(
+    stream: R,
+    cfg: &HttpsConfig,
+) -> Result<HttpsResponse, HttpsError> {
+    let mut reader = BufReader::new(stream);
     let mut header_budget = MAX_HTTPS_HEADER_BYTES;
 
     let status_line = read_http_line(&mut reader, &mut header_budget)?;
@@ -356,10 +376,20 @@ pub fn https_get_bytes(
                 cfg.max_response_bytes
             )));
         }
-        let mut buf = vec![0u8; len];
+        // Stream lazily via `take(len)` so truncated responses claiming a huge `Content-Length`
+        // never eagerly preallocate `len` bytes before observing EOF.
+        let mut buf = Vec::with_capacity(len.min(64 * 1024));
         reader
-            .read_exact(&mut buf)
+            .by_ref()
+            .take(len as u64)
+            .read_to_end(&mut buf)
             .map_err(|e| HttpsError::new(format!("truncated HTTPS response body: {e}")))?;
+        if buf.len() != len {
+            return Err(HttpsError::new(format!(
+                "truncated HTTPS response body: expected {len} bytes, got {}",
+                buf.len()
+            )));
+        }
         buf
     } else {
         read_to_eof_capped(&mut reader, cfg.max_response_bytes)?
@@ -374,7 +404,7 @@ pub fn https_get_bytes(
         Some("gzip" | "x-gzip") => {
             let gz = GzipReader::new(Cursor::new(raw_body))
                 .map_err(|e| HttpsError::new(format!("gzip init failed: {e}")))?;
-            let mut limited = gz.take((cfg.max_response_bytes + 1) as u64);
+            let mut limited = gz.take(cfg.max_response_bytes.saturating_add(1) as u64);
             let mut out = Vec::new();
             limited
                 .read_to_end(&mut out)
@@ -408,7 +438,7 @@ fn read_http_line<R: BufRead>(reader: &mut R, budget: &mut usize) -> Result<Stri
         ));
     }
     let mut raw = Vec::new();
-    let cap = (*budget + 1) as u64;
+    let cap = budget.saturating_add(1) as u64;
     let mut limited = reader.take(cap);
     let n = limited
         .read_until(b'\n', &mut raw)
@@ -479,11 +509,18 @@ fn read_chunked_body<R: BufRead>(reader: &mut R, max_bytes: usize) -> Result<Vec
                 "chunked HTTPS response exceeds limit ({max_bytes} bytes)"
             )));
         }
-        let start = out.len();
-        out.resize(start + chunk_size, 0);
+        let before = out.len();
         reader
-            .read_exact(&mut out[start..])
+            .by_ref()
+            .take(chunk_size as u64)
+            .read_to_end(&mut out)
             .map_err(|e| HttpsError::new(format!("truncated HTTP chunk payload: {e}")))?;
+        if out.len() - before != chunk_size {
+            return Err(HttpsError::new(format!(
+                "truncated HTTP chunk payload: expected {chunk_size} bytes, got {}",
+                out.len() - before
+            )));
+        }
         // Read trailing CRLF (or LF) after chunk data
         let mut crlf = [0u8; 2];
         reader
@@ -504,7 +541,7 @@ fn read_chunked_body<R: BufRead>(reader: &mut R, max_bytes: usize) -> Result<Vec
 
 fn read_to_eof_capped<R: Read>(reader: &mut R, max_bytes: usize) -> Result<Vec<u8>, HttpsError> {
     let mut out = Vec::new();
-    let mut limited = reader.take((max_bytes + 1) as u64);
+    let mut limited = reader.take(max_bytes.saturating_add(1) as u64);
     limited
         .read_to_end(&mut out)
         .map_err(|e| HttpsError::new(format!("HTTPS body read failed: {e}")))?;

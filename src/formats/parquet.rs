@@ -26,6 +26,7 @@ use crate::oracle::value::{TableRow, TableVal, Val};
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 const DEFAULT_ROW_GROUP_ROWS: usize = 65_536;
 const MAX_PARQUET_PAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PARQUET_PAGE_VALUES: usize = 16 * 1024 * 1024;
 const MAX_PARQUET_FOOTER_BYTES: usize = 32 * 1024 * 1024;
 const MAX_THRIFT_SKIP_DEPTH: usize = 64;
 
@@ -1302,6 +1303,11 @@ fn decode_rle_hybrid(data: &[u8], bit_width: u8, count: usize) -> Result<Vec<u32
     if count == 0 {
         return Ok(Vec::new());
     }
+    if count > MAX_PARQUET_PAGE_VALUES {
+        return Err(format!(
+            "Parquet RLE value count ({count}) exceeds limit ({MAX_PARQUET_PAGE_VALUES})"
+        ));
+    }
     if bit_width == 0 {
         return Ok(vec![0u32; count]);
     }
@@ -1316,7 +1322,7 @@ fn decode_rle_hybrid(data: &[u8], bit_width: u8, count: usize) -> Result<Vec<u32
         (1u64 << bit_width) - 1
     };
 
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(65_536));
     let mut pos = 0usize;
     while out.len() < count {
         let header = read_uvarint(data, &mut pos)?;
@@ -1324,7 +1330,10 @@ fn decode_rle_hybrid(data: &[u8], bit_width: u8, count: usize) -> Result<Vec<u32
             // RLE run
             let run_len = usize::try_from(header >> 1)
                 .map_err(|_| "Parquet RLE run length overflow".to_string())?;
-            if pos + byte_width > data.len() {
+            if pos
+                .checked_add(byte_width)
+                .is_none_or(|end| end > data.len())
+            {
                 return Err("truncated Parquet RLE run value".to_string());
             }
             let mut val = 0u32;
@@ -1341,11 +1350,14 @@ fn decode_rle_hybrid(data: &[u8], bit_width: u8, count: usize) -> Result<Vec<u32
             let total_bytes = num_groups
                 .checked_mul(bw)
                 .ok_or_else(|| "Parquet bit-packed byte length overflow".to_string())?;
-            if pos + total_bytes > data.len() {
+            let Some(end) = pos.checked_add(total_bytes) else {
+                return Err("Parquet bit-packed bounds overflow".to_string());
+            };
+            if end > data.len() {
                 return Err("truncated Parquet bit-packed run".to_string());
             }
-            let slice = &data[pos..pos + total_bytes];
-            pos += total_bytes;
+            let slice = &data[pos..end];
+            pos = end;
 
             let total_vals = num_groups
                 .checked_mul(8)
@@ -1393,7 +1405,12 @@ fn decode_plain_values(
     type_length: Option<i32>,
     count: usize,
 ) -> Result<(Vec<RawParquetVal>, usize), String> {
-    let mut vals = Vec::with_capacity(count);
+    if count > MAX_PARQUET_PAGE_VALUES {
+        return Err(format!(
+            "Parquet PLAIN value count ({count}) exceeds limit ({MAX_PARQUET_PAGE_VALUES})"
+        ));
+    }
+    let mut vals = Vec::with_capacity(count.min(65_536));
     let mut pos = 0usize;
     match phys_type {
         PT_BOOLEAN => {
@@ -2281,13 +2298,18 @@ where
 
     let total_rows = usize::try_from(fm.num_rows)
         .map_err(|_| "Parquet file has negative num_rows".to_string())?;
-    let mut rows: Vec<TableRow> = Vec::with_capacity(total_rows.min(1024 * 1024));
+    let mut rows: Vec<TableRow> = Vec::with_capacity(total_rows.min(65_536));
 
     for rg in &fm.row_groups {
         let rg_rows = usize::try_from(rg.num_rows)
             .map_err(|_| "Parquet row group has negative num_rows".to_string())?;
         if rg_rows == 0 {
             continue;
+        }
+        if rg_rows > MAX_PARQUET_PAGE_VALUES {
+            return Err(format!(
+                "Parquet row group num_rows ({rg_rows}) exceeds limit ({MAX_PARQUET_PAGE_VALUES})"
+            ));
         }
 
         let mut col_data: Vec<Vec<Val>> = Vec::with_capacity(schema.cols.len());
@@ -2587,7 +2609,7 @@ fn decode_column_chunk(
 
     let mut cursor = start;
     let mut dictionary: Option<Vec<RawParquetVal>> = None;
-    let mut out_vals: Vec<Val> = Vec::with_capacity(expected_rows);
+    let mut out_vals: Vec<Val> = Vec::with_capacity(expected_rows.min(65_536));
 
     while out_vals.len() < expected_rows && cursor < end {
         let mut hdr_reader = ThriftReader::new(&file_bytes[cursor..end]);
@@ -2599,14 +2621,20 @@ fn decode_column_chunk(
             .map_err(|_| "negative Parquet compressed_page_size".to_string())?;
         let uncomp_sz = usize::try_from(ph.uncompressed_page_size)
             .map_err(|_| "negative Parquet uncompressed_page_size".to_string())?;
-        if cursor + comp_sz > end {
+        let Some(page_end) = cursor.checked_add(comp_sz) else {
+            return Err(format!(
+                "Parquet page size overflow in column `{}`",
+                col.name
+            ));
+        };
+        if page_end > end {
             return Err(format!(
                 "truncated Parquet page payload in column `{}`",
                 col.name
             ));
         }
-        let page_raw = &file_bytes[cursor..cursor + comp_sz];
-        cursor += comp_sz;
+        let page_raw = &file_bytes[cursor..page_end];
+        cursor = page_end;
 
         match ph.page_type {
             PAGE_DICTIONARY => {
@@ -2781,7 +2809,7 @@ fn decode_page_values(
                 .first()
                 .ok_or_else(|| "truncated Parquet dictionary bit-width byte".to_string())?;
             let indices = decode_rle_hybrid(&data[1..], bit_width, non_null_count)?;
-            let mut vals = Vec::with_capacity(non_null_count);
+            let mut vals = Vec::with_capacity(non_null_count.min(65_536));
             for idx in indices {
                 let v = dict.get(idx as usize).ok_or_else(|| {
                     format!(

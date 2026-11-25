@@ -3079,11 +3079,12 @@ impl<'a> Checker<'a> {
                 };
                 let ok_var = self.fresh("try_ok");
                 let err_var = self.fresh("try_err");
+                let err_tags = lty.tags.union(&err_ty.all_tags());
+                let ret_pc = pc.union(&lty.tags);
                 let ret_ty = ret_ctx.and_then(|(_, t)| t);
                 let err_arm_body = match (ret_ctx, ret_ty) {
                     (Some((lbl, _)), Some(Ty::Result { ok_ty: f_ok, .. })) => {
-                        let ret_pc = pc.union(&lty.tags);
-                        self.record_flow_ret(&lty.tags, &ret_pc);
+                        self.record_flow_ret(&err_tags, &ret_pc);
                         ExecExpr::Jump {
                             label: lbl.to_string(),
                             args: vec![ExecExpr::Prim {
@@ -3093,12 +3094,24 @@ impl<'a> Checker<'a> {
                         }
                     }
                     // In `fn main(...) : Int`, `try` propagates fatal I/O errors cleanly as Fail!
-                    _ => ExecExpr::Fail(Box::new(ExecExpr::Prim {
-                        op: ExecPrimOp::ValToText,
-                        args: vec![ExecExpr::Var(err_var.clone())],
-                    })),
+                    // Still propagate `ret_pc` so post-`try` statements cannot launder the Ok/Err
+                    // discriminant of a sensitive `Result`, and redact sensitive error payloads.
+                    _ => {
+                        if !ret_pc.is_empty() {
+                            self.record_flow_ret(&TagSet::empty(), &ret_pc);
+                        }
+                        if !err_tags.is_empty() {
+                            ExecExpr::Fail(Box::new(ExecExpr::Lit(Literal::Text(
+                                crate::oracle::value::redact_tags(&err_tags),
+                            ))))
+                        } else {
+                            ExecExpr::Fail(Box::new(ExecExpr::Prim {
+                                op: ExecPrimOp::ValToText,
+                                args: vec![ExecExpr::Var(err_var.clone())],
+                            }))
+                        }
+                    }
                 };
-                let _ = err_ty;
                 let case_ex = ExecExpr::CaseE {
                     scrut: Box::new(e),
                     arms: vec![
