@@ -1958,7 +1958,8 @@ fn prune_exec_plan_derives(
                         | ExecDeriveItem::SummaryCol { expr, .. } => {
                             exec_row_expr_cols(expr, &mut live);
                         }
-                        ExecDeriveItem::BucketCol { source, .. } => {
+                        ExecDeriveItem::BucketCol { source, .. }
+                        | ExecDeriveItem::CoarsenCol { source, .. } => {
                             live.insert(source.clone());
                         }
                     }

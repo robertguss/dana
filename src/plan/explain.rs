@@ -1267,6 +1267,35 @@ fn trace_exec_provenance(
                             cols.push(new_col);
                         }
                     }
+                    ExecDeriveItem::CoarsenCol {
+                        name,
+                        source,
+                        allow,
+                        ..
+                    } => {
+                        let src_tags = cols
+                            .iter()
+                            .find(|c| c.name == *source)
+                            .map(|c| c.tags.clone())
+                            .unwrap_or_default();
+                        lines.push(format!(
+                            "COARSEN Derive({name} <- {source}, allow={}): tags={}, bucketed=true (eligible for clearance under suppress_small_groups)",
+                            allow.len(),
+                            fmt_tags(&src_tags)
+                        ));
+                        let new_col = ColSpec {
+                            name: name.clone(),
+                            ty: ScalarTy::Text,
+                            tags: src_tags,
+                            bucketed: true,
+                            agg_kind: AggKind::Raw,
+                        };
+                        if let Some(slot) = cols.iter_mut().find(|c| c.name == *name) {
+                            *slot = new_col;
+                        } else {
+                            cols.push(new_col);
+                        }
+                    }
                 }
             }
             Some(TableTy {

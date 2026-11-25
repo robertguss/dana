@@ -406,15 +406,55 @@ pub fn parse_csv_records(input: &str, delimiter: u8) -> Vec<CsvRecord> {
     records
 }
 
+/// CSV/TSV stream parsing options.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CsvReadOptions {
+    /// When `true`, accept exact integral decimal strings such as `"5.0"` or `"-42.00"` as `Int`
+    /// while rejecting non-integral values like `"5.5"`.
+    pub coerce_integral_floats: bool,
+}
+
+fn parse_csv_int_i64(trimmed: &str, coerce_integral_floats: bool) -> Result<i64, &'static str> {
+    if trimmed.is_empty() {
+        return Err("MissingRequired");
+    }
+    if let Ok(n) = trimmed.parse::<i64>() {
+        return Ok(n);
+    }
+    if !coerce_integral_floats {
+        return Err("BadInt");
+    }
+    let Some((int_part, frac_part)) = trimmed.split_once('.') else {
+        return Err("BadInt");
+    };
+    if frac_part.is_empty() || !frac_part.bytes().all(|b| b == b'0') {
+        return Err("BadInt");
+    }
+    let digits = int_part.strip_prefix(['+', '-']).unwrap_or(int_part);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("BadInt");
+    }
+    int_part.parse::<i64>().map_err(|_| "BadInt")
+}
+
 /// Parse a single cell string according to a [`ScalarTy`], returning `(error_kind, val)`.
 pub fn parse_csv_cell(raw: &str, ty: &ScalarTy) -> Result<Val, &'static str> {
+    parse_csv_cell_with_options(raw, ty, CsvReadOptions::default())
+}
+
+/// Parse a single cell string according to a [`ScalarTy`] and [`CsvReadOptions`].
+pub fn parse_csv_cell_with_options(
+    raw: &str,
+    ty: &ScalarTy,
+    opts: CsvReadOptions,
+) -> Result<Val, &'static str> {
     let trimmed = raw.trim();
     match ty {
         ScalarTy::Option(inner) => {
             if trimmed.is_empty() {
                 Ok(Val::OptNone)
             } else {
-                let v = parse_csv_cell(raw, inner)?;
+                let v = parse_csv_cell_with_options(raw, inner, opts)?;
                 Ok(Val::OptSome(Box::new(v)))
             }
         }
@@ -425,13 +465,9 @@ pub fn parse_csv_cell(raw: &str, ty: &ScalarTy) -> Result<Val, &'static str> {
             "" => Err("MissingRequired"),
             _ => Err("BadBool"),
         },
-        ScalarTy::Int => {
-            if trimmed.is_empty() {
-                return Err("MissingRequired");
-            }
-            let n: i64 = trimmed.parse().map_err(|_| "BadInt")?;
-            Ok(Val::Int(BigInt::from(n)))
-        }
+        ScalarTy::Int => parse_csv_int_i64(trimmed, opts.coerce_integral_floats)
+            .map(BigInt::from)
+            .map(Val::Int),
         ScalarTy::Decimal => {
             if trimmed.is_empty() {
                 return Err("MissingRequired");
@@ -485,6 +521,31 @@ pub fn read_csv_stream_with_schema<R, F>(
     reader: R,
     schema: &TableTy,
     delimiter: u8,
+    check_constraint: F,
+) -> Result<(TableVal, TableVal), String>
+where
+    R: Read,
+    F: FnMut(usize, &Val) -> bool,
+{
+    read_csv_stream_with_options(
+        reader,
+        schema,
+        delimiter,
+        CsvReadOptions::default(),
+        check_constraint,
+    )
+}
+
+/// Streaming RFC 4180 CSV/TSV parser accepting [`CsvReadOptions`] and validating each row
+/// against a [`TableTy`] schema and optional per-column constraint evaluator callback.
+///
+/// # Errors
+/// Returns an error string on I/O, UTF-8, or missing required header column errors.
+pub fn read_csv_stream_with_options<R, F>(
+    reader: R,
+    schema: &TableTy,
+    delimiter: u8,
+    opts: CsvReadOptions,
     mut check_constraint: F,
 ) -> Result<(TableVal, TableVal), String>
 where
@@ -552,7 +613,7 @@ where
                 bad_hit = Some((col.name.as_str(), "MissingColumn", String::new()));
                 break;
             };
-            match parse_csv_cell(raw_val, &col.ty) {
+            match parse_csv_cell_with_options(raw_val, &col.ty, opts) {
                 Ok(val) => {
                     let inner_ok = match &val {
                         Val::OptNone => true,
@@ -760,33 +821,27 @@ fn parse_csv_bool_fast(trimmed: &str) -> Result<bool, &'static str> {
 }
 
 #[inline]
-fn parse_csv_cell_slot(
+fn parse_csv_cell_slot_with_options(
     raw: &str,
     field_idx: usize,
     ty: &ScalarTy,
+    opts: CsvReadOptions,
 ) -> Result<CsvRowSlot, &'static str> {
     match ty {
         ScalarTy::Option(inner) if !inner.is_option() => {
             if raw.trim().is_empty() {
                 Ok(CsvRowSlot::Null)
             } else {
-                parse_csv_cell_slot(raw, field_idx, inner)
+                parse_csv_cell_slot_with_options(raw, field_idx, inner, opts)
             }
         }
-        ScalarTy::Option(_) => parse_csv_cell(raw, ty).map(CsvRowSlot::Generic),
+        ScalarTy::Option(_) => parse_csv_cell_with_options(raw, ty, opts).map(CsvRowSlot::Generic),
         ScalarTy::Text => Ok(CsvRowSlot::TextField(field_idx)),
         ScalarTy::Bytes => Ok(CsvRowSlot::BytesField(field_idx)),
         ScalarTy::Unit => Ok(CsvRowSlot::Unit),
         ScalarTy::Bool => parse_csv_bool_fast(raw.trim()).map(CsvRowSlot::Bool),
         ScalarTy::Int => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return Err("MissingRequired");
-            }
-            trimmed
-                .parse::<i64>()
-                .map(CsvRowSlot::Int)
-                .map_err(|_| "BadInt")
+            parse_csv_int_i64(raw.trim(), opts.coerce_integral_floats).map(CsvRowSlot::Int)
         }
         ScalarTy::Decimal => {
             let trimmed = raw.trim();
@@ -907,6 +962,36 @@ pub fn read_csv_stream_to_vm_table<R, F>(
     delimiter: u8,
     batch_size: usize,
     fast_constraints: &[FastColConstraint],
+    fallback_constraint: F,
+) -> Result<(VmTable, TableVal), String>
+where
+    R: Read,
+    F: FnMut(usize, &Val) -> bool,
+{
+    read_csv_stream_to_vm_table_with_options(
+        reader,
+        schema,
+        delimiter,
+        batch_size,
+        CsvReadOptions::default(),
+        fast_constraints,
+        fallback_constraint,
+    )
+}
+
+/// Streaming CSV parser accepting [`CsvReadOptions`] that packs typed records directly into
+/// vectorized columnar [`VmTable`] batches while still quarantining invalid rows with exact
+/// line numbers, error kinds, multiline quoted fields, `.gz`/`.zst` streams, and `where` constraints.
+///
+/// # Errors
+/// Returns an error string on I/O, UTF-8, or missing required header column errors.
+pub fn read_csv_stream_to_vm_table_with_options<R, F>(
+    reader: R,
+    schema: &TableTy,
+    delimiter: u8,
+    batch_size: usize,
+    opts: CsvReadOptions,
+    fast_constraints: &[FastColConstraint],
     mut fallback_constraint: F,
 ) -> Result<(VmTable, TableVal), String>
 where
@@ -983,7 +1068,7 @@ where
                 bad_hit = Some((col.name.as_str(), "MissingColumn", String::new()));
                 break;
             };
-            match parse_csv_cell_slot(raw_val, field_idx, &col.ty) {
+            match parse_csv_cell_slot_with_options(raw_val, field_idx, &col.ty, opts) {
                 Ok(slot) => {
                     let constraint_ok = match &slot {
                         CsvRowSlot::Null => true,

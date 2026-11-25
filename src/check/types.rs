@@ -27,6 +27,8 @@ pub struct CheckedProgram {
     pub exec: ExecProgram,
     /// Metadata source spans for functions, schemas, and tests.
     pub spans: Vec<(Ident, String, Span)>,
+    /// Non-fatal compiler warnings (e.g. unused CSV/JSONL/XLSX quarantine tables).
+    pub warnings: Vec<Diagnostic>,
 }
 
 /// Check an already-resolved multi-module program.
@@ -163,6 +165,7 @@ struct Checker<'a> {
     flow_stack: Vec<FlowState>,
     loop_state_stack: Vec<Vec<Ident>>,
     current_fn_declared_ret: Option<LTy>,
+    warnings: Vec<Diagnostic>,
 }
 
 impl<'a> Checker<'a> {
@@ -211,6 +214,7 @@ impl<'a> Checker<'a> {
             flow_stack: Vec::new(),
             loop_state_stack: Vec::new(),
             current_fn_declared_ret: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -383,6 +387,7 @@ impl<'a> Checker<'a> {
                 metadata,
             },
             spans: self.spans,
+            warnings: self.warnings,
         }
     }
 
@@ -1602,7 +1607,33 @@ impl<'a> Checker<'a> {
                     steps.push(BlockStep::Bind(name.name.clone(), rhs_lty, rhs));
                 }
                 StmtKind::Assign { lhs, rhs } => {
+                    let quarantine_candidate = match &lhs.kind {
+                        ExprKind::Tuple(elems) if elems.len() == 2 => match &elems[1].kind {
+                            ExprKind::Ident(bad_name) if !bad_name.starts_with('_') => {
+                                let was_outer_mut = env.get(bad_name).is_some_and(|b| b.mutable);
+                                Some((bad_name.clone(), elems[1].span, was_outer_mut))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
                     self.lower_assign_stmt(lhs, rhs, env, &mut cur_pc, scope, ret_ctx, &mut steps);
+                    if let Some((bad_name, bad_span, false)) = quarantine_candidate
+                        && let Some(binding) = env.get(&bad_name)
+                        && let Ty::Table(tt) = &binding.lty.ty
+                        && is_quarantine_bad_row_table(tt)
+                        && !stmts_reference_ident(&stmts[idx + 1..], &bad_name)
+                    {
+                        self.warnings.push(
+                            Diagnostic::warning(
+                                DiagCode::SchemaError,
+                                format!(
+                                    "unused quarantine table `{bad_name}`: inspect `{bad_name}.count()`, rename to `_{bad_name}` to ignore, or pass `on_bad_rows: :error` to fail on malformed rows"
+                                ),
+                            )
+                            .with_span(bad_span),
+                        );
+                    }
                     if want_val
                         && !matches!(expected_ret, Some(Ty::Unit))
                         && let ExprKind::Ident(name) = &lhs.kind
@@ -2260,6 +2291,7 @@ impl<'a> Checker<'a> {
         // Monotone fixpoint over `(cur_loop_pc, mutable var tags)` so cross-iteration flows
         // (`b = a; a = secret`) and guarded `break if secret` taint all modified loop vars!
         let diag_mark = self.diags.len();
+        let warn_mark = self.warnings.len();
         let mut cur_loop_pc = base_loop_pc;
         let mut working_env = env.clone();
         let mut final_body = ExecExpr::Lit(Literal::Unit);
@@ -2268,6 +2300,7 @@ impl<'a> Checker<'a> {
         self.loop_state_stack.push(state_names.clone());
         for iter_idx in 0..MAX_LOOP_FIXPOINT_ITERS {
             self.diags.truncate(diag_mark);
+            self.warnings.truncate(warn_mark);
             let mut body_env = working_env.clone();
             body_env.insert(
                 item_var.clone(),
@@ -2373,6 +2406,7 @@ impl<'a> Checker<'a> {
         state_names.sort();
 
         let diag_mark = self.diags.len();
+        let warn_mark = self.warnings.len();
         let mut cur_loop_pc = cur_pc.clone();
         let mut working_env = env.clone();
         let mut final_cond = ExecExpr::Lit(Literal::Bool(false));
@@ -2382,6 +2416,7 @@ impl<'a> Checker<'a> {
         self.loop_state_stack.push(state_names.clone());
         for iter_idx in 0..MAX_LOOP_FIXPOINT_ITERS {
             self.diags.truncate(diag_mark);
+            self.warnings.truncate(warn_mark);
             let (cond_ex, cond_lty) = self.check_expr(
                 cond,
                 &working_env,
@@ -4401,6 +4436,22 @@ impl<'a> Checker<'a> {
                         }
                         continue;
                     }
+                    // Detect `coarsen(.col, allow: [...], other: "...")` built-in declassifier.
+                    if let ExprKind::Call {
+                        callee,
+                        args: cargs,
+                    } = &value.kind
+                        && let ExprKind::Ident(fn_name) = &callee.kind
+                        && fn_name == "coarsen"
+                    {
+                        if let Some((item, spec)) =
+                            self.check_coarsen_call(&name.name, cargs, &out_tt, value.span)
+                        {
+                            upsert_col(&mut out_tt.cols, spec);
+                            items.push(item);
+                        }
+                        continue;
+                    }
                     let (re, re_ty, re_tags) =
                         self.check_row_expr(value, &out_tt.cols, env, None, false);
                     let scalar_ty = re_ty.to_scalar_ty().unwrap_or_else(|| {
@@ -4965,6 +5016,211 @@ impl<'a> Checker<'a> {
                 source,
                 cuts,
                 labels,
+            },
+            spec,
+        ))
+    }
+
+    fn check_coarsen_call(
+        &mut self,
+        out_col: &str,
+        args: &[CallArg],
+        in_tt: &TableTy,
+        span: Span,
+    ) -> Option<(ExecDeriveItem, ColSpec)> {
+        let source = match args.first() {
+            Some(CallArg::Positional(Expr {
+                kind: ExprKind::DotField(m),
+                ..
+            })) => m.name.clone(),
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`coarsen` expects `.col, allow: [...], other: \"...\"`",
+                    )
+                    .with_span(span),
+                );
+                return None;
+            }
+        };
+        let Some(src_col) = in_tt.find_col(&source) else {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!("unknown column `.{source}` in `coarsen`"),
+                )
+                .with_span(span),
+            );
+            return None;
+        };
+        let is_text = matches!(&src_col.ty, ScalarTy::Text)
+            || matches!(&src_col.ty, ScalarTy::Option(inner) if matches!(inner.as_ref(), ScalarTy::Text));
+        if !is_text {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!(
+                        "`coarsen` requires a `Text` or `Text?` column, found `{:?}` on `.{source}`",
+                        src_col.ty
+                    ),
+                )
+                .with_span(span),
+            );
+            return None;
+        }
+        let mut valid = true;
+        let mut allow_arg: Option<&Expr> = None;
+        let mut other_arg: Option<&Expr> = None;
+        for arg in args.iter().skip(1) {
+            match arg {
+                CallArg::Positional(e) => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`coarsen` expects named arguments `allow: [...]` and `other: \"...\"` after `.col`",
+                        )
+                        .with_span(e.span),
+                    );
+                    valid = false;
+                }
+                CallArg::Named { name, value, .. } if name.name == "allow" => {
+                    if allow_arg.is_some() {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "duplicate `allow:` argument in `coarsen`",
+                            )
+                            .with_span(name.span),
+                        );
+                        valid = false;
+                    } else {
+                        allow_arg = Some(value);
+                    }
+                }
+                CallArg::Named { name, value, .. } if name.name == "other" => {
+                    if other_arg.is_some() {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "duplicate `other:` argument in `coarsen`",
+                            )
+                            .with_span(name.span),
+                        );
+                        valid = false;
+                    } else {
+                        other_arg = Some(value);
+                    }
+                }
+                CallArg::Named { name, .. } => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("unknown argument `{}:` in `coarsen`", name.name),
+                        )
+                        .with_span(name.span),
+                    );
+                    valid = false;
+                }
+            }
+        }
+        let mut allow = Vec::new();
+        match allow_arg {
+            Some(Expr {
+                kind: ExprKind::List(items),
+                span: list_span,
+            }) => {
+                for it in items {
+                    if let ExprKind::Text { value: s, .. } = &it.kind {
+                        allow.push(s.clone());
+                    } else {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::PrivacyError,
+                                "`coarsen` `allow:` entries must be compile-time string literals",
+                            )
+                            .with_span(it.span),
+                        );
+                        valid = false;
+                    }
+                }
+                if allow.is_empty() && valid {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`coarsen` requires a non-empty `allow: [...]` list",
+                        )
+                        .with_span(*list_span),
+                    );
+                    valid = false;
+                }
+            }
+            Some(other_expr) => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`coarsen` requires `allow: [...]` list literal",
+                    )
+                    .with_span(other_expr.span),
+                );
+                valid = false;
+            }
+            None => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`coarsen` requires `allow: [...]` list literal",
+                    )
+                    .with_span(span),
+                );
+                valid = false;
+            }
+        }
+        let other = match other_arg {
+            Some(Expr {
+                kind: ExprKind::Text { value: s, .. },
+                ..
+            }) => s.clone(),
+            Some(other_expr) => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::PrivacyError,
+                        "`coarsen` `other:` must be a compile-time string literal",
+                    )
+                    .with_span(other_expr.span),
+                );
+                valid = false;
+                String::new()
+            }
+            None => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`coarsen` requires `other: \"...\"` string literal",
+                    )
+                    .with_span(span),
+                );
+                valid = false;
+                String::new()
+            }
+        };
+        if !valid {
+            return None;
+        }
+        let spec = ColSpec {
+            name: out_col.to_string(),
+            ty: ScalarTy::Text,
+            // Always produces non-null `Text`; clears under `suppress_small_groups` & `suppress_small_cells`.
+            tags: src_col.tags.clone(),
+            bucketed: true,
+            agg_kind: AggKind::Raw,
+        };
+        Some((
+            ExecDeriveItem::CoarsenCol {
+                name: out_col.to_string(),
+                source,
+                allow,
+                other,
             },
             spec,
         ))
@@ -8409,11 +8665,146 @@ impl<'a> Checker<'a> {
                     );
                     return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
                 };
-                let bad_tt = quarantine_bad_row_table_ty(&cs.decl.schema);
-                let ok_ty = Ty::Tuple(vec![
-                    LTy::public(Ty::Table(cs.decl.schema)),
-                    LTy::public(Ty::Table(bad_tt)),
-                ]);
+                let mut error_on_bad_rows = false;
+                let mut coerce_integral_floats = false;
+                let mut seen_as = false;
+                let mut seen_bad_mode = false;
+                let mut seen_coerce = false;
+                let mut seen_sheet = false;
+                for arg in args.iter().skip(1) {
+                    match arg {
+                        CallArg::Positional(e) => {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!(
+                                        "unexpected positional argument in `files.{}`",
+                                        member.name
+                                    ),
+                                )
+                                .with_span(e.span),
+                            );
+                        }
+                        CallArg::Named { name, .. } if name.name == "as" => {
+                            if seen_as {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        format!(
+                                            "duplicate `as:` argument in `files.{}`",
+                                            member.name
+                                        ),
+                                    )
+                                    .with_span(name.span),
+                                );
+                            }
+                            seen_as = true;
+                        }
+                        CallArg::Named { name, .. }
+                            if member.name == "read_xlsx" && name.name == "sheet" =>
+                        {
+                            if seen_sheet {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        "duplicate `sheet:` argument in `files.read_xlsx`",
+                                    )
+                                    .with_span(name.span),
+                                );
+                            }
+                            seen_sheet = true;
+                        }
+                        CallArg::Named { name, value, .. }
+                            if member.name == "read_csv" && name.name == "on_bad_rows" =>
+                        {
+                            if seen_bad_mode {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        "duplicate `on_bad_rows:` argument in `files.read_csv`",
+                                    )
+                                    .with_span(name.span),
+                                );
+                            }
+                            seen_bad_mode = true;
+                            match &value.kind {
+                                ExprKind::Atom(a) if a == "quarantine" => error_on_bad_rows = false,
+                                ExprKind::Atom(a) if a == "error" => error_on_bad_rows = true,
+                                _ => {
+                                    self.diags.push(
+                                        Diagnostic::error(
+                                            DiagCode::TypeError,
+                                            "`files.read_csv` `on_bad_rows:` must be `:quarantine` or `:error`",
+                                        )
+                                        .with_span(value.span),
+                                    );
+                                }
+                            }
+                        }
+                        CallArg::Named { name, value, .. }
+                            if member.name == "read_csv"
+                                && name.name == "coerce_integral_floats" =>
+                        {
+                            if seen_coerce {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        "duplicate `coerce_integral_floats:` argument in `files.read_csv`",
+                                    )
+                                    .with_span(name.span),
+                                );
+                            }
+                            seen_coerce = true;
+                            if let ExprKind::Bool(b) = &value.kind {
+                                coerce_integral_floats = *b;
+                            } else {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::TypeError,
+                                        "`files.read_csv` `coerce_integral_floats:` must be a `Bool` literal (`true` or `false`)",
+                                    )
+                                    .with_span(value.span),
+                                );
+                            }
+                        }
+                        CallArg::Named { name, .. }
+                            if name.name == "on_bad_rows"
+                                || name.name == "coerce_integral_floats" =>
+                        {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!(
+                                        "`files.{}` does not support `{}:`",
+                                        member.name, name.name
+                                    ),
+                                )
+                                .with_span(name.span),
+                            );
+                        }
+                        CallArg::Named { name, .. } => {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!(
+                                        "unknown argument `{}:` in `files.{}`",
+                                        name.name, member.name
+                                    ),
+                                )
+                                .with_span(name.span),
+                            );
+                        }
+                    }
+                }
+                let ok_ty = if error_on_bad_rows {
+                    Ty::Table(cs.decl.schema)
+                } else {
+                    let bad_tt = quarantine_bad_row_table_ty(&cs.decl.schema);
+                    Ty::Tuple(vec![
+                        LTy::public(Ty::Table(cs.decl.schema)),
+                        LTy::public(Ty::Table(bad_tt)),
+                    ])
+                };
                 let res_ty = Ty::Result {
                     ok_ty: Box::new(ok_ty),
                     err_ty: Box::new(Ty::Text),
@@ -8421,7 +8812,17 @@ impl<'a> Checker<'a> {
                 let mut call_args = vec![rex, pex];
                 let mut out_tags = plty.tags;
                 let hop = match member.name.as_str() {
-                    "read_csv" => ExecHostOp::Core(HostOp::ReadCsv(schema_name)),
+                    "read_csv" => {
+                        if !error_on_bad_rows && !coerce_integral_floats {
+                            ExecHostOp::Core(HostOp::ReadCsv(schema_name))
+                        } else {
+                            ExecHostOp::ReadCsvEx {
+                                schema: schema_name,
+                                error_on_bad_rows,
+                                coerce_integral_floats,
+                            }
+                        }
+                    }
                     "read_jsonl" => ExecHostOp::ReadJsonl(schema_name),
                     _ => {
                         let sheet = match named_expr_arg(args, "sheet") {
@@ -11876,6 +12277,11 @@ impl<'a> Checker<'a> {
                                 "`redact` is a table pipeline verb, not a row function; use `|> redact(.col)` instead of calling it inside `derive(...)`",
                             );
                         }
+                        "coarsen" => {
+                            diag = diag.with_hint(
+                                "`coarsen` is a `derive(...)` column declassifier, not a general row expression; write `|> derive(out = coarsen(.col, allow: [...], other: \"...\"))`",
+                            );
+                        }
                         "suppress_small_groups" => {
                             diag = diag.with_hint(
                                 "`suppress_small_groups` is a table pipeline verb, not a row function; pipe it directly after `summarize(...)` as `|> suppress_small_groups(min: k, distinct_by: .id)`",
@@ -12785,6 +13191,228 @@ fn upsert_col(cols: &mut Vec<ColSpec>, spec: ColSpec) {
         *existing = spec;
     } else {
         cols.push(spec);
+    }
+}
+
+fn is_quarantine_bad_row_table(tt: &TableTy) -> bool {
+    tt.cols.len() == 5
+        && tt.cols[0].name == "line"
+        && tt.cols[0].ty == ScalarTy::Int
+        && tt.cols[1].name == "column"
+        && tt.cols[1].ty == ScalarTy::Text
+        && tt.cols[2].name == "error_kind"
+        && tt.cols[2].ty == ScalarTy::Text
+        && tt.cols[3].name == "raw_value"
+        && tt.cols[3].ty == ScalarTy::Text
+        && tt.cols[4].name == "raw_line"
+        && tt.cols[4].ty == ScalarTy::Text
+}
+
+fn for_target_binds(target: &ast::ForTarget, ident: &str) -> bool {
+    match target {
+        ast::ForTarget::Name(n) => n.name == ident,
+        ast::ForTarget::Wildcard(_) => false,
+        ast::ForTarget::Tuple(parts, _) => parts.iter().any(|p| for_target_binds(p, ident)),
+    }
+}
+
+fn assign_lhs_binds(lhs: &Expr, ident: &str) -> bool {
+    match &lhs.kind {
+        ExprKind::Ident(n) => n == ident,
+        ExprKind::Tuple(parts) => parts.iter().any(|p| assign_lhs_binds(p, ident)),
+        _ => false,
+    }
+}
+
+fn stmts_reference_ident(stmts: &[&Stmt], ident: &str) -> bool {
+    for st in stmts {
+        match &st.kind {
+            StmtKind::Var { name, value, .. } => {
+                if expr_references_ident(value, ident) {
+                    return true;
+                }
+                if name.name == ident {
+                    return false;
+                }
+            }
+            StmtKind::Assign { lhs, rhs } => {
+                if expr_references_ident(rhs, ident) {
+                    return true;
+                }
+                if assign_lhs_binds(lhs, ident) {
+                    return false;
+                }
+            }
+            StmtKind::Assert(e) | StmtKind::Expr(e) => {
+                if expr_references_ident(e, ident) {
+                    return true;
+                }
+            }
+            StmtKind::Return { value, guard } => {
+                if value
+                    .as_ref()
+                    .is_some_and(|e| expr_references_ident(e, ident))
+                    || guard
+                        .as_ref()
+                        .is_some_and(|e| expr_references_ident(e, ident))
+                {
+                    return true;
+                }
+            }
+            StmtKind::Break { guard } | StmtKind::Continue { guard } => {
+                if guard
+                    .as_ref()
+                    .is_some_and(|e| expr_references_ident(e, ident))
+                {
+                    return true;
+                }
+            }
+            StmtKind::Stop(opt) => {
+                if opt
+                    .as_ref()
+                    .is_some_and(|e| expr_references_ident(e, ident))
+                {
+                    return true;
+                }
+            }
+            StmtKind::For { target, iter, body } => {
+                if expr_references_ident(iter, ident) {
+                    return true;
+                }
+                if !for_target_binds(target, ident) && stmt_slice_references_ident(body, ident) {
+                    return true;
+                }
+            }
+            StmtKind::While { cond, body } => {
+                if expr_references_ident(cond, ident) || stmt_slice_references_ident(body, ident) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn stmt_slice_references_ident(stmts: &[Stmt], ident: &str) -> bool {
+    let refs: Vec<&Stmt> = stmts.iter().collect();
+    stmts_reference_ident(&refs, ident)
+}
+
+fn expr_references_ident(expr: &Expr, ident: &str) -> bool {
+    match &expr.kind {
+        ExprKind::Ident(n) => n == ident,
+        ExprKind::Int(_)
+        | ExprKind::Decimal(_)
+        | ExprKind::Date(_)
+        | ExprKind::Timestamp(_)
+        | ExprKind::Text { .. }
+        | ExprKind::Atom(_)
+        | ExprKind::Bool(_)
+        | ExprKind::None
+        | ExprKind::CapName(_)
+        | ExprKind::Underscore
+        | ExprKind::DotField(_)
+        | ExprKind::DotSelf => false,
+        ExprKind::InterpText { parts, .. } => parts.iter().any(|p| match p {
+            ast::InterpPart::Literal { .. } => false,
+            ast::InterpPart::Expr(e) => expr_references_ident(e, ident),
+        }),
+        ExprKind::Paren(inner)
+        | ExprKind::Unary { expr: inner, .. }
+        | ExprKind::Field {
+            receiver: inner, ..
+        } => expr_references_ident(inner, ident),
+        ExprKind::Binary { lhs, rhs, .. }
+        | ExprKind::Index {
+            target: lhs,
+            index: rhs,
+        } => expr_references_ident(lhs, ident) || expr_references_ident(rhs, ident),
+        ExprKind::Tuple(xs) | ExprKind::List(xs) => {
+            xs.iter().any(|x| expr_references_ident(x, ident))
+        }
+        ExprKind::Map(pairs) => pairs
+            .iter()
+            .any(|(k, v)| expr_references_ident(k, ident) || expr_references_ident(v, ident)),
+        ExprKind::Call { callee, args } => {
+            expr_references_ident(callee, ident)
+                || args.iter().any(|a| match a {
+                    CallArg::Positional(e) | CallArg::Named { value: e, .. } => {
+                        expr_references_ident(e, ident)
+                    }
+                })
+        }
+        ExprKind::IfInline {
+            cond,
+            then_expr,
+            else_ifs,
+            else_expr,
+        } => {
+            expr_references_ident(cond, ident)
+                || expr_references_ident(then_expr, ident)
+                || else_ifs.iter().any(|(c, t)| {
+                    expr_references_ident(c, ident) || expr_references_ident(t, ident)
+                })
+                || expr_references_ident(else_expr, ident)
+        }
+        ExprKind::IfBlock {
+            cond,
+            then_body,
+            else_ifs,
+            else_body,
+        } => {
+            expr_references_ident(cond, ident)
+                || stmt_slice_references_ident(then_body, ident)
+                || else_ifs.iter().any(|b| {
+                    expr_references_ident(&b.cond, ident)
+                        || stmt_slice_references_ident(&b.body, ident)
+                })
+                || else_body
+                    .as_ref()
+                    .is_some_and(|b| stmt_slice_references_ident(&b.body, ident))
+        }
+        ExprKind::Case { scrut, lines } => {
+            if expr_references_ident(scrut, ident) {
+                return true;
+            }
+            let mut arm_stmts: Vec<&Stmt> = Vec::new();
+            for line in lines {
+                match line {
+                    ast::CaseLine::ArmHeader { .. } => {
+                        if stmts_reference_ident(&arm_stmts, ident) {
+                            return true;
+                        }
+                        arm_stmts.clear();
+                    }
+                    ast::CaseLine::ArmInline { expr, .. } => {
+                        if stmts_reference_ident(&arm_stmts, ident) {
+                            return true;
+                        }
+                        arm_stmts.clear();
+                        if expr_references_ident(expr, ident) {
+                            return true;
+                        }
+                    }
+                    ast::CaseLine::Stmt(st) => arm_stmts.push(st),
+                }
+            }
+            stmts_reference_ident(&arm_stmts, ident)
+        }
+        ExprKind::Lambda { params, body } => {
+            let shadowed = params.iter().any(|p| match p {
+                ast::LambdaParam::Name(n) => n.name == ident,
+                ast::LambdaParam::Wildcard(_) => false,
+            });
+            if shadowed {
+                return false;
+            }
+            match body {
+                ast::LambdaBody::Expr(e) => expr_references_ident(e, ident),
+                ast::LambdaBody::Block(stmts) => stmt_slice_references_ident(stmts, ident),
+            }
+        }
+        ExprKind::TableLit { rows, .. } => rows
+            .iter()
+            .any(|row| row.iter().any(|c| expr_references_ident(c, ident))),
     }
 }
 

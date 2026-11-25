@@ -27,8 +27,9 @@ use crate::formats::compress::{
 use crate::formats::constraint::FastColConstraint;
 use crate::formats::crypto::hmac_sha256_pseudonym;
 use crate::formats::csv::{
-    format_csv_table_with_options, format_csv_vm_table_with_options, read_csv_stream_to_vm_table,
-    read_csv_stream_with_schema, write_csv_table_with_options, write_csv_vm_table_with_options,
+    CsvReadOptions, format_csv_table_with_options, format_csv_vm_table_with_options,
+    read_csv_stream_to_vm_table_with_options, read_csv_stream_with_options,
+    write_csv_table_with_options, write_csv_vm_table_with_options,
 };
 use crate::formats::json::{
     format_jsonl_table, format_jsonl_vm_table, read_jsonl_stream_with_schema, write_jsonl_table,
@@ -261,6 +262,7 @@ pub(crate) fn run_exec_program_with_engine(
         prog,
         ew: &mut ew,
         fuel: cfg.fuel,
+        initial_fuel: cfg.fuel,
         vm_cfg,
     };
     let out = ev.eval_expr(&entry_fn.body, &env);
@@ -327,6 +329,7 @@ pub(crate) fn eval_exec_entry_with_engine(
         prog,
         ew: &mut ew,
         fuel: cfg.fuel,
+        initial_fuel: cfg.fuel,
         vm_cfg,
     };
     match ev.eval_expr(&entry_fn.body, &env) {
@@ -399,6 +402,7 @@ pub(crate) fn run_program_tests_with_engine(
             prog,
             ew: &mut ew,
             fuel: cfg.fuel,
+            initial_fuel: cfg.fuel,
             vm_cfg,
         };
         match ev.eval_expr(&f.body, &env) {
@@ -449,6 +453,7 @@ pub(crate) fn eval_pure_exec_call(
         prog,
         ew: &mut ew,
         fuel,
+        initial_fuel: fuel,
         vm_cfg: None,
     };
     match ev.eval_call(fn_name, args) {
@@ -512,6 +517,7 @@ struct Evaluator<'a> {
     prog: &'a ExecProgram,
     ew: &'a mut ExecWorld,
     fuel: usize,
+    initial_fuel: usize,
     vm_cfg: Option<crate::vm::VmConfig>,
 }
 
@@ -698,7 +704,10 @@ impl<'a> Evaluator<'a> {
         if self.fuel == 0 {
             return Some(EvalOut::Stopped(Bug {
                 kind: BugKind::OutsideBoundary,
-                message: "execution step limit exceeded".to_string(),
+                message: format!(
+                    "execution step limit exceeded ({} steps); pass `--oracle-steps N` to increase the oracle step budget, or omit `--oracle` to run on the vectorized VM",
+                    self.initial_fuel
+                ),
             }));
         }
         self.fuel -= 1;
@@ -2997,6 +3006,20 @@ impl<'a> Evaluator<'a> {
                     EvalOut::Failed("RawReadDB.raw_sql expects (RawReadDB, params)".to_string())
                 }
             }
+            ExecHostOp::ReadCsvEx {
+                schema,
+                error_on_bad_rows,
+                coerce_integral_floats,
+            } => match args {
+                [Val::CapReadFiles(handle), Val::Text(path)] => self.eval_read_csv_with_opts(
+                    schema,
+                    *handle,
+                    path,
+                    *error_on_bad_rows,
+                    *coerce_integral_floats,
+                ),
+                _ => EvalOut::Failed("read_csv expects (ReadFiles, path)".to_string()),
+            },
             ExecHostOp::ReadXlsx { schema, sheet } => match args {
                 [Val::CapReadFiles(handle), Val::Text(path)] => {
                     self.eval_read_xlsx(schema, *handle, path, sheet.as_deref())
@@ -3163,7 +3186,7 @@ impl<'a> Evaluator<'a> {
                 EvalOut::Ok(Val::Unit)
             }
             (HostOp::ReadCsv(schema_name), [Val::CapReadFiles(handle), Val::Text(path)]) => {
-                self.eval_read_csv(schema_name, *handle, path)
+                self.eval_read_csv_with_opts(schema_name, *handle, path, false, false)
             }
             (
                 HostOp::WriteFile
@@ -3233,7 +3256,14 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn eval_read_csv(&mut self, schema_name: &str, handle: CapHandle, path: &str) -> EvalOut {
+    fn eval_read_csv_with_opts(
+        &mut self,
+        schema_name: &str,
+        handle: CapHandle,
+        path: &str,
+        error_on_bad_rows: bool,
+        coerce_integral_floats: bool,
+    ) -> EvalOut {
         let Some(cs) = self.prog.find_schema(schema_name) else {
             return EvalOut::Failed(format!("unknown schema `{schema_name}`"));
         };
@@ -3242,10 +3272,33 @@ impl<'a> Evaluator<'a> {
         } else {
             b','
         };
+        let opts = CsvReadOptions {
+            coerce_integral_floats,
+        };
         let constraints = cs.constraints.clone();
         let schema_tt = cs.decl.schema.clone();
         let self_cols = build_constraint_self_cols(&schema_tt);
         let empty_env = RTEnv::new();
+
+        let format_bad_err = |bad: &TableVal| -> EvalOut {
+            let first = &bad.rows[0];
+            let line_s = first
+                .cells
+                .first()
+                .map_or_else(|| "?".to_string(), format_display_val);
+            let col_s = first
+                .cells
+                .get(1)
+                .map_or_else(|| "?".to_string(), format_display_val);
+            let kind_s = first
+                .cells
+                .get(2)
+                .map_or_else(|| "BadRow".to_string(), format_display_val);
+            EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                "{path}: {} invalid CSV row(s) under schema `{schema_name}` (first error at line {line_s}, column `{col_s}`: {kind_s})",
+                bad.rows.len()
+            )))))
+        };
 
         if let Some(vm_cfg) = self.vm_cfg {
             let fast_constraints: Vec<FastColConstraint> = constraints
@@ -3278,11 +3331,12 @@ impl<'a> Evaluator<'a> {
                             )))));
                         }
                     };
-                    read_csv_stream_to_vm_table(
+                    read_csv_stream_to_vm_table_with_options(
                         reader,
                         &schema_tt,
                         delimiter,
                         vm_cfg.batch_size,
+                        opts,
                         &fast_constraints,
                         |ci, val| {
                             self.eval_schema_constraint(
@@ -3313,11 +3367,12 @@ impl<'a> Evaluator<'a> {
                             )))));
                         }
                     };
-                    read_csv_stream_to_vm_table(
+                    read_csv_stream_to_vm_table_with_options(
                         reader,
                         &schema_tt,
                         delimiter,
                         vm_cfg.batch_size,
+                        opts,
                         &fast_constraints,
                         |ci, val| {
                             self.eval_schema_constraint(
@@ -3332,10 +3387,20 @@ impl<'a> Evaluator<'a> {
                 }
             };
             return match parsed {
-                Ok((good_vm, bad)) => EvalOut::Ok(Val::ResOk(Box::new(Val::Tuple(vec![
-                    Val::Columnar(Arc::new(good_vm)),
-                    Val::Table(bad),
-                ])))),
+                Ok((good_vm, bad)) => {
+                    if error_on_bad_rows {
+                        if !bad.rows.is_empty() {
+                            format_bad_err(&bad)
+                        } else {
+                            EvalOut::Ok(Val::ResOk(Box::new(Val::Columnar(Arc::new(good_vm)))))
+                        }
+                    } else {
+                        EvalOut::Ok(Val::ResOk(Box::new(Val::Tuple(vec![
+                            Val::Columnar(Arc::new(good_vm)),
+                            Val::Table(bad),
+                        ]))))
+                    }
+                }
                 Err(msg) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(msg)))),
             };
         }
@@ -3361,7 +3426,7 @@ impl<'a> Evaluator<'a> {
                         )))));
                     }
                 };
-                read_csv_stream_with_schema(reader, &schema_tt, delimiter, |ci, val| {
+                read_csv_stream_with_options(reader, &schema_tt, delimiter, opts, |ci, val| {
                     self.eval_schema_constraint(&self_cols, &constraints, ci, val, &empty_env)
                 })
             }
@@ -3383,16 +3448,26 @@ impl<'a> Evaluator<'a> {
                         )))));
                     }
                 };
-                read_csv_stream_with_schema(reader, &schema_tt, delimiter, |ci, val| {
+                read_csv_stream_with_options(reader, &schema_tt, delimiter, opts, |ci, val| {
                     self.eval_schema_constraint(&self_cols, &constraints, ci, val, &empty_env)
                 })
             }
         };
         match parsed {
-            Ok((good, bad)) => EvalOut::Ok(Val::ResOk(Box::new(Val::Tuple(vec![
-                Val::Table(good),
-                Val::Table(bad),
-            ])))),
+            Ok((good, bad)) => {
+                if error_on_bad_rows {
+                    if !bad.rows.is_empty() {
+                        format_bad_err(&bad)
+                    } else {
+                        EvalOut::Ok(Val::ResOk(Box::new(Val::Table(good))))
+                    }
+                } else {
+                    EvalOut::Ok(Val::ResOk(Box::new(Val::Tuple(vec![
+                        Val::Table(good),
+                        Val::Table(bad),
+                    ]))))
+                }
+            }
             Err(msg) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(msg)))),
         }
     }
@@ -4566,6 +4641,47 @@ impl<'a> Evaluator<'a> {
                                     name: name.clone(),
                                     ty: ScalarTy::Text,
                                     tags: tv.cols[src_idx].tags.clone(),
+                                    bucketed: true,
+                                    agg_kind: AggKind::Raw,
+                                });
+                                for (row, v) in tv.rows.iter_mut().zip(new_vals) {
+                                    row.cells.push(v);
+                                }
+                            }
+                        }
+                        ExecDeriveItem::CoarsenCol {
+                            name,
+                            source,
+                            allow,
+                            other,
+                        } => {
+                            let Some(src_idx) = tv.cols.iter().position(|c| c.name == *source)
+                            else {
+                                return EvalOut::Failed(format!("coarsen: missing col `{source}`"));
+                            };
+                            let src_tags = tv.cols[src_idx].tags.clone();
+                            let existing_idx = tv.cols.iter().position(|c| c.name == *name);
+                            let mut new_vals = Vec::with_capacity(tv.rows.len());
+                            for row in &tv.rows {
+                                let kept = match unwrap_opt_ref(&row.cells[src_idx]) {
+                                    Some(Val::Text(s)) if allow.iter().any(|a| a == s) => s.clone(),
+                                    _ => other.clone(),
+                                };
+                                new_vals.push(Val::Text(kept));
+                            }
+                            if let Some(idx) = existing_idx {
+                                tv.cols[idx].ty = ScalarTy::Text;
+                                tv.cols[idx].tags = src_tags;
+                                tv.cols[idx].bucketed = true;
+                                tv.cols[idx].agg_kind = AggKind::Raw;
+                                for (row, v) in tv.rows.iter_mut().zip(new_vals) {
+                                    row.cells[idx] = v;
+                                }
+                            } else {
+                                tv.cols.push(ColSpec {
+                                    name: name.clone(),
+                                    ty: ScalarTy::Text,
+                                    tags: src_tags,
                                     bucketed: true,
                                     agg_kind: AggKind::Raw,
                                 });

@@ -19,7 +19,9 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Cursor, IsTerminal};
 use std::path::{Path, PathBuf};
 
-use crate::base::{DiagCode, Diagnostic, SourceMap, render_diagnostic, render_diagnostics_json};
+use crate::base::{
+    DiagCode, Diagnostic, Severity, SourceMap, render_diagnostic, render_diagnostics_json,
+};
 use crate::check::{
     check_resolved, check_resolved_with_lock, parse_policy, pin_vendor_dir, resolve_path,
     verify_vendor_dir,
@@ -55,10 +57,10 @@ USAGE:
 COMMANDS:
   check [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--json] <FILE...>
       Parse, type-check, privacy-check, and verify Dana source file(s) (with offline schema.lock).
-  run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]
+  run [--oracle] [--oracle-steps N] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]
       Compile and execute a Dana program's `main` function (vectorized columnar VM + SQL pushdown
       by default; pass `--oracle` for the reference row-by-row engine).
-  dry-run [--oracle] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]
+  dry-run [--oracle] [--oracle-steps N] [--db Name=URI]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]
       Execute strictly read-only, printing redacted WriteTable diffs and suppressing disk/DB writes.
   schema-sync --db Name=URI [--db Name2=URI2 ...] [--schemas s1,s2,...] [--out schema.lock]
       Introspect live SQLite/PostgreSQL databases and update schema.lock while preserving sensitivity tags.
@@ -68,7 +70,7 @@ COMMANDS:
       Start a safe read-only, privacy-redacted interactive REPL (or run a one-liner via `--eval`).
   vendor pin|verify [--dir PATH]
       Pin or verify SHA-256 hashes of pure-by-default vendored modules in `vendor/vendor.lock`.
-  test [--oracle] [--policy FILE] [--filter SUBSTR] [PATH...]
+  test [--oracle] [--oracle-steps N] [--policy FILE] [--filter SUBSTR] [PATH...]
       Run all inline `examples` and `test` blocks across file(s) or directory.
   format [--check] <PATH...>
       Format Dana source file(s) canonically with 2-space indentation.
@@ -477,6 +479,7 @@ fn cmd_check(args: &[String]) -> i32 {
         match resolve_path(&path, policy, &mut sm) {
             Ok(resolved) => match check_resolved_with_lock(&resolved, &sm, schema_lock.as_ref()) {
                 Ok(checked) => {
+                    all_diags.extend(checked.warnings.iter().cloned());
                     if let Err(d) = lower_program(checked) {
                         all_diags.push(d);
                     }
@@ -494,39 +497,92 @@ fn cmd_check(args: &[String]) -> i32 {
             eprint!("{}", render_diagnostic(d, &sm));
         }
     }
-    if all_diags.is_empty() { 0 } else { 1 }
+    if all_diags.iter().any(|d| d.severity() == Severity::Error) {
+        1
+    } else {
+        0
+    }
+}
+
+fn parse_positive_usize_flag(cmd_name: &str, flag: &str, raw: &str) -> Result<usize, String> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "{cmd_name}: `{flag}` requires a positive integer, got `{raw}`"
+        ));
+    }
+    let parsed: usize = raw
+        .parse()
+        .map_err(|_| format!("{cmd_name}: `{flag}` value `{raw}` overflows step counter"))?;
+    if parsed == 0 {
+        return Err(format!("{cmd_name}: `{flag}` must be at least 1"));
+    }
+    Ok(parsed)
 }
 
 fn cmd_test(args: &[String]) -> i32 {
     let mut use_oracle = false;
+    let mut oracle_steps: Option<usize> = None;
     let mut policy_path: Option<PathBuf> = None;
     let mut filter: Option<String> = None;
     let mut paths = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--oracle" => use_oracle = true,
-            "--policy" => {
-                i += 1;
-                let Some(p) = args.get(i) else {
-                    eprintln!("dana test: `--policy` requires a file path");
-                    return 2;
-                };
-                policy_path = Some(PathBuf::from(p));
-            }
-            "--filter" => {
-                i += 1;
-                let Some(f) = args.get(i) else {
-                    eprintln!("dana test: `--filter` requires a pattern");
-                    return 2;
-                };
-                filter = Some(f.clone());
-            }
-            flag if flag.starts_with('-') => {
-                eprintln!("dana test: unknown flag `{flag}`");
+        let arg = args[i].as_str();
+        if let Some(val) = arg.strip_prefix("--oracle-steps=") {
+            if oracle_steps.is_some() {
+                eprintln!("dana test: duplicate `--oracle-steps` flag");
                 return 2;
             }
-            p => paths.push(PathBuf::from(p)),
+            match parse_positive_usize_flag("dana test", "--oracle-steps", val) {
+                Ok(n) => oracle_steps = Some(n),
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 2;
+                }
+            }
+        } else {
+            match arg {
+                "--oracle" => use_oracle = true,
+                "--oracle-steps" => {
+                    if oracle_steps.is_some() {
+                        eprintln!("dana test: duplicate `--oracle-steps` flag");
+                        return 2;
+                    }
+                    i += 1;
+                    let Some(val) = args.get(i) else {
+                        eprintln!("dana test: `--oracle-steps` requires a positive integer");
+                        return 2;
+                    };
+                    match parse_positive_usize_flag("dana test", "--oracle-steps", val) {
+                        Ok(n) => oracle_steps = Some(n),
+                        Err(e) => {
+                            eprintln!("{e}");
+                            return 2;
+                        }
+                    }
+                }
+                "--policy" => {
+                    i += 1;
+                    let Some(p) = args.get(i) else {
+                        eprintln!("dana test: `--policy` requires a file path");
+                        return 2;
+                    };
+                    policy_path = Some(PathBuf::from(p));
+                }
+                "--filter" => {
+                    i += 1;
+                    let Some(f) = args.get(i) else {
+                        eprintln!("dana test: `--filter` requires a pattern");
+                        return 2;
+                    };
+                    filter = Some(f.clone());
+                }
+                flag if flag.starts_with('-') => {
+                    eprintln!("dana test: unknown flag `{flag}`");
+                    return 2;
+                }
+                p => paths.push(PathBuf::from(p)),
+            }
         }
         i += 1;
     }
@@ -544,7 +600,11 @@ fn cmd_test(args: &[String]) -> i32 {
     let mut sm = SourceMap::new();
     let mut total = 0usize;
     let mut failed = 0usize;
-    let cfg = RunConfig::default();
+    let def_cfg = RunConfig::default();
+    let cfg = RunConfig {
+        fuel: oracle_steps.unwrap_or(def_cfg.fuel),
+        ..def_cfg
+    };
     let vm_cfg = VmConfig::default();
 
     for path in files {
@@ -573,6 +633,9 @@ fn cmd_test(args: &[String]) -> i32 {
                 return 1;
             }
         };
+        for w in &checked.warnings {
+            eprint!("{}", render_diagnostic(w, &sm));
+        }
         let lowered = match lower_program(checked) {
             Ok(l) => l,
             Err(d) => {
@@ -613,6 +676,7 @@ fn cmd_test(args: &[String]) -> i32 {
 fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
     let cmd_name = if dry_run { "dana dry-run" } else { "dana run" };
     let mut use_oracle = false;
+    let mut oracle_steps: Option<usize> = None;
     let mut policy_path: Option<PathBuf> = None;
     let mut lock_path: Option<PathBuf> = None;
     let mut db_bindings: HashMap<String, String> = HashMap::new();
@@ -624,7 +688,19 @@ fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
 
     while i < args.len() {
         let arg = args[i].as_str();
-        if let Some(val) = arg.strip_prefix("--policy=") {
+        if let Some(val) = arg.strip_prefix("--oracle-steps=") {
+            if oracle_steps.is_some() {
+                eprintln!("{cmd_name}: duplicate `--oracle-steps` flag");
+                return 2;
+            }
+            match parse_positive_usize_flag(cmd_name, "--oracle-steps", val) {
+                Ok(n) => oracle_steps = Some(n),
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 2;
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--policy=") {
             policy_path = Some(PathBuf::from(val));
         } else if let Some(val) = arg.strip_prefix("--schema-lock=") {
             lock_path = Some(PathBuf::from(val));
@@ -653,6 +729,24 @@ fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
                     break;
                 }
                 "--oracle" => use_oracle = true,
+                "--oracle-steps" => {
+                    if oracle_steps.is_some() {
+                        eprintln!("{cmd_name}: duplicate `--oracle-steps` flag");
+                        return 2;
+                    }
+                    i += 1;
+                    let Some(val) = args.get(i) else {
+                        eprintln!("{cmd_name}: `--oracle-steps` requires a positive integer");
+                        return 2;
+                    };
+                    match parse_positive_usize_flag(cmd_name, "--oracle-steps", val) {
+                        Ok(n) => oracle_steps = Some(n),
+                        Err(e) => {
+                            eprintln!("{e}");
+                            return 2;
+                        }
+                    }
+                }
                 "--emit-core" if !dry_run => emit_core = true,
                 "--policy" => {
                     i += 1;
@@ -749,6 +843,9 @@ fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
             return 1;
         }
     };
+    for w in &checked.warnings {
+        eprint!("{}", render_diagnostic(w, &sm));
+    }
     let lowered = match lower_program(checked) {
         Ok(l) => l,
         Err(d) => {
@@ -772,15 +869,17 @@ fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
         }
     }
 
+    let def_cfg = RunConfig::default();
     let cfg = RunConfig {
         args: prog_args,
         allow_export,
         work_dir: None,
         live_io: true,
+        fuel: oracle_steps.unwrap_or(def_cfg.fuel),
         db_bindings,
         schema_lock,
         dry_run,
-        ..RunConfig::default()
+        ..def_cfg
     };
     let res = if use_oracle {
         run_exec_program(&lowered.exec, &cfg)

@@ -43,8 +43,9 @@ use crate::vm::ops::sort_win::{
     op_window, seed_from_bigint,
 };
 use crate::vm::ops::{
-    OpErr, OpExecConfig, VmMode, VmTable, op_derive_bucket, op_derive_col_expr, op_drop, op_filter,
-    op_group_by, op_limit, op_pseudonymize, op_redact, op_rename, op_select, op_union,
+    OpErr, OpExecConfig, VmMode, VmTable, op_derive_bucket, op_derive_coarsen, op_derive_col_expr,
+    op_drop, op_filter, op_group_by, op_limit, op_pseudonymize, op_redact, op_rename, op_select,
+    op_union,
 };
 
 // ===========================================================================
@@ -529,6 +530,14 @@ fn eval_exec_plan_to_table(
                             labels,
                         } => {
                             t = op_derive_bucket(t, name, source, cuts, labels, None, cfg)?;
+                        }
+                        ExecDeriveItem::CoarsenCol {
+                            name,
+                            source,
+                            allow,
+                            other,
+                        } => {
+                            t = op_derive_coarsen(t, name, source, allow, other, cfg)?;
                         }
                     }
                 }

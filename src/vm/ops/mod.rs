@@ -674,7 +674,114 @@ pub fn op_derive_bucket(
     })
 }
 
-/// Early-terminating columnar `Limit(n)`.
+/// Vectorized `CoarsenCol` derive step (`coarsen(.source, allow: [...], other: "...")`).
+pub fn op_derive_coarsen(
+    tbl: VmTable,
+    name: &str,
+    source: &str,
+    allow: &[String],
+    other: &str,
+    cfg: &OpExecConfig,
+) -> Result<VmTable, OpErr> {
+    let mut out_cols = reset_cols_raw(tbl.cols, cfg.mode);
+    let Some(src_idx) = out_cols.iter().position(|c| c.name == source) else {
+        return Err(if cfg.mode == VmMode::CoreV01 {
+            OpErr::Wrong
+        } else {
+            OpErr::Failed(format!("coarsen: missing col `{source}`"))
+        });
+    };
+    let target_spec = ColSpec {
+        name: name.to_string(),
+        ty: ScalarTy::Text,
+        tags: out_cols[src_idx].tags.clone(),
+        bucketed: true,
+        agg_kind: AggKind::Raw,
+    };
+    let existing_idx = out_cols.iter().position(|c| c.name == name);
+    match existing_idx {
+        Some(idx) => out_cols[idx] = target_spec.clone(),
+        None => out_cols.push(target_spec.clone()),
+    }
+    let total_rows = tbl.batches.iter().map(Batch::active_len).sum();
+    let mode = cfg.mode;
+    let other_bytes = other.as_bytes();
+
+    let batches = parallel_map_batches(
+        tbl.batches,
+        total_rows,
+        cfg.parallel_threshold_rows,
+        cfg.max_threads,
+        |mut batch| -> Result<Batch, OpErr> {
+            clear_group_meta_if_core(&mut batch, mode);
+            let mut offsets = Vec::with_capacity(batch.len + 1);
+            let mut data = Vec::new();
+            offsets.push(0);
+            let src_col = &batch.cols[src_idx];
+            match &src_col.data {
+                ColumnData::Text {
+                    offsets: src_off,
+                    data: src_data,
+                } => {
+                    for r in 0..batch.len {
+                        let valid = src_col.validity.as_ref().is_none_or(|bm| bm.is_valid(r));
+                        if valid {
+                            let s = std::str::from_utf8(&src_data[src_off[r]..src_off[r + 1]])
+                                .unwrap_or("");
+                            if allow.iter().any(|a| a == s) {
+                                data.extend_from_slice(s.as_bytes());
+                            } else {
+                                data.extend_from_slice(other_bytes);
+                            }
+                        } else {
+                            data.extend_from_slice(other_bytes);
+                        }
+                        offsets.push(data.len());
+                    }
+                }
+                _ => {
+                    for r in 0..batch.len {
+                        let v = src_col.get_val(r);
+                        let matched = match &v {
+                            Val::Text(s) => allow.iter().find(|a| a.as_str() == s.as_str()),
+                            Val::OptSome(inner) => match inner.as_ref() {
+                                Val::Text(s) => allow.iter().find(|a| a.as_str() == s.as_str()),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(m) = matched {
+                            data.extend_from_slice(m.as_bytes());
+                        } else {
+                            data.extend_from_slice(other_bytes);
+                        }
+                        offsets.push(data.len());
+                    }
+                }
+            }
+            let new_col = Column {
+                spec: target_spec.clone(),
+                data: ColumnData::Text { offsets, data },
+                validity: None,
+            };
+            if mode == VmMode::CoreV01 {
+                for c in &mut batch.cols {
+                    c.spec.agg_kind = AggKind::Raw;
+                }
+            }
+            match existing_idx {
+                Some(idx) => batch.cols[idx] = new_col,
+                None => batch.cols.push(new_col),
+            }
+            Ok(batch)
+        },
+    )?;
+
+    Ok(VmTable {
+        cols: out_cols,
+        batches,
+    })
+}
 #[must_use]
 pub fn op_limit(tbl: VmTable, limit: usize, mode: VmMode) -> VmTable {
     let out_cols = reset_cols_raw(tbl.cols, mode);

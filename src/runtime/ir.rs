@@ -189,6 +189,12 @@ pub enum ExecHostOp {
     ConsolePrintProfile,
     /// `files.read_jsonl(path, as: Schema)` -> `Result((Table(S), Table(BadRow(S))), Text)`.
     ReadJsonl(Ident),
+    /// `files.read_csv(path, as: Schema, ...)` with Slice 6.2 `on_bad_rows` / `coerce_integral_floats`.
+    ReadCsvEx {
+        schema: Ident,
+        error_on_bad_rows: bool,
+        coerce_integral_floats: bool,
+    },
     /// `files.read_xlsx(path, sheet: ..., as: Schema)` -> `Result((Table(S), Table(BadRow(S))), Text)`.
     ReadXlsx {
         schema: Ident,
@@ -306,6 +312,12 @@ pub enum ExecDeriveItem {
         cuts: Vec<Literal>,
         labels: Vec<String>,
     },
+    CoarsenCol {
+        name: Ident,
+        source: Ident,
+        allow: Vec<String>,
+        other: String,
+    },
 }
 
 impl ExecDeriveItem {
@@ -315,16 +327,17 @@ impl ExecDeriveItem {
         match self {
             Self::ColExpr { name, .. }
             | Self::SummaryCol { name, .. }
-            | Self::BucketCol { name, .. } => name,
+            | Self::BucketCol { name, .. }
+            | Self::CoarsenCol { name, .. } => name,
         }
     }
 
-    /// Embedded row expression for `ColExpr` or `SummaryCol`, or `None` for `BucketCol`.
+    /// Embedded row expression for `ColExpr` or `SummaryCol`, or `None` for `BucketCol` / `CoarsenCol`.
     #[must_use]
     pub fn col_expr(&self) -> Option<&ExecRowExpr> {
         match self {
             Self::ColExpr { expr, .. } | Self::SummaryCol { expr, .. } => Some(expr),
-            Self::BucketCol { .. } => None,
+            Self::BucketCol { .. } | Self::CoarsenCol { .. } => None,
         }
     }
 }
@@ -1012,6 +1025,17 @@ fn run_exec_clone(initial: ExecCloneTask<'_>) -> (Vec<ExecExpr>, Vec<ExecPlan>, 
                                     source: source.clone(),
                                     cuts: cuts.clone(),
                                     labels: labels.clone(),
+                                }),
+                                ExecDeriveItem::CoarsenCol {
+                                    name,
+                                    source,
+                                    allow,
+                                    other,
+                                } => citems.push(ExecDeriveItem::CoarsenCol {
+                                    name: name.clone(),
+                                    source: source.clone(),
+                                    allow: allow.clone(),
+                                    other: other.clone(),
                                 }),
                             }
                         }
@@ -1711,7 +1735,7 @@ fn push_exec_plan_children(plan: &mut ExecPlan, stack: &mut Vec<ExecDropNode>) {
                             ExecRowExpr::Lit(Literal::Unit),
                         )));
                     }
-                    ExecDeriveItem::BucketCol { .. } => {}
+                    ExecDeriveItem::BucketCol { .. } | ExecDeriveItem::CoarsenCol { .. } => {}
                 }
             }
         }
@@ -2435,6 +2459,7 @@ fn try_exec_expr_to_core(root: &ExecExpr) -> Option<Expr> {
                                 cuts: cuts.clone(),
                                 labels: labels.clone(),
                             }),
+                            ExecDeriveItem::CoarsenCol { .. } => return None,
                         }
                     }
                     plans.push(Plan::Derive {

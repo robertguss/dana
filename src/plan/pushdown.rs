@@ -2198,6 +2198,63 @@ fn translate_bucket_col(
     Ok((SqlExpr::Case { whens, else_br }, spec))
 }
 
+fn translate_coarsen_col(
+    schema: &TableTy,
+    name: &str,
+    source: &str,
+    allow: &[String],
+    other: &str,
+    dialect: SqlDialect,
+) -> Result<(SqlExpr, ColSpec), String> {
+    let Some(src_col) = schema.find_col(source) else {
+        return Err(format!("CoarsenCol references missing source `{source}`"));
+    };
+    if allow.is_empty() {
+        return Err("invalid CoarsenCol empty allow list".to_string());
+    }
+    let is_text = matches!(&src_col.ty, ScalarTy::Text)
+        || matches!(&src_col.ty, ScalarTy::Option(inner) if matches!(inner.as_ref(), ScalarTy::Text));
+    if !is_text {
+        return Err(non_exact_type_reason(dialect, &src_col.ty, "CoarsenCol"));
+    }
+    let mut whens = Vec::with_capacity(allow.len());
+    for allowed in allow {
+        let mut lhs = SqlExpr::Col {
+            table_alias: None,
+            name: source.to_string(),
+        };
+        if dialect == SqlDialect::Postgres {
+            lhs = SqlExpr::CollateC(Box::new(lhs));
+        }
+        let rhs = SqlExpr::Param {
+            slot: SqlParamSlot::Literal(SqlParam::Text(allowed.clone())),
+            pg_cast: Some("TEXT"),
+        };
+        let cond = SqlExpr::Binary {
+            op: "=",
+            left: Box::new(lhs),
+            right: Box::new(rhs),
+        };
+        let then_e = SqlExpr::Param {
+            slot: SqlParamSlot::Literal(SqlParam::Text(allowed.clone())),
+            pg_cast: Some("TEXT"),
+        };
+        whens.push((cond, then_e));
+    }
+    let else_br = Box::new(SqlExpr::Param {
+        slot: SqlParamSlot::Literal(SqlParam::Text(other.to_string())),
+        pg_cast: Some("TEXT"),
+    });
+    let spec = ColSpec {
+        name: name.to_string(),
+        ty: ScalarTy::Text,
+        tags: src_col.tags.clone(),
+        bucketed: true,
+        agg_kind: AggKind::Raw,
+    };
+    Ok((SqlExpr::Case { whens, else_br }, spec))
+}
+
 // ===========================================================================
 // Shared Core PrimOp SQL Translation
 // ===========================================================================
@@ -5155,6 +5212,35 @@ fn split_exec_node(
                                 source,
                                 cuts,
                                 labels,
+                                ctx.dialect,
+                            ) {
+                                Ok((sql_e, spec)) => {
+                                    cur = cur.apply_derive_single(name, sql_e, spec);
+                                    names.push(name.clone());
+                                }
+                                Err(reason) => {
+                                    return NodeSplit::Hybrid {
+                                        pushed: orig,
+                                        placeholder_var: PLACEHOLDER.to_string(),
+                                        local_plan: rebuild_exec_unary(
+                                            plan,
+                                            exec_placeholder_plan(PLACEHOLDER),
+                                        ),
+                                        reason,
+                                    };
+                                }
+                            },
+                            ExecDeriveItem::CoarsenCol {
+                                name,
+                                source,
+                                allow,
+                                other,
+                            } => match translate_coarsen_col(
+                                &cur.schema,
+                                name,
+                                source,
+                                allow,
+                                other,
                                 ctx.dialect,
                             ) {
                                 Ok((sql_e, spec)) => {
