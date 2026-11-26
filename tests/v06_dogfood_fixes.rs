@@ -1469,7 +1469,7 @@ fn check_src_with_lock(
 
 #[test]
 fn v06_sqlite_attach_and_unattached_schema_table_fallback() -> TestResult {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.5");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.6");
     let tmp = TempDir::new("sqlite_attach")?;
     let main_db = tmp.path().join("main.db");
     let populi_db = tmp.path().join("populi.db");
@@ -2777,12 +2777,12 @@ end
     let db_out = assert_oracle_vm_parity(db_src, Some(("DB", &uri)))?;
     assert_eq!(db_out, vec!["2"]);
 
-    // 5. CLI --version prints `dana v0.6.5`
+    // 5. CLI --version prints `dana v0.6.6`
     let ver = Command::new(env!("CARGO_BIN_EXE_dana"))
         .arg("--version")
         .output()?;
     assert_eq!(ver.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.5");
+    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.6");
 
     Ok(())
 }
@@ -4722,4 +4722,398 @@ end
     );
 
     Ok(())
+}
+
+// ===========================================================================
+// v0.6.6: Known-NOT-NULL COALESCE Elimination & PostgreSQL TryParseDecimal Pushdown
+// ===========================================================================
+
+#[test]
+fn v066_unicode_whitespace_and_known_not_null_try_parse_decimal_pushdown() -> TestResult {
+    let src = r##"module V066PushdownTest
+
+schema SubRow
+  uid: Int?
+  cid: Int?
+  raw_dec: Text?
+end
+
+schema CourseRow
+  cid: Int?
+  state: Text?
+end
+
+schema UserOptRow
+  uid: Int?
+  u_tag: Text?
+end
+
+fn run_q(db: ReadDB(DB))
+  courses = (db.table(CourseRow, from: "courses")
+    |> where(.cid.some? and (.state ?? "") == "active")
+    |> derive(c_cid: .cid ?? 0, st_val: .state ?? "")
+    |> select(.c_cid, .st_val)
+    |> dedupe_by(.c_cid, order_by: [asc(.st_val)]))
+
+  users_opt = (db.table(UserOptRow, from: "users")
+    |> where(.uid.some?)
+    |> derive(u_label: .u_tag ?? "")
+    |> select(.uid, .u_label)
+    |> dedupe_by(.uid, order_by: [asc(.u_label)]))
+
+  db.table(SubRow, from: "subs")
+    |> where(.uid.some? and .cid.some?)
+    |> derive(
+      u_id: .uid ?? 0,
+      c_cid: .cid ?? 0,
+      parsed_opt: (.raw_dec ?? "").try_parse_decimal
+    )
+    |> join_many_to_one(courses, on: [.c_cid])
+    |> join_many_to_one(users_opt, on: [.uid])
+    |> select(.u_id, .c_cid, .st_val, .u_label, .parsed_opt)
+    |> sort_by(.u_id, .c_cid, .st_val, .u_label, .parsed_opt)
+end
+"##;
+
+    let checked = check_src(src)?;
+    let (opt_prog, _) = dana::plan::optimize_exec_program(&checked.exec);
+    let f = opt_prog.find_fun("run_q").ok_or("missing run_q")?;
+    let plan = find_first_plan(&f.body).ok_or("missing run_q plan")?;
+
+    let pg_q = match split_exec_plan_pushdown(plan, &opt_prog, "DB", SqlDialect::Postgres, None) {
+        SplitPlan::FullyPushed(q) => q,
+        other => return Err(format!("expected FullyPushed for Postgres, got {other:?}").into()),
+    };
+
+    // 1. All COALESCE on known-non-null `.uid`, `.cid`, and `.state` must be eliminated,
+    //    and non-null join keys must emit `=` instead of `IS NOT DISTINCT FROM`.
+    assert!(
+        !pg_q.sql.contains("COALESCE(\"uid\"")
+            && !pg_q.sql.contains("COALESCE(\"cid\"")
+            && !pg_q.sql.contains("COALESCE(\"state\"")
+            && !pg_q.sql.contains("IS NOT DISTINCT FROM"),
+        "expected COALESCE on known-non-null cols and IS NOT DISTINCT FROM to be eliminated:\n{}",
+        pg_q.sql
+    );
+
+    // 2. TryParseDecimal must hoist Unicode trim into AS MATERIALIZED CTE (`_dana_dec_*`)
+    //    and emit nested CASE validation before CAST(... AS NUMERIC).
+    assert!(
+        pg_q.sql.contains("AS MATERIALIZED (")
+            && pg_q.sql.contains("\"_dana_dec_")
+            && pg_q.sql.contains("LENGTH(")
+            && pg_q.sql.contains("AS NUMERIC)")
+            && pg_q.sql.contains("^[+-]?[0-9]+(\\.[0-9]{0,18})?$"),
+        "expected materialized _dana_dec_* nested-CASE TryParseDecimal SQL:\n{}",
+        pg_q.sql
+    );
+
+    // 3. The BTRIM parameter emitted for TrimUnicode must match every Unicode White_Space char.
+    let expected_ws: String = (0..=0x0010_FFFFu32)
+        .filter_map(char::from_u32)
+        .filter(|c| c.is_whitespace())
+        .collect();
+    let has_exact_ws_param = pg_q.param_slots.iter().any(|slot| match slot {
+        dana::plan::pushdown::SqlParamSlot::Literal(dana::db::SqlParam::Text(s)) => {
+            s == &expected_ws
+        }
+        _ => false,
+    });
+    assert!(
+        has_exact_ws_param,
+        "expected TrimUnicode SqlParam containing all Unicode White_Space chars"
+    );
+
+    let lock_sq = dana::db::schema_lock::SchemaLockFile {
+        version: dana::db::schema_lock::SCHEMA_LOCK_VERSION,
+        dbs: vec![dana::db::schema_lock::LockedDb {
+            name: "DB".to_string(),
+            dialect: SqlDialect::Sqlite,
+            tables: vec![],
+        }],
+    };
+    let sq_split =
+        split_exec_plan_pushdown(plan, &opt_prog, "DB", SqlDialect::Sqlite, Some(&lock_sq));
+    assert!(
+        !matches!(sq_split, SplitPlan::FullyPushed(_)),
+        "SQLite must not FullyPush TryParseDecimal: {sq_split:?}"
+    );
+    let sq_collected = dana::plan::collect_exec_plan_pushdowns(
+        plan,
+        &opt_prog,
+        SqlDialect::Sqlite,
+        Some(&lock_sq),
+    );
+    assert!(
+        sq_collected
+            .boundary_reasons
+            .iter()
+            .any(|r| r.contains("TryParseDecimal")),
+        "expected TryParseDecimal boundary reason on SQLite, got {:?}",
+        sq_collected.boundary_reasons
+    );
+    assert!(
+        sq_collected
+            .branches
+            .iter()
+            .all(|b| !b.pushdown.sql.contains("MATERIALIZED")),
+        "SQLite branches must not emit PostgreSQL MATERIALIZED"
+    );
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL server via DANA_TEST_POSTGRES_URL"]
+fn v066_postgres_live_try_parse_decimal_and_coalesce_not_null() -> TestResult {
+    let url = std::env::var("DANA_TEST_POSTGRES_URL").map_err(|_| {
+        "DANA_TEST_POSTGRES_URL must be set to run v066_postgres_live_try_parse_decimal_and_coalesce_not_null"
+    })?;
+    let tmp = TempDir::new("v066_live_pg_dec")?;
+    let schema_name = format!(
+        "dana_v066_dec_{}_{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let lock_path = tmp.path().join("schema.lock");
+
+    {
+        let mut pg = open_connection(&url)?;
+        pg.execute(
+            &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+            &[],
+        )?;
+        pg.execute(&format!(r#"CREATE SCHEMA "{schema_name}""#), &[])?;
+        pg.execute(
+            &format!(
+                r#"CREATE TABLE "{schema_name}"."users" (
+                    "uid" BIGINT,
+                    "label" TEXT
+                )"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"INSERT INTO "{schema_name}"."users" VALUES
+                    (1, 'u1'),
+                    (NULL, 'u_null')"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"CREATE TABLE "{schema_name}"."items" (
+                    "id" BIGINT PRIMARY KEY,
+                    "uid" BIGINT,
+                    "raw_amt" TEXT
+                )"#
+            ),
+            &[],
+        )?;
+        let nbsp_ws = "\u{00A0} 42.5 \u{2003}\t";
+        let lf_end = "12.\n";
+        let lf_mid = "12\n3";
+        pg.execute(
+            &format!(r#"INSERT INTO "{schema_name}"."items" VALUES ($1, $2, $3)"#),
+            &[
+                dana::db::SqlParam::Int(1),
+                dana::db::SqlParam::Int(1),
+                dana::db::SqlParam::Text("12.".to_string()),
+            ],
+        )?;
+        let rows: Vec<(i64, Option<i64>, Option<&str>)> = vec![
+            (2, Some(1), Some("+12.5")),
+            (3, Some(1), Some("-0.00")),
+            (4, Some(1), Some(".5")),
+            (5, Some(1), Some("1e5")),
+            (6, Some(1), Some("1_000")),
+            (7, Some(1), Some(nbsp_ws)),
+            (8, Some(1), Some("170141183460469231731.687303715884105727")),
+            (9, Some(1), Some("170141183460469231731.687303715884105728")),
+            (
+                10,
+                Some(1),
+                Some("-170141183460469231731.687303715884105727"),
+            ),
+            (
+                11,
+                Some(1),
+                Some("-170141183460469231731.687303715884105728"),
+            ),
+            (12, Some(1), Some("1.123456789012345678")),
+            (13, Some(1), Some("1.1234567890123456789")),
+            (14, Some(1), Some("abc")),
+            (15, Some(1), Some("")),
+            (16, Some(1), None),
+            (17, Some(1), Some(lf_mid)),
+            (18, Some(1), Some(lf_end)),
+            (19, None, Some("99.9")),
+        ];
+        for (id, uid, raw) in rows {
+            pg.execute(
+                &format!(r#"INSERT INTO "{schema_name}"."items" VALUES ($1, $2, $3)"#),
+                &[
+                    dana::db::SqlParam::Int(id),
+                    uid.map_or(dana::db::SqlParam::Null, dana::db::SqlParam::Int),
+                    raw.map_or(dana::db::SqlParam::Null, |s| {
+                        dana::db::SqlParam::Text(s.to_string())
+                    }),
+                ],
+            )?;
+        }
+    }
+
+    let sync = Command::new(env!("CARGO_BIN_EXE_dana"))
+        .args([
+            "schema-sync",
+            "--db",
+            &format!("PG={url}"),
+            "--schemas",
+            &schema_name,
+            "--out",
+            &lock_path.display().to_string(),
+        ])
+        .output()?;
+    if sync.status.code() != Some(0) {
+        let _ = open_connection(&url).and_then(|mut pg| {
+            pg.execute(
+                &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+                &[],
+            )
+        });
+        return Err(format!(
+            "dana schema-sync failed: {}",
+            String::from_utf8_lossy(&sync.stderr)
+        )
+        .into());
+    }
+
+    let lock = dana::db::schema_lock::parse_schema_lock(&fs::read_to_string(&lock_path)?)?;
+    let src = format!(
+        r##"module LivePgV066Dec
+
+schema ItemRow
+  id: Int
+  uid: Int?
+  raw_amt: Text?
+end
+
+schema UserRow
+  uid: Int?
+  label: Text?
+end
+
+fn query_items(db: ReadDB(PG))
+  users = (db.table(UserRow, from: "{schema_name}.users")
+    |> where(.uid.some?)
+    |> derive(u_id: .uid ?? 0, lbl: .label ?? "")
+    |> select(.u_id, .lbl)
+    |> dedupe_by(.u_id, order_by: [asc(.lbl)]))
+
+  db.table(ItemRow, from: "{schema_name}.items")
+    |> where(.uid.some?)
+    |> derive(
+      u_id: .uid ?? 0,
+      parsed: (.raw_amt ?? "").try_parse_decimal
+    )
+    |> join_many_to_one(users, on: [.u_id])
+    |> select(.id, .u_id, .lbl, .parsed)
+    |> sort_by(.id)
+end
+
+fn main(db: ReadDB(PG), console: Console) : Int
+  for r in query_items(db)
+    console.print("#{{r.id}}:#{{r.u_id}}:#{{r.lbl}}:#{{r.parsed}}")
+  end
+  0
+end
+"##
+    );
+
+    let test_res = (|| -> TestResult {
+        let checked = check_src_with_lock(&src, &lock)?;
+        let (opt_prog, _) = dana::plan::optimize_exec_program(&checked.exec);
+        let qf = opt_prog
+            .find_fun("query_items")
+            .ok_or("missing query_items")?;
+        let plan = find_first_plan(&qf.body).ok_or("missing ExecPlan")?;
+        let sp = split_exec_plan_pushdown(plan, &opt_prog, "PG", SqlDialect::Postgres, Some(&lock));
+        match sp {
+            SplitPlan::FullyPushed(q) => {
+                assert!(
+                    !q.sql.contains("COALESCE(\"uid\"")
+                        && !q.sql.contains("IS NOT DISTINCT FROM")
+                        && q.sql.contains("AS MATERIALIZED (")
+                        && q.sql.contains("\"_dana_dec_"),
+                    "expected optimized FullyPushed PG SQL:\n{}",
+                    q.sql
+                );
+            }
+            other => return Err(format!("expected FullyPushed live PG SQL, got {other:?}").into()),
+        }
+        let out = assert_oracle_vm_parity(&src, Some(("PG", &url)))?;
+        assert_eq!(out.len(), 18, "expected 18 non-null uid rows: {out:?}");
+        assert!(out[0] == "1:1:u1:12.0", "unexpected id=1: {:?}", out[0]);
+        assert!(
+            out[2] == "3:1:u1:0.0",
+            "unexpected id=3 (-0.00): {:?}",
+            out[2]
+        );
+        assert!(
+            out[3] == "4:1:u1:none",
+            "unexpected id=4 (.5): {:?}",
+            out[3]
+        );
+        assert!(
+            out[6] == "7:1:u1:42.5",
+            "unexpected id=7 (unicode ws): {:?}",
+            out[6]
+        );
+        assert!(
+            out[7] == "8:1:u1:170141183460469231731.687303715884105727",
+            "unexpected id=8 (DEC_MAX): {:?}",
+            out[7]
+        );
+        assert!(
+            out[8] == "9:1:u1:none",
+            "unexpected id=9 (DEC_MAX+1): {:?}",
+            out[8]
+        );
+        assert!(
+            out[9] == "10:1:u1:-170141183460469231731.687303715884105727",
+            "unexpected id=10 (DEC_MIN): {:?}",
+            out[9]
+        );
+        assert!(
+            out[10] == "11:1:u1:none",
+            "unexpected id=11 (DEC_MIN-1): {:?}",
+            out[10]
+        );
+        assert!(
+            out[11] == "12:1:u1:1.123456789012345678",
+            "unexpected id=12 (18 dec): {:?}",
+            out[11]
+        );
+        assert!(
+            out[12] == "13:1:u1:none",
+            "unexpected id=13 (19 dec): {:?}",
+            out[12]
+        );
+        assert!(
+            out[16] == "17:1:u1:none" && out[17] == "18:1:u1:12.0",
+            "unexpected newline cases id=17/18: {:?}",
+            &out[16..18]
+        );
+        Ok(())
+    })();
+
+    let _ = open_connection(&url).and_then(|mut pg| {
+        pg.execute(
+            &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+            &[],
+        )
+    });
+
+    test_res
 }

@@ -582,6 +582,9 @@ pub fn bind_exec_plan_sources(plan: &ExecPlan, bindings: &HashMap<Ident, ExecPla
 // Internal Structured SQL AST (Guarantees Exact Left-to-Right Parameter Order)
 // ===========================================================================
 
+/// All 25 Unicode `White_Space` codepoints trimmed by Rust `str::trim` (verified against Python / Oracle).
+const RUST_UNICODE_WHITESPACE: &str = "\u{0009}\u{000A}\u{000B}\u{000C}\u{000D}\u{0020}\u{0085}\u{00A0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}";
+
 #[derive(Clone, Debug)]
 enum SqlExpr {
     Col {
@@ -646,7 +649,12 @@ enum SqlExpr {
         items: Vec<SqlExpr>,
     },
     TrimAscii(Box<SqlExpr>),
+    TrimUnicode(Box<SqlExpr>),
     TryParseIsoDate {
+        inner: Box<SqlExpr>,
+        already_trimmed: bool,
+    },
+    TryParseDecimal {
         inner: Box<SqlExpr>,
         already_trimmed: bool,
     },
@@ -742,10 +750,12 @@ fn select_defines_hoisted_iso(query: &SqlQuery) -> bool {
     matches!(
         query,
         SqlQuery::Select { items, .. }
-            if items
-                .iter()
-                .any(|item| item.alias.starts_with("_dana_iso_")
+            if items.iter().any(|item| {
+                (item.alias.starts_with("_dana_iso_")
                     && matches!(item.expr, SqlExpr::TrimAscii(_)))
+                    || (item.alias.starts_with("_dana_dec_")
+                        && matches!(item.expr, SqlExpr::TrimUnicode(_)))
+            })
     )
 }
 
@@ -1196,11 +1206,20 @@ impl<'a> SqlRenderState<'a> {
             SqlExpr::TrimAscii(inner) => {
                 self.render_trimmed_ascii(inner);
             }
+            SqlExpr::TrimUnicode(inner) => {
+                self.render_trimmed_unicode(inner);
+            }
             SqlExpr::TryParseIsoDate {
                 inner,
                 already_trimmed,
             } => {
                 self.render_try_parse_iso_date(inner, *already_trimmed);
+            }
+            SqlExpr::TryParseDecimal {
+                inner,
+                already_trimmed,
+            } => {
+                self.render_try_parse_decimal(inner, *already_trimmed);
             }
             SqlExpr::ExtractYear(inner) => {
                 self.sql.push_str("CAST(EXTRACT(YEAR FROM ");
@@ -1270,6 +1289,58 @@ impl<'a> SqlRenderState<'a> {
             self.render_expr(inner);
         } else {
             self.render_trimmed_ascii(inner);
+        }
+    }
+
+    fn render_trimmed_unicode(&mut self, inner: &SqlExpr) {
+        let func = match self.dialect {
+            SqlDialect::Sqlite => "TRIM",
+            SqlDialect::Postgres => "BTRIM",
+        };
+        self.sql.push_str(func);
+        self.sql.push('(');
+        self.render_expr(inner);
+        self.sql.push_str(", ");
+        self.emit_param(
+            &SqlParamSlot::Literal(SqlParam::Text(RUST_UNICODE_WHITESPACE.to_string())),
+            Some("TEXT"),
+        );
+        self.sql.push(')');
+    }
+
+    fn render_decimal_source(&mut self, inner: &SqlExpr, already_trimmed: bool) {
+        if already_trimmed {
+            self.render_expr(inner);
+        } else {
+            self.render_trimmed_unicode(inner);
+        }
+    }
+
+    fn render_try_parse_decimal(&mut self, inner: &SqlExpr, already_trimmed: bool) {
+        match self.dialect {
+            SqlDialect::Sqlite => self.sql.push_str("NULL"),
+            SqlDialect::Postgres => {
+                // Nested CASE guarantees PostgreSQL validates LENGTH + exact decimal syntax
+                // before evaluating CAST(... AS NUMERIC), even though AND is not short-circuited.
+                self.sql.push_str("(CASE WHEN (LENGTH(");
+                self.render_decimal_source(inner, already_trimmed);
+                self.sql.push_str(") <= 100000) THEN (CASE WHEN (");
+                self.render_decimal_source(inner, already_trimmed);
+                self.sql
+                    .push_str(" ~ '^[+-]?[0-9]+(\\.[0-9]{0,18})?$') THEN (CASE WHEN (CAST(");
+                self.render_decimal_source(inner, already_trimmed);
+                self.sql.push_str(
+                    " AS NUMERIC) >= CAST('-170141183460469231731.687303715884105727' AS NUMERIC) AND CAST(",
+                );
+                self.render_decimal_source(inner, already_trimmed);
+                self.sql.push_str(
+                    " AS NUMERIC) <= CAST('170141183460469231731.687303715884105727' AS NUMERIC)) THEN CAST(",
+                );
+                self.render_decimal_source(inner, already_trimmed);
+                self.sql.push_str(
+                    " AS NUMERIC) ELSE CAST(NULL AS NUMERIC) END) ELSE CAST(NULL AS NUMERIC) END) ELSE CAST(NULL AS NUMERIC) END)",
+                );
+            }
         }
     }
 
@@ -1532,6 +1603,7 @@ struct PushedNode {
     query: SqlQuery,
     schema: TableTy,
     unique_keys: Vec<Vec<Ident>>,
+    known_not_null: HashSet<Ident>,
     pushed_ops: Vec<String>,
     deterministic_order: bool,
     needs_wrap_for_filter: bool,
@@ -1672,6 +1744,12 @@ impl PushedNode {
         {
             unique_keys.push(pk_cols);
         }
+        let known_not_null: HashSet<Ident> = schema
+            .cols
+            .iter()
+            .filter(|c| !c.ty.is_option())
+            .map(|c| c.name.clone())
+            .collect();
         Ok(Self {
             db_name: db_name.to_string(),
             query: SqlQuery::Select {
@@ -1688,6 +1766,7 @@ impl PushedNode {
             },
             schema: schema.clone(),
             unique_keys,
+            known_not_null,
             pushed_ops: vec![format!("SourceDB({table_name})")],
             deterministic_order: true,
             needs_wrap_for_filter: has_pg_text_cast,
@@ -1733,6 +1812,7 @@ impl PushedNode {
         }
         self.unique_keys
             .retain(|uk| uk.iter().all(|k| cols.contains(k)));
+        self.known_not_null.retain(|k| cols.contains(k));
         self.schema = TableTy {
             cols: out_cols,
             row_tags: self.schema.row_tags,
@@ -1810,6 +1890,15 @@ impl PushedNode {
                 }
             }
         }
+        self.known_not_null = self
+            .known_not_null
+            .into_iter()
+            .map(|k| {
+                rename_map
+                    .get(k.as_str())
+                    .map_or(k, |&new_n| new_n.to_string())
+            })
+            .collect();
         self.schema = TableTy {
             cols: out_cols,
             row_tags: self.schema.row_tags,
@@ -1884,7 +1973,9 @@ impl PushedNode {
     }
 
     fn apply_filter(mut self, pred_expr: SqlExpr, pred_tags: &TagSet) -> Self {
-        let pred_expr = simplify_coalesce_pred(pred_expr);
+        let pred_expr =
+            simplify_known_not_null(simplify_coalesce_pred(pred_expr), &self.known_not_null);
+        collect_filter_not_null_cols(&pred_expr, &mut self.known_not_null);
         let (wrapped, pred_expr) = self.hoist_try_parse_iso_dates(pred_expr);
         self = wrapped;
         if self.needs_wrap_for_filter {
@@ -1924,12 +2015,21 @@ impl PushedNode {
         if wave.is_empty() {
             return self;
         }
+        let in_not_null = self.known_not_null.clone();
         let mut meta = Vec::with_capacity(wave.len());
         let mut exprs = Vec::with_capacity(wave.len());
+        let mut next_not_null = self.known_not_null.clone();
         for (name, expr, spec) in wave {
+            let simplified = simplify_known_not_null(expr, &in_not_null);
+            if !spec.ty.is_option() || sql_expr_is_not_null(&simplified, &in_not_null) {
+                next_not_null.insert(name.clone());
+            } else {
+                next_not_null.remove(&name);
+            }
             meta.push((name, spec));
-            exprs.push(expr);
+            exprs.push(simplified);
         }
+        self.known_not_null = next_not_null;
         let (wrapped, exprs) = self.hoist_try_parse_iso_dates_batch(exprs);
         self = wrapped;
         // Wrap first so derived expressions always see clean upstream column names,
@@ -2005,6 +2105,7 @@ impl PushedNode {
         self.schema.summarized = false;
         self.schema.distinct_by = None;
         self.unique_keys.retain(|uk| !uk.iter().any(|k| k == col));
+        self.known_not_null.insert(col.to_string());
         self.needs_wrap_for_filter = true;
         self.needs_wrap_for_proj = true;
         self.pushed_ops.push(format!("Redact({col})"));
@@ -2410,6 +2511,15 @@ impl PushedNode {
         ops.extend(right.pushed_ops);
         ops.push("Union".to_string());
         let next_alias = left.next_alias_id.max(right.next_alias_id);
+        let known_not_null: HashSet<Ident> = merged_cols
+            .iter()
+            .filter(|c| {
+                !c.ty.is_option()
+                    || (left.known_not_null.contains(&c.name)
+                        && right.known_not_null.contains(&c.name))
+            })
+            .map(|c| c.name.clone())
+            .collect();
         Ok(Self {
             db_name: left.db_name,
             query: SqlQuery::UnionAll {
@@ -2426,6 +2536,7 @@ impl PushedNode {
                 distinct_by: None,
             },
             unique_keys: Vec::new(),
+            known_not_null,
             pushed_ops: ops,
             deterministic_order: false,
             needs_wrap_for_filter: true,
@@ -2510,15 +2621,17 @@ impl PushedNode {
                 table_alias: Some(r_alias.clone()),
                 name: rc.name.clone(),
             };
-            let eq_expr = if lc.ty.is_option() || rc.ty.is_option() {
-                SqlExpr::NullSafeEq {
-                    negated: false,
+            let l_non_null = !lc.ty.is_option() || left.known_not_null.contains(&lc.name);
+            let r_non_null = !rc.ty.is_option() || right.known_not_null.contains(&rc.name);
+            let eq_expr = if l_non_null && r_non_null {
+                SqlExpr::Binary {
+                    op: "=",
                     left: Box::new(l_col),
                     right: Box::new(r_col),
                 }
             } else {
-                SqlExpr::Binary {
-                    op: "=",
+                SqlExpr::NullSafeEq {
+                    negated: false,
                     left: Box::new(l_col),
                     right: Box::new(r_col),
                 }
@@ -2551,7 +2664,7 @@ impl PushedNode {
             distinct_by: None,
         };
 
-        let (query, out_unique_keys) = match kind {
+        let (query, out_unique_keys, out_known_not_null) = match kind {
             JoinKind::Semi | JoinKind::Anti => {
                 let items: Vec<SqlSelectItem> = left
                     .schema
@@ -2600,7 +2713,7 @@ impl PushedNode {
                     order_by: Vec::new(),
                     limit: None,
                 };
-                (q, left.unique_keys)
+                (q, left.unique_keys, left.known_not_null)
             }
             _ => {
                 let same_key_names: &[Ident] = match on {
@@ -2614,6 +2727,35 @@ impl PushedNode {
                     .filter(|rc| !same_key_names.contains(&rc.name))
                     .collect();
                 let l_len = left.schema.cols.len();
+                let is_left_join = matches!(kind, JoinKind::LeftOne | JoinKind::LeftManyToOne);
+                let mut out_nn = HashSet::new();
+                for (i, lc) in left.schema.cols.iter().enumerate() {
+                    let matched_non_null_rhs = !is_left_join
+                        && key_pairs.iter().any(|(lk, rk)| {
+                            lk.name == lc.name
+                                && (!rk.ty.is_option() || right.known_not_null.contains(&rk.name))
+                        });
+                    if !lc.ty.is_option()
+                        || left.known_not_null.contains(&lc.name)
+                        || matched_non_null_rhs
+                    {
+                        out_nn.insert(joined_cols[i].name.clone());
+                    }
+                }
+                if !is_left_join {
+                    for (j, rc) in r_kept.iter().enumerate() {
+                        let matched_non_null_lhs = key_pairs.iter().any(|(lk, rk)| {
+                            rk.name == rc.name
+                                && (!lk.ty.is_option() || left.known_not_null.contains(&lk.name))
+                        });
+                        if !rc.ty.is_option()
+                            || right.known_not_null.contains(&rc.name)
+                            || matched_non_null_lhs
+                        {
+                            out_nn.insert(joined_cols[l_len + j].name.clone());
+                        }
+                    }
+                }
                 let mut items = Vec::with_capacity(joined_cols.len());
                 let mut left_rename_map: HashMap<Ident, Ident> = HashMap::new();
                 for (i, lc) in left.schema.cols.iter().enumerate() {
@@ -2674,7 +2816,7 @@ impl PushedNode {
                 } else {
                     Vec::new()
                 };
-                (q, preserved_uqs)
+                (q, preserved_uqs, out_nn)
             }
         };
 
@@ -2683,6 +2825,7 @@ impl PushedNode {
             query,
             schema: out_schema,
             unique_keys: out_unique_keys,
+            known_not_null: out_known_not_null,
             pushed_ops: ops,
             deterministic_order: false,
             needs_wrap_for_filter: true,
@@ -2749,6 +2892,30 @@ impl PushedNode {
                 ));
             }
         }
+
+        let mut out_known_not_null = HashSet::new();
+        for gc in &ordered_group_cols {
+            if !gc.ty.is_option() || self.known_not_null.contains(&gc.name) {
+                out_known_not_null.insert(gc.name.clone());
+            }
+        }
+        let mut agg_expr_indices = Vec::new();
+        let mut agg_exprs = Vec::new();
+        for (idx, (_, _, arg_opt)) in agg_items.iter().enumerate() {
+            if let Some((e, _, _)) = arg_opt {
+                agg_expr_indices.push(idx);
+                agg_exprs.push(simplify_known_not_null(e.clone(), &self.known_not_null));
+            }
+        }
+        let (wrapped, hoisted_agg_exprs) = self.hoist_try_parse_iso_dates_batch(agg_exprs);
+        self = wrapped;
+        let mut agg_items_owned: Vec<TranslatedAggSpec> = agg_items.to_vec();
+        for (idx, hoisted_e) in agg_expr_indices.into_iter().zip(hoisted_agg_exprs) {
+            if let Some((_, ty, ts)) = agg_items_owned[idx].2.take() {
+                agg_items_owned[idx].2 = Some((hoisted_e, ty, ts));
+            }
+        }
+        let agg_items = agg_items_owned.as_slice();
 
         if self.needs_wrap_for_proj || self.needs_wrap_for_filter {
             self = self.wrap_as_subquery();
@@ -2875,6 +3042,12 @@ impl PushedNode {
                 expr: sql_e,
                 alias: name.clone(),
             });
+            if matches!(
+                op,
+                ExecAggOp::Core(AggOp::Count | AggOp::CountDistinct) | ExecAggOp::CountIf
+            ) {
+                out_known_not_null.insert(name.clone());
+            }
             out_cols.push(ColSpec {
                 name: name.clone(),
                 ty: out_ty,
@@ -2943,6 +3116,7 @@ impl PushedNode {
         let ordered_key_names: Vec<Ident> =
             ordered_group_cols.iter().map(|c| c.name.clone()).collect();
         self.unique_keys = vec![ordered_key_names.clone()];
+        self.known_not_null = out_known_not_null;
         self.schema = TableTy {
             cols: out_cols,
             row_tags,
@@ -2973,8 +3147,16 @@ fn expr_has_untrimmed_try_parse_date(expr: &SqlExpr) -> bool {
         SqlExpr::TryParseIsoDate {
             already_trimmed: false,
             ..
+        }
+        | SqlExpr::TryParseDecimal {
+            already_trimmed: false,
+            ..
         } => true,
         SqlExpr::TryParseIsoDate {
+            inner,
+            already_trimmed: true,
+        }
+        | SqlExpr::TryParseDecimal {
             inner,
             already_trimmed: true,
         }
@@ -2984,6 +3166,7 @@ fn expr_has_untrimmed_try_parse_date(expr: &SqlExpr) -> bool {
         | SqlExpr::Cast { expr: inner, .. }
         | SqlExpr::Agg { arg: inner, .. }
         | SqlExpr::TrimAscii(inner)
+        | SqlExpr::TrimUnicode(inner)
         | SqlExpr::ExtractYear(inner) => expr_has_untrimmed_try_parse_date(inner),
         SqlExpr::Binary { left, right, .. }
         | SqlExpr::NullSafeEq { left, right, .. }
@@ -3090,8 +3273,10 @@ fn collect_sql_expr_col_refs(expr: &SqlExpr, out: &mut HashSet<String>) {
         | SqlExpr::Cast { expr: inner, .. }
         | SqlExpr::Agg { arg: inner, .. }
         | SqlExpr::TrimAscii(inner)
+        | SqlExpr::TrimUnicode(inner)
         | SqlExpr::ExtractYear(inner)
-        | SqlExpr::TryParseIsoDate { inner, .. } => collect_sql_expr_col_refs(inner, out),
+        | SqlExpr::TryParseIsoDate { inner, .. }
+        | SqlExpr::TryParseDecimal { inner, .. } => collect_sql_expr_col_refs(inner, out),
         SqlExpr::Binary { left, right, .. }
         | SqlExpr::NullSafeEq { left, right, .. }
         | SqlExpr::Coalesce(left, right)
@@ -3408,10 +3593,20 @@ fn simplify_coalesce_pred(expr: SqlExpr) -> SqlExpr {
             }
         }
         SqlExpr::TrimAscii(inner) => SqlExpr::TrimAscii(Box::new(simplify_coalesce_pred(*inner))),
+        SqlExpr::TrimUnicode(inner) => {
+            SqlExpr::TrimUnicode(Box::new(simplify_coalesce_pred(*inner)))
+        }
         SqlExpr::TryParseIsoDate {
             inner,
             already_trimmed,
         } => SqlExpr::TryParseIsoDate {
+            inner: Box::new(simplify_coalesce_pred(*inner)),
+            already_trimmed,
+        },
+        SqlExpr::TryParseDecimal {
+            inner,
+            already_trimmed,
+        } => SqlExpr::TryParseDecimal {
             inner: Box::new(simplify_coalesce_pred(*inner)),
             already_trimmed,
         },
@@ -3421,6 +3616,187 @@ fn simplify_coalesce_pred(expr: SqlExpr) -> SqlExpr {
         SqlExpr::AtTimeZone { expr, tz } => SqlExpr::AtTimeZone {
             expr: Box::new(simplify_coalesce_pred(*expr)),
             tz: Box::new(simplify_coalesce_pred(*tz)),
+        },
+        other @ (SqlExpr::Col { .. }
+        | SqlExpr::Param { .. }
+        | SqlExpr::Exists { .. }
+        | SqlExpr::CountStar
+        | SqlExpr::Agg { .. }
+        | SqlExpr::BoolLit(_)
+        | SqlExpr::IntLit(_)
+        | SqlExpr::RowNumber { .. }) => other,
+    }
+}
+
+fn sql_expr_is_not_null(expr: &SqlExpr, known_not_null: &HashSet<Ident>) -> bool {
+    match expr {
+        SqlExpr::Col {
+            table_alias: None,
+            name,
+        } => known_not_null.contains(name),
+        SqlExpr::Cast { expr, .. } => sql_expr_is_not_null(expr, known_not_null),
+        SqlExpr::Coalesce(left, right) => {
+            sql_expr_is_not_null(left, known_not_null)
+                || sql_expr_is_not_null(right, known_not_null)
+        }
+        SqlExpr::Param {
+            slot: SqlParamSlot::Literal(p),
+            ..
+        } => !matches!(p, SqlParam::Null),
+        SqlExpr::BoolLit(_) | SqlExpr::IntLit(_) | SqlExpr::CountStar => true,
+        _ => false,
+    }
+}
+
+fn collect_filter_not_null_cols(expr: &SqlExpr, out: &mut HashSet<Ident>) {
+    match expr {
+        SqlExpr::Binary {
+            op: "AND",
+            left,
+            right,
+        } => {
+            collect_filter_not_null_cols(left, out);
+            collect_filter_not_null_cols(right, out);
+        }
+        SqlExpr::IsNull { negated: true, arg } => {
+            if let SqlExpr::Col {
+                table_alias: None,
+                name,
+            } = arg.as_ref()
+            {
+                out.insert(name.clone());
+            }
+        }
+        SqlExpr::Unary { op: "NOT", arg } => {
+            if let SqlExpr::IsNull {
+                negated: false,
+                arg: inner,
+            } = arg.as_ref()
+                && let SqlExpr::Col {
+                    table_alias: None,
+                    name,
+                } = inner.as_ref()
+            {
+                out.insert(name.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn simplify_known_not_null(expr: SqlExpr, known_not_null: &HashSet<Ident>) -> SqlExpr {
+    match expr {
+        SqlExpr::Unary { op, arg } => SqlExpr::Unary {
+            op,
+            arg: Box::new(simplify_known_not_null(*arg, known_not_null)),
+        },
+        SqlExpr::Binary { op, left, right } => SqlExpr::Binary {
+            op,
+            left: Box::new(simplify_known_not_null(*left, known_not_null)),
+            right: Box::new(simplify_known_not_null(*right, known_not_null)),
+        },
+        SqlExpr::NullSafeEq {
+            negated,
+            left,
+            right,
+        } => {
+            let left = simplify_known_not_null(*left, known_not_null);
+            let right = simplify_known_not_null(*right, known_not_null);
+            if sql_expr_is_not_null(&left, known_not_null)
+                && sql_expr_is_not_null(&right, known_not_null)
+            {
+                return SqlExpr::Binary {
+                    op: if negated { "<>" } else { "=" },
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            }
+            SqlExpr::NullSafeEq {
+                negated,
+                left: Box::new(left),
+                right: Box::new(right),
+            }
+        }
+        SqlExpr::IsNull { negated, arg } => SqlExpr::IsNull {
+            negated,
+            arg: Box::new(simplify_known_not_null(*arg, known_not_null)),
+        },
+        SqlExpr::CollateC(inner) => {
+            SqlExpr::CollateC(Box::new(simplify_known_not_null(*inner, known_not_null)))
+        }
+        SqlExpr::Func { name, args } => SqlExpr::Func {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| simplify_known_not_null(a, known_not_null))
+                .collect(),
+        },
+        SqlExpr::Cast { expr, ty } => SqlExpr::Cast {
+            expr: Box::new(simplify_known_not_null(*expr, known_not_null)),
+            ty,
+        },
+        SqlExpr::Case { whens, else_br } => SqlExpr::Case {
+            whens: whens
+                .into_iter()
+                .map(|(c, t)| {
+                    (
+                        simplify_known_not_null(c, known_not_null),
+                        simplify_known_not_null(t, known_not_null),
+                    )
+                })
+                .collect(),
+            else_br: Box::new(simplify_known_not_null(*else_br, known_not_null)),
+        },
+        SqlExpr::Coalesce(left, right) => {
+            let left = simplify_known_not_null(*left, known_not_null);
+            if sql_expr_is_not_null(&left, known_not_null) {
+                return left;
+            }
+            let right = simplify_known_not_null(*right, known_not_null);
+            SqlExpr::Coalesce(Box::new(left), Box::new(right))
+        }
+        SqlExpr::Substring {
+            str_expr,
+            start,
+            len,
+        } => SqlExpr::Substring {
+            str_expr: Box::new(simplify_known_not_null(*str_expr, known_not_null)),
+            start: Box::new(simplify_known_not_null(*start, known_not_null)),
+            len: Box::new(simplify_known_not_null(*len, known_not_null)),
+        },
+        SqlExpr::InList { expr, items } => SqlExpr::InList {
+            expr: Box::new(simplify_known_not_null(*expr, known_not_null)),
+            items: items
+                .into_iter()
+                .map(|it| simplify_known_not_null(it, known_not_null))
+                .collect(),
+        },
+        SqlExpr::TrimAscii(inner) => {
+            SqlExpr::TrimAscii(Box::new(simplify_known_not_null(*inner, known_not_null)))
+        }
+        SqlExpr::TrimUnicode(inner) => {
+            SqlExpr::TrimUnicode(Box::new(simplify_known_not_null(*inner, known_not_null)))
+        }
+        SqlExpr::TryParseIsoDate {
+            inner,
+            already_trimmed,
+        } => SqlExpr::TryParseIsoDate {
+            inner: Box::new(simplify_known_not_null(*inner, known_not_null)),
+            already_trimmed,
+        },
+        SqlExpr::TryParseDecimal {
+            inner,
+            already_trimmed,
+        } => SqlExpr::TryParseDecimal {
+            inner: Box::new(simplify_known_not_null(*inner, known_not_null)),
+            already_trimmed,
+        },
+        SqlExpr::ExtractYear(inner) => {
+            SqlExpr::ExtractYear(Box::new(simplify_known_not_null(*inner, known_not_null)))
+        }
+        SqlExpr::AtTimeZone { expr, tz } => SqlExpr::AtTimeZone {
+            expr: Box::new(simplify_known_not_null(*expr, known_not_null)),
+            tz: Box::new(simplify_known_not_null(*tz, known_not_null)),
         },
         other @ (SqlExpr::Col { .. }
         | SqlExpr::Param { .. }
@@ -3478,6 +3854,52 @@ fn rewrite_leaf_try_parse_dates(
             inner,
             already_trimmed: true,
         } => SqlExpr::TryParseIsoDate {
+            inner: Box::new(rewrite_leaf_try_parse_dates(
+                *inner,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+            already_trimmed: true,
+        },
+        SqlExpr::TryParseDecimal {
+            inner,
+            already_trimmed: false,
+        } => {
+            if expr_has_untrimmed_try_parse_date(&inner) {
+                SqlExpr::TryParseDecimal {
+                    inner: Box::new(rewrite_leaf_try_parse_dates(
+                        *inner,
+                        schema,
+                        next_alias_id,
+                        hoisted,
+                    )),
+                    already_trimmed: false,
+                }
+            } else {
+                let candidate = loop {
+                    *next_alias_id += 1;
+                    let alias = format!("_dana_dec_{}", *next_alias_id);
+                    if schema.find_col(&alias).is_none()
+                        && !hoisted.iter().any(|(n, _)| n == &alias)
+                    {
+                        break alias;
+                    }
+                };
+                hoisted.push((candidate.clone(), SqlExpr::TrimUnicode(inner)));
+                SqlExpr::TryParseDecimal {
+                    inner: Box::new(SqlExpr::Col {
+                        table_alias: None,
+                        name: candidate,
+                    }),
+                    already_trimmed: true,
+                }
+            }
+        }
+        SqlExpr::TryParseDecimal {
+            inner,
+            already_trimmed: true,
+        } => SqlExpr::TryParseDecimal {
             inner: Box::new(rewrite_leaf_try_parse_dates(
                 *inner,
                 schema,
@@ -3647,6 +4069,9 @@ fn rewrite_leaf_try_parse_dates(
             next_alias_id,
             hoisted,
         ))),
+        SqlExpr::TrimUnicode(inner) => SqlExpr::TrimUnicode(Box::new(
+            rewrite_leaf_try_parse_dates(*inner, schema, next_alias_id, hoisted),
+        )),
         SqlExpr::ExtractYear(inner) => SqlExpr::ExtractYear(Box::new(
             rewrite_leaf_try_parse_dates(*inner, schema, next_alias_id, hoisted),
         )),
@@ -6493,9 +6918,25 @@ fn translate_exec_row_expr(
                     d_tags.union(&tz_tags),
                 ))
             }
+            (ExecPrimOp::TryParseDecimal, [s_re]) => {
+                if ctx.dialect != SqlDialect::Postgres {
+                    return Err("SQLite TryParseDecimal requires local VM".to_string());
+                }
+                let (s_e, s_ty, s_tags) = translate_exec_row_expr(s_re, schema, ctx)?;
+                if s_ty != ScalarTy::Text {
+                    return Err("TryParseDecimal expects Text".to_string());
+                }
+                Ok((
+                    SqlExpr::TryParseDecimal {
+                        inner: Box::new(s_e),
+                        already_trimmed: false,
+                    },
+                    ScalarTy::Option(Box::new(ScalarTy::Decimal)),
+                    s_tags,
+                ))
+            }
             (
                 ExecPrimOp::TryParseInt
-                | ExecPrimOp::TryParseDecimal
                 | ExecPrimOp::TryParseFloat
                 | ExecPrimOp::ClampFloat
                 | ExecPrimOp::RoundToFloat

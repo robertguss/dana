@@ -111,11 +111,11 @@ Rust 1.90+ and the system C libraries behind `src/ffi/` (`zlib`, `zstd`, `sqlite
 ```sh
 # macOS (Apple Silicon / Intel)
 brew install pkg-config openssl@3 zstd
-cargo install --git https://github.com/robertguss/dana --tag v0.6.4
+cargo install --git https://github.com/robertguss/dana --tag v0.6.6
 
 # Ubuntu / Debian
 sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev libzstd-dev zlib1g-dev
-cargo install --git https://github.com/robertguss/dana --tag v0.6.4
+cargo install --git https://github.com/robertguss/dana --tag v0.6.6
 ```
 
 ## Quickstart CLI
