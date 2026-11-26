@@ -733,6 +733,39 @@ fn sql_query_subquery_depth(query: &SqlQuery) -> usize {
     }
 }
 
+fn select_defines_hoisted_iso(query: &SqlQuery) -> bool {
+    matches!(
+        query,
+        SqlQuery::Select { items, .. }
+            if items
+                .iter()
+                .any(|item| item.alias.starts_with("_dana_iso_")
+                    && matches!(item.expr, SqlExpr::TrimAscii(_)))
+    )
+}
+
+fn sql_from_has_hoisted_iso(from: &SqlFrom) -> bool {
+    match from {
+        SqlFrom::Table { .. } | SqlFrom::CteRef { .. } => false,
+        SqlFrom::Subquery { query, .. } => sql_query_has_hoisted_iso(query),
+        SqlFrom::Join { left, right, .. } => {
+            sql_from_has_hoisted_iso(left) || sql_from_has_hoisted_iso(right)
+        }
+    }
+}
+
+fn sql_query_has_hoisted_iso(query: &SqlQuery) -> bool {
+    if select_defines_hoisted_iso(query) {
+        return true;
+    }
+    match query {
+        SqlQuery::Select { from, .. } => sql_from_has_hoisted_iso(from),
+        SqlQuery::UnionAll { left, right, .. } => {
+            sql_query_has_hoisted_iso(left) || sql_query_has_hoisted_iso(right)
+        }
+    }
+}
+
 fn lift_from(from: &SqlFrom, ctes: &mut Vec<(String, SqlQuery)>) -> SqlFrom {
     match from {
         SqlFrom::Table { .. } | SqlFrom::CteRef { .. } => from.clone(),
@@ -834,7 +867,9 @@ impl<'a> SqlRenderState<'a> {
     }
 
     fn render_root_query(&mut self, query: &SqlQuery) {
-        if sql_query_subquery_depth(query) >= 4 {
+        let should_lift = sql_query_subquery_depth(query) >= 4
+            || (self.dialect == SqlDialect::Postgres && sql_query_has_hoisted_iso(query));
+        if should_lift {
             let (ctes, root) = lift_subqueries_to_ctes(query);
             self.sql.push_str("WITH ");
             for (idx, (cte_name, cte_query)) in ctes.iter().enumerate() {
@@ -842,7 +877,11 @@ impl<'a> SqlRenderState<'a> {
                     self.sql.push_str(", ");
                 }
                 self.sql.push_str(&quote_sql_ident(cte_name));
-                self.sql.push_str(" AS (");
+                if self.dialect == SqlDialect::Postgres && select_defines_hoisted_iso(cte_query) {
+                    self.sql.push_str(" AS MATERIALIZED (");
+                } else {
+                    self.sql.push_str(" AS (");
+                }
                 self.render_query(cte_query);
                 self.sql.push(')');
             }
@@ -1773,16 +1812,21 @@ impl PushedNode {
         Ok(self)
     }
 
-    /// Hoist any `TryParseIsoDate` trim subexpression once into an inner subquery so the 15
-    /// validation checks never duplicate inner SQL parameters (e.g. `COALESCE`/`SUBSTRING`).
-    fn hoist_try_parse_iso_dates(mut self, mut expr: SqlExpr) -> (Self, SqlExpr) {
+    /// Hoist any `TryParseIsoDate` trim subexpressions across `exprs` into shared inner subquery
+    /// columns so the 15 validation checks never duplicate inner SQL parameters and independent
+    /// derive columns share a single materialized CTE.
+    fn hoist_try_parse_iso_dates_batch(mut self, mut exprs: Vec<SqlExpr>) -> (Self, Vec<SqlExpr>) {
         loop {
             let mut hoisted = Vec::new();
             let mut next_id = self.next_alias_id;
-            expr = rewrite_leaf_try_parse_dates(expr, &self.schema, &mut next_id, &mut hoisted);
+            for expr in &mut exprs {
+                let taken = std::mem::replace(expr, SqlExpr::BoolLit(false));
+                *expr =
+                    rewrite_leaf_try_parse_dates(taken, &self.schema, &mut next_id, &mut hoisted);
+            }
             self.next_alias_id = next_id;
             if hoisted.is_empty() {
-                return (self, expr);
+                return (self, exprs);
             }
             let must_wrap = self.needs_wrap_for_proj
                 || self.needs_wrap_for_filter
@@ -1816,7 +1860,14 @@ impl PushedNode {
         }
     }
 
+    fn hoist_try_parse_iso_dates(self, expr: SqlExpr) -> (Self, SqlExpr) {
+        let (wrapped, exprs) = self.hoist_try_parse_iso_dates_batch(vec![expr]);
+        let out = exprs.into_iter().next().unwrap_or(SqlExpr::BoolLit(false));
+        (wrapped, out)
+    }
+
     fn apply_filter(mut self, pred_expr: SqlExpr, pred_tags: &TagSet) -> Self {
+        let pred_expr = simplify_coalesce_pred(pred_expr);
         let (wrapped, pred_expr) = self.hoist_try_parse_iso_dates(pred_expr);
         self = wrapped;
         if self.needs_wrap_for_filter {
@@ -1852,40 +1903,51 @@ impl PushedNode {
         self
     }
 
-    fn apply_derive_single(mut self, name: &str, expr: SqlExpr, spec: ColSpec) -> Self {
-        let (wrapped, expr) = self.hoist_try_parse_iso_dates(expr);
+    fn apply_derive_wave(mut self, wave: Vec<(Ident, SqlExpr, ColSpec)>) -> Self {
+        if wave.is_empty() {
+            return self;
+        }
+        let mut meta = Vec::with_capacity(wave.len());
+        let mut exprs = Vec::with_capacity(wave.len());
+        for (name, expr, spec) in wave {
+            meta.push((name, spec));
+            exprs.push(expr);
+        }
+        let (wrapped, exprs) = self.hoist_try_parse_iso_dates_batch(exprs);
         self = wrapped;
         // Wrap first so derived expressions always see clean upstream column names,
         // and subsequent derives/filters can safely reference newly derived or overwritten columns.
         if self.needs_wrap_for_proj || self.needs_wrap_for_filter {
             self = self.wrap_as_subquery();
         }
-        let existing_pos = self.schema.cols.iter().position(|c| c.name == name);
-        if let SqlQuery::Select { items, .. } = &mut self.query {
-            match existing_pos {
-                Some(idx) => {
-                    items[idx] = SqlSelectItem {
-                        expr,
-                        alias: name.to_string(),
-                    };
-                }
-                None => {
-                    items.push(SqlSelectItem {
-                        expr,
-                        alias: name.to_string(),
-                    });
-                }
-            }
-        }
         for c in &mut self.schema.cols {
             c.agg_kind = AggKind::Raw;
         }
-        match existing_pos {
-            Some(idx) => {
-                self.schema.cols[idx] = spec;
-                self.unique_keys.retain(|uk| !uk.iter().any(|k| k == name));
+        for ((name, spec), expr) in meta.into_iter().zip(exprs) {
+            let existing_pos = self.schema.cols.iter().position(|c| c.name == name);
+            if let SqlQuery::Select { items, .. } = &mut self.query {
+                match existing_pos {
+                    Some(idx) => {
+                        items[idx] = SqlSelectItem {
+                            expr,
+                            alias: name.clone(),
+                        };
+                    }
+                    None => {
+                        items.push(SqlSelectItem {
+                            expr,
+                            alias: name.clone(),
+                        });
+                    }
+                }
             }
-            None => self.schema.cols.push(spec),
+            match existing_pos {
+                Some(idx) => {
+                    self.schema.cols[idx] = spec;
+                    self.unique_keys.retain(|uk| !uk.iter().any(|k| k == &name));
+                }
+                None => self.schema.cols.push(spec),
+            }
         }
         self.schema.grouped_by = None;
         self.schema.summarized = false;
@@ -2944,6 +3006,398 @@ fn expr_has_untrimmed_try_parse_date(expr: &SqlExpr) -> bool {
         | SqlExpr::CountStar
         | SqlExpr::BoolLit(_)
         | SqlExpr::IntLit(_) => false,
+    }
+}
+
+fn collect_sql_from_col_refs(from: &SqlFrom, out: &mut HashSet<String>) {
+    match from {
+        SqlFrom::Table { .. } | SqlFrom::CteRef { .. } => {}
+        SqlFrom::Subquery { query, .. } => collect_sql_query_col_refs(query, out),
+        SqlFrom::Join {
+            left, right, on, ..
+        } => {
+            collect_sql_from_col_refs(left, out);
+            collect_sql_from_col_refs(right, out);
+            collect_sql_expr_col_refs(on, out);
+        }
+    }
+}
+
+fn collect_sql_query_col_refs(query: &SqlQuery, out: &mut HashSet<String>) {
+    match query {
+        SqlQuery::Select {
+            distinct_on,
+            items,
+            from,
+            where_clause,
+            group_by,
+            order_by,
+            ..
+        } => {
+            for e in distinct_on {
+                collect_sql_expr_col_refs(e, out);
+            }
+            for item in items {
+                collect_sql_expr_col_refs(&item.expr, out);
+            }
+            collect_sql_from_col_refs(from, out);
+            if let Some(w) = where_clause {
+                collect_sql_expr_col_refs(w, out);
+            }
+            for g in group_by {
+                collect_sql_expr_col_refs(g, out);
+            }
+            for o in order_by {
+                collect_sql_expr_col_refs(&o.expr, out);
+            }
+        }
+        SqlQuery::UnionAll { left, right, .. } => {
+            collect_sql_query_col_refs(left, out);
+            collect_sql_query_col_refs(right, out);
+        }
+    }
+}
+
+fn collect_sql_expr_col_refs(expr: &SqlExpr, out: &mut HashSet<String>) {
+    match expr {
+        SqlExpr::Col { name, .. } => {
+            out.insert(name.clone());
+        }
+        SqlExpr::Param { .. } | SqlExpr::CountStar | SqlExpr::BoolLit(_) | SqlExpr::IntLit(_) => {}
+        SqlExpr::Unary { arg: inner, .. }
+        | SqlExpr::IsNull { arg: inner, .. }
+        | SqlExpr::CollateC(inner)
+        | SqlExpr::Cast { expr: inner, .. }
+        | SqlExpr::Agg { arg: inner, .. }
+        | SqlExpr::TrimAscii(inner)
+        | SqlExpr::TryParseIsoDate { inner, .. } => collect_sql_expr_col_refs(inner, out),
+        SqlExpr::Binary { left, right, .. }
+        | SqlExpr::NullSafeEq { left, right, .. }
+        | SqlExpr::Coalesce(left, right) => {
+            collect_sql_expr_col_refs(left, out);
+            collect_sql_expr_col_refs(right, out);
+        }
+        SqlExpr::Func { args, .. } => {
+            for a in args {
+                collect_sql_expr_col_refs(a, out);
+            }
+        }
+        SqlExpr::Case { whens, else_br } => {
+            for (c, t) in whens {
+                collect_sql_expr_col_refs(c, out);
+                collect_sql_expr_col_refs(t, out);
+            }
+            collect_sql_expr_col_refs(else_br, out);
+        }
+        SqlExpr::Exists { subquery, .. } => collect_sql_query_col_refs(subquery, out),
+        SqlExpr::Substring {
+            str_expr,
+            start,
+            len,
+        } => {
+            collect_sql_expr_col_refs(str_expr, out);
+            collect_sql_expr_col_refs(start, out);
+            collect_sql_expr_col_refs(len, out);
+        }
+        SqlExpr::InList { expr, items } => {
+            collect_sql_expr_col_refs(expr, out);
+            for item in items {
+                collect_sql_expr_col_refs(item, out);
+            }
+        }
+        SqlExpr::RowNumber {
+            partition_by,
+            order_by,
+        } => {
+            for p in partition_by {
+                collect_sql_expr_col_refs(p, out);
+            }
+            for o in order_by {
+                collect_sql_expr_col_refs(&o.expr, out);
+            }
+        }
+    }
+}
+
+fn sql_expr_col_refs(expr: &SqlExpr) -> HashSet<String> {
+    let mut out = HashSet::new();
+    collect_sql_expr_col_refs(expr, &mut out);
+    out
+}
+
+struct DeriveWaveState {
+    working_schema: TableTy,
+    wave: Vec<(Ident, SqlExpr, ColSpec)>,
+    written: HashSet<String>,
+    read: HashSet<String>,
+}
+
+impl DeriveWaveState {
+    fn new(schema: TableTy, capacity: usize) -> Self {
+        Self {
+            working_schema: schema,
+            wave: Vec::with_capacity(capacity),
+            written: HashSet::new(),
+            read: HashSet::new(),
+        }
+    }
+
+    fn push_item(
+        &mut self,
+        mut cur: PushedNode,
+        name: &str,
+        sql_e: SqlExpr,
+        spec: ColSpec,
+    ) -> PushedNode {
+        let deps = sql_expr_col_refs(&sql_e);
+        let conflicts = deps.iter().any(|d| self.written.contains(d))
+            || self.written.contains(name)
+            || self.read.contains(name);
+        if conflicts && !self.wave.is_empty() {
+            let taken = std::mem::take(&mut self.wave);
+            cur = cur.apply_derive_wave(taken);
+            self.written.clear();
+            self.read.clear();
+        }
+        if self.wave.is_empty() {
+            for c in &mut self.working_schema.cols {
+                c.agg_kind = AggKind::Raw;
+            }
+        }
+        match self.working_schema.cols.iter().position(|c| c.name == name) {
+            Some(idx) => self.working_schema.cols[idx] = spec.clone(),
+            None => self.working_schema.cols.push(spec.clone()),
+        }
+        self.working_schema.grouped_by = None;
+        self.working_schema.summarized = false;
+        self.working_schema.distinct_by = None;
+        self.written.insert(name.to_string());
+        self.read.extend(deps);
+        self.wave.push((name.to_string(), sql_e, spec));
+        cur
+    }
+
+    fn finish(mut self, mut cur: PushedNode) -> PushedNode {
+        if !self.wave.is_empty() {
+            let taken = std::mem::take(&mut self.wave);
+            cur = cur.apply_derive_wave(taken);
+        }
+        cur
+    }
+}
+
+fn exact_non_null_lit(expr: &SqlExpr) -> Option<SqlParam> {
+    match expr {
+        SqlExpr::BoolLit(b) => Some(SqlParam::Bool(*b)),
+        SqlExpr::IntLit(n) => Some(SqlParam::Int(*n)),
+        SqlExpr::Param {
+            slot:
+                SqlParamSlot::Literal(
+                    p @ (SqlParam::Text(_)
+                    | SqlParam::Int(_)
+                    | SqlParam::Bool(_)
+                    | SqlParam::Date(_)),
+                ),
+            ..
+        } => Some(p.clone()),
+        _ => None,
+    }
+}
+
+const fn same_exact_lit_kind(a: &SqlParam, b: &SqlParam) -> bool {
+    matches!(
+        (a, b),
+        (SqlParam::Text(_), SqlParam::Text(_))
+            | (SqlParam::Int(_), SqlParam::Int(_))
+            | (SqlParam::Bool(_), SqlParam::Bool(_))
+            | (SqlParam::Date(_), SqlParam::Date(_))
+    )
+}
+
+const fn is_sql_col(expr: &SqlExpr) -> bool {
+    matches!(expr, SqlExpr::Col { .. })
+}
+
+fn combine_null_guard_pred(col: SqlExpr, null_matches: bool, pred: SqlExpr) -> SqlExpr {
+    if null_matches {
+        SqlExpr::Binary {
+            op: "OR",
+            left: Box::new(SqlExpr::IsNull {
+                negated: false,
+                arg: Box::new(col),
+            }),
+            right: Box::new(pred),
+        }
+    } else {
+        SqlExpr::Binary {
+            op: "AND",
+            left: Box::new(SqlExpr::IsNull {
+                negated: true,
+                arg: Box::new(col),
+            }),
+            right: Box::new(pred),
+        }
+    }
+}
+
+fn try_rewrite_coalesce_eq(op: &'static str, left: &SqlExpr, right: &SqlExpr) -> Option<SqlExpr> {
+    if op != "=" && op != "<>" {
+        return None;
+    }
+    let (col, def_lit, target_lit, cmp) = match (left, right) {
+        (SqlExpr::Coalesce(c, d), rhs) if is_sql_col(c) => {
+            let d_lit = exact_non_null_lit(d)?;
+            let t_lit = exact_non_null_lit(rhs)?;
+            if !same_exact_lit_kind(&d_lit, &t_lit) {
+                return None;
+            }
+            (
+                c.as_ref().clone(),
+                d_lit,
+                t_lit,
+                SqlExpr::Binary {
+                    op,
+                    left: Box::new(c.as_ref().clone()),
+                    right: Box::new(rhs.clone()),
+                },
+            )
+        }
+        (lhs, SqlExpr::Coalesce(c, d)) if is_sql_col(c) => {
+            let d_lit = exact_non_null_lit(d)?;
+            let t_lit = exact_non_null_lit(lhs)?;
+            if !same_exact_lit_kind(&d_lit, &t_lit) {
+                return None;
+            }
+            (
+                c.as_ref().clone(),
+                d_lit,
+                t_lit,
+                SqlExpr::Binary {
+                    op,
+                    left: Box::new(lhs.clone()),
+                    right: Box::new(c.as_ref().clone()),
+                },
+            )
+        }
+        _ => return None,
+    };
+    let null_matches = if op == "=" {
+        def_lit == target_lit
+    } else {
+        def_lit != target_lit
+    };
+    Some(combine_null_guard_pred(col, null_matches, cmp))
+}
+
+/// Rewrite `COALESCE(col, d) = t`, `COALESCE(col, d) <> t`, and `COALESCE(col, d) IN (...)`
+/// (with exact non-null literals) into MCV-histogram-friendly exact 3-valued logic on `col`
+/// (`(col IS NULL) OR ...` / `(col IS NOT NULL) AND ...`).
+fn simplify_coalesce_pred(expr: SqlExpr) -> SqlExpr {
+    match expr {
+        SqlExpr::Unary { op, arg } => SqlExpr::Unary {
+            op,
+            arg: Box::new(simplify_coalesce_pred(*arg)),
+        },
+        SqlExpr::Binary { op, left, right } => {
+            let left = simplify_coalesce_pred(*left);
+            let right = simplify_coalesce_pred(*right);
+            if let Some(rewritten) = try_rewrite_coalesce_eq(op, &left, &right) {
+                return rewritten;
+            }
+            SqlExpr::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            }
+        }
+        SqlExpr::NullSafeEq {
+            negated,
+            left,
+            right,
+        } => SqlExpr::NullSafeEq {
+            negated,
+            left: Box::new(simplify_coalesce_pred(*left)),
+            right: Box::new(simplify_coalesce_pred(*right)),
+        },
+        SqlExpr::IsNull { negated, arg } => SqlExpr::IsNull {
+            negated,
+            arg: Box::new(simplify_coalesce_pred(*arg)),
+        },
+        SqlExpr::CollateC(inner) => SqlExpr::CollateC(Box::new(simplify_coalesce_pred(*inner))),
+        SqlExpr::Func { name, args } => SqlExpr::Func {
+            name,
+            args: args.into_iter().map(simplify_coalesce_pred).collect(),
+        },
+        SqlExpr::Cast { expr, ty } => SqlExpr::Cast {
+            expr: Box::new(simplify_coalesce_pred(*expr)),
+            ty,
+        },
+        SqlExpr::Case { whens, else_br } => SqlExpr::Case {
+            whens: whens
+                .into_iter()
+                .map(|(c, t)| (simplify_coalesce_pred(c), simplify_coalesce_pred(t)))
+                .collect(),
+            else_br: Box::new(simplify_coalesce_pred(*else_br)),
+        },
+        SqlExpr::Coalesce(left, right) => SqlExpr::Coalesce(
+            Box::new(simplify_coalesce_pred(*left)),
+            Box::new(simplify_coalesce_pred(*right)),
+        ),
+        SqlExpr::Substring {
+            str_expr,
+            start,
+            len,
+        } => SqlExpr::Substring {
+            str_expr: Box::new(simplify_coalesce_pred(*str_expr)),
+            start: Box::new(simplify_coalesce_pred(*start)),
+            len: Box::new(simplify_coalesce_pred(*len)),
+        },
+        SqlExpr::InList { expr, items } => {
+            let expr = simplify_coalesce_pred(*expr);
+            let items: Vec<SqlExpr> = items.into_iter().map(simplify_coalesce_pred).collect();
+            if !items.is_empty()
+                && let SqlExpr::Coalesce(c, d) = &expr
+                && is_sql_col(c)
+                && let Some(def_lit) = exact_non_null_lit(d)
+            {
+                let item_lits: Option<Vec<SqlParam>> = items
+                    .iter()
+                    .map(|it| {
+                        let p = exact_non_null_lit(it)?;
+                        same_exact_lit_kind(&def_lit, &p).then_some(p)
+                    })
+                    .collect();
+                if let Some(lits) = item_lits {
+                    let null_matches = lits.iter().any(|p| p == &def_lit);
+                    let col = c.as_ref().clone();
+                    let in_expr = SqlExpr::InList {
+                        expr: Box::new(col.clone()),
+                        items,
+                    };
+                    return combine_null_guard_pred(col, null_matches, in_expr);
+                }
+            }
+            SqlExpr::InList {
+                expr: Box::new(expr),
+                items,
+            }
+        }
+        SqlExpr::TrimAscii(inner) => SqlExpr::TrimAscii(Box::new(simplify_coalesce_pred(*inner))),
+        SqlExpr::TryParseIsoDate {
+            inner,
+            already_trimmed,
+        } => SqlExpr::TryParseIsoDate {
+            inner: Box::new(simplify_coalesce_pred(*inner)),
+            already_trimmed,
+        },
+        other @ (SqlExpr::Col { .. }
+        | SqlExpr::Param { .. }
+        | SqlExpr::Exists { .. }
+        | SqlExpr::CountStar
+        | SqlExpr::Agg { .. }
+        | SqlExpr::BoolLit(_)
+        | SqlExpr::IntLit(_)
+        | SqlExpr::RowNumber { .. }) => other,
     }
 }
 
@@ -4340,11 +4794,12 @@ fn split_core_node(
                 NodeSplit::Pushed(node) => {
                     let orig = node.clone();
                     let mut cur = node;
+                    let mut waves = DeriveWaveState::new(cur.schema.clone(), items.len());
                     let mut names = Vec::with_capacity(items.len());
                     for item in items {
                         match item {
                             DeriveItem::ColExpr { name, expr } => {
-                                match translate_core_row_expr(expr, &cur.schema, ctx) {
+                                match translate_core_row_expr(expr, &waves.working_schema, ctx) {
                                     Ok((sql_e, sty, tags)) => {
                                         let spec = ColSpec {
                                             name: name.clone(),
@@ -4353,7 +4808,7 @@ fn split_core_node(
                                             bucketed: false,
                                             agg_kind: AggKind::Raw,
                                         };
-                                        cur = cur.apply_derive_single(name, sql_e, spec);
+                                        cur = waves.push_item(cur, name, sql_e, spec);
                                         names.push(name.clone());
                                     }
                                     Err(reason) => {
@@ -4375,7 +4830,7 @@ fn split_core_node(
                                 cuts,
                                 labels,
                             } => match translate_bucket_col(
-                                &cur.schema,
+                                &waves.working_schema,
                                 name,
                                 source,
                                 cuts,
@@ -4383,7 +4838,7 @@ fn split_core_node(
                                 ctx.dialect,
                             ) {
                                 Ok((sql_e, spec)) => {
-                                    cur = cur.apply_derive_single(name, sql_e, spec);
+                                    cur = waves.push_item(cur, name, sql_e, spec);
                                     names.push(name.clone());
                                 }
                                 Err(reason) => {
@@ -4400,6 +4855,7 @@ fn split_core_node(
                             },
                         }
                     }
+                    cur = waves.finish(cur);
                     cur.pushed_ops
                         .push(format!("Derive([{}])", names.join(", ")));
                     NodeSplit::Pushed(cur)
@@ -6306,6 +6762,7 @@ fn split_exec_node(
                 NodeSplit::Pushed(node) => {
                     let orig = node.clone();
                     let mut cur = node;
+                    let mut waves = DeriveWaveState::new(cur.schema.clone(), items.len());
                     let mut names = Vec::with_capacity(items.len());
                     for item in items {
                         match item {
@@ -6315,10 +6772,10 @@ fn split_exec_node(
                                     ExecDeriveItem::SummaryCol { agg_kind, .. } => *agg_kind,
                                     _ => AggKind::Raw,
                                 };
-                                match translate_exec_row_expr(expr, &cur.schema, ctx) {
+                                match translate_exec_row_expr(expr, &waves.working_schema, ctx) {
                                     Ok((sql_e, sty, tags)) => {
-                                        let existing_tags = cur
-                                            .schema
+                                        let existing_tags = waves
+                                            .working_schema
                                             .find_col(name)
                                             .map(|c| c.tags.clone())
                                             .unwrap_or_default();
@@ -6329,7 +6786,7 @@ fn split_exec_node(
                                             bucketed: false,
                                             agg_kind: ak,
                                         };
-                                        cur = cur.apply_derive_single(name, sql_e, spec);
+                                        cur = waves.push_item(cur, name, sql_e, spec);
                                         names.push(name.clone());
                                     }
                                     Err(reason) => {
@@ -6351,7 +6808,7 @@ fn split_exec_node(
                                 cuts,
                                 labels,
                             } => match translate_bucket_col(
-                                &cur.schema,
+                                &waves.working_schema,
                                 name,
                                 source,
                                 cuts,
@@ -6359,7 +6816,7 @@ fn split_exec_node(
                                 ctx.dialect,
                             ) {
                                 Ok((sql_e, spec)) => {
-                                    cur = cur.apply_derive_single(name, sql_e, spec);
+                                    cur = waves.push_item(cur, name, sql_e, spec);
                                     names.push(name.clone());
                                 }
                                 Err(reason) => {
@@ -6380,7 +6837,7 @@ fn split_exec_node(
                                 allow,
                                 other,
                             } => match translate_coarsen_col(
-                                &cur.schema,
+                                &waves.working_schema,
                                 name,
                                 source,
                                 allow,
@@ -6388,7 +6845,7 @@ fn split_exec_node(
                                 ctx.dialect,
                             ) {
                                 Ok((sql_e, spec)) => {
-                                    cur = cur.apply_derive_single(name, sql_e, spec);
+                                    cur = waves.push_item(cur, name, sql_e, spec);
                                     names.push(name.clone());
                                 }
                                 Err(reason) => {
@@ -6405,6 +6862,7 @@ fn split_exec_node(
                             },
                         }
                     }
+                    cur = waves.finish(cur);
                     cur.pushed_ops
                         .push(format!("Derive([{}])", names.join(", ")));
                     NodeSplit::Pushed(cur)

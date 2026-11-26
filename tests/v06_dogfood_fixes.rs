@@ -1469,7 +1469,7 @@ fn check_src_with_lock(
 
 #[test]
 fn v06_sqlite_attach_and_unattached_schema_table_fallback() -> TestResult {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.3");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.4");
     let tmp = TempDir::new("sqlite_attach")?;
     let main_db = tmp.path().join("main.db");
     let populi_db = tmp.path().join("populi.db");
@@ -2777,12 +2777,12 @@ end
     let db_out = assert_oracle_vm_parity(db_src, Some(("DB", &uri)))?;
     assert_eq!(db_out, vec!["2"]);
 
-    // 5. CLI --version prints `dana v0.6.3`
+    // 5. CLI --version prints `dana v0.6.4`
     let ver = Command::new(env!("CARGO_BIN_EXE_dana"))
         .arg("--version")
         .output()?;
     assert_eq!(ver.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.3");
+    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.4");
 
     Ok(())
 }
@@ -3955,4 +3955,520 @@ end
     let out = assert_oracle_vm_parity(src, Some(("DB", &uri)))?;
     assert_eq!(out, vec!["cov:5:5:3:2:4"]);
     Ok(())
+}
+
+// ===========================================================================
+// Patch v0.6.4 Tests: PostgreSQL Materialized ISO CTEs, Derive Wave Coalescing,
+// and MCV-Histogram-Friendly COALESCE Predicates
+// ===========================================================================
+
+#[test]
+fn v064_postgres_materialized_iso_batch_derive_and_coalesce_mcv_rewrite() -> TestResult {
+    let tmp = TempDir::new("v064_pushdown")?;
+    let db_path = tmp.path().join("v064.db");
+    let uri = sqlite_uri(&db_path);
+    {
+        let mut conn = open_connection(&uri)?;
+        for stmt in [
+            "CREATE TABLE populi_enr (
+                sid TEXT,
+                campus TEXT,
+                status TEXT,
+                grade TEXT,
+                tstart TEXT,
+                tend TEXT,
+                oid TEXT,
+                a INTEGER,
+                b INTEGER
+            )",
+            "CREATE TABLE canvas_users (sid TEXT, state TEXT)",
+            "CREATE TABLE canvas_courses (oid TEXT, state TEXT)",
+            // Exercises NULL, \"\", matching, and non-matching values across all COALESCE 3VL cases.
+            "INSERT INTO populi_enr VALUES
+                ('S1', 'Online Campus', 'ENROLLED', 'A', '2025-09-01', '2025-11-15', 'O1', 10, 20),
+                ('S2', 'Online Campus', 'WITHDRAWN', NULL, '2025-09-01', '2025-11-15', 'O1', 3, 4),
+                ('S3', 'Online Campus', 'ENROLLED', '', '2025-09-01', '2025-11-15', 'O2', 5, 6),
+                ('S4', 'Online Campus', 'ENROLLED', 'NGC', '2025-09-01', '2025-11-15', 'O1', 1, 2),
+                ('S5', NULL, 'ENROLLED', 'A', '2025-09-01', '2025-11-15', 'O1', 2, 2),
+                ('S6', '', 'ENROLLED', 'A', '2025-09-01', '2025-11-15', 'O1', 4, 2),
+                ('S7', 'Online Campus', NULL, 'A', '2025-09-01', '2025-11-15', 'O1', 6, 2),
+                ('S8', 'Online Campus', '', 'A', '2025-09-01', '2025-11-15', 'O1', 7, 2)",
+            "INSERT INTO canvas_users VALUES ('S1', 'active'), ('S2', 'active'), ('S3', 'deleted')",
+            "INSERT INTO canvas_courses VALUES ('O1', 'available'), ('O2', 'deleted')",
+        ] {
+            conn.execute(stmt, &[])?;
+        }
+    }
+
+    let src = r##"
+module V064Pushdown
+
+schema Enr
+  sid: Text?
+  campus: Text?
+  status: Text?
+  grade: Text?
+  tstart: Text?
+  tend: Text?
+  oid: Text?
+  a: Int
+  b: Int
+end
+
+schema CUser
+  sid: Text?
+  state: Text?
+end
+
+schema CCourse
+  oid: Text?
+  state: Text?
+end
+
+fn wts_like(db: ReadDB(DB), cutoff: Date)
+  pseudo = (db.table(CUser, from: "canvas_users")
+    |> where(.sid.some? and (.sid ?? "") != "" and .state.some? and .state != "deleted")
+    |> derive(matched_sid: .sid ?? "")
+    |> select(.matched_sid)
+    |> distinct())
+
+  cc = (db.table(CCourse, from: "canvas_courses")
+    |> where(.oid.some? and (.oid ?? "") != "" and .state.some? and .state != "deleted")
+    |> derive(matched_oid: .oid ?? "")
+    |> select(.matched_oid)
+    |> distinct())
+
+  db.table(Enr, from: "populi_enr")
+    |> where(
+      (.campus ?? "") == "Online Campus"
+        and (.status ?? "").in?(["ENROLLED", "WITHDRAWN", "INCOMPLETE"])
+        and not (.grade ?? "").in?(["NGC", "PN", "WAIV", "APPR"])
+    )
+    |> derive(
+      s_id: .sid ?? "",
+      o_id: .oid ?? "",
+      t_start_opt: (.tstart ?? "").slice(0, 10).try_parse_date,
+      t_end_opt: (.tend ?? "").slice(0, 10).try_parse_date,
+      flag_a: (.status ?? "") == "WITHDRAWN",
+      flag_b: (.grade ?? "") == "A",
+      tag_x: (.status ?? "").lower,
+      dep_match: .tag_x == "enrolled" and .s_id == "S1",
+      status: "OVERWRITTEN"
+    )
+    |> where(.t_start_opt.some? and .t_end_opt.some?)
+    |> derive(term_start: .t_start_opt ?? 1970-01-01, term_end: .t_end_opt ?? 1970-01-01)
+    |> where(.term_end < cutoff)
+    |> left_join_many_to_one(pseudo, on: left.s_id == right.matched_sid)
+    |> left_join_many_to_one(cc, on: left.o_id == right.matched_oid)
+    |> derive(has_u: .matched_sid.some?, has_c: .matched_oid.some?)
+    |> select(.flag_a, .flag_b, .dep_match, .status, .has_u, .has_c)
+end
+
+fn wts_summary(db: ReadDB(DB), cutoff: Date)
+  wts_like(db, cutoff)
+    |> summarize(
+      n: count(),
+      dfw_n: count_if(.flag_a),
+      a_grade_n: count_if(.flag_b),
+      dep_n: count_if(.dep_match),
+      ov_n: count_if(.status == "OVERWRITTEN"),
+      u_hits: count_if(.has_u),
+      c_hits: count_if(.has_c)
+    )
+end
+
+fn three_vl_probe(db: ReadDB(DB))
+  # Tests all 6 COALESCE 3VL combinations: d==t / d!=t across =, !=, IN, and NOT(IN).
+  db.table(Enr, from: "populi_enr")
+    |> where(
+      ((.campus ?? "") == "" or (.campus ?? "") == "Online Campus")
+        and (.status ?? "") != ""
+        and (.campus ?? "") != "Main Campus"
+        and not (.grade ?? "").in?(["NGC", ""])
+    )
+    |> select(.a, .campus, .status, .grade)
+    |> sort_by(.a)
+end
+
+fn main(db: ReadDB(DB), console: Console) : Int
+  for r in wts_summary(db, 2026-06-01)
+    console.print("s:#{r.n}:#{r.dfw_n}:#{r.a_grade_n}:#{r.dep_n}:#{r.ov_n}:#{r.u_hits}:#{r.c_hits}")
+  end
+  for r in three_vl_probe(db)
+    console.print("p:#{r.campus}:#{r.status}:#{r.grade}")
+  end
+  0
+end
+"##;
+
+    let checked = check_src(src)?;
+    let (opt_prog, _) = dana::plan::optimize_exec_program(&checked.exec);
+
+    let f_wts = opt_prog
+        .find_fun("wts_summary")
+        .ok_or("missing wts_summary")?;
+    let p_wts = find_first_plan(&f_wts.body).ok_or("missing wts_summary plan")?;
+
+    let pg_q = match split_exec_plan_pushdown(p_wts, &opt_prog, "DB", SqlDialect::Postgres, None) {
+        SplitPlan::FullyPushed(q) => q,
+        other => return Err(format!("expected FullyPushed for Postgres, got {other:?}").into()),
+    };
+    let sq_q = match split_exec_plan_pushdown(p_wts, &opt_prog, "DB", SqlDialect::Sqlite, None) {
+        SplitPlan::FullyPushed(q) => q,
+        other => return Err(format!("expected FullyPushed for SQLite, got {other:?}").into()),
+    };
+
+    // 1. SQLite must never emit PostgreSQL's `AS MATERIALIZED (`.
+    assert!(
+        !sq_q.sql.contains("MATERIALIZED"),
+        "SQLite SQL must not contain MATERIALIZED:\n{}",
+        sq_q.sql
+    );
+
+    // 2. Postgres must materialize the batched `_dana_iso_*` CTE once with both BTRIM expressions.
+    assert_eq!(
+        pg_q.sql.matches("AS MATERIALIZED (").count(),
+        1,
+        "expected exactly 1 AS MATERIALIZED CTE bundling both ISO date trims in Postgres:\n{}",
+        pg_q.sql
+    );
+    let mat_body = pg_q
+        .sql
+        .split("AS MATERIALIZED (")
+        .nth(1)
+        .and_then(|s| s.split("), \"").next())
+        .ok_or("missing materialized CTE body")?;
+    assert_eq!(
+        mat_body.matches("BTRIM(").count(),
+        2,
+        "expected both ISO date BTRIMs bundled inside single AS MATERIALIZED CTE:\n{mat_body}"
+    );
+    assert_eq!(
+        mat_body.matches("\"_dana_iso_").count(),
+        2,
+        "expected 2 hoisted _dana_iso_* aliases inside single AS MATERIALIZED CTE:\n{mat_body}"
+    );
+
+    // 3. Independent derive wave coalescing keeps CTE count well below uncoalesced count (~26+).
+    let cte_defs =
+        pg_q.sql.matches(" AS (").count() + pg_q.sql.matches("AS MATERIALIZED (").count();
+    assert!(
+        cte_defs <= 20,
+        "expected coalesced CTE count <= 20, got {cte_defs}:\n{}",
+        pg_q.sql
+    );
+
+    // 4. COALESCE filter predicates were simplified away from COALESCE(...) for MCV stats.
+    assert!(
+        !pg_q.sql.contains("COALESCE(\"campus\"")
+            && pg_q.sql.contains("\"campus\" IS NOT NULL")
+            && pg_q.sql.contains("\"status\" IS NOT NULL")
+            && pg_q.sql.contains("\"grade\" IS NOT NULL"),
+        "expected COALESCE equality/IN predicates simplified to MCV-friendly IS NOT NULL/IS NULL:\n{}",
+        pg_q.sql
+    );
+
+    let f_probe = opt_prog
+        .find_fun("three_vl_probe")
+        .ok_or("missing three_vl_probe")?;
+    let p_probe = find_first_plan(&f_probe.body).ok_or("missing three_vl_probe plan")?;
+    let probe_pg =
+        match split_exec_plan_pushdown(p_probe, &opt_prog, "DB", SqlDialect::Postgres, None) {
+            SplitPlan::Hybrid { pushdown, .. } => pushdown,
+            other => {
+                return Err(format!("expected Hybrid pushdown for probe, got {other:?}").into());
+            }
+        };
+    assert!(
+        !probe_pg.sql.contains("COALESCE(")
+            && probe_pg.sql.contains("\"campus\" IS NULL")
+            && probe_pg.sql.contains("\"status\" IS NOT NULL")
+            && probe_pg.sql.contains("\"grade\" IS NULL"),
+        "expected zero COALESCE(...) calls in three_vl_probe Postgres WHERE SQL:\n{}",
+        probe_pg.sql
+    );
+
+    // 5. Exact Oracle == VM == SQLite Pushdown parity across wts_summary and 6-way 3VL probe.
+    let out = assert_oracle_vm_parity(src, Some(("DB", &uri)))?;
+    assert_eq!(
+        out,
+        vec![
+            "s:3:1:1:1:3:2:2",
+            // three_vl_probe: only S1, S5, S6 survive:
+            // S2 (grade=NULL) and S3 (grade='') are excluded because `""` is in `["NGC", ""]`,
+            // testing `d in list` under `NOT`; S4 has 'NGC'; S7 (status=NULL) & S8 (status='') fail `!= ""`.
+            // Sorted by `a`: S5 (a=2), S6 (a=4), S1 (a=10).
+            "p:none:ENROLLED:A",
+            "p::ENROLLED:A",
+            "p:Online Campus:ENROLLED:A",
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL instance (DANA_TEST_POSTGRES_URL)"]
+fn v064_postgres_live_hash_join_no_nested_loop_regression() -> TestResult {
+    let url = std::env::var("DANA_TEST_POSTGRES_URL").map_err(
+        |_| "DANA_TEST_POSTGRES_URL must be set to run live PostgreSQL v0.6.4 regression test",
+    )?;
+    let schema_name = format!("dana_v064_pg_{}", std::process::id());
+    {
+        let mut pg = open_connection(&url)?;
+        pg.execute(
+            &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+            &[],
+        )?;
+        pg.execute(&format!(r#"CREATE SCHEMA "{schema_name}""#), &[])?;
+        pg.execute(
+            &format!(
+                r#"CREATE TYPE "{schema_name}".wf_state AS ENUM ('active', 'available', 'deleted')"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"CREATE TABLE "{schema_name}".enrollments (
+                    id INTEGER PRIMARY KEY,
+                    sid VARCHAR(64),
+                    tid VARCHAR(32),
+                    tname VARCHAR(64),
+                    tstart VARCHAR(32),
+                    tend VARCHAR(32),
+                    oid VARCHAR(64),
+                    campus VARCHAR(64),
+                    status VARCHAR(32),
+                    grade VARCHAR(16),
+                    finalized VARCHAR(8)
+                )"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"CREATE TABLE "{schema_name}".canvas_users (
+                    uid INTEGER PRIMARY KEY,
+                    sid VARCHAR(64),
+                    state "{schema_name}".wf_state
+                )"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"CREATE TABLE "{schema_name}".canvas_courses (
+                    cid INTEGER PRIMARY KEY,
+                    oid VARCHAR(64),
+                    state "{schema_name}".wf_state
+                )"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"INSERT INTO "{schema_name}".enrollments
+                   SELECT
+                     g,
+                     'S' || (1 + (g % 800))::text,
+                     CASE WHEN g % 3 = 0 THEN 'T1' ELSE 'T2' END,
+                     CASE WHEN g % 3 = 0 THEN '2025 Fall' ELSE '2026 Winter' END,
+                     '2025-09-01T00:00:00Z',
+                     CASE WHEN g % 10 = 0 THEN '2026-12-15T00:00:00Z' ELSE '2025-11-15T00:00:00Z' END,
+                     'O' || (1 + (g % 300))::text,
+                     CASE WHEN g % 4 = 0 THEN 'Main Campus' ELSE 'Online Campus' END,
+                     CASE WHEN g % 5 = 0 THEN 'WITHDRAWN' ELSE 'ENROLLED' END,
+                     CASE WHEN g % 7 = 0 THEN NULL WHEN g % 11 = 0 THEN 'NGC' ELSE 'A' END,
+                     '1'
+                   FROM generate_series(1, 5000) AS g"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"INSERT INTO "{schema_name}".canvas_users
+                   SELECT
+                     g,
+                     'S' || (1 + (g % 700))::text,
+                     (CASE WHEN g % 10 = 0 THEN 'deleted' ELSE 'active' END)::"{schema_name}".wf_state
+                   FROM generate_series(1, 2000) AS g"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"INSERT INTO "{schema_name}".canvas_courses
+                   SELECT
+                     g,
+                     'O' || (1 + (g % 250))::text,
+                     (CASE WHEN g % 8 = 0 THEN 'deleted' ELSE 'available' END)::"{schema_name}".wf_state
+                   FROM generate_series(1, 1000) AS g"#
+            ),
+            &[],
+        )?;
+        pg.execute(&format!(r#"ANALYZE "{schema_name}".enrollments"#), &[])?;
+        pg.execute(&format!(r#"ANALYZE "{schema_name}".canvas_users"#), &[])?;
+        pg.execute(&format!(r#"ANALYZE "{schema_name}".canvas_courses"#), &[])?;
+    }
+
+    let test_res: TestResult = (|| {
+        let src = format!(
+            r##"
+module V064PgLiveHashJoin
+
+schema Enrollment
+  sid: Text? [pii]
+  tid: Text?
+  tname: Text?
+  tstart: Text?
+  tend: Text?
+  oid: Text?
+  campus: Text?
+  status: Text? [ferpa]
+  grade: Text? [ferpa]
+  finalized: Text? [ferpa]
+end
+
+schema CanvasUser
+  sid: Text? [pii]
+  state: Text?
+end
+
+schema CanvasCourse
+  oid: Text?
+  state: Text?
+end
+
+fn online_enr(db: ReadDB(PG), completed_before: Date)
+  pseudo = (db.table(CanvasUser, from: "{schema_name}.canvas_users")
+    |> where(.sid.some? and (.sid ?? "") != "" and .state.some? and .state != "deleted")
+    |> derive(matched_sid: .sid ?? "")
+    |> select(.matched_sid)
+    |> distinct())
+
+  cc = (db.table(CanvasCourse, from: "{schema_name}.canvas_courses")
+    |> where(.oid.some? and (.oid ?? "") != "" and .state.some? and .state != "deleted")
+    |> derive(matched_oid: .oid ?? "")
+    |> select(.matched_oid)
+    |> distinct())
+
+  db.table(Enrollment, from: "{schema_name}.enrollments")
+    |> where(
+      (.campus ?? "") == "Online Campus"
+        and (.status ?? "").in?(["ENROLLED", "WITHDRAWN", "INCOMPLETE"])
+        and not (.grade ?? "").in?(["NGC", "PN", "WAIV", "APPR"])
+    )
+    |> derive(
+      s_id: .sid ?? "",
+      t_id: .tid ?? "",
+      t_name: .tname ?? "",
+      t_start_opt: (.tstart ?? "").slice(0, 10).try_parse_date,
+      t_end_opt: (.tend ?? "").slice(0, 10).try_parse_date,
+      o_id: .oid ?? "",
+      is_dfw: (.status ?? "") == "WITHDRAWN" or ((.finalized ?? "") == "1" and (.grade ?? "").in?(["F", "UF", "D+", "D", "D-"])),
+      is_wd: (.status ?? "") == "WITHDRAWN",
+      is_fail: (.finalized ?? "") == "1" and (.grade ?? "").in?(["F", "UF"])
+    )
+    |> where(.t_start_opt.some? and .t_end_opt.some?)
+    |> derive(term_start: .t_start_opt ?? 1970-01-01, term_end: .t_end_opt ?? 1970-01-01)
+    |> where(.term_end < completed_before)
+    |> left_join_many_to_one(pseudo, on: left.s_id == right.matched_sid)
+    |> left_join_many_to_one(cc, on: left.o_id == right.matched_oid)
+    |> derive(has_u: .matched_sid.some?, has_c: .matched_oid.some?)
+    |> select(.sid, .t_id, .t_name, .term_start, .term_end, .is_dfw, .has_u, .has_c)
+end
+
+fn coverage(db: ReadDB(PG), completed_before: Date)
+  online_enr(db, completed_before)
+    |> summarize(
+      uniq_s: count_distinct(.sid),
+      rows_n: count(),
+      u_hits: count_if(.has_u),
+      c_hits: count_if(.has_c)
+    )
+    |> suppress_small_groups(min: 10, distinct_by: .sid)
+end
+
+fn main(db: ReadDB(PG), console: Console) : Int
+  for r in coverage(db, 2026-06-01)
+    console.print("cov:#{{r.uniq_s}}:#{{r.rows_n}}:#{{r.u_hits}}:#{{r.c_hits}}")
+  end
+  0
+end
+"##
+        );
+
+        let checked = check_src(&src)?;
+        let (opt_prog, _) = dana::plan::optimize_exec_program(&checked.exec);
+        let cov_fn = opt_prog.find_fun("coverage").ok_or("missing coverage")?;
+        let plan = find_first_plan(&cov_fn.body).ok_or("missing coverage plan")?;
+        let sp = split_exec_plan_pushdown(plan, &opt_prog, "PG", SqlDialect::Postgres, None);
+        let pushdown = match sp {
+            SplitPlan::Hybrid { pushdown, .. } => pushdown,
+            other => return Err(format!("expected Hybrid pushdown, got {other:?}").into()),
+        };
+
+        let cutoff_days = dana::formats::time::parse_iso_date("2026-06-01")?;
+        let params = pushdown.resolve_params(
+            |name| match name {
+                "completed_before" => Some(dana::oracle::value::Val::Date(cutoff_days.into())),
+                _ => None,
+            },
+            |_| None,
+        )?;
+        let explain_schema = dana::core::syntax::TableTy {
+            cols: vec![dana::core::syntax::ColSpec {
+                name: "QUERY PLAN".to_string(),
+                ty: dana::core::syntax::ScalarTy::Text,
+                tags: dana::core::syntax::TagSet::empty(),
+                bucketed: false,
+                agg_kind: dana::core::syntax::AggKind::Raw,
+            }],
+            row_tags: dana::core::syntax::TagSet::empty(),
+            order_tags: dana::core::syntax::TagSet::empty(),
+            grouped_by: None,
+            summarized: false,
+            distinct_by: None,
+        };
+        let mut pg = open_connection(&url)?;
+        let explain_tbl = pg.query_rows(
+            &format!("EXPLAIN (FORMAT TEXT) {}", pushdown.sql),
+            &params,
+            &explain_schema,
+        )?;
+        let plan_text: Vec<String> = explain_tbl
+            .rows
+            .iter()
+            .filter_map(|r| match r.cells.first() {
+                Some(dana::oracle::value::Val::Text(line)) => Some(line.clone()),
+                _ => None,
+            })
+            .collect();
+        let joined_plan = plan_text.join("\n");
+        assert!(
+            joined_plan.contains("Hash Left Join")
+                || joined_plan.contains("Hash Right Join")
+                || joined_plan.contains("Hash Join"),
+            "expected PostgreSQL planner to choose Hash Join:\n{joined_plan}\nSQL:\n{}",
+            pushdown.sql
+        );
+        assert!(
+            !joined_plan.contains("Nested Loop"),
+            "PostgreSQL planner regressed to Nested Loop:\n{joined_plan}\nSQL:\n{}",
+            pushdown.sql
+        );
+
+        let out = assert_oracle_vm_parity(&src, Some(("PG", &url)))?;
+        assert_eq!(out.len(), 1);
+        assert!(out[0].starts_with("cov:"), "unexpected output: {out:?}");
+        Ok(())
+    })();
+
+    let _ = open_connection(&url).and_then(|mut pg| {
+        pg.execute(
+            &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+            &[],
+        )
+    });
+
+    test_res
 }

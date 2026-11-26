@@ -103,6 +103,7 @@ jobs:
           cargo test --test differential_sql -- live_postgres_differential_pushdown --ignored --nocapture
           cargo test --test v06_dogfood_fixes -- v062_postgres_live_custom_enum_pushdown --ignored --nocapture
           cargo test --test v06_dogfood_fixes -- v063_postgres_live_single_query_join_suppress_pushdown --ignored --nocapture
+          cargo test --test v06_dogfood_fixes -- v064_postgres_live_hash_join_no_nested_loop_regression --ignored --nocapture
 
   macos-verify:
     name: macOS ARM64 Verification
