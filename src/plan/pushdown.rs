@@ -236,6 +236,43 @@ pub fn split_exec_plan_pushdown(
     split_exec_plan_pushdown_with_table_refs(plan, prog, db_name, dialect, lock, None)
 }
 
+/// Hidden metadata column alias carrying per-group raw row counts from SQL `Summarize`
+/// into a downstream local `SuppressSmallGroups` stage.
+pub const HIDDEN_GROUP_ROW_COUNT_COL: &str = "__dana_gm_rows";
+
+/// Hidden metadata column alias carrying per-group `COUNT(DISTINCT key)` counts from
+/// SQL `Summarize` into a downstream local `SuppressSmallGroups(distinct_by: ...)` stage.
+pub const HIDDEN_GROUP_DISTINCT_COUNT_COL: &str = "__dana_gm_dist";
+
+const fn join_right_is_order_insensitive(kind: JoinKind, outer_order_insensitive: bool) -> bool {
+    outer_order_insensitive
+        || matches!(
+            kind,
+            JoinKind::InnerOne
+                | JoinKind::LeftOne
+                | JoinKind::InnerManyToOne
+                | JoinKind::LeftManyToOne
+                | JoinKind::Semi
+                | JoinKind::Anti
+        )
+}
+
+#[derive(Clone, Copy)]
+enum SuppressPushCtx<'a> {
+    None,
+    Direct(Option<&'a str>),
+    Indirect,
+}
+
+impl SuppressPushCtx<'_> {
+    const fn indirect_if_active(self) -> Self {
+        match self {
+            Self::None => Self::None,
+            Self::Direct(_) | Self::Indirect => Self::Indirect,
+        }
+    }
+}
+
 /// Variant of [`split_exec_plan_pushdown`] accepting resolved SQL table references
 /// (used by the SQLite driver for `--attach` namespaces and unattached `schema.table` fallbacks).
 #[must_use]
@@ -247,8 +284,23 @@ pub fn split_exec_plan_pushdown_with_table_refs(
     lock: Option<&SchemaLockFile>,
     table_refs: Option<&HashMap<String, String>>,
 ) -> SplitPlan<ExecPlan> {
+    split_exec_plan_pushdown_with_options(plan, prog, db_name, dialect, lock, table_refs, false)
+}
+
+/// Variant of [`split_exec_plan_pushdown_with_table_refs`] also threading caller
+/// `order_insensitive` (e.g. when splitting the right side of a local unique/semi/anti join).
+#[must_use]
+pub fn split_exec_plan_pushdown_with_options(
+    plan: &ExecPlan,
+    prog: &ExecProgram,
+    db_name: &str,
+    dialect: SqlDialect,
+    lock: Option<&SchemaLockFile>,
+    table_refs: Option<&HashMap<String, String>>,
+    order_insensitive: bool,
+) -> SplitPlan<ExecPlan> {
     let ctx = ExecSplitCtx::new(prog, Some(db_name), dialect, lock);
-    match split_exec_node(plan, &ctx, false, false, false) {
+    match split_exec_node(plan, &ctx, order_insensitive, SuppressPushCtx::None, false) {
         NodeSplit::Pushed(node) => {
             SplitPlan::FullyPushed(node.into_query_with_table_refs(dialect, None, table_refs))
         }
@@ -324,7 +376,7 @@ pub fn collect_exec_plan_pushdowns(
         plan,
         &ctx,
         false,
-        false,
+        SuppressPushCtx::None,
         false,
         &mut next_id,
         &mut branches,
@@ -621,6 +673,10 @@ enum SqlFrom {
     Table {
         name: String,
     },
+    CteRef {
+        cte_name: String,
+        alias: String,
+    },
     Subquery {
         query: Box<SqlQuery>,
         alias: String,
@@ -658,6 +714,90 @@ enum SqlQuery {
     },
 }
 
+fn sql_from_subquery_depth(from: &SqlFrom) -> usize {
+    match from {
+        SqlFrom::Table { .. } | SqlFrom::CteRef { .. } => 0,
+        SqlFrom::Subquery { query, .. } => 1 + sql_query_subquery_depth(query),
+        SqlFrom::Join { left, right, .. } => {
+            sql_from_subquery_depth(left).max(sql_from_subquery_depth(right))
+        }
+    }
+}
+
+fn sql_query_subquery_depth(query: &SqlQuery) -> usize {
+    match query {
+        SqlQuery::Select { from, .. } => sql_from_subquery_depth(from),
+        SqlQuery::UnionAll { left, right, .. } => {
+            1 + sql_query_subquery_depth(left).max(sql_query_subquery_depth(right))
+        }
+    }
+}
+
+fn lift_from(from: &SqlFrom, ctes: &mut Vec<(String, SqlQuery)>) -> SqlFrom {
+    match from {
+        SqlFrom::Table { .. } | SqlFrom::CteRef { .. } => from.clone(),
+        SqlFrom::Subquery { query, alias } => {
+            let flat_inner = lift_query(query, ctes);
+            let cte_name = format!("_cte_{}", ctes.len());
+            ctes.push((cte_name.clone(), flat_inner));
+            SqlFrom::CteRef {
+                cte_name,
+                alias: alias.clone(),
+            }
+        }
+        SqlFrom::Join {
+            left,
+            kind,
+            right,
+            on,
+        } => SqlFrom::Join {
+            left: Box::new(lift_from(left, ctes)),
+            kind: *kind,
+            right: Box::new(lift_from(right, ctes)),
+            on: on.clone(),
+        },
+    }
+}
+
+fn lift_query(query: &SqlQuery, ctes: &mut Vec<(String, SqlQuery)>) -> SqlQuery {
+    match query {
+        SqlQuery::Select {
+            distinct,
+            distinct_on,
+            items,
+            from,
+            where_clause,
+            group_by,
+            order_by,
+            limit,
+        } => SqlQuery::Select {
+            distinct: *distinct,
+            distinct_on: distinct_on.clone(),
+            items: items.clone(),
+            from: Box::new(lift_from(from, ctes)),
+            where_clause: where_clause.clone(),
+            group_by: group_by.clone(),
+            order_by: order_by.clone(),
+            limit: limit.clone(),
+        },
+        SqlQuery::UnionAll {
+            left,
+            right,
+            col_names,
+        } => SqlQuery::UnionAll {
+            left: Box::new(lift_query(left, ctes)),
+            right: Box::new(lift_query(right, ctes)),
+            col_names: col_names.clone(),
+        },
+    }
+}
+
+fn lift_subqueries_to_ctes(query: &SqlQuery) -> (Vec<(String, SqlQuery)>, SqlQuery) {
+    let mut ctes = Vec::new();
+    let root = lift_query(query, &mut ctes);
+    (ctes, root)
+}
+
 struct SqlRenderState<'a> {
     dialect: SqlDialect,
     sql: String,
@@ -690,6 +830,26 @@ impl<'a> SqlRenderState<'a> {
                     let _ = write!(self.sql, "${idx}");
                 }
             }
+        }
+    }
+
+    fn render_root_query(&mut self, query: &SqlQuery) {
+        if sql_query_subquery_depth(query) >= 4 {
+            let (ctes, root) = lift_subqueries_to_ctes(query);
+            self.sql.push_str("WITH ");
+            for (idx, (cte_name, cte_query)) in ctes.iter().enumerate() {
+                if idx > 0 {
+                    self.sql.push_str(", ");
+                }
+                self.sql.push_str(&quote_sql_ident(cte_name));
+                self.sql.push_str(" AS (");
+                self.render_query(cte_query);
+                self.sql.push(')');
+            }
+            self.sql.push(' ');
+            self.render_query(&root);
+        } else {
+            self.render_query(query);
         }
     }
 
@@ -797,6 +957,11 @@ impl<'a> SqlRenderState<'a> {
                 } else {
                     self.sql.push_str(&quote_sql_table_ref(name));
                 }
+            }
+            SqlFrom::CteRef { cte_name, alias } => {
+                self.sql.push_str(&quote_sql_ident(cte_name));
+                self.sql.push_str(" AS ");
+                self.sql.push_str(&quote_sql_ident(alias));
             }
             SqlFrom::Subquery { query, alias } => {
                 self.sql.push('(');
@@ -1337,7 +1502,7 @@ impl PushedNode {
         table_refs: Option<&HashMap<String, String>>,
     ) -> SqlPushdownQuery {
         let mut renderer = SqlRenderState::with_table_refs(dialect, table_refs);
-        renderer.render_query(&self.query);
+        renderer.render_root_query(&self.query);
         SqlPushdownQuery {
             db_name: self.db_name,
             dialect,
@@ -2454,6 +2619,7 @@ impl PushedNode {
         distinct_key: Option<&str>,
         dialect: SqlDialect,
         sort_groups_core: bool,
+        emit_group_meta: Option<Option<&str>>,
     ) -> Result<Self, String> {
         if agg_items.is_empty() {
             return Err("empty Summarize cannot be pushed".to_string());
@@ -2490,11 +2656,32 @@ impl PushedNode {
         let key_tags = TagSet::union_list(ordered_group_cols.iter().map(|c| &c.tags));
         let row_tags = self.schema.row_tags.union(&key_tags).union(&dk_tags);
 
+        if let Some(Some(dk)) = emit_group_meta {
+            let Some(dk_col) = self.schema.find_col(dk) else {
+                return Err(format!(
+                    "suppress_small_groups distinct_by references missing column `{dk}`"
+                ));
+            };
+            if !is_dialect_exact_eq(dialect, &dk_col.ty) {
+                return Err(non_exact_type_reason(
+                    dialect,
+                    &dk_col.ty,
+                    "SuppressSmallGroups distinct_by",
+                ));
+            }
+        }
+
         if self.needs_wrap_for_proj || self.needs_wrap_for_filter {
             self = self.wrap_as_subquery();
         }
 
-        let mut select_items = Vec::with_capacity(ordered_group_cols.len() + agg_items.len());
+        let extra_meta_cols = match emit_group_meta {
+            None => 0,
+            Some(None) => 1,
+            Some(Some(_)) => 2,
+        };
+        let mut select_items =
+            Vec::with_capacity(ordered_group_cols.len() + agg_items.len() + extra_meta_cols);
         let mut group_by_exprs = Vec::with_capacity(ordered_group_cols.len());
         let mut order_by_items = Vec::with_capacity(ordered_group_cols.len());
         let mut out_cols = ordered_group_cols.clone();
@@ -2616,6 +2803,50 @@ impl PushedNode {
                 bucketed: false,
                 agg_kind: kind,
             });
+        }
+
+        if let Some(dk_opt) = emit_group_meta {
+            if out_cols.iter().any(|c| c.name.starts_with("__dana_gm_")) {
+                return Err(
+                    "reserved group-meta column name conflict requires local VM".to_string()
+                );
+            }
+            select_items.push(SqlSelectItem {
+                expr: SqlExpr::CountStar,
+                alias: HIDDEN_GROUP_ROW_COUNT_COL.to_string(),
+            });
+            out_cols.push(ColSpec {
+                name: HIDDEN_GROUP_ROW_COUNT_COL.to_string(),
+                ty: ScalarTy::Int,
+                tags: TagSet::empty(),
+                bucketed: false,
+                agg_kind: AggKind::Raw,
+            });
+            if let Some(dk) = dk_opt {
+                let dk_tags = self
+                    .schema
+                    .find_col(dk)
+                    .map(|c| c.tags.clone())
+                    .unwrap_or_default();
+                select_items.push(SqlSelectItem {
+                    expr: SqlExpr::Agg {
+                        func: "COUNT",
+                        distinct: true,
+                        arg: Box::new(SqlExpr::Col {
+                            table_alias: None,
+                            name: dk.to_string(),
+                        }),
+                    },
+                    alias: HIDDEN_GROUP_DISTINCT_COUNT_COL.to_string(),
+                });
+                out_cols.push(ColSpec {
+                    name: HIDDEN_GROUP_DISTINCT_COUNT_COL.to_string(),
+                    ty: ScalarTy::Int,
+                    tags: dk_tags,
+                    bucketed: false,
+                    agg_kind: AggKind::Raw,
+                });
+            }
         }
 
         if let SqlQuery::Select {
@@ -4391,6 +4622,7 @@ fn split_core_node(
                         distinct_key.as_deref(),
                         ctx.dialect,
                         true,
+                        None,
                     ) {
                         Ok(next) => NodeSplit::Pushed(next),
                         Err(reason) => NodeSplit::Hybrid {
@@ -4469,7 +4701,8 @@ fn split_core_node(
             suffixes,
         } => {
             let l_split = split_core_node(left, ctx, order_insensitive, false);
-            let r_split = split_core_node(right, ctx, order_insensitive, false);
+            let r_ord_insens = join_right_is_order_insensitive(*kind, order_insensitive);
+            let r_split = split_core_node(right, ctx, r_ord_insens, false);
             match (l_split, r_split) {
                 (NodeSplit::Pushed(l), NodeSplit::Pushed(r)) => match PushedNode::apply_join(
                     *kind,
@@ -4703,15 +4936,9 @@ fn collect_core_rec(
                     branches,
                     reasons,
                 );
-                let new_r = collect_core_rec(
-                    right,
-                    ctx,
-                    order_insensitive,
-                    false,
-                    next_id,
-                    branches,
-                    reasons,
-                );
+                let r_ord_insens = join_right_is_order_insensitive(*kind, order_insensitive);
+                let new_r =
+                    collect_core_rec(right, ctx, r_ord_insens, false, next_id, branches, reasons);
                 Plan::Join {
                     kind: *kind,
                     left: Box::new(new_l),
@@ -5909,7 +6136,7 @@ fn split_exec_node(
     plan: &ExecPlan,
     ctx: &ExecSplitCtx<'_>,
     order_insensitive: bool,
-    parent_is_suppress: bool,
+    suppress_ctx: SuppressPushCtx<'_>,
     parent_has_sort: bool,
 ) -> NodeSplit<ExecPlan> {
     const PLACEHOLDER: &str = "__dana_pushdown_0";
@@ -5949,7 +6176,13 @@ fn split_exec_node(
             }
         }
         ExecPlan::Select { input, cols } => {
-            match split_exec_node(input, ctx, order_insensitive, false, parent_has_sort) {
+            match split_exec_node(
+                input,
+                ctx,
+                order_insensitive,
+                SuppressPushCtx::None,
+                parent_has_sort,
+            ) {
                 NodeSplit::Pushed(node) => match node.apply_select(cols) {
                     Ok(next) => NodeSplit::Pushed(next),
                     Err(reason) => NodeSplit::LocalOnly { reason },
@@ -5973,7 +6206,7 @@ fn split_exec_node(
                 input,
                 ctx,
                 order_insensitive,
-                parent_is_suppress,
+                suppress_ctx.indirect_if_active(),
                 parent_has_sort,
             ) {
                 NodeSplit::Pushed(node) => match node.apply_drop(cols) {
@@ -5995,7 +6228,13 @@ fn split_exec_node(
             }
         }
         ExecPlan::Rename { input, pairs } => {
-            match split_exec_node(input, ctx, order_insensitive, false, parent_has_sort) {
+            match split_exec_node(
+                input,
+                ctx,
+                order_insensitive,
+                SuppressPushCtx::None,
+                parent_has_sort,
+            ) {
                 NodeSplit::Pushed(node) => {
                     // Phase 2 `ExecPlan::Rename` stores `(old_name, new_name)` directly.
                     match node.apply_rename(pairs) {
@@ -6018,7 +6257,13 @@ fn split_exec_node(
             }
         }
         ExecPlan::Filter { input, pred } => {
-            match split_exec_node(input, ctx, order_insensitive, false, parent_has_sort) {
+            match split_exec_node(
+                input,
+                ctx,
+                order_insensitive,
+                SuppressPushCtx::None,
+                parent_has_sort,
+            ) {
                 NodeSplit::Pushed(node) => match translate_exec_row_expr(pred, &node.schema, ctx) {
                     Ok((sql_e, ScalarTy::Bool, p_tags)) => {
                         NodeSplit::Pushed(node.apply_filter(sql_e, &p_tags))
@@ -6055,7 +6300,7 @@ fn split_exec_node(
                 input,
                 ctx,
                 order_insensitive,
-                parent_is_suppress,
+                suppress_ctx.indirect_if_active(),
                 parent_has_sort,
             ) {
                 NodeSplit::Pushed(node) => {
@@ -6072,10 +6317,15 @@ fn split_exec_node(
                                 };
                                 match translate_exec_row_expr(expr, &cur.schema, ctx) {
                                     Ok((sql_e, sty, tags)) => {
+                                        let existing_tags = cur
+                                            .schema
+                                            .find_col(name)
+                                            .map(|c| c.tags.clone())
+                                            .unwrap_or_default();
                                         let spec = ColSpec {
                                             name: name.clone(),
                                             ty: sty,
-                                            tags,
+                                            tags: existing_tags.union(&tags),
                                             bucketed: false,
                                             agg_kind: ak,
                                         };
@@ -6177,7 +6427,13 @@ fn split_exec_node(
             input,
             col,
             replacement,
-        } => match split_exec_node(input, ctx, order_insensitive, false, parent_has_sort) {
+        } => match split_exec_node(
+            input,
+            ctx,
+            order_insensitive,
+            SuppressPushCtx::None,
+            parent_has_sort,
+        ) {
             NodeSplit::Pushed(node) => {
                 let orig = node.clone();
                 match node.apply_redact(col, replacement) {
@@ -6205,7 +6461,7 @@ fn split_exec_node(
         },
         ExecPlan::Sort { input, keys } => {
             let child_ord_insens = order_insensitive || exec_sort_is_total_hint(input, keys, ctx);
-            match split_exec_node(input, ctx, child_ord_insens, false, true) {
+            match split_exec_node(input, ctx, child_ord_insens, SuppressPushCtx::None, true) {
                 NodeSplit::Pushed(node) => {
                     let orig = node.clone();
                     match node.apply_sort(keys, ctx.dialect) {
@@ -6235,32 +6491,37 @@ fn split_exec_node(
                 NodeSplit::LocalOnly { reason } => NodeSplit::LocalOnly { reason },
             }
         }
-        ExecPlan::Limit { input, n } => match split_exec_node(input, ctx, false, false, false) {
-            NodeSplit::Pushed(node) => {
-                let orig = node.clone();
-                match node.apply_limit(n) {
-                    Ok(next) => NodeSplit::Pushed(next),
-                    Err(reason) => NodeSplit::Hybrid {
-                        pushed: orig,
-                        placeholder_var: PLACEHOLDER.to_string(),
-                        local_plan: rebuild_exec_unary(plan, exec_placeholder_plan(PLACEHOLDER)),
-                        reason,
-                    },
+        ExecPlan::Limit { input, n } => {
+            match split_exec_node(input, ctx, false, SuppressPushCtx::None, false) {
+                NodeSplit::Pushed(node) => {
+                    let orig = node.clone();
+                    match node.apply_limit(n) {
+                        Ok(next) => NodeSplit::Pushed(next),
+                        Err(reason) => NodeSplit::Hybrid {
+                            pushed: orig,
+                            placeholder_var: PLACEHOLDER.to_string(),
+                            local_plan: rebuild_exec_unary(
+                                plan,
+                                exec_placeholder_plan(PLACEHOLDER),
+                            ),
+                            reason,
+                        },
+                    }
                 }
+                NodeSplit::Hybrid {
+                    pushed,
+                    placeholder_var,
+                    local_plan,
+                    reason,
+                } => NodeSplit::Hybrid {
+                    pushed,
+                    placeholder_var,
+                    local_plan: rebuild_exec_unary(plan, local_plan),
+                    reason,
+                },
+                NodeSplit::LocalOnly { reason } => NodeSplit::LocalOnly { reason },
             }
-            NodeSplit::Hybrid {
-                pushed,
-                placeholder_var,
-                local_plan,
-                reason,
-            } => NodeSplit::Hybrid {
-                pushed,
-                placeholder_var,
-                local_plan: rebuild_exec_unary(plan, local_plan),
-                reason,
-            },
-            NodeSplit::LocalOnly { reason } => NodeSplit::LocalOnly { reason },
-        },
+        }
         ExecPlan::DedupeBy {
             input,
             keys,
@@ -6279,7 +6540,13 @@ fn split_exec_node(
                         || uqs.iter().any(|uk| uk.iter().all(|k| combined.contains(k)))
                 });
             let child_ord_insens = order_insensitive && unique_tie;
-            match split_exec_node(input, ctx, child_ord_insens, false, parent_has_sort) {
+            match split_exec_node(
+                input,
+                ctx,
+                child_ord_insens,
+                SuppressPushCtx::None,
+                parent_has_sort,
+            ) {
                 NodeSplit::Pushed(node) => {
                     let orig = node.clone();
                     match node.apply_dedupe_by(
@@ -6320,7 +6587,13 @@ fn split_exec_node(
                 || exec_plan_cols_and_uqs_hint(input, ctx)
                     .is_some_and(|(in_cols, _)| in_cols.iter().all(|c| cols.contains(c)));
             let child_ord_insens = order_insensitive && covers_all_hint;
-            match split_exec_node(input, ctx, child_ord_insens, false, parent_has_sort) {
+            match split_exec_node(
+                input,
+                ctx,
+                child_ord_insens,
+                SuppressPushCtx::None,
+                parent_has_sort,
+            ) {
                 NodeSplit::Pushed(node) => {
                     let orig = node.clone();
                     match node.apply_distinct(cols, ctx.dialect, order_insensitive) {
@@ -6351,7 +6624,13 @@ fn split_exec_node(
             }
         }
         ExecPlan::GroupBy { input, .. } => {
-            match split_exec_node(input, ctx, order_insensitive, false, parent_has_sort) {
+            match split_exec_node(
+                input,
+                ctx,
+                order_insensitive,
+                SuppressPushCtx::None,
+                parent_has_sort,
+            ) {
                 NodeSplit::Pushed(node) => NodeSplit::Hybrid {
                     pushed: node,
                     placeholder_var: PLACEHOLDER.to_string(),
@@ -6396,22 +6675,37 @@ fn split_exec_node(
                 rebuild_exec_unary(plan, mid)
             };
 
-            match split_exec_node(raw_inner, ctx, child_ord_insens, false, false) {
+            match split_exec_node(
+                raw_inner,
+                ctx,
+                child_ord_insens,
+                SuppressPushCtx::None,
+                false,
+            ) {
                 NodeSplit::Pushed(node) => {
-                    if parent_is_suppress {
-                        return NodeSplit::Hybrid {
-                            pushed: node,
-                            placeholder_var: PLACEHOLDER.to_string(),
-                            local_plan: wrap_local(exec_placeholder_plan(PLACEHOLDER)),
-                            reason: "suppress_small_groups requires local group cardinality metadata from summarize".to_string(),
-                        };
-                    }
+                    let emit_group_meta = match suppress_ctx {
+                        SuppressPushCtx::None => None,
+                        SuppressPushCtx::Direct(distinct_by) => Some(distinct_by),
+                        SuppressPushCtx::Indirect => {
+                            return NodeSplit::Hybrid {
+                                pushed: node,
+                                placeholder_var: PLACEHOLDER.to_string(),
+                                local_plan: wrap_local(exec_placeholder_plan(PLACEHOLDER)),
+                                reason: "suppress_small_groups requires local group cardinality metadata from summarize".to_string(),
+                            };
+                        }
+                    };
                     if !group_keys.is_empty() && !order_insensitive {
+                        let reason = if matches!(suppress_ctx, SuppressPushCtx::Direct(_)) {
+                            "grouped ExecPlan summarize under suppress_small_groups preserves first-seen order unless followed by total sort"
+                        } else {
+                            "grouped ExecPlan summarize preserves first-seen order unless followed by total sort"
+                        };
                         return NodeSplit::Hybrid {
                             pushed: node,
                             placeholder_var: PLACEHOLDER.to_string(),
                             local_plan: wrap_local(exec_placeholder_plan(PLACEHOLDER)),
-                            reason: "grouped ExecPlan summarize preserves first-seen order unless followed by total sort".to_string(),
+                            reason: reason.to_string(),
                         };
                     }
                     let orig = node.clone();
@@ -6439,6 +6733,7 @@ fn split_exec_node(
                         distinct_key.as_deref(),
                         ctx.dialect,
                         false,
+                        emit_group_meta,
                     ) {
                         Ok(next) => NodeSplit::Pushed(next),
                         Err(reason) => NodeSplit::Hybrid {
@@ -6464,8 +6759,10 @@ fn split_exec_node(
             }
         }
         ExecPlan::Union { left, right } => {
-            let l_split = split_exec_node(left, ctx, order_insensitive, false, false);
-            let r_split = split_exec_node(right, ctx, order_insensitive, false, false);
+            let l_split =
+                split_exec_node(left, ctx, order_insensitive, SuppressPushCtx::None, false);
+            let r_split =
+                split_exec_node(right, ctx, order_insensitive, SuppressPushCtx::None, false);
             match (l_split, r_split) {
                 (NodeSplit::Pushed(l), NodeSplit::Pushed(r)) => {
                     match PushedNode::apply_union(l, r) {
@@ -6514,8 +6811,10 @@ fn split_exec_node(
             on,
             suffixes,
         } => {
-            let l_split = split_exec_node(left, ctx, order_insensitive, false, false);
-            let r_split = split_exec_node(right, ctx, order_insensitive, false, false);
+            let l_split =
+                split_exec_node(left, ctx, order_insensitive, SuppressPushCtx::None, false);
+            let r_ord_insens = join_right_is_order_insensitive(*kind, order_insensitive);
+            let r_split = split_exec_node(right, ctx, r_ord_insens, SuppressPushCtx::None, false);
             match (l_split, r_split) {
                 (NodeSplit::Pushed(l), NodeSplit::Pushed(r)) => match PushedNode::apply_join(
                     *kind,
@@ -6569,21 +6868,30 @@ fn split_exec_node(
                 },
             }
         }
-        ExecPlan::SuppressSmallGroups { input, .. } => split_exec_local_barrier(
-            plan,
-            input,
-            ctx,
-            order_insensitive,
-            true,
-            parent_has_sort,
-            "suppress_small_groups requires local VM",
-        ),
+        ExecPlan::SuppressSmallGroups {
+            input, distinct_by, ..
+        } => {
+            let child_suppress_ctx = if matches!(input.as_ref(), ExecPlan::Summarize { .. }) {
+                SuppressPushCtx::Direct(distinct_by.as_deref())
+            } else {
+                SuppressPushCtx::Indirect
+            };
+            split_exec_local_barrier(
+                plan,
+                input,
+                ctx,
+                order_insensitive,
+                child_suppress_ctx,
+                parent_has_sort,
+                "suppress_small_groups enforces k-anonymity locally over SQL-aggregated groups",
+            )
+        }
         ExecPlan::Shuffle { input, .. } => split_exec_local_barrier(
             plan,
             input,
             ctx,
             false,
-            false,
+            SuppressPushCtx::None,
             false,
             "shuffle requires local VM",
         ),
@@ -6592,7 +6900,7 @@ fn split_exec_node(
             input,
             ctx,
             order_insensitive,
-            false,
+            SuppressPushCtx::None,
             parent_has_sort,
             "suppress_small_cells requires local VM",
         ),
@@ -6601,7 +6909,7 @@ fn split_exec_node(
             input,
             ctx,
             false,
-            false,
+            SuppressPushCtx::None,
             false,
             "window operator requires local VM",
         ),
@@ -6610,7 +6918,7 @@ fn split_exec_node(
             input,
             ctx,
             false,
-            false,
+            SuppressPushCtx::None,
             false,
             "fill_gaps operator requires local VM",
         ),
@@ -6619,7 +6927,7 @@ fn split_exec_node(
             input,
             ctx,
             false,
-            false,
+            SuppressPushCtx::None,
             false,
             "pivot_wider operator requires local VM",
         ),
@@ -6628,7 +6936,7 @@ fn split_exec_node(
             input,
             ctx,
             false,
-            false,
+            SuppressPushCtx::None,
             false,
             "pivot_longer operator requires local VM",
         ),
@@ -6637,7 +6945,7 @@ fn split_exec_node(
             input,
             ctx,
             false,
-            false,
+            SuppressPushCtx::None,
             false,
             "crosstab operator requires local VM",
         ),
@@ -6646,7 +6954,7 @@ fn split_exec_node(
             input,
             ctx,
             false,
-            false,
+            SuppressPushCtx::None,
             false,
             "keyed pseudonymize requires local VM",
         ),
@@ -6658,7 +6966,7 @@ fn split_exec_local_barrier(
     input: &ExecPlan,
     ctx: &ExecSplitCtx<'_>,
     child_order_insensitive: bool,
-    child_parent_is_suppress: bool,
+    child_suppress_ctx: SuppressPushCtx<'_>,
     child_parent_has_sort: bool,
     barrier_msg: &str,
 ) -> NodeSplit<ExecPlan> {
@@ -6667,7 +6975,7 @@ fn split_exec_local_barrier(
         input,
         ctx,
         child_order_insensitive,
-        child_parent_is_suppress,
+        child_suppress_ctx,
         child_parent_has_sort,
     ) {
         NodeSplit::Pushed(node) => NodeSplit::Hybrid {
@@ -6699,19 +7007,13 @@ fn collect_exec_rec(
     plan: &ExecPlan,
     ctx: &ExecSplitCtx<'_>,
     order_insensitive: bool,
-    parent_is_suppress: bool,
+    suppress_ctx: SuppressPushCtx<'_>,
     parent_has_sort: bool,
     next_id: &mut usize,
     branches: &mut Vec<CollectedBranchPushdown>,
     reasons: &mut Vec<String>,
 ) -> ExecPlan {
-    match split_exec_node(
-        plan,
-        ctx,
-        order_insensitive,
-        parent_is_suppress,
-        parent_has_sort,
-    ) {
+    match split_exec_node(plan, ctx, order_insensitive, suppress_ctx, parent_has_sort) {
         NodeSplit::Pushed(node) => {
             let var = format!("__dana_pushdown_{}", *next_id);
             *next_id += 1;
@@ -6749,17 +7051,18 @@ fn collect_exec_rec(
                     left,
                     ctx,
                     order_insensitive,
-                    false,
+                    SuppressPushCtx::None,
                     false,
                     next_id,
                     branches,
                     reasons,
                 );
+                let r_ord_insens = join_right_is_order_insensitive(*kind, order_insensitive);
                 let new_r = collect_exec_rec(
                     right,
                     ctx,
-                    order_insensitive,
-                    false,
+                    r_ord_insens,
+                    SuppressPushCtx::None,
                     false,
                     next_id,
                     branches,
@@ -6779,7 +7082,7 @@ fn collect_exec_rec(
                     left,
                     ctx,
                     order_insensitive,
-                    false,
+                    SuppressPushCtx::None,
                     false,
                     next_id,
                     branches,
@@ -6789,7 +7092,7 @@ fn collect_exec_rec(
                     right,
                     ctx,
                     order_insensitive,
-                    false,
+                    SuppressPushCtx::None,
                     false,
                     next_id,
                     branches,
@@ -6804,13 +7107,32 @@ fn collect_exec_rec(
                 reasons.push(reason);
                 plan.clone()
             }
-            ExecPlan::SuppressSmallGroups { input, .. }
-            | ExecPlan::SuppressSmallCells { input, .. } => {
+            ExecPlan::SuppressSmallGroups {
+                input, distinct_by, ..
+            } => {
+                let child_suppress_ctx = if matches!(input.as_ref(), ExecPlan::Summarize { .. }) {
+                    SuppressPushCtx::Direct(distinct_by.as_deref())
+                } else {
+                    SuppressPushCtx::Indirect
+                };
                 let new_in = collect_exec_rec(
                     input,
                     ctx,
                     order_insensitive,
-                    matches!(plan, ExecPlan::SuppressSmallGroups { .. }),
+                    child_suppress_ctx,
+                    parent_has_sort,
+                    next_id,
+                    branches,
+                    reasons,
+                );
+                rebuild_exec_unary(plan, new_in)
+            }
+            ExecPlan::SuppressSmallCells { input, .. } => {
+                let new_in = collect_exec_rec(
+                    input,
+                    ctx,
+                    order_insensitive,
+                    SuppressPushCtx::None,
                     parent_has_sort,
                     next_id,
                     branches,
@@ -6821,7 +7143,14 @@ fn collect_exec_rec(
             ExecPlan::Sort { input, keys } => {
                 let child_ord = order_insensitive || exec_sort_is_total_hint(input, keys, ctx);
                 let new_in = collect_exec_rec(
-                    input, ctx, child_ord, false, true, next_id, branches, reasons,
+                    input,
+                    ctx,
+                    child_ord,
+                    SuppressPushCtx::None,
+                    true,
+                    next_id,
+                    branches,
+                    reasons,
                 );
                 rebuild_exec_unary(plan, new_in)
             }
@@ -6847,7 +7176,7 @@ fn collect_exec_rec(
                     input,
                     ctx,
                     child_ord,
-                    false,
+                    SuppressPushCtx::None,
                     parent_has_sort,
                     next_id,
                     branches,
@@ -6857,11 +7186,17 @@ fn collect_exec_rec(
             }
             other => {
                 if let Some(child) = exec_unary_child(other) {
+                    let child_suppress =
+                        if matches!(other, ExecPlan::Drop { .. } | ExecPlan::Derive { .. }) {
+                            suppress_ctx.indirect_if_active()
+                        } else {
+                            SuppressPushCtx::None
+                        };
                     let new_in = collect_exec_rec(
                         child,
                         ctx,
                         order_insensitive,
-                        false,
+                        child_suppress,
                         parent_has_sort,
                         next_id,
                         branches,

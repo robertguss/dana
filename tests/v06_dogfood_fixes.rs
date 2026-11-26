@@ -1469,7 +1469,7 @@ fn check_src_with_lock(
 
 #[test]
 fn v06_sqlite_attach_and_unattached_schema_table_fallback() -> TestResult {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.2");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.3");
     let tmp = TempDir::new("sqlite_attach")?;
     let main_db = tmp.path().join("main.db");
     let populi_db = tmp.path().join("populi.db");
@@ -2777,12 +2777,12 @@ end
     let db_out = assert_oracle_vm_parity(db_src, Some(("DB", &uri)))?;
     assert_eq!(db_out, vec!["2"]);
 
-    // 5. CLI --version prints `dana v0.6.2`
+    // 5. CLI --version prints `dana v0.6.3`
     let ver = Command::new(env!("CARGO_BIN_EXE_dana"))
         .arg("--version")
         .output()?;
     assert_eq!(ver.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.2");
+    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.3");
 
     Ok(())
 }
@@ -3297,4 +3297,662 @@ end
     });
 
     test_res
+}
+
+// ===========================================================================
+// Patch v0.6.3 Tests: Join RHS distinct, SuppressSmallGroups Summarize pushdown,
+// and Pure Table-Helper Inlining / LetE DB-Plan Fusion
+// ===========================================================================
+
+#[test]
+fn v063_join_right_distinct_suppress_small_groups_and_helper_inlining() -> TestResult {
+    let tmp = TempDir::new("v063_single_query")?;
+    let db_path = tmp.path().join("pilot.db");
+    let uri = sqlite_uri(&db_path);
+    let mut conn = open_connection(&uri)?;
+    for stmt in [
+        "CREATE TABLE enrollments (
+            id INTEGER PRIMARY KEY,
+            sid TEXT NOT NULL,
+            oid TEXT NOT NULL,
+            term_id TEXT NOT NULL,
+            cutoff_day TEXT NOT NULL,
+            failed INTEGER NOT NULL
+        )",
+        "CREATE TABLE canvas_users (
+            uid INTEGER PRIMARY KEY,
+            sid TEXT,
+            state TEXT NOT NULL
+        )",
+        "CREATE TABLE canvas_courses (
+            cid INTEGER PRIMARY KEY,
+            oid TEXT,
+            state TEXT NOT NULL
+        )",
+        "INSERT INTO enrollments VALUES
+            (1, 'S1', 'O1', 'T1', '2025-10-01', 0),
+            (2, 'S1', 'O2', 'T1', '2025-10-01', 1),
+            (3, 'S2', 'O1', 'T1', '2025-10-01', 0),
+            (4, 'S3', 'O9', 'T1', '2025-10-01', 1),
+            (5, 'S4', 'O1', 'T1', '2025-10-01', 0),
+            (6, 'S5', 'O1', 'T1', '2025-10-01', 0),
+            (7, 'S6', 'O1', 'T2', '2025-10-01', 0),
+            (8, 'S6', 'O2', 'T2', '2025-10-01', 0),
+            (9, 'S7', 'O1', 'T3', '2025-10-01', 1),
+            (10, 'S8', 'O1', 'T3', '2025-10-01', 0),
+            (11, 'S9', 'O1', 'T3', '2025-10-01', 0),
+            (12, 'S10', 'O1', 'T3', '2025-10-01', 0),
+            (13, 'S11', 'O1', 'T3', '2025-10-01', 0),
+            (14, 'S12', 'O1', 'T4', '2026-06-01', 1)",
+        "INSERT INTO canvas_users VALUES
+            (1, 'S1', 'active'),
+            (2, 'S1', 'active'),
+            (3, 'S2', 'active'),
+            (4, 'S4', 'deleted'),
+            (5, 'S5', 'active'),
+            (6, 'S6', 'active'),
+            (7, 'S7', 'active'),
+            (8, 'S8', 'active'),
+            (9, 'S9', 'active'),
+            (10, 'S10', 'active')",
+        "INSERT INTO canvas_courses VALUES
+            (1, 'O1', 'available'),
+            (2, 'O1', 'available'),
+            (3, 'O2', 'available'),
+            (4, 'O9', 'deleted')",
+    ] {
+        conn.execute(stmt, &[])?;
+    }
+
+    // 1. Helper with `let pseudo = ... |> distinct()` + `let cc = ... |> distinct()` +
+    //    `left_join_many_to_one` inlined into ungrouped + grouped (Drop & MaskComplementary)
+    //    and empty-result + all-NULL distinct_by cases.
+    let src = r##"
+module V063JoinSuppress
+
+schema Enrollment
+  id: Int
+  sid: Text [pii]
+  oid: Text
+  term_id: Text
+  cutoff_day: Text
+  failed: Int
+end
+
+schema CanvasUser
+  uid: Int
+  sid: Text? [pii]
+  state: Text
+end
+
+schema CanvasCourse
+  cid: Int
+  oid: Text?
+  state: Text
+end
+
+fn joined_enrollments(db: ReadDB(DB), cutoff_date: Date)
+  pseudo = (db.table(CanvasUser, from: "canvas_users")
+    |> where(.sid.some? and .state != "deleted")
+    |> derive(matched_sid: .sid ?? "")
+    |> select(.matched_sid)
+    |> distinct())
+
+  cc = (db.table(CanvasCourse, from: "canvas_courses")
+    |> where(.oid.some? and .state != "deleted")
+    |> derive(matched_oid: .oid ?? "")
+    |> select(.matched_oid)
+    |> distinct())
+
+  db.table(Enrollment, from: "enrollments")
+    |> derive(cday_opt: .cutoff_day.try_parse_date)
+    |> where(.cday_opt.some?)
+    |> derive(cday: .cday_opt ?? 1970-01-01)
+    |> where(.cday < cutoff_date)
+    |> left_join_many_to_one(pseudo, on: left.sid == right.matched_sid)
+    |> left_join_many_to_one(cc, on: left.oid == right.matched_oid)
+    |> derive(has_u: .matched_sid.some?, has_c: .matched_oid.some?)
+    |> select(.sid, .term_id, .failed, .has_u, .has_c)
+end
+
+fn compute_cov(db: ReadDB(DB), before: Date)
+  joined_enrollments(db, before)
+    |> summarize(
+      uniq_s: count_distinct(.sid),
+      rows_n: count(),
+      u_hits: count_if(.has_u),
+      c_hits: count_if(.has_c)
+    )
+    |> suppress_small_groups(min: 5, distinct_by: .sid)
+end
+
+fn compute_terms_drop(db: ReadDB(DB), before: Date)
+  joined_enrollments(db, before)
+    |> group_by(.term_id)
+    |> summarize(uniq_s: count_distinct(.sid), rows_n: count())
+    |> suppress_small_groups(min: 5, distinct_by: .sid)
+    |> sort_by(.term_id)
+end
+
+fn compute_terms_mask(db: ReadDB(DB), before: Date)
+  joined_enrollments(db, before)
+    |> group_by(.term_id)
+    |> summarize(uniq_s: count_distinct(.sid), rows_n: count())
+    |> suppress_small_groups(min: 5, distinct_by: .sid, mode: :mask)
+    |> sort_by(.term_id)
+end
+
+fn main(db: ReadDB(DB), console: Console) : Int
+  cov = compute_cov(db, 2026-01-01)
+  cov_empty = compute_cov(db, 2020-01-01)
+  td = compute_terms_drop(db, 2026-01-01)
+  tm = compute_terms_mask(db, 2026-01-01)
+  for r in cov
+    console.print("cov:#{r.uniq_s}:#{r.rows_n}:#{r.u_hits}:#{r.c_hits}")
+  end
+  console.print("empty:#{cov_empty.count()}")
+  for r in td
+    console.print("drop:#{r.term_id}:#{r.uniq_s}:#{r.rows_n}")
+  end
+  for r in tm
+    console.print("mask:#{r.term_id}:#{r.uniq_s ?? -1}:#{r.rows_n ?? -1}")
+  end
+  0
+end
+"##;
+
+    let out = assert_oracle_vm_parity(src, Some(("DB", &uri)))?;
+    assert_eq!(
+        out,
+        vec![
+            "cov:11:13:10:12",
+            "empty:0",
+            "drop:T1:5:6",
+            "drop:T3:5:5",
+            "mask:T1:-1:-1",
+            "mask:T2:-1:-1",
+            "mask:T3:5:5",
+        ]
+    );
+
+    // Verify optimizer + pushdown produces a single pushed SQL query per pipeline
+    let checked = check_src(src)?;
+    let (opt_prog, _) = dana::plan::optimize_exec_program(&checked.exec);
+    for (fn_name, expect_meta) in [
+        ("compute_cov", true),
+        ("compute_terms_drop", true),
+        ("compute_terms_mask", true),
+    ] {
+        let f = opt_prog
+            .find_fun(fn_name)
+            .ok_or_else(|| format!("missing fn {fn_name}"))?;
+        let plan = find_first_plan(&f.body).ok_or_else(|| format!("missing plan in {fn_name}"))?;
+        let sp = split_exec_plan_pushdown(plan, &opt_prog, "DB", SqlDialect::Sqlite, None);
+        match sp {
+            SplitPlan::Hybrid {
+                pushdown,
+                local_suffix,
+                ..
+            } => {
+                assert!(
+                    pushdown.sql.contains("SELECT DISTINCT")
+                        && pushdown.sql.contains("LEFT JOIN")
+                        && pushdown.sql.contains("COUNT(*)"),
+                    "expected single joined SQL query with DISTINCT & COUNT(*) in {fn_name}:\n{}",
+                    pushdown.sql
+                );
+                if expect_meta {
+                    assert!(
+                        pushdown.sql.contains("__dana_gm_rows")
+                            && pushdown.sql.contains("__dana_gm_dist"),
+                        "expected hidden group meta columns in {fn_name}:\n{}",
+                        pushdown.sql
+                    );
+                }
+                assert!(
+                    !pushdown
+                        .boundary_reason
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("order-preserving distinct"),
+                    "unexpected distinct boundary in {fn_name}: {:?}",
+                    pushdown.boundary_reason
+                );
+                assert!(
+                    matches!(
+                        local_suffix,
+                        dana::runtime::ir::ExecPlan::SuppressSmallGroups { .. }
+                            | dana::runtime::ir::ExecPlan::Sort { .. }
+                    ),
+                    "expected only SuppressSmallGroups/Sort in local suffix for {fn_name}"
+                );
+            }
+            other => {
+                return Err(format!(
+                    "expected Hybrid single-query SQL in {fn_name}, got {other:?}"
+                )
+                .into());
+            }
+        }
+    }
+
+    // Verify `dana explain` CLI output uses optimized helper inlining and has no distinct boundary
+    let explain_path = tmp.path().join("explain_v063.dana");
+    fs::write(&explain_path, src)?;
+    let explain_out = Command::new(env!("CARGO_BIN_EXE_dana"))
+        .args(["explain", "--dialect", "sqlite"])
+        .arg(&explain_path)
+        .output()?;
+    assert_eq!(explain_out.status.code(), Some(0));
+    let explain_txt = String::from_utf8_lossy(&explain_out.stdout);
+    assert!(
+        explain_txt.contains("__dana_gm_rows") && explain_txt.contains("__dana_gm_dist"),
+        "expected hidden group meta in dana explain:\n{explain_txt}"
+    );
+    assert!(
+        !explain_txt.contains("order-preserving distinct requires local VM"),
+        "unexpected distinct boundary in dana explain:\n{explain_txt}"
+    );
+
+    // 2. All-NULL distinct_by group suppresses cleanly (SQL COUNT(DISTINCT) == 0 == local tracker)
+    let src_all_null = r##"
+module V063AllNull
+
+schema NullRec
+  grp: Text
+  uid: Int?
+end
+
+fn main(db: ReadDB(DB), console: Console) : Int
+  res = (db.table(NullRec, from: "null_recs")
+    |> group_by(.grp)
+    |> summarize(u: count_distinct(.uid), n: count())
+    |> suppress_small_groups(min: 5, distinct_by: .uid)
+    |> sort_by(.grp))
+  for r in res
+    console.print("#{r.grp}:#{r.u}:#{r.n}")
+  end
+  0
+end
+"##;
+    conn.execute(
+        "CREATE TABLE null_recs (grp TEXT NOT NULL, uid INTEGER)",
+        &[],
+    )?;
+    conn.execute(
+        "INSERT INTO null_recs VALUES ('A', NULL), ('A', NULL), ('A', NULL), ('A', NULL), ('A', NULL), ('B', 1), ('B', 2), ('B', 3), ('B', 4), ('B', 5)",
+        &[],
+    )?;
+    let null_out = assert_oracle_vm_parity(src_all_null, Some(("DB", &uri)))?;
+    assert_eq!(null_out, vec!["B:5:5"]);
+
+    // 3. Function with failing `promise` must NOT be bypassed by inlining
+    let src_promise = r#"
+module V063Promise
+
+fn checked_pos() : Table(x: Int)
+  promise all(.x > 0)
+  table
+    | x |
+    | -1 |
+  end
+end
+
+fn main() : Int
+  t = checked_pos() |> summarize(n: count())
+  t.count()
+end
+"#;
+    assert_oracle_vm_trap_kind(src_promise, BugKind::PromiseViolation)?;
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL instance (DANA_TEST_POSTGRES_URL)"]
+fn v063_postgres_live_single_query_join_suppress_pushdown() -> TestResult {
+    let url = std::env::var("DANA_TEST_POSTGRES_URL").map_err(
+        |_| "DANA_TEST_POSTGRES_URL must be set to run live PostgreSQL v0.6.3 pushdown test",
+    )?;
+    let schema_name = format!("dana_v063_pg_{}", std::process::id());
+    {
+        let mut pg = open_connection(&url)?;
+        pg.execute(
+            &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+            &[],
+        )?;
+        pg.execute(&format!(r#"CREATE SCHEMA "{schema_name}""#), &[])?;
+        pg.execute(
+            &format!(r#"CREATE TYPE "{schema_name}".wf_state AS ENUM ('active', 'deleted')"#),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"CREATE TABLE "{schema_name}".enrollments (
+                    id INTEGER PRIMARY KEY,
+                    sid TEXT NOT NULL,
+                    oid TEXT NOT NULL,
+                    term_id TEXT NOT NULL,
+                    term_end TEXT NOT NULL
+                )"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"CREATE TABLE "{schema_name}".canvas_users (
+                    uid INTEGER PRIMARY KEY,
+                    sid TEXT,
+                    state "{schema_name}".wf_state NOT NULL
+                )"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"CREATE TABLE "{schema_name}".canvas_courses (
+                    cid INTEGER PRIMARY KEY,
+                    oid TEXT,
+                    state "{schema_name}".wf_state NOT NULL
+                )"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"INSERT INTO "{schema_name}".enrollments VALUES
+                    (1, 'S1', 'O1', 'T1', '2025-11-15'),
+                    (2, 'S2', 'O1', 'T1', '2025-11-15'),
+                    (3, 'S3', 'O2', 'T1', '2025-11-15'),
+                    (4, 'S4', 'O1', 'T1', '2025-11-15'),
+                    (5, 'S5', 'O1', 'T1', '2025-11-15'),
+                    (6, 'S6', 'O1', 'T2', '2025-11-15'),
+                    (7, 'S7', 'O1', 'T3', '2026-05-01')"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"INSERT INTO "{schema_name}".canvas_users VALUES
+                    (1, 'S1', 'active'),
+                    (2, 'S1', 'active'),
+                    (3, 'S2', 'active'),
+                    (4, 'S4', 'deleted'),
+                    (5, 'S5', 'active')"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"INSERT INTO "{schema_name}".canvas_courses VALUES
+                    (1, 'O1', 'active'),
+                    (2, 'O1', 'active'),
+                    (3, 'O2', 'deleted')"#
+            ),
+            &[],
+        )?;
+    }
+
+    let test_res: TestResult = (|| {
+        let src = format!(
+            r##"
+module V063PgLive
+
+schema Enrollment
+  id: Int
+  sid: Text [pii]
+  oid: Text
+  term_id: Text
+  term_end: Text
+end
+
+schema CanvasUser
+  uid: Int
+  sid: Text? [pii]
+  state: Text
+end
+
+schema CanvasCourse
+  cid: Int
+  oid: Text?
+  state: Text
+end
+
+fn online_enr(db: ReadDB(PG), cutoff: Date)
+  pseudo = (db.table(CanvasUser, from: "{schema_name}.canvas_users")
+    |> where(.sid.some? and .state != "deleted")
+    |> derive(matched_sid: .sid ?? "")
+    |> select(.matched_sid)
+    |> distinct())
+
+  cc = (db.table(CanvasCourse, from: "{schema_name}.canvas_courses")
+    |> where(.oid.some? and .state != "deleted")
+    |> derive(matched_oid: .oid ?? "")
+    |> select(.matched_oid)
+    |> distinct())
+
+  db.table(Enrollment, from: "{schema_name}.enrollments")
+    |> derive(end_opt: .term_end.try_parse_date)
+    |> where(.end_opt.some?)
+    |> derive(term_end_d: .end_opt ?? 1970-01-01)
+    |> where(.term_end_d < cutoff)
+    |> left_join_many_to_one(pseudo, on: left.sid == right.matched_sid)
+    |> left_join_many_to_one(cc, on: left.oid == right.matched_oid)
+    |> derive(has_u: .matched_sid.some?, has_c: .matched_oid.some?)
+    |> select(.sid, .term_id, .has_u, .has_c)
+end
+
+fn coverage(db: ReadDB(PG), before: Date)
+  online_enr(db, before)
+    |> summarize(
+      uniq_s: count_distinct(.sid),
+      rows_n: count(),
+      u_hits: count_if(.has_u),
+      c_hits: count_if(.has_c)
+    )
+    |> suppress_small_groups(min: 5, distinct_by: .sid)
+end
+
+fn terms_sorted(db: ReadDB(PG), before: Date)
+  online_enr(db, before)
+    |> group_by(.term_id)
+    |> summarize(uniq_s: count_distinct(.sid), rows_n: count())
+    |> suppress_small_groups(min: 5, distinct_by: .sid)
+    |> sort_by(.term_id)
+end
+
+fn main(db: ReadDB(PG), console: Console) : Int
+  cov = coverage(db, 2026-01-01)
+  trm = terms_sorted(db, 2026-01-01)
+  for r in cov
+    console.print("cov:#{{r.uniq_s}}:#{{r.rows_n}}:#{{r.u_hits}}:#{{r.c_hits}}")
+  end
+  for r in trm
+    console.print("term:#{{r.term_id}}:#{{r.uniq_s}}:#{{r.rows_n}}")
+  end
+  0
+end
+"##
+        );
+
+        let checked = check_src(&src)?;
+        let (opt_prog, _) = dana::plan::optimize_exec_program(&checked.exec);
+        for fn_name in ["coverage", "terms_sorted"] {
+            let f = opt_prog
+                .find_fun(fn_name)
+                .ok_or_else(|| format!("missing fn {fn_name}"))?;
+            let plan =
+                find_first_plan(&f.body).ok_or_else(|| format!("missing plan in {fn_name}"))?;
+            let sp = split_exec_plan_pushdown(plan, &opt_prog, "PG", SqlDialect::Postgres, None);
+            match sp {
+                SplitPlan::Hybrid { pushdown, .. } => {
+                    assert!(
+                        pushdown.sql.contains("SELECT DISTINCT")
+                            && pushdown.sql.contains("LEFT JOIN")
+                            && pushdown.sql.contains("__dana_gm_rows")
+                            && pushdown.sql.contains("__dana_gm_dist"),
+                        "expected single PG query with DISTINCT & hidden meta in {fn_name}:\n{}",
+                        pushdown.sql
+                    );
+                }
+                other => {
+                    return Err(format!(
+                        "expected Hybrid single PG query in {fn_name}, got {other:?}"
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let out = assert_oracle_vm_parity(&src, Some(("PG", &url)))?;
+        assert_eq!(out, vec!["cov:6:6:3:5", "term:T1:5:5"]);
+        Ok(())
+    })();
+
+    let _ = open_connection(&url).and_then(|mut pg| {
+        pg.execute(
+            &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+            &[],
+        )
+    });
+
+    test_res
+}
+
+#[test]
+fn v063_deep_pipeline_cte_linearization_sqlite_and_postgres() -> TestResult {
+    let tmp = TempDir::new("v063_cte_linearize")?;
+    let db_path = tmp.path().join("deep.db");
+    let uri = sqlite_uri(&db_path);
+    let mut conn = open_connection(&uri)?;
+    for stmt in [
+        "CREATE TABLE populi_enr (
+            sid TEXT NOT NULL,
+            tid TEXT NOT NULL,
+            tname TEXT NOT NULL,
+            tstart TEXT NOT NULL,
+            tend TEXT NOT NULL,
+            oid TEXT NOT NULL,
+            campus TEXT NOT NULL,
+            status TEXT NOT NULL,
+            grade TEXT,
+            finalized TEXT NOT NULL
+        )",
+        "CREATE TABLE canvas_users (sid TEXT, state TEXT)",
+        "CREATE TABLE canvas_courses (oid TEXT, state TEXT)",
+        "INSERT INTO populi_enr VALUES
+            ('S1', '201', 'Fall', '2025-09-01T00:00:00Z', '2025-11-15T00:00:00Z', 'O1', 'Online Campus', 'ENROLLED', 'A', '1'),
+            ('S2', '201', 'Fall', '2025-09-01T00:00:00Z', '2025-11-15T00:00:00Z', 'O1', 'Online Campus', 'ENROLLED', 'F', '1'),
+            ('S3', '201', 'Fall', '2025-09-01T00:00:00Z', '2025-11-15T00:00:00Z', 'O2', 'Online Campus', 'WITHDRAWN', NULL, '0'),
+            ('S4', '201', 'Fall', '2025-09-01T00:00:00Z', '2025-11-15T00:00:00Z', 'O1', 'Online Campus', 'ENROLLED', 'B', '1'),
+            ('S5', '201', 'Fall', '2025-09-01T00:00:00Z', '2025-11-15T00:00:00Z', 'O1', 'Online Campus', 'ENROLLED', 'D', '1'),
+            ('S6', '202', 'Spring', '2026-09-01T00:00:00Z', '2026-12-15T00:00:00Z', 'O1', 'Online Campus', 'ENROLLED', 'A', '1')",
+        "INSERT INTO canvas_users VALUES ('S1', 'active'), ('S1', 'active'), ('S2', 'active'), ('S4', 'deleted')",
+        "INSERT INTO canvas_courses VALUES ('O1', 'available'), ('O1', 'completed'), ('O2', 'deleted')",
+    ] {
+        conn.execute(stmt, &[])?;
+    }
+
+    let src = r##"
+module V063DeepCte
+
+schema Enr
+  sid: Text? [pii]
+  tid: Text?
+  tname: Text?
+  tstart: Text?
+  tend: Text?
+  oid: Text?
+  campus: Text?
+  status: Text? [ferpa]
+  grade: Text? [ferpa]
+  finalized: Text? [ferpa]
+end
+
+schema CUser
+  sid: Text? [pii]
+  state: Text?
+end
+
+schema CCourse
+  oid: Text?
+  state: Text?
+end
+
+fn online(db: ReadDB(DB), cutoff: Date)
+  pseudo = (db.table(CUser, from: "canvas_users")
+    |> where(.sid.some? and (.sid ?? "") != "" and .state.some? and .state != "deleted")
+    |> derive(matched_sid: .sid ?? "")
+    |> select(.matched_sid)
+    |> distinct())
+
+  cc = (db.table(CCourse, from: "canvas_courses")
+    |> where(.oid.some? and (.oid ?? "") != "" and .state.some? and .state != "deleted")
+    |> derive(matched_oid: .oid ?? "")
+    |> select(.matched_oid)
+    |> distinct())
+
+  db.table(Enr, from: "populi_enr")
+    |> where(
+      (.campus ?? "") == "Online Campus"
+        and (.status ?? "").in?(["ENROLLED", "WITHDRAWN", "INCOMPLETE"])
+        and not (.grade ?? "").in?(["NGC", "PN", "WAIV", "APPR"])
+    )
+    |> derive(
+      s_id: .sid ?? "",
+      t_id: .tid ?? "",
+      t_name: .tname ?? "",
+      t_start_opt: (.tstart ?? "").slice(0, 10).try_parse_date,
+      t_end_opt: (.tend ?? "").slice(0, 10).try_parse_date,
+      o_id: .oid ?? "",
+      is_dfw: (.status ?? "") == "WITHDRAWN" or ((.finalized ?? "") == "1" and (.grade ?? "").in?(["F", "UF", "D+", "D", "D-"])),
+      is_wd: (.status ?? "") == "WITHDRAWN",
+      is_fail: (.finalized ?? "") == "1" and (.grade ?? "").in?(["F", "UF"])
+    )
+    |> where(.t_start_opt.some? and .t_end_opt.some?)
+    |> derive(term_start: .t_start_opt ?? 1970-01-01, term_end: .t_end_opt ?? 1970-01-01)
+    |> where(.term_end < cutoff)
+    |> left_join_many_to_one(pseudo, on: left.s_id == right.matched_sid)
+    |> left_join_many_to_one(cc, on: left.o_id == right.matched_oid)
+    |> derive(has_u: .matched_sid.some?, has_c: .matched_oid.some?)
+    |> select(.sid, .tid, .t_id, .t_name, .term_start, .term_end, .is_dfw, .is_wd, .is_fail, .has_u, .has_c)
+end
+
+fn main(db: ReadDB(DB), console: Console) : Int
+  cov = (online(db, 2026-06-01)
+    |> summarize(
+      uniq_s: count_distinct(.sid),
+      rows_n: count(),
+      dfw_n: count_if(.is_dfw),
+      u_hits: count_if(.has_u),
+      c_hits: count_if(.has_c)
+    )
+    |> suppress_small_groups(min: 5, distinct_by: .sid))
+  for r in cov
+    console.print("cov:#{r.uniq_s}:#{r.rows_n}:#{r.dfw_n}:#{r.u_hits}:#{r.c_hits}")
+  end
+  0
+end
+"##;
+
+    let checked = check_src(src)?;
+    let (opt_prog, _) = dana::plan::optimize_exec_program(&checked.exec);
+    let f = opt_prog.find_fun("main").ok_or("missing main")?;
+    let plan = find_first_plan(&f.body).ok_or("missing plan")?;
+    for dialect in [SqlDialect::Sqlite, SqlDialect::Postgres] {
+        match split_exec_plan_pushdown(plan, &opt_prog, "DB", dialect, None) {
+            SplitPlan::Hybrid { pushdown, .. } => {
+                assert!(
+                    pushdown.sql.starts_with(r#"WITH "_cte_0" AS ("#),
+                    "expected flat WITH CTE SQL for {dialect}:\n{}",
+                    pushdown.sql
+                );
+            }
+            other => return Err(format!("expected Hybrid SQL for {dialect}, got {other:?}").into()),
+        }
+    }
+
+    let out = assert_oracle_vm_parity(src, Some(("DB", &uri)))?;
+    assert_eq!(out, vec!["cov:5:5:3:2:4"]);
+    Ok(())
 }

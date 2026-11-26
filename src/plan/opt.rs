@@ -5,12 +5,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::core::syntax::{
-    CaseArm, DeriveItem, Expr, FunDecl, Ident, JoinKind, JoinOn, Literal, Plan, PrimOp, Program,
-    RowExpr,
+    CaseArm, DeriveItem, Expr, FunDecl, FunKind, Ident, JoinKind, JoinOn, Literal, Plan, PrimOp,
+    Program, RowExpr,
 };
 use crate::runtime::ir::{
-    ExecCaseArm, ExecDeriveItem, ExecExpr, ExecFun, ExecPlan, ExecPrimOp, ExecProgram, ExecPromise,
-    ExecRowExpr,
+    ExecCaseArm, ExecDeriveItem, ExecExpr, ExecFun, ExecPattern, ExecPlan, ExecPrimOp, ExecProgram,
+    ExecPromise, ExecRowExpr,
 };
 
 /// Counters describing algebraic rewrites applied during optimization.
@@ -1121,6 +1121,1347 @@ fn prune_core_plan_derives(
 // Phase 2 Execution IR Optimizer (`ExecPlan` / `ExecProgram`)
 // ===========================================================================
 
+const MAX_INLINE_DEPTH: usize = 4;
+
+fn exec_plan_input(plan: &ExecPlan) -> Option<&ExecPlan> {
+    match plan {
+        ExecPlan::SourceExpr(_)
+        | ExecPlan::SourceDB { .. }
+        | ExecPlan::Join { .. }
+        | ExecPlan::Union { .. } => None,
+        ExecPlan::Select { input, .. }
+        | ExecPlan::Drop { input, .. }
+        | ExecPlan::Rename { input, .. }
+        | ExecPlan::Derive { input, .. }
+        | ExecPlan::Filter { input, .. }
+        | ExecPlan::Distinct { input, .. }
+        | ExecPlan::DedupeBy { input, .. }
+        | ExecPlan::Sort { input, .. }
+        | ExecPlan::Limit { input, .. }
+        | ExecPlan::GroupBy { input, .. }
+        | ExecPlan::Summarize { input, .. }
+        | ExecPlan::SuppressSmallGroups { input, .. }
+        | ExecPlan::Shuffle { input, .. }
+        | ExecPlan::SuppressSmallCells { input, .. }
+        | ExecPlan::Window { input, .. }
+        | ExecPlan::FillGaps { input, .. }
+        | ExecPlan::PivotWider { input, .. }
+        | ExecPlan::PivotLonger { input, .. }
+        | ExecPlan::Crosstab { input, .. }
+        | ExecPlan::Redact { input, .. }
+        | ExecPlan::Pseudonymize { input, .. } => Some(input),
+    }
+}
+
+fn exec_plan_input_mut(plan: &mut ExecPlan) -> Option<&mut ExecPlan> {
+    match plan {
+        ExecPlan::SourceExpr(_)
+        | ExecPlan::SourceDB { .. }
+        | ExecPlan::Join { .. }
+        | ExecPlan::Union { .. } => None,
+        ExecPlan::Select { input, .. }
+        | ExecPlan::Drop { input, .. }
+        | ExecPlan::Rename { input, .. }
+        | ExecPlan::Derive { input, .. }
+        | ExecPlan::Filter { input, .. }
+        | ExecPlan::Distinct { input, .. }
+        | ExecPlan::DedupeBy { input, .. }
+        | ExecPlan::Sort { input, .. }
+        | ExecPlan::Limit { input, .. }
+        | ExecPlan::GroupBy { input, .. }
+        | ExecPlan::Summarize { input, .. }
+        | ExecPlan::SuppressSmallGroups { input, .. }
+        | ExecPlan::Shuffle { input, .. }
+        | ExecPlan::SuppressSmallCells { input, .. }
+        | ExecPlan::Window { input, .. }
+        | ExecPlan::FillGaps { input, .. }
+        | ExecPlan::PivotWider { input, .. }
+        | ExecPlan::PivotLonger { input, .. }
+        | ExecPlan::Crosstab { input, .. }
+        | ExecPlan::Redact { input, .. }
+        | ExecPlan::Pseudonymize { input, .. } => Some(input.as_mut()),
+    }
+}
+
+fn exec_plan_has_source_db(plan: &ExecPlan) -> bool {
+    let mut stack = vec![plan];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            ExecPlan::SourceDB { .. } => return true,
+            ExecPlan::Union { left, right } | ExecPlan::Join { left, right, .. } => {
+                stack.push(right);
+                stack.push(left);
+            }
+            other => {
+                if let Some(child) = exec_plan_input(other) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    false
+}
+
+fn exec_expr_may_stop(expr: &ExecExpr) -> bool {
+    match expr {
+        ExecExpr::Lit(_)
+        | ExecExpr::Var(_)
+        | ExecExpr::ConstRef(_)
+        | ExecExpr::TableLit { .. }
+        | ExecExpr::Lam { .. } => false,
+        ExecExpr::Tuple(xs) | ExecExpr::Ctor { args: xs, .. } => xs.iter().any(exec_expr_may_stop),
+        ExecExpr::Proj { tup, .. } => exec_expr_may_stop(tup),
+        ExecExpr::Prim { op, args } => {
+            exec_prim_op_may_stop(op) || args.iter().any(exec_expr_may_stop)
+        }
+        ExecExpr::Rel(plan) => exec_plan_may_stop(plan),
+        ExecExpr::LetE { .. }
+        | ExecExpr::IfE { .. }
+        | ExecExpr::CaseE { .. }
+        | ExecExpr::App { .. }
+        | ExecExpr::Call { .. }
+        | ExecExpr::Join { .. }
+        | ExecExpr::Jump { .. }
+        | ExecExpr::ForLoop { .. }
+        | ExecExpr::WhileLoop { .. }
+        | ExecExpr::Host { .. }
+        | ExecExpr::Assert { .. }
+        | ExecExpr::CheckPromise { .. }
+        | ExecExpr::Stop { .. }
+        | ExecExpr::Fail(_) => true,
+    }
+}
+
+fn exec_plan_may_stop(plan: &ExecPlan) -> bool {
+    match plan {
+        ExecPlan::SourceExpr(e) => exec_expr_may_stop(e),
+        ExecPlan::SourceDB { cap, .. } => exec_expr_may_stop(cap),
+        ExecPlan::Filter { input, pred } => {
+            exec_plan_may_stop(input) || may_stop_exec_row_expr(pred)
+        }
+        ExecPlan::Derive { input, items } => {
+            exec_plan_may_stop(input) || items.iter().any(may_stop_exec_derive_item)
+        }
+        ExecPlan::Summarize { input, aggs, .. } => {
+            exec_plan_may_stop(input)
+                || aggs
+                    .iter()
+                    .any(|a| a.arg.as_ref().is_some_and(may_stop_exec_row_expr))
+        }
+        ExecPlan::Limit { input, n } => n.to_usize().is_none() || exec_plan_may_stop(input),
+        ExecPlan::Select { input, .. }
+        | ExecPlan::Drop { input, .. }
+        | ExecPlan::Rename { input, .. }
+        | ExecPlan::Distinct { input, .. }
+        | ExecPlan::DedupeBy { input, .. }
+        | ExecPlan::Sort { input, .. }
+        | ExecPlan::GroupBy { input, .. }
+        | ExecPlan::Redact { input, .. } => exec_plan_may_stop(input),
+        ExecPlan::Union { left, right } => exec_plan_may_stop(left) || exec_plan_may_stop(right),
+        ExecPlan::Join {
+            kind, left, right, ..
+        } => {
+            if matches!(kind, JoinKind::InnerMany | JoinKind::Semi | JoinKind::Anti) {
+                exec_plan_may_stop(left) || exec_plan_may_stop(right)
+            } else {
+                // Unique/many-to-one joins can trap at runtime on duplicate right keys.
+                true
+            }
+        }
+        ExecPlan::SuppressSmallGroups { .. }
+        | ExecPlan::Shuffle { .. }
+        | ExecPlan::SuppressSmallCells { .. }
+        | ExecPlan::Window { .. }
+        | ExecPlan::FillGaps { .. }
+        | ExecPlan::PivotWider { .. }
+        | ExecPlan::PivotLonger { .. }
+        | ExecPlan::Crosstab { .. }
+        | ExecPlan::Pseudonymize { .. } => true,
+    }
+}
+
+fn exec_plan_is_leftmost_input(plan: &ExecPlan, target: &str) -> bool {
+    let mut cur = plan;
+    loop {
+        match cur {
+            ExecPlan::SourceExpr(e) => return matches!(e.as_ref(), ExecExpr::Var(v) if v == target),
+            ExecPlan::Join { left, .. } => cur = left,
+            ExecPlan::Union { left, .. } => cur = left,
+            other => {
+                let Some(child) = exec_plan_input(other) else {
+                    return false;
+                };
+                cur = child;
+            }
+        }
+    }
+}
+
+fn push_exec_pattern_binders(pat: &ExecPattern, bound: &mut HashSet<Ident>) {
+    match pat {
+        ExecPattern::Wildcard | ExecPattern::Lit(_) => {}
+        ExecPattern::Bind(id) => {
+            bound.insert(id.clone());
+        }
+        ExecPattern::Ctor { binders, .. } | ExecPattern::ListExact(binders) => {
+            for b in binders {
+                bound.insert(b.clone());
+            }
+        }
+    }
+}
+
+fn collect_exec_row_expr_outer_vars(
+    re: &ExecRowExpr,
+    bound: &HashSet<Ident>,
+    out: &mut HashSet<Ident>,
+) {
+    match re {
+        ExecRowExpr::Lit(_) | ExecRowExpr::Col(_) | ExecRowExpr::ConstRef(_) => {}
+        ExecRowExpr::OuterVar(v) => {
+            if !bound.contains(v) {
+                out.insert(v.clone());
+            }
+        }
+        ExecRowExpr::CallPure { args, .. } | ExecRowExpr::Prim { args, .. } => {
+            for a in args {
+                collect_exec_row_expr_outer_vars(a, bound, out);
+            }
+        }
+        ExecRowExpr::IfE {
+            cond,
+            then_br,
+            else_br,
+        } => {
+            collect_exec_row_expr_outer_vars(cond, bound, out);
+            collect_exec_row_expr_outer_vars(then_br, bound, out);
+            collect_exec_row_expr_outer_vars(else_br, bound, out);
+        }
+        ExecRowExpr::Coalesce {
+            opt_expr,
+            default_expr,
+        } => {
+            collect_exec_row_expr_outer_vars(opt_expr, bound, out);
+            collect_exec_row_expr_outer_vars(default_expr, bound, out);
+        }
+    }
+}
+
+fn collect_exec_expr_free_vars(expr: &ExecExpr, bound: &HashSet<Ident>, out: &mut HashSet<Ident>) {
+    match expr {
+        ExecExpr::Lit(_) | ExecExpr::ConstRef(_) | ExecExpr::TableLit { .. } => {}
+        ExecExpr::Var(v) => {
+            if !bound.contains(v) {
+                out.insert(v.clone());
+            }
+        }
+        ExecExpr::LetE {
+            name,
+            bound: b,
+            body,
+            ..
+        } => {
+            collect_exec_expr_free_vars(b, bound, out);
+            let mut next = bound.clone();
+            next.insert(name.clone());
+            collect_exec_expr_free_vars(body, &next, out);
+        }
+        ExecExpr::IfE {
+            cond,
+            then_br,
+            else_br,
+        } => {
+            collect_exec_expr_free_vars(cond, bound, out);
+            collect_exec_expr_free_vars(then_br, bound, out);
+            collect_exec_expr_free_vars(else_br, bound, out);
+        }
+        ExecExpr::CaseE { scrut, arms } => {
+            collect_exec_expr_free_vars(scrut, bound, out);
+            for arm in arms {
+                let mut next = bound.clone();
+                push_exec_pattern_binders(&arm.pattern, &mut next);
+                collect_exec_expr_free_vars(&arm.body, &next, out);
+            }
+        }
+        ExecExpr::Lam { params, body, .. } => {
+            let mut next = bound.clone();
+            for (p, _) in params {
+                next.insert(p.clone());
+            }
+            collect_exec_expr_free_vars(body, &next, out);
+        }
+        ExecExpr::App { fn_expr, args } => {
+            collect_exec_expr_free_vars(fn_expr, bound, out);
+            for a in args {
+                collect_exec_expr_free_vars(a, bound, out);
+            }
+        }
+        ExecExpr::Call { args, .. }
+        | ExecExpr::Jump { args, .. }
+        | ExecExpr::Tuple(args)
+        | ExecExpr::Ctor { args, .. }
+        | ExecExpr::Prim { args, .. }
+        | ExecExpr::Host { args, .. } => {
+            for a in args {
+                collect_exec_expr_free_vars(a, bound, out);
+            }
+        }
+        ExecExpr::Join {
+            params, rhs, body, ..
+        } => {
+            let mut next = bound.clone();
+            for (p, _) in params {
+                next.insert(p.clone());
+            }
+            collect_exec_expr_free_vars(rhs, &next, out);
+            collect_exec_expr_free_vars(body, bound, out);
+        }
+        ExecExpr::ForLoop {
+            item_var,
+            iter_expr,
+            state_vars,
+            body,
+            after,
+        } => {
+            collect_exec_expr_free_vars(iter_expr, bound, out);
+            let mut after_bound = bound.clone();
+            for (sv, _) in state_vars {
+                after_bound.insert(sv.clone());
+            }
+            let mut body_bound = after_bound.clone();
+            body_bound.insert(item_var.clone());
+            collect_exec_expr_free_vars(body, &body_bound, out);
+            collect_exec_expr_free_vars(after, &after_bound, out);
+        }
+        ExecExpr::WhileLoop {
+            cond,
+            state_vars,
+            body,
+            after,
+        } => {
+            let mut next = bound.clone();
+            for (sv, _) in state_vars {
+                next.insert(sv.clone());
+            }
+            collect_exec_expr_free_vars(cond, &next, out);
+            collect_exec_expr_free_vars(body, &next, out);
+            collect_exec_expr_free_vars(after, &next, out);
+        }
+        ExecExpr::Proj { tup, .. } | ExecExpr::Fail(tup) => {
+            collect_exec_expr_free_vars(tup, bound, out);
+        }
+        ExecExpr::Assert { cond, .. } => collect_exec_expr_free_vars(cond, bound, out),
+        ExecExpr::Stop {
+            detail: Some(d), ..
+        } => collect_exec_expr_free_vars(d, bound, out),
+        ExecExpr::Stop { detail: None, .. } => {}
+        ExecExpr::Rel(plan) => collect_exec_plan_free_vars(plan, bound, out),
+        ExecExpr::CheckPromise { ret_var, promise } => {
+            let mut next = bound.clone();
+            next.insert(ret_var.clone());
+            match promise {
+                ExecPromise::UniqueCols(_) => {}
+                ExecPromise::AllRows(re) => collect_exec_row_expr_outer_vars(re, &next, out),
+                ExecPromise::BoolExpr(e) => collect_exec_expr_free_vars(e, &next, out),
+            }
+        }
+    }
+}
+
+fn collect_exec_plan_free_vars(plan: &ExecPlan, bound: &HashSet<Ident>, out: &mut HashSet<Ident>) {
+    let mut stack = vec![plan];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            ExecPlan::SourceExpr(e) => collect_exec_expr_free_vars(e, bound, out),
+            ExecPlan::SourceDB { cap, .. } => collect_exec_expr_free_vars(cap, bound, out),
+            ExecPlan::Shuffle { input, seed } => {
+                collect_exec_expr_free_vars(seed, bound, out);
+                stack.push(input);
+            }
+            ExecPlan::Pseudonymize { input, secret, .. } => {
+                collect_exec_expr_free_vars(secret, bound, out);
+                stack.push(input);
+            }
+            ExecPlan::Filter { input, pred } => {
+                collect_exec_row_expr_outer_vars(pred, bound, out);
+                stack.push(input);
+            }
+            ExecPlan::Derive { input, items } => {
+                for item in items {
+                    if let Some(re) = item.col_expr() {
+                        collect_exec_row_expr_outer_vars(re, bound, out);
+                    }
+                }
+                stack.push(input);
+            }
+            ExecPlan::Summarize { input, aggs, .. } => {
+                for a in aggs {
+                    if let Some(re) = &a.arg {
+                        collect_exec_row_expr_outer_vars(re, bound, out);
+                    }
+                }
+                stack.push(input);
+            }
+            ExecPlan::Union { left, right } | ExecPlan::Join { left, right, .. } => {
+                stack.push(right);
+                stack.push(left);
+            }
+            other => {
+                if let Some(child) = exec_plan_input(other) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+}
+
+fn count_row_expr_outer_vars(re: &ExecRowExpr, target: &str) -> usize {
+    match re {
+        ExecRowExpr::Lit(_) | ExecRowExpr::Col(_) | ExecRowExpr::ConstRef(_) => 0,
+        ExecRowExpr::OuterVar(v) => usize::from(v == target),
+        ExecRowExpr::CallPure { args, .. } | ExecRowExpr::Prim { args, .. } => args
+            .iter()
+            .map(|a| count_row_expr_outer_vars(a, target))
+            .sum(),
+        ExecRowExpr::IfE {
+            cond,
+            then_br,
+            else_br,
+        } => {
+            count_row_expr_outer_vars(cond, target)
+                + count_row_expr_outer_vars(then_br, target)
+                + count_row_expr_outer_vars(else_br, target)
+        }
+        ExecRowExpr::Coalesce {
+            opt_expr,
+            default_expr,
+        } => {
+            count_row_expr_outer_vars(opt_expr, target)
+                + count_row_expr_outer_vars(default_expr, target)
+        }
+    }
+}
+
+fn count_exec_expr_var_uses(expr: &ExecExpr, target: &str) -> usize {
+    match expr {
+        ExecExpr::Lit(_) | ExecExpr::ConstRef(_) | ExecExpr::TableLit { .. } => 0,
+        ExecExpr::Var(v) => usize::from(v == target),
+        ExecExpr::LetE {
+            name, bound, body, ..
+        } => {
+            count_exec_expr_var_uses(bound, target)
+                + if name == target {
+                    0
+                } else {
+                    count_exec_expr_var_uses(body, target)
+                }
+        }
+        ExecExpr::IfE {
+            cond,
+            then_br,
+            else_br,
+        } => {
+            count_exec_expr_var_uses(cond, target)
+                + count_exec_expr_var_uses(then_br, target)
+                + count_exec_expr_var_uses(else_br, target)
+        }
+        ExecExpr::CaseE { scrut, arms } => {
+            count_exec_expr_var_uses(scrut, target)
+                + arms
+                    .iter()
+                    .map(|arm| {
+                        let mut arm_bound = HashSet::new();
+                        push_exec_pattern_binders(&arm.pattern, &mut arm_bound);
+                        if arm_bound.contains(target) {
+                            0
+                        } else {
+                            count_exec_expr_var_uses(&arm.body, target)
+                        }
+                    })
+                    .sum::<usize>()
+        }
+        ExecExpr::Lam { params, body, .. } => {
+            if params.iter().any(|(p, _)| p == target) {
+                0
+            } else {
+                count_exec_expr_var_uses(body, target)
+            }
+        }
+        ExecExpr::App { fn_expr, args } => {
+            count_exec_expr_var_uses(fn_expr, target)
+                + args
+                    .iter()
+                    .map(|a| count_exec_expr_var_uses(a, target))
+                    .sum::<usize>()
+        }
+        ExecExpr::Call { args, .. }
+        | ExecExpr::Jump { args, .. }
+        | ExecExpr::Tuple(args)
+        | ExecExpr::Ctor { args, .. }
+        | ExecExpr::Prim { args, .. }
+        | ExecExpr::Host { args, .. } => args
+            .iter()
+            .map(|a| count_exec_expr_var_uses(a, target))
+            .sum(),
+        ExecExpr::Join {
+            params, rhs, body, ..
+        } => {
+            (if params.iter().any(|(p, _)| p == target) {
+                0
+            } else {
+                count_exec_expr_var_uses(rhs, target)
+            }) + count_exec_expr_var_uses(body, target)
+        }
+        ExecExpr::ForLoop {
+            item_var,
+            iter_expr,
+            state_vars,
+            body,
+            after,
+        } => {
+            let state_shadows = state_vars.iter().any(|(s, _)| s == target);
+            count_exec_expr_var_uses(iter_expr, target)
+                + if state_shadows || item_var == target {
+                    0
+                } else {
+                    count_exec_expr_var_uses(body, target)
+                }
+                + if state_shadows {
+                    0
+                } else {
+                    count_exec_expr_var_uses(after, target)
+                }
+        }
+        ExecExpr::WhileLoop {
+            cond,
+            state_vars,
+            body,
+            after,
+        } => {
+            if state_vars.iter().any(|(s, _)| s == target) {
+                0
+            } else {
+                count_exec_expr_var_uses(cond, target)
+                    + count_exec_expr_var_uses(body, target)
+                    + count_exec_expr_var_uses(after, target)
+            }
+        }
+        ExecExpr::Proj { tup, .. } | ExecExpr::Fail(tup) => count_exec_expr_var_uses(tup, target),
+        ExecExpr::Assert { cond, .. } => count_exec_expr_var_uses(cond, target),
+        ExecExpr::Stop {
+            detail: Some(d), ..
+        } => count_exec_expr_var_uses(d, target),
+        ExecExpr::Stop { detail: None, .. } => 0,
+        ExecExpr::Rel(plan) => count_exec_plan_var_uses(plan, target),
+        ExecExpr::CheckPromise { ret_var, promise } => {
+            if ret_var == target {
+                0
+            } else {
+                match promise {
+                    ExecPromise::UniqueCols(_) => 0,
+                    ExecPromise::AllRows(re) => count_row_expr_outer_vars(re, target),
+                    ExecPromise::BoolExpr(e) => count_exec_expr_var_uses(e, target),
+                }
+            }
+        }
+    }
+}
+
+fn count_exec_plan_var_uses(plan: &ExecPlan, target: &str) -> usize {
+    let mut total = 0;
+    let mut stack = vec![plan];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            ExecPlan::SourceExpr(e) => total += count_exec_expr_var_uses(e, target),
+            ExecPlan::SourceDB { cap, .. } => total += count_exec_expr_var_uses(cap, target),
+            ExecPlan::Shuffle { input, seed } => {
+                total += count_exec_expr_var_uses(seed, target);
+                stack.push(input);
+            }
+            ExecPlan::Pseudonymize { input, secret, .. } => {
+                total += count_exec_expr_var_uses(secret, target);
+                stack.push(input);
+            }
+            ExecPlan::Filter { input, pred } => {
+                total += count_row_expr_outer_vars(pred, target);
+                stack.push(input);
+            }
+            ExecPlan::Derive { input, items } => {
+                for item in items {
+                    if let Some(re) = item.col_expr() {
+                        total += count_row_expr_outer_vars(re, target);
+                    }
+                }
+                stack.push(input);
+            }
+            ExecPlan::Summarize { input, aggs, .. } => {
+                for a in aggs {
+                    if let Some(re) = &a.arg {
+                        total += count_row_expr_outer_vars(re, target);
+                    }
+                }
+                stack.push(input);
+            }
+            ExecPlan::Union { left, right } | ExecPlan::Join { left, right, .. } => {
+                stack.push(right);
+                stack.push(left);
+            }
+            other => {
+                if let Some(child) = exec_plan_input(other) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    total
+}
+
+fn collect_exec_expr_binders(expr: &ExecExpr, out: &mut HashSet<Ident>) {
+    match expr {
+        ExecExpr::Lit(_)
+        | ExecExpr::Var(_)
+        | ExecExpr::ConstRef(_)
+        | ExecExpr::TableLit { .. }
+        | ExecExpr::Stop { detail: None, .. } => {}
+        ExecExpr::LetE {
+            name, bound, body, ..
+        } => {
+            out.insert(name.clone());
+            collect_exec_expr_binders(bound, out);
+            collect_exec_expr_binders(body, out);
+        }
+        ExecExpr::IfE {
+            cond,
+            then_br,
+            else_br,
+        } => {
+            collect_exec_expr_binders(cond, out);
+            collect_exec_expr_binders(then_br, out);
+            collect_exec_expr_binders(else_br, out);
+        }
+        ExecExpr::CaseE { scrut, arms } => {
+            collect_exec_expr_binders(scrut, out);
+            for arm in arms {
+                push_exec_pattern_binders(&arm.pattern, out);
+                collect_exec_expr_binders(&arm.body, out);
+            }
+        }
+        ExecExpr::Lam { params, body, .. } => {
+            for (p, _) in params {
+                out.insert(p.clone());
+            }
+            collect_exec_expr_binders(body, out);
+        }
+        ExecExpr::App { fn_expr, args } => {
+            collect_exec_expr_binders(fn_expr, out);
+            for a in args {
+                collect_exec_expr_binders(a, out);
+            }
+        }
+        ExecExpr::Call { args, .. }
+        | ExecExpr::Jump { args, .. }
+        | ExecExpr::Tuple(args)
+        | ExecExpr::Ctor { args, .. }
+        | ExecExpr::Prim { args, .. }
+        | ExecExpr::Host { args, .. } => {
+            for a in args {
+                collect_exec_expr_binders(a, out);
+            }
+        }
+        ExecExpr::Join {
+            params, rhs, body, ..
+        } => {
+            for (p, _) in params {
+                out.insert(p.clone());
+            }
+            collect_exec_expr_binders(rhs, out);
+            collect_exec_expr_binders(body, out);
+        }
+        ExecExpr::ForLoop {
+            item_var,
+            iter_expr,
+            state_vars,
+            body,
+            after,
+        } => {
+            out.insert(item_var.clone());
+            for (sv, _) in state_vars {
+                out.insert(sv.clone());
+            }
+            collect_exec_expr_binders(iter_expr, out);
+            collect_exec_expr_binders(body, out);
+            collect_exec_expr_binders(after, out);
+        }
+        ExecExpr::WhileLoop {
+            cond,
+            state_vars,
+            body,
+            after,
+        } => {
+            for (sv, _) in state_vars {
+                out.insert(sv.clone());
+            }
+            collect_exec_expr_binders(cond, out);
+            collect_exec_expr_binders(body, out);
+            collect_exec_expr_binders(after, out);
+        }
+        ExecExpr::Proj { tup, .. } | ExecExpr::Fail(tup) => collect_exec_expr_binders(tup, out),
+        ExecExpr::Assert { cond, .. } => collect_exec_expr_binders(cond, out),
+        ExecExpr::Stop {
+            detail: Some(d), ..
+        } => collect_exec_expr_binders(d, out),
+        ExecExpr::Rel(plan) => collect_exec_plan_binders(plan, out),
+        ExecExpr::CheckPromise { ret_var, promise } => {
+            out.insert(ret_var.clone());
+            if let ExecPromise::BoolExpr(e) = promise {
+                collect_exec_expr_binders(e, out);
+            }
+        }
+    }
+}
+
+fn collect_exec_plan_binders(plan: &ExecPlan, out: &mut HashSet<Ident>) {
+    let mut stack = vec![plan];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            ExecPlan::SourceExpr(e) => collect_exec_expr_binders(e, out),
+            ExecPlan::SourceDB { cap, .. } => collect_exec_expr_binders(cap, out),
+            ExecPlan::Shuffle { input, seed } => {
+                collect_exec_expr_binders(seed, out);
+                stack.push(input);
+            }
+            ExecPlan::Pseudonymize { input, secret, .. } => {
+                collect_exec_expr_binders(secret, out);
+                stack.push(input);
+            }
+            ExecPlan::Union { left, right } | ExecPlan::Join { left, right, .. } => {
+                stack.push(right);
+                stack.push(left);
+            }
+            other => {
+                if let Some(child) = exec_plan_input(other) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+}
+
+fn subst_exec_row_expr(re: &ExecRowExpr, params: &HashMap<Ident, ExecExpr>) -> ExecRowExpr {
+    match re {
+        ExecRowExpr::Lit(_) | ExecRowExpr::Col(_) | ExecRowExpr::ConstRef(_) => re.clone(),
+        ExecRowExpr::OuterVar(v) => match params.get(v) {
+            Some(ExecExpr::Var(arg_v)) => ExecRowExpr::OuterVar(arg_v.clone()),
+            Some(ExecExpr::Lit(l)) => ExecRowExpr::Lit(l.clone()),
+            Some(ExecExpr::ConstRef(c)) => ExecRowExpr::ConstRef(c.clone()),
+            _ => ExecRowExpr::OuterVar(v.clone()),
+        },
+        ExecRowExpr::CallPure { fn_name, args } => ExecRowExpr::CallPure {
+            fn_name: fn_name.clone(),
+            args: args
+                .iter()
+                .map(|a| subst_exec_row_expr(a, params))
+                .collect(),
+        },
+        ExecRowExpr::IfE {
+            cond,
+            then_br,
+            else_br,
+        } => ExecRowExpr::IfE {
+            cond: Box::new(subst_exec_row_expr(cond, params)),
+            then_br: Box::new(subst_exec_row_expr(then_br, params)),
+            else_br: Box::new(subst_exec_row_expr(else_br, params)),
+        },
+        ExecRowExpr::Coalesce {
+            opt_expr,
+            default_expr,
+        } => ExecRowExpr::Coalesce {
+            opt_expr: Box::new(subst_exec_row_expr(opt_expr, params)),
+            default_expr: Box::new(subst_exec_row_expr(default_expr, params)),
+        },
+        ExecRowExpr::Prim { op, args } => ExecRowExpr::Prim {
+            op: op.clone(),
+            args: args
+                .iter()
+                .map(|a| subst_exec_row_expr(a, params))
+                .collect(),
+        },
+    }
+}
+
+fn subst_exec_derive_item(
+    item: &ExecDeriveItem,
+    params: &HashMap<Ident, ExecExpr>,
+) -> ExecDeriveItem {
+    match item {
+        ExecDeriveItem::ColExpr { name, expr } => ExecDeriveItem::ColExpr {
+            name: name.clone(),
+            expr: Box::new(subst_exec_row_expr(expr, params)),
+        },
+        ExecDeriveItem::SummaryCol {
+            name,
+            expr,
+            agg_kind,
+        } => ExecDeriveItem::SummaryCol {
+            name: name.clone(),
+            expr: Box::new(subst_exec_row_expr(expr, params)),
+            agg_kind: *agg_kind,
+        },
+        ExecDeriveItem::BucketCol { .. } | ExecDeriveItem::CoarsenCol { .. } => item.clone(),
+    }
+}
+
+fn without_shadowed<'a>(
+    params: &HashMap<Ident, ExecExpr>,
+    names: impl IntoIterator<Item = &'a str>,
+) -> HashMap<Ident, ExecExpr> {
+    let mut next = params.clone();
+    for n in names {
+        next.remove(n);
+    }
+    next
+}
+
+fn subst_exec_expr(expr: &ExecExpr, params: &HashMap<Ident, ExecExpr>) -> ExecExpr {
+    if params.is_empty() {
+        return expr.clone();
+    }
+    match expr {
+        ExecExpr::Lit(_) | ExecExpr::ConstRef(_) | ExecExpr::TableLit { .. } => expr.clone(),
+        ExecExpr::Var(v) => params.get(v).cloned().unwrap_or_else(|| expr.clone()),
+        ExecExpr::LetE {
+            name,
+            lty,
+            bound,
+            body,
+        } => {
+            let next = without_shadowed(params, [name.as_str()]);
+            ExecExpr::LetE {
+                name: name.clone(),
+                lty: lty.clone(),
+                bound: Box::new(subst_exec_expr(bound, params)),
+                body: Box::new(subst_exec_expr(body, &next)),
+            }
+        }
+        ExecExpr::IfE {
+            cond,
+            then_br,
+            else_br,
+        } => ExecExpr::IfE {
+            cond: Box::new(subst_exec_expr(cond, params)),
+            then_br: Box::new(subst_exec_expr(then_br, params)),
+            else_br: Box::new(subst_exec_expr(else_br, params)),
+        },
+        ExecExpr::CaseE { scrut, arms } => ExecExpr::CaseE {
+            scrut: Box::new(subst_exec_expr(scrut, params)),
+            arms: arms
+                .iter()
+                .map(|arm| {
+                    let mut binders = HashSet::new();
+                    push_exec_pattern_binders(&arm.pattern, &mut binders);
+                    let mut next = params.clone();
+                    for b in binders {
+                        next.remove(&b);
+                    }
+                    ExecCaseArm {
+                        pattern: arm.pattern.clone(),
+                        body: subst_exec_expr(&arm.body, &next),
+                    }
+                })
+                .collect(),
+        },
+        ExecExpr::Lam {
+            params: lam_params,
+            pc,
+            ret,
+            body,
+        } => {
+            let next = without_shadowed(params, lam_params.iter().map(|(p, _)| p.as_str()));
+            ExecExpr::Lam {
+                params: lam_params.clone(),
+                pc: pc.clone(),
+                ret: ret.clone(),
+                body: Arc::new(subst_exec_expr(body, &next)),
+            }
+        }
+        ExecExpr::App { fn_expr, args } => ExecExpr::App {
+            fn_expr: Box::new(subst_exec_expr(fn_expr, params)),
+            args: args.iter().map(|a| subst_exec_expr(a, params)).collect(),
+        },
+        ExecExpr::Call { fn_name, args } => ExecExpr::Call {
+            fn_name: fn_name.clone(),
+            args: args.iter().map(|a| subst_exec_expr(a, params)).collect(),
+        },
+        ExecExpr::Join {
+            label,
+            params: j_params,
+            rhs,
+            body,
+        } => {
+            let next = without_shadowed(params, j_params.iter().map(|(p, _)| p.as_str()));
+            ExecExpr::Join {
+                label: label.clone(),
+                params: j_params.clone(),
+                rhs: Box::new(subst_exec_expr(rhs, &next)),
+                body: Box::new(subst_exec_expr(body, params)),
+            }
+        }
+        ExecExpr::Jump { label, args } => ExecExpr::Jump {
+            label: label.clone(),
+            args: args.iter().map(|a| subst_exec_expr(a, params)).collect(),
+        },
+        ExecExpr::ForLoop {
+            item_var,
+            iter_expr,
+            state_vars,
+            body,
+            after,
+        } => {
+            let after_next = without_shadowed(params, state_vars.iter().map(|(s, _)| s.as_str()));
+            let body_next = without_shadowed(&after_next, [item_var.as_str()]);
+            ExecExpr::ForLoop {
+                item_var: item_var.clone(),
+                iter_expr: Box::new(subst_exec_expr(iter_expr, params)),
+                state_vars: state_vars.clone(),
+                body: Box::new(subst_exec_expr(body, &body_next)),
+                after: Box::new(subst_exec_expr(after, &after_next)),
+            }
+        }
+        ExecExpr::WhileLoop {
+            cond,
+            state_vars,
+            body,
+            after,
+        } => {
+            let next = without_shadowed(params, state_vars.iter().map(|(s, _)| s.as_str()));
+            ExecExpr::WhileLoop {
+                cond: Box::new(subst_exec_expr(cond, &next)),
+                state_vars: state_vars.clone(),
+                body: Box::new(subst_exec_expr(body, &next)),
+                after: Box::new(subst_exec_expr(after, &next)),
+            }
+        }
+        ExecExpr::Tuple(xs) => {
+            ExecExpr::Tuple(xs.iter().map(|x| subst_exec_expr(x, params)).collect())
+        }
+        ExecExpr::Proj { tup, idx } => ExecExpr::Proj {
+            tup: Box::new(subst_exec_expr(tup, params)),
+            idx: idx.clone(),
+        },
+        ExecExpr::Ctor {
+            type_name,
+            ctor_name,
+            args,
+        } => ExecExpr::Ctor {
+            type_name: type_name.clone(),
+            ctor_name: ctor_name.clone(),
+            args: args.iter().map(|a| subst_exec_expr(a, params)).collect(),
+        },
+        ExecExpr::Prim { op, args } => ExecExpr::Prim {
+            op: op.clone(),
+            args: args.iter().map(|a| subst_exec_expr(a, params)).collect(),
+        },
+        ExecExpr::Rel(plan) => ExecExpr::Rel(Box::new(subst_exec_plan(plan, params))),
+        ExecExpr::Host { op, args } => ExecExpr::Host {
+            op: op.clone(),
+            args: args.iter().map(|a| subst_exec_expr(a, params)).collect(),
+        },
+        ExecExpr::Assert { cond, message } => ExecExpr::Assert {
+            cond: Box::new(subst_exec_expr(cond, params)),
+            message: message.clone(),
+        },
+        ExecExpr::CheckPromise { ret_var, promise } => {
+            let next = without_shadowed(params, [ret_var.as_str()]);
+            ExecExpr::CheckPromise {
+                ret_var: ret_var.clone(),
+                promise: match promise {
+                    ExecPromise::UniqueCols(c) => ExecPromise::UniqueCols(c.clone()),
+                    ExecPromise::AllRows(re) => {
+                        ExecPromise::AllRows(Box::new(subst_exec_row_expr(re, &next)))
+                    }
+                    ExecPromise::BoolExpr(e) => {
+                        ExecPromise::BoolExpr(Box::new(subst_exec_expr(e, &next)))
+                    }
+                },
+            }
+        }
+        ExecExpr::Stop {
+            kind,
+            detail,
+            detail_tags,
+        } => ExecExpr::Stop {
+            kind: *kind,
+            detail: detail
+                .as_deref()
+                .map(|d| Box::new(subst_exec_expr(d, params))),
+            detail_tags: detail_tags.clone(),
+        },
+        ExecExpr::Fail(e) => ExecExpr::Fail(Box::new(subst_exec_expr(e, params))),
+    }
+}
+
+fn subst_exec_plan_mut(plan: &mut ExecPlan, params: &HashMap<Ident, ExecExpr>) {
+    match plan {
+        ExecPlan::SourceExpr(e) => **e = subst_exec_expr(e, params),
+        ExecPlan::SourceDB { cap, .. } => **cap = subst_exec_expr(cap, params),
+        ExecPlan::Filter { input, pred } => {
+            *pred = subst_exec_row_expr(pred, params);
+            subst_exec_plan_mut(input, params);
+        }
+        ExecPlan::Derive { input, items } => {
+            for item in items {
+                *item = subst_exec_derive_item(item, params);
+            }
+            subst_exec_plan_mut(input, params);
+        }
+        ExecPlan::Summarize { input, aggs, .. } => {
+            for agg in aggs {
+                if let Some(re) = &mut agg.arg {
+                    *re = subst_exec_row_expr(re, params);
+                }
+            }
+            subst_exec_plan_mut(input, params);
+        }
+        ExecPlan::Shuffle { input, seed } => {
+            **seed = subst_exec_expr(seed, params);
+            subst_exec_plan_mut(input, params);
+        }
+        ExecPlan::Pseudonymize { input, secret, .. } => {
+            **secret = subst_exec_expr(secret, params);
+            subst_exec_plan_mut(input, params);
+        }
+        ExecPlan::Union { left, right } | ExecPlan::Join { left, right, .. } => {
+            subst_exec_plan_mut(left, params);
+            subst_exec_plan_mut(right, params);
+        }
+        other => {
+            if let Some(child) = exec_plan_input_mut(other) {
+                subst_exec_plan_mut(child, params);
+            }
+        }
+    }
+}
+
+fn subst_exec_plan(plan: &ExecPlan, params: &HashMap<Ident, ExecExpr>) -> ExecPlan {
+    let mut out = plan.clone();
+    subst_exec_plan_mut(&mut out, params);
+    out
+}
+
+fn replace_single_plan_var(plan: &mut ExecPlan, var_name: &str, replacement: &ExecPlan) -> bool {
+    match plan {
+        ExecPlan::SourceExpr(e) => {
+            if let ExecExpr::Var(v) = e.as_ref()
+                && v == var_name
+            {
+                *plan = replacement.clone();
+                return true;
+            }
+            false
+        }
+        ExecPlan::SourceDB { .. } => false,
+        ExecPlan::Join { left, right, .. } | ExecPlan::Union { left, right } => {
+            replace_single_plan_var(left, var_name, replacement)
+                || replace_single_plan_var(right, var_name, replacement)
+        }
+        other => exec_plan_input_mut(other)
+            .is_some_and(|child| replace_single_plan_var(child, var_name, replacement)),
+    }
+}
+
+fn spine_contains_plan_var(expr: &ExecExpr, var_name: &str) -> bool {
+    let mut cur = expr;
+    loop {
+        match cur {
+            ExecExpr::Rel(plan) => {
+                let mut stack = vec![plan.as_ref()];
+                while let Some(p) = stack.pop() {
+                    match p {
+                        ExecPlan::SourceExpr(e) => {
+                            if matches!(e.as_ref(), ExecExpr::Var(v) if v == var_name) {
+                                return true;
+                            }
+                        }
+                        ExecPlan::Union { left, right } | ExecPlan::Join { left, right, .. } => {
+                            stack.push(right);
+                            stack.push(left);
+                        }
+                        other => {
+                            if let Some(c) = exec_plan_input(other) {
+                                stack.push(c);
+                            }
+                        }
+                    }
+                }
+                return false;
+            }
+            ExecExpr::LetE {
+                name, bound, body, ..
+            } => {
+                if count_exec_expr_var_uses(bound, var_name) == 1 {
+                    return matches!(bound.as_ref(), ExecExpr::Rel(_))
+                        && spine_contains_plan_var(bound, var_name);
+                }
+                if name == var_name {
+                    return false;
+                }
+                cur = body;
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn try_inline_table_helper_call(
+    fn_name: &str,
+    opt_args: &[ExecExpr],
+    prog: &ExecProgram,
+    inlining: &[Ident],
+    stats: &mut OptStats,
+) -> Option<ExecPlan> {
+    if inlining.len() >= MAX_INLINE_DEPTH || inlining.iter().any(|n| n == fn_name) {
+        return None;
+    }
+    if !opt_args.iter().all(|a| {
+        matches!(
+            a,
+            ExecExpr::Lit(_) | ExecExpr::Var(_) | ExecExpr::ConstRef(_)
+        )
+    }) {
+        return None;
+    }
+    let callee = prog.find_fun(fn_name)?;
+    if callee.kind != FunKind::Function || callee.params.len() != opt_args.len() {
+        return None;
+    }
+    let mut next_inlining = Vec::with_capacity(inlining.len() + 1);
+    next_inlining.extend_from_slice(inlining);
+    next_inlining.push(fn_name.to_string());
+
+    let mut callee_stats = OptStats::default();
+    let opt_body =
+        optimize_exec_expr_impl(&callee.body, prog, Some(&next_inlining), &mut callee_stats);
+    let ExecExpr::Rel(ref callee_plan) = opt_body else {
+        return None;
+    };
+    if !exec_plan_has_source_db(callee_plan) {
+        return None;
+    }
+
+    let mut free_arg_vars = HashSet::new();
+    let mut param_map = HashMap::with_capacity(callee.params.len());
+    for ((p_name, _), arg) in callee.params.iter().zip(opt_args) {
+        if let ExecExpr::Var(v) = arg {
+            free_arg_vars.insert(v.clone());
+        }
+        param_map.insert(p_name.clone(), arg.clone());
+    }
+    let mut binders = HashSet::new();
+    collect_exec_plan_binders(callee_plan, &mut binders);
+    if binders.iter().any(|b| free_arg_vars.contains(b)) {
+        return None;
+    }
+
+    let substituted = subst_exec_plan(callee_plan, &param_map);
+    stats.filters_fused += callee_stats.filters_fused;
+    stats.predicates_pushed += callee_stats.predicates_pushed;
+    stats.dead_ops_eliminated += callee_stats.dead_ops_eliminated + 1;
+    stats.derive_items_pruned += callee_stats.derive_items_pruned;
+    stats.limits_folded += callee_stats.limits_folded;
+    Some(substituted)
+}
+
+fn inline_calls_in_exec_plan_mut(
+    plan: &mut ExecPlan,
+    prog: &ExecProgram,
+    inlining: &[Ident],
+    stats: &mut OptStats,
+) {
+    match plan {
+        ExecPlan::SourceExpr(e) => {
+            if let ExecExpr::Call { fn_name, args } = e.as_ref() {
+                let opt_args: Vec<ExecExpr> = args
+                    .iter()
+                    .map(|a| optimize_exec_expr_impl(a, prog, Some(inlining), stats))
+                    .collect();
+                if let Some(inlined) =
+                    try_inline_table_helper_call(fn_name, &opt_args, prog, inlining, stats)
+                {
+                    *plan = inlined;
+                    return;
+                }
+                **e = ExecExpr::Call {
+                    fn_name: fn_name.clone(),
+                    args: opt_args,
+                };
+                return;
+            }
+            let opt_e = optimize_exec_expr_impl(e, prog, Some(inlining), stats);
+            if matches!(opt_e, ExecExpr::Rel(_)) {
+                stats.dead_ops_eliminated += 1;
+                *plan = opt_e.into_plan();
+            } else {
+                **e = opt_e;
+            }
+        }
+        ExecPlan::SourceDB { cap, .. } => {
+            **cap = optimize_exec_expr_impl(cap, prog, Some(inlining), stats);
+        }
+        ExecPlan::Shuffle { input, seed } => {
+            inline_calls_in_exec_plan_mut(input, prog, inlining, stats);
+            **seed = optimize_exec_expr_impl(seed, prog, Some(inlining), stats);
+        }
+        ExecPlan::Pseudonymize { input, secret, .. } => {
+            inline_calls_in_exec_plan_mut(input, prog, inlining, stats);
+            **secret = optimize_exec_expr_impl(secret, prog, Some(inlining), stats);
+        }
+        ExecPlan::Union { left, right } | ExecPlan::Join { left, right, .. } => {
+            inline_calls_in_exec_plan_mut(left, prog, inlining, stats);
+            inline_calls_in_exec_plan_mut(right, prog, inlining, stats);
+        }
+        other => {
+            if let Some(child) = exec_plan_input_mut(other) {
+                inline_calls_in_exec_plan_mut(child, prog, inlining, stats);
+            }
+        }
+    }
+}
+
+fn inline_calls_in_exec_plan(
+    plan: &ExecPlan,
+    prog: &ExecProgram,
+    inlining: &[Ident],
+    stats: &mut OptStats,
+) -> ExecPlan {
+    let mut out = plan.clone();
+    inline_calls_in_exec_plan_mut(&mut out, prog, inlining, stats);
+    out
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Recursive top-level LetE spine DB-plan fuser"
+)]
+fn fuse_db_plan_along_spine(
+    cur: &ExecExpr,
+    var_name: &str,
+    bound_plan: &ExecPlan,
+    bound_fvs: &HashSet<Ident>,
+    may_stop: bool,
+    let_depth: usize,
+    prog: &ExecProgram,
+    stats: &mut OptStats,
+) -> Option<ExecExpr> {
+    match cur {
+        ExecExpr::Rel(tail_plan) => {
+            if may_stop && !(let_depth == 0 && exec_plan_is_leftmost_input(tail_plan, var_name)) {
+                return None;
+            }
+            let mut replaced = (**tail_plan).clone();
+            if !replace_single_plan_var(&mut replaced, var_name, bound_plan) {
+                return None;
+            }
+            let rewritten = rewrite_exec_plan(&replaced, prog, stats);
+            let pruned = prune_exec_plan_derives(&rewritten, None, stats);
+            stats.dead_ops_eliminated += 1;
+            Some(ExecExpr::Rel(Box::new(pruned)))
+        }
+        ExecExpr::LetE {
+            name: b_name,
+            lty: b_lty,
+            bound: b_bound,
+            body: b_body,
+        } => {
+            if count_exec_expr_var_uses(b_bound, var_name) == 1 {
+                let ExecExpr::Rel(b_plan) = b_bound.as_ref() else {
+                    return None;
+                };
+                if may_stop && !(let_depth == 0 && exec_plan_is_leftmost_input(b_plan, var_name)) {
+                    return None;
+                }
+                let mut replaced = (**b_plan).clone();
+                if !replace_single_plan_var(&mut replaced, var_name, bound_plan) {
+                    return None;
+                }
+                let rewritten = rewrite_exec_plan(&replaced, prog, stats);
+                let pruned = prune_exec_plan_derives(&rewritten, None, stats);
+                stats.dead_ops_eliminated += 1;
+                return Some(ExecExpr::LetE {
+                    name: b_name.clone(),
+                    lty: b_lty.clone(),
+                    bound: Box::new(ExecExpr::Rel(Box::new(pruned))),
+                    body: b_body.clone(),
+                });
+            }
+            if exec_expr_may_stop(b_bound) || b_name == var_name || bound_fvs.contains(b_name) {
+                return None;
+            }
+            let next_body = fuse_db_plan_along_spine(
+                b_body,
+                var_name,
+                bound_plan,
+                bound_fvs,
+                may_stop,
+                let_depth + 1,
+                prog,
+                stats,
+            )?;
+            Some(ExecExpr::LetE {
+                name: b_name.clone(),
+                lty: b_lty.clone(),
+                bound: b_bound.clone(),
+                body: Box::new(next_body),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn try_fuse_single_use_db_let(
+    name: &str,
+    opt_bound: &ExecExpr,
+    opt_body: &ExecExpr,
+    prog: &ExecProgram,
+    inlining: Option<&[Ident]>,
+    stats: &mut OptStats,
+) -> Option<ExecExpr> {
+    if count_exec_expr_var_uses(opt_body, name) != 1 || !spine_contains_plan_var(opt_body, name) {
+        return None;
+    }
+    let mut local_stats = OptStats::default();
+    let bound_plan = match opt_bound {
+        ExecExpr::Rel(p) => (**p).clone(),
+        ExecExpr::Call { fn_name, args } => {
+            let stack = inlining?;
+            try_inline_table_helper_call(fn_name, args, prog, stack, &mut local_stats)?
+        }
+        _ => return None,
+    };
+    if !exec_plan_has_source_db(&bound_plan) {
+        return None;
+    }
+    let may_stop = exec_plan_may_stop(&bound_plan);
+    let mut bound_fvs = HashSet::new();
+    collect_exec_plan_free_vars(&bound_plan, &HashSet::new(), &mut bound_fvs);
+
+    let fused = fuse_db_plan_along_spine(
+        opt_body,
+        name,
+        &bound_plan,
+        &bound_fvs,
+        may_stop,
+        0,
+        prog,
+        &mut local_stats,
+    )?;
+    stats.filters_fused += local_stats.filters_fused;
+    stats.predicates_pushed += local_stats.predicates_pushed;
+    stats.dead_ops_eliminated += local_stats.dead_ops_eliminated;
+    stats.derive_items_pruned += local_stats.derive_items_pruned;
+    stats.limits_folded += local_stats.limits_folded;
+    Some(fused)
+}
+
 /// Optimize every relational [`ExecPlan`] nested inside an [`ExecProgram`].
 #[must_use]
 pub fn optimize_exec_program(prog: &ExecProgram) -> (ExecProgram, OptStats) {
@@ -1129,7 +2470,7 @@ pub fn optimize_exec_program(prog: &ExecProgram) -> (ExecProgram, OptStats) {
         .funs
         .iter()
         .map(|f| ExecFun {
-            body: optimize_exec_expr(&f.body, prog, &mut stats),
+            body: optimize_exec_expr_impl(&f.body, prog, Some(&[]), &mut stats),
             ..f.clone()
         })
         .collect();
@@ -1151,6 +2492,15 @@ pub fn optimize_exec_plan(plan: &ExecPlan, prog: &ExecProgram) -> (ExecPlan, Opt
 }
 
 fn optimize_exec_expr(expr: &ExecExpr, prog: &ExecProgram, stats: &mut OptStats) -> ExecExpr {
+    optimize_exec_expr_impl(expr, prog, None, stats)
+}
+
+fn optimize_exec_expr_impl(
+    expr: &ExecExpr,
+    prog: &ExecProgram,
+    inlining: Option<&[Ident]>,
+    stats: &mut OptStats,
+) -> ExecExpr {
     match expr {
         ExecExpr::Lit(_) | ExecExpr::Var(_) | ExecExpr::ConstRef(_) | ExecExpr::TableLit { .. } => {
             expr.clone()
@@ -1160,28 +2510,37 @@ fn optimize_exec_expr(expr: &ExecExpr, prog: &ExecProgram, stats: &mut OptStats)
             lty,
             bound,
             body,
-        } => ExecExpr::LetE {
-            name: name.clone(),
-            lty: lty.clone(),
-            bound: Box::new(optimize_exec_expr(bound, prog, stats)),
-            body: Box::new(optimize_exec_expr(body, prog, stats)),
-        },
+        } => {
+            let opt_bound = optimize_exec_expr_impl(bound, prog, inlining, stats);
+            let opt_body = optimize_exec_expr_impl(body, prog, inlining, stats);
+            if let Some(fused) =
+                try_fuse_single_use_db_let(name, &opt_bound, &opt_body, prog, inlining, stats)
+            {
+                return fused;
+            }
+            ExecExpr::LetE {
+                name: name.clone(),
+                lty: lty.clone(),
+                bound: Box::new(opt_bound),
+                body: Box::new(opt_body),
+            }
+        }
         ExecExpr::IfE {
             cond,
             then_br,
             else_br,
         } => ExecExpr::IfE {
-            cond: Box::new(optimize_exec_expr(cond, prog, stats)),
-            then_br: Box::new(optimize_exec_expr(then_br, prog, stats)),
-            else_br: Box::new(optimize_exec_expr(else_br, prog, stats)),
+            cond: Box::new(optimize_exec_expr_impl(cond, prog, inlining, stats)),
+            then_br: Box::new(optimize_exec_expr_impl(then_br, prog, inlining, stats)),
+            else_br: Box::new(optimize_exec_expr_impl(else_br, prog, inlining, stats)),
         },
         ExecExpr::CaseE { scrut, arms } => ExecExpr::CaseE {
-            scrut: Box::new(optimize_exec_expr(scrut, prog, stats)),
+            scrut: Box::new(optimize_exec_expr_impl(scrut, prog, inlining, stats)),
             arms: arms
                 .iter()
                 .map(|a| ExecCaseArm {
                     pattern: a.pattern.clone(),
-                    body: optimize_exec_expr(&a.body, prog, stats),
+                    body: optimize_exec_expr_impl(&a.body, prog, inlining, stats),
                 })
                 .collect(),
         },
@@ -1194,20 +2553,20 @@ fn optimize_exec_expr(expr: &ExecExpr, prog: &ExecProgram, stats: &mut OptStats)
             params: params.clone(),
             pc: pc.clone(),
             ret: ret.clone(),
-            body: Arc::new(optimize_exec_expr(body, prog, stats)),
+            body: Arc::new(optimize_exec_expr_impl(body, prog, inlining, stats)),
         },
         ExecExpr::App { fn_expr, args } => ExecExpr::App {
-            fn_expr: Box::new(optimize_exec_expr(fn_expr, prog, stats)),
+            fn_expr: Box::new(optimize_exec_expr_impl(fn_expr, prog, inlining, stats)),
             args: args
                 .iter()
-                .map(|a| optimize_exec_expr(a, prog, stats))
+                .map(|a| optimize_exec_expr_impl(a, prog, inlining, stats))
                 .collect(),
         },
         ExecExpr::Call { fn_name, args } => ExecExpr::Call {
             fn_name: fn_name.clone(),
             args: args
                 .iter()
-                .map(|a| optimize_exec_expr(a, prog, stats))
+                .map(|a| optimize_exec_expr_impl(a, prog, inlining, stats))
                 .collect(),
         },
         ExecExpr::Join {
@@ -1218,14 +2577,14 @@ fn optimize_exec_expr(expr: &ExecExpr, prog: &ExecProgram, stats: &mut OptStats)
         } => ExecExpr::Join {
             label: label.clone(),
             params: params.clone(),
-            rhs: Box::new(optimize_exec_expr(rhs, prog, stats)),
-            body: Box::new(optimize_exec_expr(body, prog, stats)),
+            rhs: Box::new(optimize_exec_expr_impl(rhs, prog, inlining, stats)),
+            body: Box::new(optimize_exec_expr_impl(body, prog, inlining, stats)),
         },
         ExecExpr::Jump { label, args } => ExecExpr::Jump {
             label: label.clone(),
             args: args
                 .iter()
-                .map(|a| optimize_exec_expr(a, prog, stats))
+                .map(|a| optimize_exec_expr_impl(a, prog, inlining, stats))
                 .collect(),
         },
         ExecExpr::ForLoop {
@@ -1236,10 +2595,10 @@ fn optimize_exec_expr(expr: &ExecExpr, prog: &ExecProgram, stats: &mut OptStats)
             after,
         } => ExecExpr::ForLoop {
             item_var: item_var.clone(),
-            iter_expr: Box::new(optimize_exec_expr(iter_expr, prog, stats)),
+            iter_expr: Box::new(optimize_exec_expr_impl(iter_expr, prog, inlining, stats)),
             state_vars: state_vars.clone(),
-            body: Box::new(optimize_exec_expr(body, prog, stats)),
-            after: Box::new(optimize_exec_expr(after, prog, stats)),
+            body: Box::new(optimize_exec_expr_impl(body, prog, inlining, stats)),
+            after: Box::new(optimize_exec_expr_impl(after, prog, inlining, stats)),
         },
         ExecExpr::WhileLoop {
             cond,
@@ -1247,18 +2606,18 @@ fn optimize_exec_expr(expr: &ExecExpr, prog: &ExecProgram, stats: &mut OptStats)
             body,
             after,
         } => ExecExpr::WhileLoop {
-            cond: Box::new(optimize_exec_expr(cond, prog, stats)),
+            cond: Box::new(optimize_exec_expr_impl(cond, prog, inlining, stats)),
             state_vars: state_vars.clone(),
-            body: Box::new(optimize_exec_expr(body, prog, stats)),
-            after: Box::new(optimize_exec_expr(after, prog, stats)),
+            body: Box::new(optimize_exec_expr_impl(body, prog, inlining, stats)),
+            after: Box::new(optimize_exec_expr_impl(after, prog, inlining, stats)),
         },
         ExecExpr::Tuple(xs) => ExecExpr::Tuple(
             xs.iter()
-                .map(|x| optimize_exec_expr(x, prog, stats))
+                .map(|x| optimize_exec_expr_impl(x, prog, inlining, stats))
                 .collect(),
         ),
         ExecExpr::Proj { tup, idx } => ExecExpr::Proj {
-            tup: Box::new(optimize_exec_expr(tup, prog, stats)),
+            tup: Box::new(optimize_exec_expr_impl(tup, prog, inlining, stats)),
             idx: idx.clone(),
         },
         ExecExpr::Ctor {
@@ -1270,26 +2629,33 @@ fn optimize_exec_expr(expr: &ExecExpr, prog: &ExecProgram, stats: &mut OptStats)
             ctor_name: ctor_name.clone(),
             args: args
                 .iter()
-                .map(|a| optimize_exec_expr(a, prog, stats))
+                .map(|a| optimize_exec_expr_impl(a, prog, inlining, stats))
                 .collect(),
         },
         ExecExpr::Prim { op, args } => ExecExpr::Prim {
             op: op.clone(),
             args: args
                 .iter()
-                .map(|a| optimize_exec_expr(a, prog, stats))
+                .map(|a| optimize_exec_expr_impl(a, prog, inlining, stats))
                 .collect(),
         },
-        ExecExpr::Rel(plan) => ExecExpr::Rel(Box::new(optimize_exec_plan_inner(plan, prog, stats))),
+        ExecExpr::Rel(plan) => {
+            let prepared = match inlining {
+                Some(stack) => inline_calls_in_exec_plan(plan, prog, stack, stats),
+                None => (**plan).clone(),
+            };
+            let rewritten = rewrite_exec_plan(&prepared, prog, stats);
+            ExecExpr::Rel(Box::new(prune_exec_plan_derives(&rewritten, None, stats)))
+        }
         ExecExpr::Host { op, args } => ExecExpr::Host {
             op: op.clone(),
             args: args
                 .iter()
-                .map(|a| optimize_exec_expr(a, prog, stats))
+                .map(|a| optimize_exec_expr_impl(a, prog, inlining, stats))
                 .collect(),
         },
         ExecExpr::Assert { cond, message } => ExecExpr::Assert {
-            cond: Box::new(optimize_exec_expr(cond, prog, stats)),
+            cond: Box::new(optimize_exec_expr_impl(cond, prog, inlining, stats)),
             message: message.clone(),
         },
         ExecExpr::CheckPromise { ret_var, promise } => ExecExpr::CheckPromise {
@@ -1297,9 +2663,9 @@ fn optimize_exec_expr(expr: &ExecExpr, prog: &ExecProgram, stats: &mut OptStats)
             promise: match promise {
                 ExecPromise::UniqueCols(c) => ExecPromise::UniqueCols(c.clone()),
                 ExecPromise::AllRows(re) => ExecPromise::AllRows(re.clone()),
-                ExecPromise::BoolExpr(e) => {
-                    ExecPromise::BoolExpr(Box::new(optimize_exec_expr(e, prog, stats)))
-                }
+                ExecPromise::BoolExpr(e) => ExecPromise::BoolExpr(Box::new(
+                    optimize_exec_expr_impl(e, prog, inlining, stats),
+                )),
             },
         },
         ExecExpr::Stop {
@@ -1310,10 +2676,12 @@ fn optimize_exec_expr(expr: &ExecExpr, prog: &ExecProgram, stats: &mut OptStats)
             kind: *kind,
             detail: detail
                 .as_deref()
-                .map(|d| Box::new(optimize_exec_expr(d, prog, stats))),
+                .map(|d| Box::new(optimize_exec_expr_impl(d, prog, inlining, stats))),
             detail_tags: detail_tags.clone(),
         },
-        ExecExpr::Fail(e) => ExecExpr::Fail(Box::new(optimize_exec_expr(e, prog, stats))),
+        ExecExpr::Fail(e) => {
+            ExecExpr::Fail(Box::new(optimize_exec_expr_impl(e, prog, inlining, stats)))
+        }
     }
 }
 
@@ -1447,14 +2815,21 @@ fn subst_exec_row_expr_cols(re: &ExecRowExpr, map: &HashMap<String, String>) -> 
 }
 
 fn optimize_exec_plan_inner(plan: &ExecPlan, prog: &ExecProgram, stats: &mut OptStats) -> ExecPlan {
-    let rewritten = rewrite_exec_plan(plan, prog, stats);
+    let inlined = inline_calls_in_exec_plan(plan, prog, &[], stats);
+    let rewritten = rewrite_exec_plan(&inlined, prog, stats);
     prune_exec_plan_derives(&rewritten, None, stats)
 }
 
 fn rewrite_exec_plan(plan: &ExecPlan, prog: &ExecProgram, stats: &mut OptStats) -> ExecPlan {
     match plan {
         ExecPlan::SourceExpr(e) => {
-            ExecPlan::SourceExpr(Box::new(optimize_exec_expr(e, prog, stats)))
+            let opt_e = optimize_exec_expr(e, prog, stats);
+            if matches!(opt_e, ExecExpr::Rel(_)) {
+                stats.dead_ops_eliminated += 1;
+                opt_e.into_plan()
+            } else {
+                ExecPlan::SourceExpr(Box::new(opt_e))
+            }
         }
         ExecPlan::SourceDB {
             cap,

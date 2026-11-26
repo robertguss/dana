@@ -12,14 +12,14 @@ use crate::core::check::{
 };
 use crate::core::stack::with_large_stack;
 use crate::core::syntax::{
-    AggKind, BugKind, CaseArm, ColSpec, DeriveItem, Expr, HostOp, Ident, LTy, Plan, PrimOp,
-    Program, ScalarTy, TableTy, TagSet, Ty,
+    AggKind, BugKind, CaseArm, ColSpec, DeriveItem, Expr, HostOp, Ident, JoinKind, LTy, Plan,
+    PrimOp, Program, ScalarTy, TableTy, TagSet, Ty,
 };
 use crate::db::schema_lock::SchemaLockFile;
 use crate::db::{SqlDialect, SqlParam, quote_sql_ident};
 use crate::oracle::eval::{PrimResult, RuntimeError, eval_literal, eval_prim_op};
 use crate::oracle::value::{
-    Bug, CapHandle, ClosureVal, EnvEntry, EnvList, ReportVal, TableRow, TableVal, Val,
+    Bug, CapHandle, ClosureVal, EnvEntry, EnvList, GroupMeta, ReportVal, TableRow, TableVal, Val,
     format_diag_detail, render_public_val, repr_bug_kind,
 };
 use crate::oracle::world::{
@@ -27,7 +27,8 @@ use crate::oracle::world::{
     StoredTable, World, extract_report,
 };
 use crate::plan::{
-    SplitPlan, optimize_exec_plan, optimize_program, split_exec_plan_pushdown_with_table_refs,
+    HIDDEN_GROUP_DISTINCT_COUNT_COL, HIDDEN_GROUP_ROW_COUNT_COL, SplitPlan, optimize_exec_plan,
+    optimize_exec_program, optimize_program, split_exec_plan_pushdown_with_options,
 };
 use crate::runtime::exec::{
     EvalProgramResult, RunConfig, RunResult, TestOutcome, eval_exec_entry_with_engine,
@@ -63,7 +64,12 @@ pub fn run_exec_program_vm(
 ) -> RunResult {
     let mut cfg = *vm_cfg;
     cfg.pseudonymize_mode = run_cfg.pseudonymize_mode;
-    run_exec_program_with_engine(prog, run_cfg, Some(cfg))
+    if cfg.optimize {
+        let (opt_prog, _) = optimize_exec_program(prog);
+        run_exec_program_with_engine(&opt_prog, run_cfg, Some(cfg))
+    } else {
+        run_exec_program_with_engine(prog, run_cfg, Some(cfg))
+    }
 }
 
 /// Evaluate a named entry function of a lowered [`ExecProgram`] on the vectorized columnar VM,
@@ -78,7 +84,12 @@ pub fn eval_exec_entry_vm(
 ) -> EvalProgramResult {
     let mut cfg = *vm_cfg;
     cfg.pseudonymize_mode = run_cfg.pseudonymize_mode;
-    eval_exec_entry_with_engine(prog, entry_name, prebound, run_cfg, Some(cfg))
+    if cfg.optimize {
+        let (opt_prog, _) = optimize_exec_program(prog);
+        eval_exec_entry_with_engine(&opt_prog, entry_name, prebound, run_cfg, Some(cfg))
+    } else {
+        eval_exec_entry_with_engine(prog, entry_name, prebound, run_cfg, Some(cfg))
+    }
 }
 
 /// Run all `examples` and `test` spec blocks in a lowered [`ExecProgram`] using the
@@ -92,7 +103,12 @@ pub fn run_program_tests_vm(
 ) -> Vec<TestOutcome> {
     let mut cfg = *vm_cfg;
     cfg.pseudonymize_mode = run_cfg.pseudonymize_mode;
-    run_program_tests_with_engine(prog, filter, run_cfg, Some(cfg))
+    if cfg.optimize {
+        let (opt_prog, _) = optimize_exec_program(prog);
+        run_program_tests_with_engine(&opt_prog, filter, run_cfg, Some(cfg))
+    } else {
+        run_program_tests_with_engine(prog, filter, run_cfg, Some(cfg))
+    }
 }
 
 // ===========================================================================
@@ -206,6 +222,7 @@ pub fn eval_exec_plan_vm(
             &op_cfg,
             bridge,
             true,
+            false,
         )?;
         return op_crosstab(in_tbl, rows_col, cols_col, values_col, fill, &op_cfg);
     }
@@ -218,6 +235,7 @@ pub fn eval_exec_plan_vm(
         &op_cfg,
         bridge,
         true,
+        false,
     )?;
     Ok(Val::Columnar(Arc::new(out_tbl)))
 }
@@ -260,9 +278,74 @@ fn collect_exec_source_db_caps<'a>(plan: &'a ExecPlan, out: &mut Vec<&'a ExecExp
     }
 }
 
+fn column_usize_at(col: &crate::vm::batch::Column, row: usize) -> usize {
+    if let crate::vm::batch::ColumnData::Int(v) = &col.data {
+        let valid = col.validity.as_ref().is_none_or(|bm| bm.is_valid(row));
+        return if valid {
+            usize::try_from(v[row]).unwrap_or(0)
+        } else {
+            0
+        };
+    }
+    match &col.get_val(row) {
+        Val::Int(n) => n.to_usize().unwrap_or(0),
+        Val::OptSome(inner) => match inner.as_ref() {
+            Val::Int(n) => n.to_usize().unwrap_or(0),
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+fn extract_hidden_group_meta(mut tbl: VmTable) -> VmTable {
+    let Some(rows_idx) = tbl
+        .cols
+        .iter()
+        .position(|c| c.name == HIDDEN_GROUP_ROW_COUNT_COL)
+    else {
+        return tbl;
+    };
+    let dist_idx = tbl
+        .cols
+        .iter()
+        .position(|c| c.name == HIDDEN_GROUP_DISTINCT_COUNT_COL);
+
+    let mut strip = vec![rows_idx];
+    if let Some(di) = dist_idx {
+        strip.push(di);
+    }
+    strip.sort_unstable_by(|a, b| b.cmp(a));
+    for &idx in &strip {
+        tbl.cols.remove(idx);
+    }
+
+    for batch in &mut tbl.batches {
+        let mut metas = Vec::with_capacity(batch.len);
+        for row in 0..batch.len {
+            let row_count = batch
+                .cols
+                .get(rows_idx)
+                .map_or(0, |c| column_usize_at(c, row));
+            let distinct_count =
+                dist_idx.map(|di| batch.cols.get(di).map_or(0, |c| column_usize_at(c, row)));
+            metas.push(GroupMeta {
+                row_count,
+                distinct_count,
+            });
+        }
+        batch.group_meta = Some(metas);
+        for &idx in &strip {
+            if idx < batch.cols.len() {
+                batch.cols.remove(idx);
+            }
+        }
+    }
+    tbl
+}
+
 #[expect(
     clippy::too_many_arguments,
-    reason = "Vectorized ExecPlan evaluator threads preloaded SQL-pushdown batches and bridge callbacks without row marshalling"
+    reason = "Recursive plan evaluator threading program, environment, host, bridge, pushdown, and ordering flags"
 )]
 fn eval_exec_plan_to_table(
     plan: &ExecPlan,
@@ -273,6 +356,7 @@ fn eval_exec_plan_to_table(
     cfg: &OpExecConfig,
     bridge: &mut dyn ExecPlanBridge,
     allow_pushdown: bool,
+    order_insensitive: bool,
 ) -> Result<VmTable, OpErr> {
     if allow_pushdown {
         let mut db_caps = Vec::new();
@@ -315,13 +399,14 @@ fn eval_exec_plan_to_table(
                 } else {
                     None
                 };
-                let split = split_exec_plan_pushdown_with_table_refs(
+                let split = split_exec_plan_pushdown_with_options(
                     plan,
                     prog,
                     &db_name,
                     dialect,
                     bridge.schema_lock(),
                     table_refs_opt.as_ref(),
+                    order_insensitive,
                 );
                 match split {
                     SplitPlan::FullyPushed(q) => {
@@ -350,13 +435,13 @@ fn eval_exec_plan_to_table(
                                 |c| prog.find_const(c).map(|d| eval_literal(&d.value)),
                             )
                             .map_err(OpErr::Failed)?;
-                        let pushed_tbl = bridge.exec_live_sql_batches(
+                        let pushed_tbl = extract_hidden_group_meta(bridge.exec_live_sql_batches(
                             &pushdown.db_name,
                             &pushdown.sql,
                             &params,
                             &pushdown.out_schema,
                             cfg.batch_size,
-                        )?;
+                        )?);
                         preloaded.push((placeholder_var, pushed_tbl));
                         return eval_exec_plan_to_table(
                             &local_suffix,
@@ -367,6 +452,7 @@ fn eval_exec_plan_to_table(
                             cfg,
                             bridge,
                             true,
+                            order_insensitive,
                         );
                     }
                     SplitPlan::LocalOnly { .. } => {}
@@ -445,10 +531,28 @@ fn eval_exec_plan_to_table(
             }
         }
         ExecPlan::Union { left, right } => {
-            let lt =
-                eval_exec_plan_to_table(left, prog, env, preloaded, row_host, cfg, bridge, true)?;
-            let rt =
-                eval_exec_plan_to_table(right, prog, env, preloaded, row_host, cfg, bridge, true)?;
+            let lt = eval_exec_plan_to_table(
+                left,
+                prog,
+                env,
+                preloaded,
+                row_host,
+                cfg,
+                bridge,
+                true,
+                order_insensitive,
+            )?;
+            let rt = eval_exec_plan_to_table(
+                right,
+                prog,
+                env,
+                preloaded,
+                row_host,
+                cfg,
+                bridge,
+                true,
+                order_insensitive,
+            )?;
             op_union(lt, rt, cfg.mode)?
         }
         ExecPlan::Join {
@@ -482,18 +586,44 @@ fn eval_exec_plan_to_table(
                 }
                 None
             };
+            let right_ord_insens = order_insensitive
+                || matches!(
+                    kind,
+                    JoinKind::InnerOne
+                        | JoinKind::LeftOne
+                        | JoinKind::InnerManyToOne
+                        | JoinKind::LeftManyToOne
+                        | JoinKind::Semi
+                        | JoinKind::Anti
+                );
             let lt = if let Some(b) = borrow_env_col(left, preloaded) {
                 JoinInput::Borrowed(b)
             } else {
                 JoinInput::Owned(eval_exec_plan_to_table(
-                    left, prog, env, preloaded, row_host, cfg, bridge, true,
+                    left,
+                    prog,
+                    env,
+                    preloaded,
+                    row_host,
+                    cfg,
+                    bridge,
+                    true,
+                    order_insensitive,
                 )?)
             };
             let rt = if let Some(b) = borrow_env_col(right, preloaded) {
                 JoinInput::Borrowed(b)
             } else {
                 JoinInput::Owned(eval_exec_plan_to_table(
-                    right, prog, env, preloaded, row_host, cfg, bridge, true,
+                    right,
+                    prog,
+                    env,
+                    preloaded,
+                    row_host,
+                    cfg,
+                    bridge,
+                    true,
+                    right_ord_insens,
                 )?)
             };
             op_hash_join(

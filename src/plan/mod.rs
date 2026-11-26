@@ -26,8 +26,9 @@ pub use opt::{
     OptStats, optimize_exec_plan, optimize_exec_program, optimize_plan, optimize_program,
 };
 pub use pushdown::{
-    CollectedBranchPushdown, CollectedPlanPushdowns, SplitPlan, SqlParamSlot, SqlPushdownQuery,
-    bind_exec_plan_sources, collect_core_plan_pushdowns, collect_exec_plan_pushdowns,
-    core_plan_db_names, describe_sql_param, exec_plan_db_names, split_core_plan_pushdown,
-    split_exec_plan_pushdown, split_exec_plan_pushdown_with_table_refs,
+    CollectedBranchPushdown, CollectedPlanPushdowns, HIDDEN_GROUP_DISTINCT_COUNT_COL,
+    HIDDEN_GROUP_ROW_COUNT_COL, SplitPlan, SqlParamSlot, SqlPushdownQuery, bind_exec_plan_sources,
+    collect_core_plan_pushdowns, collect_exec_plan_pushdowns, core_plan_db_names,
+    describe_sql_param, exec_plan_db_names, split_core_plan_pushdown, split_exec_plan_pushdown,
+    split_exec_plan_pushdown_with_options, split_exec_plan_pushdown_with_table_refs,
 };

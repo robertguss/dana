@@ -1439,6 +1439,8 @@ pub fn render_explain_report(
     schema_lock: Option<&SchemaLockFile>,
     display_path: &Path,
 ) -> String {
+    let (opt_prog, _) = crate::plan::optimize_exec_program(prog);
+    let prog = &opt_prog;
     let fn_bindings = collect_call_db_bindings(prog);
     let mut out = String::new();
     let mut found_any = false;
