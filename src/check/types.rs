@@ -3293,7 +3293,11 @@ impl<'a> Checker<'a> {
         ret_ctx: Option<(&str, Option<&Ty>)>,
     ) -> (ExecExpr, LTy) {
         let rhs_hint = match &llty.ty {
-            Ty::Option(inner) if matches!(op, BinOp::Eq | BinOp::Ne) => Some(inner.as_ref()),
+            Ty::Option(inner)
+                if matches!(op, BinOp::Eq | BinOp::Ne) && !matches!(rhs.kind, ExprKind::None) =>
+            {
+                Some(inner.as_ref())
+            }
             t => Some(t),
         };
         let short_circuit_pc;
@@ -3362,6 +3366,23 @@ impl<'a> Checker<'a> {
                 (ex, LTy::new(Ty::Bool, tags))
             }
             BinOp::Eq | BinOp::Ne => {
+                // Refine untyped `none` (`Option(Unit)`) against concrete `Option(T)` on either side.
+                if matches!(&llty.ty, Ty::Option(li) if matches!(li.as_ref(), Ty::Unit))
+                    && matches!(&lex, ExecExpr::Lit(Literal::NoneLit(Ty::Unit)))
+                    && let Ty::Option(ri) = &rlty.ty
+                    && !matches!(ri.as_ref(), Ty::Unit)
+                {
+                    lex = ExecExpr::Lit(Literal::NoneLit(ri.as_ref().clone()));
+                    llty.ty = rlty.ty.clone();
+                } else if matches!(&rlty.ty, Ty::Option(ri) if matches!(ri.as_ref(), Ty::Unit))
+                    && matches!(&rex, ExecExpr::Lit(Literal::NoneLit(Ty::Unit)))
+                    && let Ty::Option(li) = &llty.ty
+                    && !matches!(li.as_ref(), Ty::Unit)
+                {
+                    rex = ExecExpr::Lit(Literal::NoneLit(li.as_ref().clone()));
+                    rlty.ty = llty.ty.clone();
+                }
+
                 // Coerce `Option(T) == T` or `T == Option(T)` cleanly.
                 if let Ty::Option(inner) = &llty.ty
                     && **inner == rlty.ty
@@ -12218,13 +12239,30 @@ impl<'a> Checker<'a> {
                 let mut lhs_lit_expr: Option<&Expr> = Some(base);
 
                 while let Some((cur_op, cur_rhs)) = chain.pop() {
+                    let rhs_hint = match &lty {
+                        Ty::Option(inner)
+                            if matches!(cur_op, BinOp::Eq | BinOp::Ne)
+                                && !matches!(cur_rhs.kind, ExprKind::None) =>
+                        {
+                            Some(inner.as_ref())
+                        }
+                        t => Some(t),
+                    };
                     let (mut rre, mut rty, rtags) =
-                        self.check_row_expr(cur_rhs, cols, outer_env, Some(&lty), allow_dot_self);
+                        self.check_row_expr(cur_rhs, cols, outer_env, rhs_hint, allow_dot_self);
 
                     if lty != rty {
+                        let lhs_target = match (&rty, cur_op) {
+                            (Ty::Option(inner), BinOp::Eq | BinOp::Ne) => inner.as_ref(),
+                            (other, _) => other,
+                        };
+                        let rhs_target = match (&lty, cur_op) {
+                            (Ty::Option(inner), BinOp::Eq | BinOp::Ne) => inner.as_ref(),
+                            (other, _) => other,
+                        };
                         if let Some(le) = lhs_lit_expr
                             && matches!(lty, Ty::Decimal)
-                            && matches!(rty, Ty::Float)
+                            && matches!(lhs_target, Ty::Float)
                             && is_numeric_lit(le)
                         {
                             let (e, l) = self.check_decimal_from_expr(le, &Ty::Float);
@@ -12234,16 +12272,16 @@ impl<'a> Checker<'a> {
                             }
                         } else if let Some(le) = lhs_lit_expr
                             && matches!(lty, Ty::Int)
-                            && matches!(rty, Ty::Decimal | Ty::Float)
+                            && matches!(lhs_target, Ty::Decimal | Ty::Float)
                             && is_numeric_lit(le)
                         {
-                            let (e, l) = self.check_decimal_from_expr(le, &rty);
+                            let (e, l) = self.check_decimal_from_expr(le, lhs_target);
                             if let Some(lit) = e.into_lit() {
                                 lre = ExecRowExpr::Lit(lit);
                                 lty = l.ty;
                             }
                         } else if matches!(rty, Ty::Int | Ty::Decimal)
-                            && matches!(lty, Ty::Float)
+                            && matches!(rhs_target, Ty::Float)
                             && is_numeric_lit(cur_rhs)
                         {
                             let (e, l) = self.check_decimal_from_expr(cur_rhs, &Ty::Float);
@@ -12252,7 +12290,7 @@ impl<'a> Checker<'a> {
                                 rty = l.ty;
                             }
                         } else if matches!(rty, Ty::Int)
-                            && matches!(lty, Ty::Decimal)
+                            && matches!(rhs_target, Ty::Decimal)
                             && is_numeric_lit(cur_rhs)
                         {
                             let (e, l) = self.check_decimal_from_expr(cur_rhs, &Ty::Decimal);
@@ -12260,6 +12298,44 @@ impl<'a> Checker<'a> {
                                 rre = ExecRowExpr::Lit(lit);
                                 rty = l.ty;
                             }
+                        }
+                    }
+
+                    if matches!(cur_op, BinOp::Eq | BinOp::Ne) {
+                        // Refine untyped `none` (`Option(Unit)`) against concrete `Option(T)` on either side.
+                        if matches!(&lty, Ty::Option(li) if matches!(li.as_ref(), Ty::Unit))
+                            && matches!(&lre, ExecRowExpr::Lit(Literal::NoneLit(Ty::Unit)))
+                            && let Ty::Option(ri) = &rty
+                            && !matches!(ri.as_ref(), Ty::Unit)
+                        {
+                            lre = ExecRowExpr::Lit(Literal::NoneLit(ri.as_ref().clone()));
+                            lty = rty.clone();
+                        } else if matches!(&rty, Ty::Option(ri) if matches!(ri.as_ref(), Ty::Unit))
+                            && matches!(&rre, ExecRowExpr::Lit(Literal::NoneLit(Ty::Unit)))
+                            && let Ty::Option(li) = &lty
+                            && !matches!(li.as_ref(), Ty::Unit)
+                        {
+                            rre = ExecRowExpr::Lit(Literal::NoneLit(li.as_ref().clone()));
+                            rty = lty.clone();
+                        }
+
+                        // Coerce `Option(T) == T` or `T == Option(T)` cleanly inside row expressions.
+                        if let Ty::Option(inner) = &lty
+                            && **inner == rty
+                        {
+                            rre = ExecRowExpr::Prim {
+                                op: ExecPrimOp::Core(PrimOp::SomeVal(rty.clone())),
+                                args: vec![rre],
+                            };
+                            rty = lty.clone();
+                        } else if let Ty::Option(inner) = &rty
+                            && **inner == lty
+                        {
+                            lre = ExecRowExpr::Prim {
+                                op: ExecPrimOp::Core(PrimOp::SomeVal(lty.clone())),
+                                args: vec![lre],
+                            };
+                            lty = rty.clone();
                         }
                     }
                     let tags = ltags.union(&rtags);

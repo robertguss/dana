@@ -593,7 +593,11 @@ enum SqlExpr {
         expr: Box<SqlExpr>,
         items: Vec<SqlExpr>,
     },
-    TryParseIsoDate(Box<SqlExpr>),
+    TrimAscii(Box<SqlExpr>),
+    TryParseIsoDate {
+        inner: Box<SqlExpr>,
+        already_trimmed: bool,
+    },
     RowNumber {
         partition_by: Vec<SqlExpr>,
         order_by: Vec<SqlOrderItem>,
@@ -980,8 +984,14 @@ impl<'a> SqlRenderState<'a> {
                 }
                 self.sql.push_str("))");
             }
-            SqlExpr::TryParseIsoDate(inner) => {
-                self.render_try_parse_iso_date(inner);
+            SqlExpr::TrimAscii(inner) => {
+                self.render_trimmed_ascii(inner);
+            }
+            SqlExpr::TryParseIsoDate {
+                inner,
+                already_trimmed,
+            } => {
+                self.render_try_parse_iso_date(inner, *already_trimmed);
             }
             SqlExpr::RowNumber {
                 partition_by,
@@ -1034,24 +1044,38 @@ impl<'a> SqlRenderState<'a> {
         }
     }
 
-    fn render_substr_slice(&mut self, inner: &SqlExpr, start: usize, len: usize) {
+    fn render_iso_source(&mut self, inner: &SqlExpr, already_trimmed: bool) {
+        if already_trimmed {
+            self.render_expr(inner);
+        } else {
+            self.render_trimmed_ascii(inner);
+        }
+    }
+
+    fn render_substr_slice(
+        &mut self,
+        inner: &SqlExpr,
+        already_trimmed: bool,
+        start: usize,
+        len: usize,
+    ) {
         match self.dialect {
             SqlDialect::Sqlite => {
                 self.sql.push_str("SUBSTR(");
-                self.render_trimmed_ascii(inner);
+                self.render_iso_source(inner, already_trimmed);
                 let _ = write!(self.sql, ", {start}, {len})");
             }
             SqlDialect::Postgres => {
                 self.sql.push_str("SUBSTRING(");
-                self.render_trimmed_ascii(inner);
+                self.render_iso_source(inner, already_trimmed);
                 let _ = write!(self.sql, " FROM {start} FOR {len})");
             }
         }
     }
 
-    fn render_try_parse_iso_date(&mut self, inner: &SqlExpr) {
+    fn render_try_parse_iso_date(&mut self, inner: &SqlExpr, already_trimmed: bool) {
         self.sql.push_str("(CASE WHEN (");
-        self.render_trimmed_ascii(inner);
+        self.render_iso_source(inner, already_trimmed);
         match self.dialect {
             SqlDialect::Sqlite => {
                 self.sql.push_str(
@@ -1063,49 +1087,49 @@ impl<'a> SqlRenderState<'a> {
                     .push_str(" ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$') THEN (CASE WHEN ((");
             }
         }
-        self.render_substr_slice(inner, 1, 4);
+        self.render_substr_slice(inner, already_trimmed, 1, 4);
         self.sql.push_str(" <> '0000') AND (");
         // Months with 31 days
         self.sql.push('(');
-        self.render_substr_slice(inner, 6, 2);
+        self.render_substr_slice(inner, already_trimmed, 6, 2);
         self.sql
             .push_str(" IN ('01','03','05','07','08','10','12') AND ");
-        self.render_substr_slice(inner, 9, 2);
+        self.render_substr_slice(inner, already_trimmed, 9, 2);
         self.sql.push_str(" >= '01' AND ");
-        self.render_substr_slice(inner, 9, 2);
+        self.render_substr_slice(inner, already_trimmed, 9, 2);
         self.sql.push_str(" <= '31')");
         // Months with 30 days
         self.sql.push_str(" OR (");
-        self.render_substr_slice(inner, 6, 2);
+        self.render_substr_slice(inner, already_trimmed, 6, 2);
         self.sql.push_str(" IN ('04','06','09','11') AND ");
-        self.render_substr_slice(inner, 9, 2);
+        self.render_substr_slice(inner, already_trimmed, 9, 2);
         self.sql.push_str(" >= '01' AND ");
-        self.render_substr_slice(inner, 9, 2);
+        self.render_substr_slice(inner, already_trimmed, 9, 2);
         self.sql.push_str(" <= '30')");
         // February with proleptic Gregorian leap-year check
         self.sql.push_str(" OR (");
-        self.render_substr_slice(inner, 6, 2);
+        self.render_substr_slice(inner, already_trimmed, 6, 2);
         self.sql.push_str(" = '02' AND ");
-        self.render_substr_slice(inner, 9, 2);
+        self.render_substr_slice(inner, already_trimmed, 9, 2);
         self.sql.push_str(" >= '01' AND ");
-        self.render_substr_slice(inner, 9, 2);
+        self.render_substr_slice(inner, already_trimmed, 9, 2);
         self.sql.push_str(" <= (CASE WHEN ((CAST(");
-        self.render_substr_slice(inner, 1, 4);
+        self.render_substr_slice(inner, already_trimmed, 1, 4);
         self.sql.push_str(" AS INTEGER) % 4 = 0 AND CAST(");
-        self.render_substr_slice(inner, 1, 4);
+        self.render_substr_slice(inner, already_trimmed, 1, 4);
         self.sql.push_str(" AS INTEGER) % 100 <> 0) OR (CAST(");
-        self.render_substr_slice(inner, 1, 4);
+        self.render_substr_slice(inner, already_trimmed, 1, 4);
         self.sql
             .push_str(" AS INTEGER) % 400 = 0)) THEN '29' ELSE '28' END))");
         match self.dialect {
             SqlDialect::Sqlite => {
                 self.sql.push_str(")) THEN ");
-                self.render_trimmed_ascii(inner);
+                self.render_iso_source(inner, already_trimmed);
                 self.sql.push_str(" ELSE NULL END) ELSE NULL END)");
             }
             SqlDialect::Postgres => {
                 self.sql.push_str(")) THEN CAST(");
-                self.render_trimmed_ascii(inner);
+                self.render_iso_source(inner, already_trimmed);
                 self.sql.push_str(
                     " AS DATE) ELSE CAST(NULL AS DATE) END) ELSE CAST(NULL AS DATE) END)",
                 );
@@ -1369,6 +1393,7 @@ impl PushedNode {
         table_name: &str,
         schema: &TableTy,
         lock: Option<&SchemaLockFile>,
+        dialect: SqlDialect,
     ) -> Result<Self, String> {
         if schema.cols.is_empty() {
             return Err("empty table schema cannot be pushed to SQL".to_string());
@@ -1381,15 +1406,33 @@ impl PushedNode {
                 ));
             }
         }
+        let mut has_pg_text_cast = false;
         let items: Vec<SqlSelectItem> = schema
             .cols
             .iter()
-            .map(|c| SqlSelectItem {
-                expr: SqlExpr::Col {
+            .map(|c| {
+                let base_col = SqlExpr::Col {
                     table_alias: None,
                     name: c.name.clone(),
-                },
-                alias: c.name.clone(),
+                };
+                // Normalize Postgres text-mapped columns (`ENUM`, `UUID`, `JSONB`, `VARCHAR`,
+                // `TEXT`) to `TEXT` at the scan boundary so pushed filters, collations, and
+                // string functions never fail on custom type OIDs.
+                let expr = if dialect == SqlDialect::Postgres
+                    && matches!(base_of_scalar(&c.ty), ScalarTy::Text)
+                {
+                    has_pg_text_cast = true;
+                    SqlExpr::Cast {
+                        expr: Box::new(base_col),
+                        ty: "TEXT",
+                    }
+                } else {
+                    base_col
+                };
+                SqlSelectItem {
+                    expr,
+                    alias: c.name.clone(),
+                }
             })
             .collect();
         let mut unique_keys = Vec::new();
@@ -1426,7 +1469,7 @@ impl PushedNode {
             unique_keys,
             pushed_ops: vec![format!("SourceDB({table_name})")],
             deterministic_order: true,
-            needs_wrap_for_filter: false,
+            needs_wrap_for_filter: has_pg_text_cast,
             needs_wrap_for_proj: false,
             next_alias_id: 0,
         })
@@ -1565,7 +1608,52 @@ impl PushedNode {
         Ok(self)
     }
 
+    /// Hoist any `TryParseIsoDate` trim subexpression once into an inner subquery so the 15
+    /// validation checks never duplicate inner SQL parameters (e.g. `COALESCE`/`SUBSTRING`).
+    fn hoist_try_parse_iso_dates(mut self, mut expr: SqlExpr) -> (Self, SqlExpr) {
+        loop {
+            let mut hoisted = Vec::new();
+            let mut next_id = self.next_alias_id;
+            expr = rewrite_leaf_try_parse_dates(expr, &self.schema, &mut next_id, &mut hoisted);
+            self.next_alias_id = next_id;
+            if hoisted.is_empty() {
+                return (self, expr);
+            }
+            let must_wrap = self.needs_wrap_for_proj
+                || self.needs_wrap_for_filter
+                || matches!(
+                    &self.query,
+                    SqlQuery::Select {
+                        distinct,
+                        distinct_on,
+                        where_clause,
+                        group_by,
+                        limit,
+                        ..
+                    } if *distinct
+                        || !distinct_on.is_empty()
+                        || where_clause.is_some()
+                        || !group_by.is_empty()
+                        || limit.is_some()
+                );
+            if must_wrap {
+                self = self.wrap_as_subquery();
+            }
+            if let SqlQuery::Select { items, .. } = &mut self.query {
+                for (alias, trim_expr) in hoisted {
+                    items.push(SqlSelectItem {
+                        expr: trim_expr,
+                        alias,
+                    });
+                }
+            }
+            self = self.wrap_as_subquery();
+        }
+    }
+
     fn apply_filter(mut self, pred_expr: SqlExpr, pred_tags: &TagSet) -> Self {
+        let (wrapped, pred_expr) = self.hoist_try_parse_iso_dates(pred_expr);
+        self = wrapped;
         if self.needs_wrap_for_filter {
             self = self.wrap_as_subquery();
         }
@@ -1600,6 +1688,8 @@ impl PushedNode {
     }
 
     fn apply_derive_single(mut self, name: &str, expr: SqlExpr, spec: ColSpec) -> Self {
+        let (wrapped, expr) = self.hoist_try_parse_iso_dates(expr);
+        self = wrapped;
         // Wrap first so derived expressions always see clean upstream column names,
         // and subsequent derives/filters can safely reference newly derived or overwritten columns.
         if self.needs_wrap_for_proj || self.needs_wrap_for_filter {
@@ -2565,6 +2655,303 @@ impl PushedNode {
         self.pushed_ops
             .push(format!("Summarize([{}])", agg_desc.join(", ")));
         Ok(self)
+    }
+}
+
+fn expr_has_untrimmed_try_parse_date(expr: &SqlExpr) -> bool {
+    match expr {
+        SqlExpr::TryParseIsoDate {
+            already_trimmed: false,
+            ..
+        } => true,
+        SqlExpr::TryParseIsoDate {
+            inner,
+            already_trimmed: true,
+        }
+        | SqlExpr::Unary { arg: inner, .. }
+        | SqlExpr::IsNull { arg: inner, .. }
+        | SqlExpr::CollateC(inner)
+        | SqlExpr::Cast { expr: inner, .. }
+        | SqlExpr::Agg { arg: inner, .. }
+        | SqlExpr::TrimAscii(inner) => expr_has_untrimmed_try_parse_date(inner),
+        SqlExpr::Binary { left, right, .. }
+        | SqlExpr::NullSafeEq { left, right, .. }
+        | SqlExpr::Coalesce(left, right) => {
+            expr_has_untrimmed_try_parse_date(left) || expr_has_untrimmed_try_parse_date(right)
+        }
+        SqlExpr::Func { args, .. } => args.iter().any(expr_has_untrimmed_try_parse_date),
+        SqlExpr::Case { whens, else_br } => {
+            whens.iter().any(|(c, t)| {
+                expr_has_untrimmed_try_parse_date(c) || expr_has_untrimmed_try_parse_date(t)
+            }) || expr_has_untrimmed_try_parse_date(else_br)
+        }
+        SqlExpr::Substring {
+            str_expr,
+            start,
+            len,
+        } => {
+            expr_has_untrimmed_try_parse_date(str_expr)
+                || expr_has_untrimmed_try_parse_date(start)
+                || expr_has_untrimmed_try_parse_date(len)
+        }
+        SqlExpr::InList { expr, items } => {
+            expr_has_untrimmed_try_parse_date(expr)
+                || items.iter().any(expr_has_untrimmed_try_parse_date)
+        }
+        SqlExpr::RowNumber {
+            partition_by,
+            order_by,
+        } => {
+            partition_by.iter().any(expr_has_untrimmed_try_parse_date)
+                || order_by
+                    .iter()
+                    .any(|o| expr_has_untrimmed_try_parse_date(&o.expr))
+        }
+        SqlExpr::Col { .. }
+        | SqlExpr::Param { .. }
+        | SqlExpr::Exists { .. }
+        | SqlExpr::CountStar
+        | SqlExpr::BoolLit(_)
+        | SqlExpr::IntLit(_) => false,
+    }
+}
+
+fn rewrite_leaf_try_parse_dates(
+    expr: SqlExpr,
+    schema: &TableTy,
+    next_alias_id: &mut usize,
+    hoisted: &mut Vec<(String, SqlExpr)>,
+) -> SqlExpr {
+    match expr {
+        SqlExpr::TryParseIsoDate {
+            inner,
+            already_trimmed: false,
+        } => {
+            if expr_has_untrimmed_try_parse_date(&inner) {
+                SqlExpr::TryParseIsoDate {
+                    inner: Box::new(rewrite_leaf_try_parse_dates(
+                        *inner,
+                        schema,
+                        next_alias_id,
+                        hoisted,
+                    )),
+                    already_trimmed: false,
+                }
+            } else {
+                let candidate = loop {
+                    *next_alias_id += 1;
+                    let alias = format!("_dana_iso_{}", *next_alias_id);
+                    if schema.find_col(&alias).is_none()
+                        && !hoisted.iter().any(|(n, _)| n == &alias)
+                    {
+                        break alias;
+                    }
+                };
+                hoisted.push((candidate.clone(), SqlExpr::TrimAscii(inner)));
+                SqlExpr::TryParseIsoDate {
+                    inner: Box::new(SqlExpr::Col {
+                        table_alias: None,
+                        name: candidate,
+                    }),
+                    already_trimmed: true,
+                }
+            }
+        }
+        SqlExpr::TryParseIsoDate {
+            inner,
+            already_trimmed: true,
+        } => SqlExpr::TryParseIsoDate {
+            inner: Box::new(rewrite_leaf_try_parse_dates(
+                *inner,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+            already_trimmed: true,
+        },
+        SqlExpr::Unary { op, arg } => SqlExpr::Unary {
+            op,
+            arg: Box::new(rewrite_leaf_try_parse_dates(
+                *arg,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+        },
+        SqlExpr::Binary { op, left, right } => SqlExpr::Binary {
+            op,
+            left: Box::new(rewrite_leaf_try_parse_dates(
+                *left,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+            right: Box::new(rewrite_leaf_try_parse_dates(
+                *right,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+        },
+        SqlExpr::NullSafeEq {
+            negated,
+            left,
+            right,
+        } => SqlExpr::NullSafeEq {
+            negated,
+            left: Box::new(rewrite_leaf_try_parse_dates(
+                *left,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+            right: Box::new(rewrite_leaf_try_parse_dates(
+                *right,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+        },
+        SqlExpr::IsNull { negated, arg } => SqlExpr::IsNull {
+            negated,
+            arg: Box::new(rewrite_leaf_try_parse_dates(
+                *arg,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+        },
+        SqlExpr::CollateC(inner) => SqlExpr::CollateC(Box::new(rewrite_leaf_try_parse_dates(
+            *inner,
+            schema,
+            next_alias_id,
+            hoisted,
+        ))),
+        SqlExpr::Func { name, args } => SqlExpr::Func {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| rewrite_leaf_try_parse_dates(a, schema, next_alias_id, hoisted))
+                .collect(),
+        },
+        SqlExpr::Cast { expr, ty } => SqlExpr::Cast {
+            expr: Box::new(rewrite_leaf_try_parse_dates(
+                *expr,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+            ty,
+        },
+        SqlExpr::Case { whens, else_br } => SqlExpr::Case {
+            whens: whens
+                .into_iter()
+                .map(|(c, t)| {
+                    (
+                        rewrite_leaf_try_parse_dates(c, schema, next_alias_id, hoisted),
+                        rewrite_leaf_try_parse_dates(t, schema, next_alias_id, hoisted),
+                    )
+                })
+                .collect(),
+            else_br: Box::new(rewrite_leaf_try_parse_dates(
+                *else_br,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+        },
+        SqlExpr::Coalesce(left, right) => SqlExpr::Coalesce(
+            Box::new(rewrite_leaf_try_parse_dates(
+                *left,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+            Box::new(rewrite_leaf_try_parse_dates(
+                *right,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+        ),
+        SqlExpr::Agg {
+            func,
+            distinct,
+            arg,
+        } => SqlExpr::Agg {
+            func,
+            distinct,
+            arg: Box::new(rewrite_leaf_try_parse_dates(
+                *arg,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+        },
+        SqlExpr::Substring {
+            str_expr,
+            start,
+            len,
+        } => SqlExpr::Substring {
+            str_expr: Box::new(rewrite_leaf_try_parse_dates(
+                *str_expr,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+            start: Box::new(rewrite_leaf_try_parse_dates(
+                *start,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+            len: Box::new(rewrite_leaf_try_parse_dates(
+                *len,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+        },
+        SqlExpr::InList { expr, items } => SqlExpr::InList {
+            expr: Box::new(rewrite_leaf_try_parse_dates(
+                *expr,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+            items: items
+                .into_iter()
+                .map(|item| rewrite_leaf_try_parse_dates(item, schema, next_alias_id, hoisted))
+                .collect(),
+        },
+        SqlExpr::TrimAscii(inner) => SqlExpr::TrimAscii(Box::new(rewrite_leaf_try_parse_dates(
+            *inner,
+            schema,
+            next_alias_id,
+            hoisted,
+        ))),
+        SqlExpr::RowNumber {
+            partition_by,
+            order_by,
+        } => SqlExpr::RowNumber {
+            partition_by: partition_by
+                .into_iter()
+                .map(|p| rewrite_leaf_try_parse_dates(p, schema, next_alias_id, hoisted))
+                .collect(),
+            order_by: order_by
+                .into_iter()
+                .map(|o| SqlOrderItem {
+                    expr: rewrite_leaf_try_parse_dates(o.expr, schema, next_alias_id, hoisted),
+                    dir: o.dir,
+                })
+                .collect(),
+        },
+        other @ (SqlExpr::Col { .. }
+        | SqlExpr::Param { .. }
+        | SqlExpr::Exists { .. }
+        | SqlExpr::CountStar
+        | SqlExpr::BoolLit(_)
+        | SqlExpr::IntLit(_)) => other,
     }
 }
 
@@ -3610,7 +3997,13 @@ fn split_core_node(
                     ),
                 };
             }
-            match PushedNode::from_source_db(&resolved_db, table_name, schema, ctx.lock) {
+            match PushedNode::from_source_db(
+                &resolved_db,
+                table_name,
+                schema,
+                ctx.lock,
+                ctx.dialect,
+            ) {
                 Ok(node) => NodeSplit::Pushed(node),
                 Err(reason) => NodeSplit::LocalOnly { reason },
             }
@@ -5269,7 +5662,10 @@ fn translate_exec_row_expr(
                     return Err("try_parse_date requires non-Option Text".to_string());
                 }
                 Ok((
-                    SqlExpr::TryParseIsoDate(Box::new(s_e)),
+                    SqlExpr::TryParseIsoDate {
+                        inner: Box::new(s_e),
+                        already_trimmed: false,
+                    },
                     ScalarTy::Option(Box::new(ScalarTy::Date)),
                     s_tags,
                 ))
@@ -5541,7 +5937,13 @@ fn split_exec_node(
                     ),
                 };
             }
-            match PushedNode::from_source_db(&resolved_db, table_name, schema, ctx.lock) {
+            match PushedNode::from_source_db(
+                &resolved_db,
+                table_name,
+                schema,
+                ctx.lock,
+                ctx.dialect,
+            ) {
                 Ok(node) => NodeSplit::Pushed(node),
                 Err(reason) => NodeSplit::LocalOnly { reason },
             }

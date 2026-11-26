@@ -1469,7 +1469,7 @@ fn check_src_with_lock(
 
 #[test]
 fn v06_sqlite_attach_and_unattached_schema_table_fallback() -> TestResult {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.1");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.2");
     let tmp = TempDir::new("sqlite_attach")?;
     let main_db = tmp.path().join("main.db");
     let populi_db = tmp.path().join("populi.db");
@@ -2777,12 +2777,524 @@ end
     let db_out = assert_oracle_vm_parity(db_src, Some(("DB", &uri)))?;
     assert_eq!(db_out, vec!["2"]);
 
-    // 5. CLI --version prints `dana v0.6.1`
+    // 5. CLI --version prints `dana v0.6.2`
     let ver = Command::new(env!("CARGO_BIN_EXE_dana"))
         .arg("--version")
         .output()?;
     assert_eq!(ver.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.1");
+    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.2");
 
     Ok(())
+}
+
+// ===========================================================================
+// Patch v0.6.2 Tests: Option(T)==T row coercion, PG ENUM/TEXT casts, ISO date dedup
+// ===========================================================================
+
+#[test]
+fn v062_option_eq_ne_row_coercion_parity_and_pushdown() -> TestResult {
+    let tmp = TempDir::new("v062_opt_eq")?;
+    let db_path = tmp.path().join("opt_eq.db");
+    let uri = sqlite_uri(&db_path);
+    {
+        let mut conn = open_connection(&uri)?;
+        conn.execute(
+            r#"CREATE TABLE "items" (
+                "id" INTEGER PRIMARY KEY NOT NULL,
+                "workflow_state" TEXT,
+                "score" NUMERIC
+            )"#,
+            &[],
+        )?;
+        conn.execute(
+            r#"INSERT INTO "items" VALUES (1, 'active', '1.00'), (2, 'deleted', '2.50'), (3, NULL, NULL), (4, 'invited', '1')"#,
+            &[],
+        )?;
+    }
+
+    let lock_sq = dana::db::schema_lock::SchemaLockFile {
+        version: dana::db::schema_lock::SCHEMA_LOCK_VERSION,
+        dbs: vec![dana::db::schema_lock::LockedDb {
+            name: "DB".to_string(),
+            dialect: SqlDialect::Sqlite,
+            tables: vec![dana::db::schema_lock::LockedTable {
+                name: "items".to_string(),
+                cols: vec![
+                    dana::db::schema_lock::LockedCol {
+                        name: "id".to_string(),
+                        ty: dana::core::ScalarTy::Int,
+                        nullable: false,
+                        pk: true,
+                        tags: dana::core::TagSet::empty(),
+                    },
+                    dana::db::schema_lock::LockedCol {
+                        name: "workflow_state".to_string(),
+                        ty: dana::core::ScalarTy::Text,
+                        nullable: true,
+                        pk: false,
+                        tags: dana::core::TagSet::empty(),
+                    },
+                    dana::db::schema_lock::LockedCol {
+                        name: "score".to_string(),
+                        ty: dana::core::ScalarTy::Decimal,
+                        nullable: true,
+                        pk: false,
+                        tags: dana::core::TagSet::empty(),
+                    },
+                ],
+            }],
+        }],
+    };
+    let mut lock_pg = lock_sq.clone();
+    lock_pg.dbs[0].dialect = SqlDialect::Postgres;
+
+    // Crucial: None != "deleted" must evaluate true, Some("deleted") != "deleted" false,
+    // symmetric LHS/RHS ("active" == .workflow_state), none == .workflow_state, and Int -> Option(Decimal).
+    let src = r##"module OptionEqRowCoercion
+
+schema Item
+  id: Int
+  workflow_state: Text?
+  score: Decimal?
+end
+
+fn scalar_none() : Text?
+  none
+end
+
+fn main(db: ReadDB(DB), console: Console) : Int
+  opt_scalar = scalar_none()
+  console.print("SC:#{opt_scalar == none}:#{none == opt_scalar}:#{opt_scalar == "deleted"}")
+  rows = db.table(Item, from: "items")
+    |> where(.workflow_state != "deleted")
+    |> derive(
+      is_active: .workflow_state == "active",
+      sym_active: "active" == .workflow_state,
+      sym_not_del: "deleted" != .workflow_state,
+      is_none_r: .workflow_state == none,
+      is_none_l: none == .workflow_state,
+      not_none_l: none != .workflow_state,
+      score_is_one: .score == 1,
+      one_is_score: 1 == .score
+    )
+    |> sort_by(.id)
+  for r in rows
+    console.print("#{r.id}:#{r.is_active}:#{r.sym_active}:#{r.sym_not_del}:#{r.is_none_r}:#{r.is_none_l}:#{r.not_none_l}:#{r.score_is_one}:#{r.one_is_score}")
+  end
+  0
+end
+"##;
+    let out = assert_oracle_vm_parity(src, Some(("DB", &uri)))?;
+    assert_eq!(
+        out,
+        vec![
+            "SC:true:true:false",
+            // id=1: "active", 1.00
+            "1:true:true:true:false:false:true:true:true",
+            // id=3: None, None -> != "deleted" is true!
+            "3:false:false:true:true:true:false:false:false",
+            // id=4: "invited", 1
+            "4:false:false:true:false:false:true:true:true",
+        ]
+    );
+
+    let checked = check_src_with_lock(src, &lock_sq)?;
+    let main_fn = checked.exec.find_fun("main").ok_or("missing main")?;
+    let plan = find_first_plan(&main_fn.body).ok_or("missing ExecPlan")?;
+    // On SQLite, `.workflow_state != "deleted"` pushes (`IS NOT ?`), while TEXT-encoded Decimal Eq/Ne
+    // cleanly falls back to Hybrid VM so '1.00' == 1 stays exact; Postgres pushes everything (`NUMERIC`).
+    match split_exec_plan_pushdown(
+        plan,
+        &checked.exec,
+        "DB",
+        SqlDialect::Sqlite,
+        Some(&lock_sq),
+    ) {
+        SplitPlan::Hybrid { pushdown, .. } => {
+            assert!(
+                pushdown.sql.contains("IS NOT ?"),
+                "expected `IS NOT ?` in SQLite Hybrid filter SQL:\n{}",
+                pushdown.sql
+            );
+        }
+        other => {
+            return Err(format!("expected Hybrid for SQLite Decimal Eq/Ne, got {other:?}").into());
+        }
+    }
+    match split_exec_plan_pushdown(
+        plan,
+        &checked.exec,
+        "DB",
+        SqlDialect::Postgres,
+        Some(&lock_pg),
+    ) {
+        SplitPlan::FullyPushed(q) => {
+            assert!(
+                q.sql.contains("IS DISTINCT FROM CAST($"),
+                "expected `IS DISTINCT FROM CAST($` in Postgres pushdown SQL:\n{}",
+                q.sql
+            );
+        }
+        other => {
+            return Err(format!("expected FullyPushed for Postgres, got {other:?}").into());
+        }
+    }
+
+    // Without Decimal Eq/Ne, Text? Option(T)==T / !=T / ==none pushes FullyPushed on BOTH SQLite and Postgres.
+    let push_text_src = r##"module OptionTextFullyPushed
+
+schema Item
+  id: Int
+  workflow_state: Text?
+  score: Decimal?
+end
+
+fn main(db: ReadDB(DB), console: Console) : Int
+  rows = db.table(Item, from: "items")
+    |> where(.workflow_state != "deleted" and none != .workflow_state)
+    |> derive(
+      is_active: .workflow_state == "active",
+      sym_active: "active" == .workflow_state
+    )
+    |> sort_by(.id)
+  console.print_table(rows)
+  0
+end
+"##;
+    let checked_pt = check_src_with_lock(push_text_src, &lock_sq)?;
+    let plan_pt = find_first_plan(&checked_pt.exec.find_fun("main").ok_or("missing main")?.body)
+        .ok_or("missing ExecPlan")?;
+    for (dialect, lk, expect_frag) in [
+        (SqlDialect::Sqlite, &lock_sq, "IS NOT ?"),
+        (SqlDialect::Postgres, &lock_pg, "IS DISTINCT FROM CAST($"),
+    ] {
+        let sp = split_exec_plan_pushdown(plan_pt, &checked_pt.exec, "DB", dialect, Some(lk));
+        match sp {
+            SplitPlan::FullyPushed(q) => {
+                assert!(
+                    q.sql.contains(expect_frag),
+                    "expected `{expect_frag}` in {dialect:?} pushdown SQL:\n{}",
+                    q.sql
+                );
+            }
+            other => {
+                return Err(format!("expected FullyPushed for {dialect:?}, got {other:?}").into());
+            }
+        }
+    }
+
+    // In-memory table expression also respects Option(T) == T / != T / none
+    let mem_src = r##"module InMemOptionEq
+
+fn main(console: Console) : Int
+  rows = table
+    | id | state |
+    | 1 | "active" |
+    | 2 | "deleted" |
+    | 3 | none |
+  end
+    |> where(.state != "deleted" and .state != none)
+    |> sort_by(.id)
+  for r in rows
+    console.print("#{r.id}:#{r.state}")
+  end
+  0
+end
+"##;
+    let mem_out = assert_oracle_vm_parity(mem_src, None)?;
+    assert_eq!(mem_out, vec!["1:active"]);
+
+    Ok(())
+}
+
+#[test]
+fn v062_postgres_text_cast_and_try_parse_date_param_dedup() -> TestResult {
+    let tmp = TempDir::new("v062_dedup")?;
+    let db_path = tmp.path().join("dedup.db");
+    let uri = sqlite_uri(&db_path);
+    {
+        let mut conn = open_connection(&uri)?;
+        conn.execute(
+            r#"CREATE TABLE "terms" (
+                "id" INTEGER PRIMARY KEY NOT NULL,
+                "workflow_state" TEXT,
+                "start_raw" TEXT,
+                "end_raw" TEXT
+            )"#,
+            &[],
+        )?;
+        conn.execute(
+            r#"INSERT INTO "terms" VALUES
+                (1, 'active', '2024-02-29T00:00:00Z', '2024-05-15T23:59:59Z'),
+                (2, 'deleted', '2024-01-01T00:00:00Z', '2024-02-01T00:00:00Z'),
+                (3, NULL, '2023-02-29T00:00:00Z', '2026-01-12T05:00:00Z'),
+                (4, 'active', NULL, '0000-01-01')"#,
+            &[],
+        )?;
+    }
+
+    let lock_sq = dana::db::schema_lock::SchemaLockFile {
+        version: dana::db::schema_lock::SCHEMA_LOCK_VERSION,
+        dbs: vec![dana::db::schema_lock::LockedDb {
+            name: "DB".to_string(),
+            dialect: SqlDialect::Sqlite,
+            tables: vec![dana::db::schema_lock::LockedTable {
+                name: "terms".to_string(),
+                cols: vec![
+                    dana::db::schema_lock::LockedCol {
+                        name: "id".to_string(),
+                        ty: dana::core::ScalarTy::Int,
+                        nullable: false,
+                        pk: true,
+                        tags: dana::core::TagSet::empty(),
+                    },
+                    dana::db::schema_lock::LockedCol {
+                        name: "workflow_state".to_string(),
+                        ty: dana::core::ScalarTy::Text,
+                        nullable: true,
+                        pk: false,
+                        tags: dana::core::TagSet::empty(),
+                    },
+                    dana::db::schema_lock::LockedCol {
+                        name: "start_raw".to_string(),
+                        ty: dana::core::ScalarTy::Text,
+                        nullable: true,
+                        pk: false,
+                        tags: dana::core::TagSet::empty(),
+                    },
+                    dana::db::schema_lock::LockedCol {
+                        name: "end_raw".to_string(),
+                        ty: dana::core::ScalarTy::Text,
+                        nullable: true,
+                        pk: false,
+                        tags: dana::core::TagSet::empty(),
+                    },
+                ],
+            }],
+        }],
+    };
+    let mut lock_pg = lock_sq.clone();
+    lock_pg.dbs[0].dialect = SqlDialect::Postgres;
+
+    let src = r##"module PgCastAndDateDedup
+
+schema Term
+  id: Int
+  workflow_state: Text?
+  start_raw: Text?
+  end_raw: Text?
+end
+
+fn main(db: ReadDB(DB), console: Console) : Int
+  rows = db.table(Term, from: "terms")
+    |> where(.workflow_state != "deleted" and not .workflow_state.in?(["archived"]))
+    |> derive(
+      start_d: (.start_raw ?? "").slice(0, 10).try_parse_date,
+      end_d: (.end_raw ?? "").slice(0, 10).try_parse_date
+    )
+    |> where((.end_raw ?? "").slice(0, 10).try_parse_date.some?)
+    |> sort_by(.workflow_state, .id)
+  for r in rows
+    console.print("#{r.id}:#{r.workflow_state}:#{r.start_d}:#{r.end_d}")
+  end
+  0
+end
+"##;
+    let out = assert_oracle_vm_parity(src, Some(("DB", &uri)))?;
+    assert_eq!(
+        out,
+        vec!["3:none:none:2026-01-12", "1:active:2024-02-29:2024-05-15",]
+    );
+
+    let checked = check_src_with_lock(src, &lock_sq)?;
+    let main_fn = checked.exec.find_fun("main").ok_or("missing main")?;
+    let plan = find_first_plan(&main_fn.body).ok_or("missing ExecPlan")?;
+
+    for (dialect, lk) in [
+        (SqlDialect::Sqlite, &lock_sq),
+        (SqlDialect::Postgres, &lock_pg),
+    ] {
+        let sp = split_exec_plan_pushdown(plan, &checked.exec, "DB", dialect, Some(lk));
+        match sp {
+            SplitPlan::FullyPushed(q) => {
+                // Before v0.6.2, each TryParseIsoDate emitted 15x inner parameters (45 per date).
+                // Now each hoisted TrimAscii emits its inner params once plus one whitespace literal (~4 per date).
+                assert!(
+                    q.param_slots.len() <= 20,
+                    "expected deduplicated TryParseIsoDate params <= 20 for {dialect:?}, got {}:\n{}",
+                    q.param_slots.len(),
+                    q.sql
+                );
+                assert!(
+                    !q.sql.contains("\"_dana_iso_")
+                        || q.out_schema
+                            .cols
+                            .iter()
+                            .all(|c| !c.name.starts_with("_dana_iso_")),
+                    "hidden hoisted column leaked into output schema"
+                );
+                if dialect == SqlDialect::Postgres {
+                    assert!(
+                        q.sql
+                            .contains(r#"CAST("workflow_state" AS TEXT) AS "workflow_state""#)
+                            && q.sql.contains("COLLATE \"C\"")
+                            && q.sql.contains("BTRIM("),
+                        "expected Postgres CAST AS TEXT, COLLATE \"C\", and BTRIM in:\n{}",
+                        q.sql
+                    );
+                }
+            }
+            other => {
+                return Err(format!("expected FullyPushed for {dialect:?}, got {other:?}").into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL server via DANA_TEST_POSTGRES_URL"]
+fn v062_postgres_live_custom_enum_pushdown() -> TestResult {
+    let url = std::env::var("DANA_TEST_POSTGRES_URL").map_err(
+        |_| "DANA_TEST_POSTGRES_URL must be set to run v062_postgres_live_custom_enum_pushdown",
+    )?;
+    let tmp = TempDir::new("v062_live_pg_enum")?;
+    let schema_name = format!(
+        "dana_v062_enum_{}_{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let lock_path = tmp.path().join("schema.lock");
+
+    {
+        let mut pg = open_connection(&url)?;
+        pg.execute(
+            &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+            &[],
+        )?;
+        pg.execute(&format!(r#"CREATE SCHEMA "{schema_name}""#), &[])?;
+        pg.execute(
+            &format!(
+                r#"CREATE TYPE "{schema_name}"."wf_state" AS ENUM ('active', 'deleted', 'invited')"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"CREATE TABLE "{schema_name}"."enrollments" (
+                    "id" BIGINT PRIMARY KEY,
+                    "uid" BIGINT NOT NULL,
+                    "workflow_state" "{schema_name}"."wf_state",
+                    "ext_id" UUID,
+                    "meta" JSONB,
+                    "start_raw" TEXT
+                )"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"INSERT INTO "{schema_name}"."enrollments" VALUES
+                    (1, 100, 'active', '11111111-1111-1111-1111-111111111111', '{{"k":1}}', '2025-01-15T12:00:00Z'),
+                    (2, 100, 'deleted', '22222222-2222-2222-2222-222222222222', '{{"k":2}}', '2025-01-16T12:00:00Z'),
+                    (3, 200, NULL, NULL, NULL, '2025-02-01'),
+                    (4, 200, 'invited', '44444444-4444-4444-4444-444444444444', '{{"k":4}}', '2025-02-02'),
+                    (5, 300, 'invited', '55555555-5555-5555-5555-555555555555', '{{"k":5}}', 'invalid')"#
+            ),
+            &[],
+        )?;
+    }
+
+    let sync = Command::new(env!("CARGO_BIN_EXE_dana"))
+        .args([
+            "schema-sync",
+            "--db",
+            &format!("PG={url}"),
+            "--schemas",
+            &schema_name,
+            "--out",
+            &lock_path.display().to_string(),
+        ])
+        .output()?;
+    if sync.status.code() != Some(0) {
+        let _ = open_connection(&url).and_then(|mut pg| {
+            pg.execute(
+                &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+                &[],
+            )
+        });
+        return Err(format!(
+            "dana schema-sync failed: {}",
+            String::from_utf8_lossy(&sync.stderr)
+        )
+        .into());
+    }
+
+    let lock = dana::db::schema_lock::parse_schema_lock(&fs::read_to_string(&lock_path)?)?;
+    let src = format!(
+        r##"module LivePgEnumPushdown
+
+schema Enroll
+  id: Int
+  uid: Int
+  workflow_state: Text?
+  ext_id: Text?
+  meta: Text?
+  start_raw: Text?
+end
+
+fn main(db: ReadDB(PG), console: Console) : Int
+  res = db.table(Enroll, from: "{schema_name}.enrollments")
+    |> where(.workflow_state != "deleted" and not .workflow_state.in?(["deleted"]))
+    |> derive(start_d: (.start_raw ?? "").slice(0, 10).try_parse_date)
+    |> where(.start_d.some?)
+    |> dedupe_by(.uid, order_by: [asc(.workflow_state), desc(.id)])
+    |> sort_by(.uid)
+  for r in res
+    console.print("#{{r.id}}:#{{r.uid}}:#{{r.workflow_state}}:#{{r.ext_id}}:#{{r.start_d}}")
+  end
+  0
+end
+"##
+    );
+
+    let test_res = (|| -> TestResult {
+        let checked = check_src_with_lock(&src, &lock)?;
+        let main_fn = checked.exec.find_fun("main").ok_or("missing main")?;
+        let plan = find_first_plan(&main_fn.body).ok_or("missing ExecPlan")?;
+        let sp =
+            split_exec_plan_pushdown(plan, &checked.exec, "PG", SqlDialect::Postgres, Some(&lock));
+        match sp {
+            SplitPlan::FullyPushed(q) => {
+                assert!(
+                    q.sql.contains("SELECT DISTINCT ON")
+                        && q.sql.contains(r#"CAST("workflow_state" AS TEXT)"#),
+                    "expected FullyPushed custom-ENUM PG SQL:\n{}",
+                    q.sql
+                );
+            }
+            other => {
+                return Err(format!("expected FullyPushed live PG SQL, got {other:?}").into());
+            }
+        }
+        let out = assert_oracle_vm_parity(&src, Some(("PG", &url)))?;
+        assert_eq!(
+            out,
+            vec![
+                "1:100:active:11111111-1111-1111-1111-111111111111:2025-01-15",
+                "3:200:none:none:2025-02-01",
+            ]
+        );
+        Ok(())
+    })();
+
+    let _ = open_connection(&url).and_then(|mut pg| {
+        pg.execute(
+            &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+            &[],
+        )
+    });
+
+    test_res
 }

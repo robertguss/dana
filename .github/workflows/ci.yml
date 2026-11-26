@@ -101,6 +101,7 @@ jobs:
         run: |
           cargo test --test db_drivers -- postgres_live_server_opt_in --nocapture
           cargo test --test differential_sql -- live_postgres_differential_pushdown --ignored --nocapture
+          cargo test --test v06_dogfood_fixes -- v062_postgres_live_custom_enum_pushdown --ignored --nocapture
 
   macos-verify:
     name: macOS ARM64 Verification
