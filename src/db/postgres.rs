@@ -57,6 +57,11 @@ pub mod oid {
     pub const JSON: u32 = 114;
     pub const FLOAT4: u32 = 700;
     pub const FLOAT8: u32 = 701;
+    pub const CHAR_ARRAY: u32 = 1002;
+    pub const NAME_ARRAY: u32 = 1003;
+    pub const TEXT_ARRAY: u32 = 1009;
+    pub const BPCHAR_ARRAY: u32 = 1014;
+    pub const VARCHAR_ARRAY: u32 = 1015;
     pub const BPCHAR: u32 = 1042;
     pub const VARCHAR: u32 = 1043;
     pub const DATE: u32 = 1082;
@@ -1389,6 +1394,11 @@ fn oid_compatible_with_scalar(type_oid: u32, base: &ScalarTy) -> bool {
                     | oid::BPCHAR
                     | oid::CHAR
                     | oid::NAME
+                    | oid::CHAR_ARRAY
+                    | oid::NAME_ARRAY
+                    | oid::TEXT_ARRAY
+                    | oid::BPCHAR_ARRAY
+                    | oid::VARCHAR_ARRAY
                     | oid::JSON
                     | oid::JSONB
                     | oid::UUID

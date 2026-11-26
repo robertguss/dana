@@ -573,11 +573,23 @@ pub fn merge_schema_lock(
     (next_lock, report)
 }
 
+/// Returns `true` if a column with locked type `locked_ty` can be safely read as `declared_ty`.
+///
+/// Supports covariant nullability widening (`T` locked -> `T?` declared), while rejecting
+/// narrowing a nullable column (`T?` locked -> `T` declared) or changing the base type.
+#[must_use]
+pub fn read_lock_ty_compatible(locked_ty: &ScalarTy, declared_ty: &ScalarTy) -> bool {
+    locked_ty == declared_ty
+        || (!locked_ty.is_option()
+            && matches!(declared_ty, ScalarTy::Option(inner) if inner.as_ref() == locked_ty))
+}
+
 /// Verify that a Dana [`TableTy`] matches the locked schema for `(db_name, table_name)`.
 ///
 /// Checks:
 /// 1. `db_name` and `table_name` exist in `lock`.
-/// 2. Every column in `expected` exists in the locked table with an identical effective [`ScalarTy`].
+/// 2. Every column in `expected` exists in the locked table with a compatible effective
+///    [`ScalarTy`] (exact match or covariant `T` -> `T?` read widening).
 /// 3. Privacy monotonicity: every sensitivity tag locked on a column is present on the corresponding
 ///    column in `expected` (`locked_col.tags ⊆ expected_col.tags`).
 ///
@@ -606,7 +618,7 @@ pub fn verify_table_against_lock(
             )));
         };
         let locked_ty = locked_col.effective_scalar_ty();
-        if locked_ty != col.ty {
+        if !read_lock_ty_compatible(&locked_ty, &col.ty) {
             return Err(DbError::SchemaDrift(format!(
                 "column `{}.{}` type drift: schema.lock has `{:?}`, code expects `{:?}`",
                 table_name, col.name, locked_ty, col.ty

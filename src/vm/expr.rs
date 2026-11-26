@@ -12,8 +12,9 @@ use std::collections::{HashMap, HashSet};
 use crate::core::bigint::BigInt;
 use crate::core::syntax::{BugKind, ColSpec, Expr, Float64, Ident, PrimOp, Program, RowExpr};
 use crate::formats::time::{
-    DecimalIntKind, date_trunc_date, date_trunc_timestamp_duration, date_trunc_timestamp_unit,
-    format_timestamp_in_tz, local_date_in_tz, months_between_days, round_decimal_bigint,
+    DecimalIntKind, add_days_checked, date_trunc_date, date_trunc_timestamp_duration,
+    date_trunc_timestamp_unit, date_year, days_between_days, format_timestamp_in_tz,
+    local_date_in_tz, midnight_in_tz, months_between_days, round_decimal_bigint,
     round_decimal_even_bigint,
 };
 use crate::oracle::eval::{PrimResult, eval_literal, eval_prim_op};
@@ -2886,6 +2887,82 @@ pub fn eval_scalar_exec_prim(
             },
             _ => Err(RowEvalErr::Failed(
                 "DateInTz requires (Timestamp, Text)".to_string(),
+            )),
+        },
+        ExecPrimOp::AddDays => match args {
+            [Val::Date(d), Val::Int(delta)] => match (d.to_i64(), delta.to_i64()) {
+                (Some(days), Some(dn)) => add_days_checked(days, dn)
+                    .map(|res| Val::Date(BigInt::from(res)))
+                    .map_err(|e| RowEvalErr::Stopped {
+                        lane,
+                        bug: Bug {
+                            kind: BugKind::IntOverflow,
+                            message: e.message,
+                        },
+                    }),
+                _ => Err(RowEvalErr::Stopped {
+                    lane,
+                    bug: Bug {
+                        kind: BugKind::IntOverflow,
+                        message: "date arithmetic overflow".to_string(),
+                    },
+                }),
+            },
+            _ => Err(RowEvalErr::Failed(
+                "AddDays requires (Date, Int)".to_string(),
+            )),
+        },
+        ExecPrimOp::DaysBetween => match args {
+            [Val::Date(d1), Val::Date(d2)] => match (d1.to_i64(), d2.to_i64()) {
+                (Some(a), Some(b)) => days_between_days(a, b)
+                    .map(|diff| Val::Int(BigInt::from(diff)))
+                    .map_err(|e| RowEvalErr::Stopped {
+                        lane,
+                        bug: Bug {
+                            kind: BugKind::IntOverflow,
+                            message: e.message,
+                        },
+                    }),
+                _ => Err(RowEvalErr::Stopped {
+                    lane,
+                    bug: Bug {
+                        kind: BugKind::IntOverflow,
+                        message: "date difference overflow".to_string(),
+                    },
+                }),
+            },
+            _ => Err(RowEvalErr::Failed(
+                "DaysBetween requires two Dates".to_string(),
+            )),
+        },
+        ExecPrimOp::DateYear => match args {
+            [Val::Date(d)] => {
+                let y = date_year(d.to_i64().unwrap_or(0));
+                Ok(Val::Int(BigInt::from(y)))
+            }
+            _ => Err(RowEvalErr::Failed("DateYear requires Date".to_string())),
+        },
+        ExecPrimOp::AtMidnightInTz => match args {
+            [Val::Date(d), Val::Text(zone)] => match d.to_i64() {
+                Some(days) => midnight_in_tz(days, zone)
+                    .map(|us| Val::Timestamp(BigInt::from(us)))
+                    .map_err(|e| RowEvalErr::Stopped {
+                        lane,
+                        bug: Bug {
+                            kind: BugKind::OutsideBoundary,
+                            message: e.message,
+                        },
+                    }),
+                None => Err(RowEvalErr::Stopped {
+                    lane,
+                    bug: Bug {
+                        kind: BugKind::OutsideBoundary,
+                        message: "AtMidnightInTz Date overflow".to_string(),
+                    },
+                }),
+            },
+            _ => Err(RowEvalErr::Failed(
+                "AtMidnightInTz requires (Date, Text)".to_string(),
             )),
         },
         ExecPrimOp::OptSubInt => match args {

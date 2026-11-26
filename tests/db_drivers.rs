@@ -1987,6 +1987,13 @@ fn schema_lock_roundtrip_merge_and_drift_verification() -> TestResult {
     ]);
     verify_table_against_lock(&merged, "Analytics", "orders", &ok_expected)?;
 
+    // Covariant read widening: non-null `customer_email: Text` locked can be read as `Text?`
+    let cov_expected = table_ty(vec![
+        col("id", ScalarTy::Int, &[]),
+        col("customer_email", opt(ScalarTy::Text), &["pii"]),
+    ]);
+    verify_table_against_lock(&merged, "Analytics", "orders", &cov_expected)?;
+
     // Drift 1: non-nullable `Decimal` where lock has nullable `Decimal?`
     let bad_nullability = table_ty(vec![col(
         "amount",
@@ -2140,6 +2147,7 @@ fn pg_type_mapping_and_extended_oid_decoding() -> TestResult {
                             ("u", oid::UUID),
                             ("c", oid::CHAR),
                             ("nm", oid::NAME),
+                            ("arr", oid::TEXT_ARRAY),
                             ("ci", 16_450),
                             ("opt_u", oid::UUID),
                         ],
@@ -2153,6 +2161,7 @@ fn pg_type_mapping_and_extended_oid_decoding() -> TestResult {
                             Some(b"550e8400-e29b-41d4-a716-446655440000".to_vec()),
                             Some(b"A".to_vec()),
                             Some(b"pg_class".to_vec()),
+                            Some(b"{online_text_entry,online_upload}".to_vec()),
                             Some(b"CaseText".to_vec()),
                             None,
                         ],
@@ -2181,10 +2190,15 @@ fn pg_type_mapping_and_extended_oid_decoding() -> TestResult {
         col("u", ScalarTy::Text, &[]),
         col("c", ScalarTy::Text, &[]),
         col("nm", ScalarTy::Text, &[]),
+        col("arr", ScalarTy::Text, &[]),
         col("ci", ScalarTy::Text, &[]),
         col("opt_u", opt(ScalarTy::Text), &[]),
     ]);
-    let tv = conn.query_rows("SELECT j, jb, u, c, nm, ci, opt_u FROM t", &[], &schema)?;
+    let tv = conn.query_rows(
+        "SELECT j, jb, u, c, nm, arr, ci, opt_u FROM t",
+        &[],
+        &schema,
+    )?;
     assert_eq!(tv.rows.len(), 1);
     assert!(val_eq(
         &tv.rows[0].cells[0],
@@ -2205,9 +2219,13 @@ fn pg_type_mapping_and_extended_oid_decoding() -> TestResult {
     ));
     assert!(val_eq(
         &tv.rows[0].cells[5],
+        &Val::Text("{online_text_entry,online_upload}".to_string())
+    ));
+    assert!(val_eq(
+        &tv.rows[0].cells[6],
         &Val::Text("CaseText".to_string())
     ));
-    assert!(val_eq(&tv.rows[0].cells[6], &Val::OptNone));
+    assert!(val_eq(&tv.rows[0].cells[7], &Val::OptNone));
     drop(conn);
     let _ = srv_thread.join();
 

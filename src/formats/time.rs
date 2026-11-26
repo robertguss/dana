@@ -328,6 +328,30 @@ pub const fn months_between_days(d1: i64, d2: i64) -> i64 {
     (y2 - y1) * 12 + (m2 as i64 - m1 as i64)
 }
 
+/// Add signed whole calendar days to a `Date` (days since `1970-01-01`).
+///
+/// # Errors
+/// Returns [`ParseFormatError`] on 64-bit integer overflow.
+pub fn add_days_checked(days: i64, delta: i64) -> Result<i64, ParseFormatError> {
+    days.checked_add(delta)
+        .ok_or_else(|| ParseFormatError::new("date arithmetic overflow"))
+}
+
+/// Signed whole calendar days between two dates: `d2 - d1`.
+///
+/// # Errors
+/// Returns [`ParseFormatError`] on 64-bit integer overflow.
+pub fn days_between_days(d1: i64, d2: i64) -> Result<i64, ParseFormatError> {
+    d2.checked_sub(d1)
+        .ok_or_else(|| ParseFormatError::new("date difference overflow"))
+}
+
+/// Proleptic Gregorian year number of a `Date` (days since `1970-01-01`).
+#[must_use]
+pub const fn date_year(days: i64) -> i64 {
+    civil_from_days(days).0
+}
+
 /// Parse an exact fixed-point `Decimal` string from Dana source (allows `_` digit separators)
 /// into a `10^-18`-scaled [`BigInt`] checked against `[DEC_MIN, DEC_MAX]`.
 ///
@@ -1245,4 +1269,65 @@ pub fn local_date_in_tz(utc_micros: i64, iana: &str) -> Result<i64, ParseFormatE
         .checked_add(offset_secs * MICROS_PER_SECOND)
         .ok_or_else(|| ParseFormatError::new("timestamp overflow in timezone conversion"))?;
     Ok(local_micros.div_euclid(MICROS_PER_DAY))
+}
+
+/// Convert a local calendar `Date` (`00:00:00` in explicit IANA timezone `iana`) to a UTC
+/// `Timestamp` (microseconds since epoch), matching PostgreSQL `(d::timestamp AT TIME ZONE iana)`.
+///
+/// # Errors
+/// Returns [`ParseFormatError`] if `iana` is unknown or overflows timestamp bounds.
+pub fn midnight_in_tz(days: i64, iana: &str) -> Result<i64, ParseFormatError> {
+    if iana == "UTC" || iana == "Etc/UTC" || iana == "Z" {
+        return days
+            .checked_mul(MICROS_PER_DAY)
+            .ok_or_else(|| ParseFormatError::new("timestamp overflow in timezone conversion"));
+    }
+    let tz = load_timezone(iana)?;
+    let local_secs = days
+        .checked_mul(86_400)
+        .ok_or_else(|| ParseFormatError::new("timestamp overflow in timezone conversion"))?;
+    let probe_offsets = [
+        tz.offset_secs_at_unix_secs(local_secs.saturating_sub(86_400)),
+        tz.offset_secs_at_unix_secs(local_secs),
+        tz.offset_secs_at_unix_secs(local_secs.saturating_add(86_400)),
+    ];
+    let mut all_offsets = Vec::with_capacity(6);
+    for &off in &probe_offsets {
+        if !all_offsets.contains(&off) {
+            all_offsets.push(off);
+        }
+        let cand = local_secs.saturating_sub(i64::from(off));
+        let refined = tz.offset_secs_at_unix_secs(cand);
+        if !all_offsets.contains(&refined) {
+            all_offsets.push(refined);
+        }
+    }
+
+    // On a fall-back fold where two UTC instants map to 00:00:00 local, pick the standard-time
+    // (later) instant to match PostgreSQL `AT TIME ZONE`.
+    let mut best_valid: Option<i64> = None;
+    for &off in &all_offsets {
+        let cand = local_secs
+            .checked_sub(i64::from(off))
+            .ok_or_else(|| ParseFormatError::new("timestamp overflow in timezone conversion"))?;
+        if tz.offset_secs_at_unix_secs(cand) == off {
+            best_valid = Some(best_valid.map_or(cand, |prev| prev.max(cand)));
+        }
+    }
+    let utc_secs = if let Some(valid) = best_valid {
+        valid
+    } else {
+        // Spring-forward gap at midnight: use the pre-transition offset matching PostgreSQL.
+        let pre_probe = local_secs
+            .saturating_sub(i64::from(probe_offsets[0]))
+            .saturating_sub(1);
+        let pre_off = tz.offset_secs_at_unix_secs(pre_probe);
+        local_secs
+            .checked_sub(i64::from(pre_off))
+            .ok_or_else(|| ParseFormatError::new("timestamp overflow in timezone conversion"))?
+    };
+
+    utc_secs
+        .checked_mul(MICROS_PER_SECOND)
+        .ok_or_else(|| ParseFormatError::new("timestamp overflow in timezone conversion"))
 }

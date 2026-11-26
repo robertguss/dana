@@ -1469,7 +1469,7 @@ fn check_src_with_lock(
 
 #[test]
 fn v06_sqlite_attach_and_unattached_schema_table_fallback() -> TestResult {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.4");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.5");
     let tmp = TempDir::new("sqlite_attach")?;
     let main_db = tmp.path().join("main.db");
     let populi_db = tmp.path().join("populi.db");
@@ -2777,12 +2777,12 @@ end
     let db_out = assert_oracle_vm_parity(db_src, Some(("DB", &uri)))?;
     assert_eq!(db_out, vec!["2"]);
 
-    // 5. CLI --version prints `dana v0.6.4`
+    // 5. CLI --version prints `dana v0.6.5`
     let ver = Command::new(env!("CARGO_BIN_EXE_dana"))
         .arg("--version")
         .output()?;
     assert_eq!(ver.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.4");
+    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.5");
 
     Ok(())
 }
@@ -4471,4 +4471,255 @@ end
     });
 
     test_res
+}
+
+// ===========================================================================
+// v0.6.5: Temporal Ops (add_days, days_between, Date.year, at_midnight_in_tz)
+//         & Covariant ReadDB schema.lock Nullability
+// ===========================================================================
+
+#[test]
+fn v065_temporal_date_ops_oracle_vm_and_pg_pushdown_parity() -> TestResult {
+    // 1. Scalar + Table pipeline parity across Oracle and VM (DST transitions included)
+    let src = r##"module TemporalV065
+
+fn main(console: Console) : Int
+  d0 = 2025-01-15
+  d_plus = d0.add_days(22)
+  d_minus = d0.add_days(-30)
+  d_fn = add_days(2025-07-04, days: 7)
+  d_pipe = d0 |> add_days(365)
+  diff_pos = days_between(d0, d_plus)
+  diff_neg = days_between(d_plus, d0)
+  y = d0.year
+
+  # DST & midnight-transition verification
+  ny_est = 2025-01-15.at_midnight_in_tz("America/New_York")
+  ny_edt = 2025-07-04.at_midnight_in_tz("America/New_York")
+  ny_spring = 2025-03-09.at_midnight_in_tz("America/New_York")
+  ny_fall = 2025-11-02.at_midnight_in_tz("America/New_York")
+  hav_gap = at_midnight_in_tz(2025-03-09, "America/Havana")
+  hav_fold = 2025-11-02.at_midnight_in_tz(tz: "America/Havana")
+
+  console.print("scalar:#{d_plus}:#{d_minus}:#{d_fn}:#{d_pipe}:#{diff_pos}:#{diff_neg}:#{y}")
+  console.print("tz:#{ny_est}|#{ny_edt}|#{ny_spring}|#{ny_fall}|#{hav_gap}|#{hav_fold}")
+
+  tbl = table
+    | id | term_start | prev_end   |
+    | 1  | 2025-01-15 | 2024-08-10 |
+    | 2  | 2025-07-04 | 2025-05-20 |
+    | 3  | 2024-02-29 | 2023-02-28 |
+  end
+    |> derive(
+      yr: .term_start.year,
+      d21_end: .term_start.add_days(22),
+      gap_days: days_between(.prev_end, .term_start),
+      cutoff_ts: .term_start.add_days(22).at_midnight_in_tz("America/New_York")
+    )
+    |> where(.gap_days > 150)
+    |> sort_by(.id)
+
+  for r in tbl
+    console.print("row:#{r.id}:#{r.yr}:#{r.d21_end}:#{r.gap_days}:#{r.cutoff_ts}")
+  end
+  0
+end
+"##;
+
+    let out = assert_oracle_vm_parity(src, None)?;
+    assert_eq!(
+        out,
+        vec![
+            "scalar:2025-02-06:2024-12-16:2025-07-11:2026-01-15:22:-22:2025",
+            "tz:2025-01-15T05:00:00Z|2025-07-04T04:00:00Z|2025-03-09T05:00:00Z|2025-11-02T04:00:00Z|2025-03-09T05:00:00Z|2025-11-02T05:00:00Z",
+            "row:1:2025:2025-02-06:158:2025-02-06T05:00:00Z",
+            "row:3:2024:2024-03-22:366:2024-03-22T04:00:00Z",
+        ]
+    );
+
+    // 2. Verify Postgres SQL pushdown Plan + SQLite clean hybrid fallback
+    let db_src = r##"module PgTemporalPushdown
+
+schema TermRow
+  id: Int
+  term_start: Date
+  prev_end: Date
+end
+
+fn run_q(db: ReadDB(Lake))
+  db.table(TermRow, from: "terms")
+    |> derive(
+      yr: .term_start.year,
+      d21_end: .term_start.add_days(22),
+      gap_days: days_between(.prev_end, .term_start),
+      cutoff_ts: .term_start.add_days(22).at_midnight_in_tz("America/New_York")
+    )
+    |> where(.gap_days > 150)
+    |> sort_by(.id)
+end
+"##;
+    let checked = check_src(db_src)?;
+    let (opt_prog, _) = dana::plan::optimize_exec_program(&checked.exec);
+    let f = opt_prog.find_fun("run_q").ok_or("missing run_q")?;
+    let plan = find_first_plan(&f.body).ok_or("missing run_q plan")?;
+
+    let lock_pg = dana::db::schema_lock::SchemaLockFile {
+        version: dana::db::schema_lock::SCHEMA_LOCK_VERSION,
+        dbs: vec![dana::db::schema_lock::LockedDb {
+            name: "Lake".to_string(),
+            dialect: SqlDialect::Postgres,
+            tables: vec![dana::db::schema_lock::LockedTable {
+                name: "terms".to_string(),
+                cols: vec![
+                    dana::db::schema_lock::LockedCol {
+                        name: "id".to_string(),
+                        ty: dana::core::ScalarTy::Int,
+                        nullable: false,
+                        pk: true,
+                        tags: dana::core::TagSet::empty(),
+                    },
+                    dana::db::schema_lock::LockedCol {
+                        name: "term_start".to_string(),
+                        ty: dana::core::ScalarTy::Date,
+                        nullable: false,
+                        pk: false,
+                        tags: dana::core::TagSet::empty(),
+                    },
+                    dana::db::schema_lock::LockedCol {
+                        name: "prev_end".to_string(),
+                        ty: dana::core::ScalarTy::Date,
+                        nullable: false,
+                        pk: false,
+                        tags: dana::core::TagSet::empty(),
+                    },
+                ],
+            }],
+        }],
+    };
+    let sp_pg = split_exec_plan_pushdown(
+        plan,
+        &opt_prog,
+        "Lake",
+        SqlDialect::Postgres,
+        Some(&lock_pg),
+    );
+    match sp_pg {
+        SplitPlan::FullyPushed(q) => {
+            assert!(
+                q.sql.contains("EXTRACT(YEAR FROM"),
+                "expected EXTRACT(YEAR FROM in PG SQL:\n{}",
+                q.sql
+            );
+            assert!(
+                q.sql.contains("AT TIME ZONE"),
+                "expected AT TIME ZONE in PG SQL:\n{}",
+                q.sql
+            );
+            assert!(
+                q.sql.contains("CAST(") && q.sql.contains("AS INTEGER)"),
+                "expected INTEGER day offset in PG SQL:\n{}",
+                q.sql
+            );
+        }
+        other => return Err(format!("expected FullyPushed for Postgres, got {other:?}").into()),
+    }
+
+    let mut lock_sq = lock_pg;
+    lock_sq.dbs[0].dialect = SqlDialect::Sqlite;
+    let sp_sq =
+        split_exec_plan_pushdown(plan, &opt_prog, "Lake", SqlDialect::Sqlite, Some(&lock_sq));
+    assert!(
+        matches!(sp_sq, SplitPlan::Hybrid { .. }),
+        "expected clean Hybrid fallback on SQLite, got {sp_sq:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn v065_covariant_readdb_schema_lock_and_strict_write() -> TestResult {
+    let lock = dana::db::schema_lock::parse_schema_lock(
+        r#"version 1
+
+db Lake dialect postgres
+  table "canvas.courses"
+    col id: Int pk
+    col workflow_state: Text
+    col sis_source_id: Text?
+  end
+end
+"#,
+    )?;
+
+    // 1. ReadDB declaring NOT NULL `workflow_state` as `Text?` MUST succeed (covariant widening)
+    let ok_src = r##"module CovariantReadOk
+schema CourseOpt
+  id: Int
+  workflow_state: Text?
+  sis_source_id: Text?
+end
+fn main(db: ReadDB(Lake)) : Int
+  _ = db.table(CourseOpt, from: "canvas.courses")
+  0
+end
+"##;
+    let mut sm = SourceMap::new();
+    let fid_ok = sm.add_file("cov_ok.dana", ok_src.to_string());
+    let mod_ok = parse_module(fid_ok, ok_src).map_err(|e| format!("{e:?}"))?;
+    let res_ok = dana::check::check_module_with_lock(fid_ok, mod_ok, None, &sm, Some(&lock));
+    assert!(
+        res_ok.is_ok(),
+        "expected covariant Text -> Text? ReadDB to pass schema.lock check: {:?}",
+        res_ok.err()
+    );
+
+    // 2. ReadDB declaring nullable `sis_source_id` as non-null `Text` MUST fail
+    let bad_narrow = r##"module NarrowReadErr
+schema CourseNarrow
+  id: Int
+  workflow_state: Text
+  sis_source_id: Text
+end
+fn main(db: ReadDB(Lake)) : Int
+  _ = db.table(CourseNarrow, from: "canvas.courses")
+  0
+end
+"##;
+    let fid_bn = sm.add_file("narrow_err.dana", bad_narrow.to_string());
+    let mod_bn = parse_module(fid_bn, bad_narrow).map_err(|e| format!("{e:?}"))?;
+    let diags_bn = dana::check::check_module_with_lock(fid_bn, mod_bn, None, &sm, Some(&lock))
+        .err()
+        .ok_or("expected SchemaError when narrowing T? -> T")?;
+    assert!(
+        diags_bn.iter().any(|d| d.code() == DiagCode::SchemaError),
+        "expected SchemaError, got {diags_bn:?}"
+    );
+
+    // 3. WriteTable.upsert with widened `workflow_state: Text?` against NOT NULL lock MUST STILL fail
+    let bad_write = r##"module StrictWriteErr
+schema OutCourse
+  id: Int
+  workflow_state: Text?
+end
+fn main(w: WriteTable(Lake, "canvas.courses")) : Int
+  t = table
+    | id | workflow_state |
+    | 1  | "active"       |
+    | 2  | none           |
+  end
+  _ = try w.upsert(t, key: .id)
+  0
+end
+"##;
+    let fid_bw = sm.add_file("write_err.dana", bad_write.to_string());
+    let mod_bw = parse_module(fid_bw, bad_write).map_err(|e| format!("{e:?}"))?;
+    let diags_bw = dana::check::check_module_with_lock(fid_bw, mod_bw, None, &sm, Some(&lock))
+        .err()
+        .ok_or("expected SchemaError on WriteTable.upsert nullability mismatch")?;
+    assert!(
+        diags_bw.iter().any(|d| d.code() == DiagCode::SchemaError),
+        "expected SchemaError, got {diags_bw:?}"
+    );
+
+    Ok(())
 }

@@ -650,6 +650,11 @@ enum SqlExpr {
         inner: Box<SqlExpr>,
         already_trimmed: bool,
     },
+    ExtractYear(Box<SqlExpr>),
+    AtTimeZone {
+        expr: Box<SqlExpr>,
+        tz: Box<SqlExpr>,
+    },
     RowNumber {
         partition_by: Vec<SqlExpr>,
         order_by: Vec<SqlOrderItem>,
@@ -1196,6 +1201,18 @@ impl<'a> SqlRenderState<'a> {
                 already_trimmed,
             } => {
                 self.render_try_parse_iso_date(inner, *already_trimmed);
+            }
+            SqlExpr::ExtractYear(inner) => {
+                self.sql.push_str("CAST(EXTRACT(YEAR FROM ");
+                self.render_expr(inner);
+                self.sql.push_str(") AS BIGINT)");
+            }
+            SqlExpr::AtTimeZone { expr, tz } => {
+                self.sql.push('(');
+                self.render_expr(expr);
+                self.sql.push_str(" AT TIME ZONE ");
+                self.render_expr(tz);
+                self.sql.push(')');
             }
             SqlExpr::RowNumber {
                 partition_by,
@@ -2966,12 +2983,15 @@ fn expr_has_untrimmed_try_parse_date(expr: &SqlExpr) -> bool {
         | SqlExpr::CollateC(inner)
         | SqlExpr::Cast { expr: inner, .. }
         | SqlExpr::Agg { arg: inner, .. }
-        | SqlExpr::TrimAscii(inner) => expr_has_untrimmed_try_parse_date(inner),
+        | SqlExpr::TrimAscii(inner)
+        | SqlExpr::ExtractYear(inner) => expr_has_untrimmed_try_parse_date(inner),
         SqlExpr::Binary { left, right, .. }
         | SqlExpr::NullSafeEq { left, right, .. }
-        | SqlExpr::Coalesce(left, right) => {
-            expr_has_untrimmed_try_parse_date(left) || expr_has_untrimmed_try_parse_date(right)
-        }
+        | SqlExpr::Coalesce(left, right)
+        | SqlExpr::AtTimeZone {
+            expr: left,
+            tz: right,
+        } => expr_has_untrimmed_try_parse_date(left) || expr_has_untrimmed_try_parse_date(right),
         SqlExpr::Func { args, .. } => args.iter().any(expr_has_untrimmed_try_parse_date),
         SqlExpr::Case { whens, else_br } => {
             whens.iter().any(|(c, t)| {
@@ -3070,10 +3090,15 @@ fn collect_sql_expr_col_refs(expr: &SqlExpr, out: &mut HashSet<String>) {
         | SqlExpr::Cast { expr: inner, .. }
         | SqlExpr::Agg { arg: inner, .. }
         | SqlExpr::TrimAscii(inner)
+        | SqlExpr::ExtractYear(inner)
         | SqlExpr::TryParseIsoDate { inner, .. } => collect_sql_expr_col_refs(inner, out),
         SqlExpr::Binary { left, right, .. }
         | SqlExpr::NullSafeEq { left, right, .. }
-        | SqlExpr::Coalesce(left, right) => {
+        | SqlExpr::Coalesce(left, right)
+        | SqlExpr::AtTimeZone {
+            expr: left,
+            tz: right,
+        } => {
             collect_sql_expr_col_refs(left, out);
             collect_sql_expr_col_refs(right, out);
         }
@@ -3390,6 +3415,13 @@ fn simplify_coalesce_pred(expr: SqlExpr) -> SqlExpr {
             inner: Box::new(simplify_coalesce_pred(*inner)),
             already_trimmed,
         },
+        SqlExpr::ExtractYear(inner) => {
+            SqlExpr::ExtractYear(Box::new(simplify_coalesce_pred(*inner)))
+        }
+        SqlExpr::AtTimeZone { expr, tz } => SqlExpr::AtTimeZone {
+            expr: Box::new(simplify_coalesce_pred(*expr)),
+            tz: Box::new(simplify_coalesce_pred(*tz)),
+        },
         other @ (SqlExpr::Col { .. }
         | SqlExpr::Param { .. }
         | SqlExpr::Exists { .. }
@@ -3615,6 +3647,23 @@ fn rewrite_leaf_try_parse_dates(
             next_alias_id,
             hoisted,
         ))),
+        SqlExpr::ExtractYear(inner) => SqlExpr::ExtractYear(Box::new(
+            rewrite_leaf_try_parse_dates(*inner, schema, next_alias_id, hoisted),
+        )),
+        SqlExpr::AtTimeZone { expr, tz } => SqlExpr::AtTimeZone {
+            expr: Box::new(rewrite_leaf_try_parse_dates(
+                *expr,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+            tz: Box::new(rewrite_leaf_try_parse_dates(
+                *tz,
+                schema,
+                next_alias_id,
+                hoisted,
+            )),
+        },
         SqlExpr::RowNumber {
             partition_by,
             order_by,
@@ -6351,6 +6400,97 @@ fn translate_exec_row_expr(
                     },
                     ScalarTy::Option(Box::new(ScalarTy::Date)),
                     s_tags,
+                ))
+            }
+            (ExecPrimOp::AddDays, [d_re, n_re]) => {
+                if ctx.dialect != SqlDialect::Postgres {
+                    return Err("SQLite Date add_days requires local VM".to_string());
+                }
+                let (d_e, d_ty, d_tags) = translate_exec_row_expr(d_re, schema, ctx)?;
+                if d_ty != ScalarTy::Date {
+                    return Err("AddDays expects (Date, Int)".to_string());
+                }
+                let Some(n) = extract_static_int_literal(n_re, ctx.prog) else {
+                    return Err("add_days with dynamic day count requires local VM".to_string());
+                };
+                if !(-365_000..=365_000).contains(&n) {
+                    return Err("add_days out of pushed day range requires local VM".to_string());
+                }
+                Ok((
+                    SqlExpr::Binary {
+                        op: "+",
+                        left: Box::new(d_e),
+                        right: Box::new(SqlExpr::Param {
+                            slot: SqlParamSlot::Literal(SqlParam::Int(n)),
+                            pg_cast: Some("INTEGER"),
+                        }),
+                    },
+                    ScalarTy::Date,
+                    d_tags,
+                ))
+            }
+            (ExecPrimOp::DaysBetween, [d1_re, d2_re]) => {
+                if ctx.dialect != SqlDialect::Postgres {
+                    return Err("SQLite days_between requires local VM".to_string());
+                }
+                let (d1_e, d1_ty, d1_tags) = translate_exec_row_expr(d1_re, schema, ctx)?;
+                let (d2_e, d2_ty, d2_tags) = translate_exec_row_expr(d2_re, schema, ctx)?;
+                if d1_ty != ScalarTy::Date || d2_ty != ScalarTy::Date {
+                    return Err("DaysBetween expects (Date, Date)".to_string());
+                }
+                Ok((
+                    SqlExpr::Cast {
+                        expr: Box::new(SqlExpr::Binary {
+                            op: "-",
+                            left: Box::new(d2_e),
+                            right: Box::new(d1_e),
+                        }),
+                        ty: "BIGINT",
+                    },
+                    ScalarTy::Int,
+                    d1_tags.union(&d2_tags),
+                ))
+            }
+            (ExecPrimOp::DateYear, [d_re]) => {
+                if ctx.dialect != SqlDialect::Postgres {
+                    return Err("SQLite Date.year requires local VM".to_string());
+                }
+                let (d_e, d_ty, d_tags) = translate_exec_row_expr(d_re, schema, ctx)?;
+                if d_ty != ScalarTy::Date {
+                    return Err("DateYear expects Date".to_string());
+                }
+                Ok((SqlExpr::ExtractYear(Box::new(d_e)), ScalarTy::Int, d_tags))
+            }
+            (ExecPrimOp::AtMidnightInTz, [d_re, tz_re]) => {
+                if ctx.dialect != SqlDialect::Postgres {
+                    return Err("SQLite at_midnight_in_tz requires local VM".to_string());
+                }
+                let (d_e, d_ty, d_tags) = translate_exec_row_expr(d_re, schema, ctx)?;
+                if d_ty != ScalarTy::Date {
+                    return Err("AtMidnightInTz expects (Date, Text)".to_string());
+                }
+                let Some((Literal::Text(tz), tz_tags)) = extract_static_scalar_lit(tz_re, ctx.prog)
+                else {
+                    return Err(
+                        "at_midnight_in_tz with dynamic timezone requires local VM".to_string()
+                    );
+                };
+                if crate::formats::time::load_timezone(&tz).is_err() {
+                    return Err("unknown timezone requires local VM trap".to_string());
+                }
+                Ok((
+                    SqlExpr::AtTimeZone {
+                        expr: Box::new(SqlExpr::Cast {
+                            expr: Box::new(d_e),
+                            ty: "TIMESTAMP",
+                        }),
+                        tz: Box::new(SqlExpr::Param {
+                            slot: SqlParamSlot::Literal(SqlParam::Text(tz)),
+                            pg_cast: Some("TEXT"),
+                        }),
+                    },
+                    ScalarTy::Timestamp,
+                    d_tags.union(&tz_tags),
                 ))
             }
             (

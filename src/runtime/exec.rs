@@ -40,10 +40,11 @@ use crate::formats::parquet::{
     write_parquet_bytes, write_parquet_vm_table_bytes,
 };
 use crate::formats::time::{
-    DecimalIntKind, date_trunc_date, date_trunc_timestamp_duration, date_trunc_timestamp_unit,
-    decimal_to_int_bigint, format_iso_date, format_iso_timestamp, format_timestamp_in_tz,
-    local_date_in_tz, months_between_days, parse_decimal_i128, parse_iso_date,
-    round_decimal_bigint, round_decimal_even_bigint,
+    DecimalIntKind, add_days_checked, date_trunc_date, date_trunc_timestamp_duration,
+    date_trunc_timestamp_unit, date_year, days_between_days, decimal_to_int_bigint,
+    format_iso_date, format_iso_timestamp, format_timestamp_in_tz, local_date_in_tz,
+    midnight_in_tz, months_between_days, parse_decimal_i128, parse_iso_date, round_decimal_bigint,
+    round_decimal_even_bigint,
 };
 use crate::formats::xlsx::{read_xlsx_bytes_with_schema, write_xlsx_sheets};
 use crate::net::{HttpsClientConfig, JsonResponse, ParsedHttpsUrl, https_get_json};
@@ -2003,6 +2004,61 @@ impl<'a> Evaluator<'a> {
                     None => EvalOut::Failed("DateInTz Timestamp overflow".to_string()),
                 },
                 _ => EvalOut::Failed("DateInTz requires (Timestamp, Text)".to_string()),
+            },
+            ExecPrimOp::AddDays => match args {
+                [Val::Date(d), Val::Int(delta)] => match (d.to_i64(), delta.to_i64()) {
+                    (Some(days), Some(dn)) => match add_days_checked(days, dn) {
+                        Ok(res) => EvalOut::Ok(Val::Date(BigInt::from(res))),
+                        Err(e) => EvalOut::Stopped(Bug {
+                            kind: BugKind::IntOverflow,
+                            message: e.message,
+                        }),
+                    },
+                    _ => EvalOut::Stopped(Bug {
+                        kind: BugKind::IntOverflow,
+                        message: "date arithmetic overflow".to_string(),
+                    }),
+                },
+                _ => EvalOut::Failed("AddDays requires (Date, Int)".to_string()),
+            },
+            ExecPrimOp::DaysBetween => match args {
+                [Val::Date(d1), Val::Date(d2)] => match (d1.to_i64(), d2.to_i64()) {
+                    (Some(a), Some(b)) => match days_between_days(a, b) {
+                        Ok(diff) => EvalOut::Ok(Val::Int(BigInt::from(diff))),
+                        Err(e) => EvalOut::Stopped(Bug {
+                            kind: BugKind::IntOverflow,
+                            message: e.message,
+                        }),
+                    },
+                    _ => EvalOut::Stopped(Bug {
+                        kind: BugKind::IntOverflow,
+                        message: "date difference overflow".to_string(),
+                    }),
+                },
+                _ => EvalOut::Failed("DaysBetween requires two Dates".to_string()),
+            },
+            ExecPrimOp::DateYear => match args {
+                [Val::Date(d)] => {
+                    let y = date_year(d.to_i64().unwrap_or(0));
+                    EvalOut::Ok(Val::Int(BigInt::from(y)))
+                }
+                _ => EvalOut::Failed("DateYear requires Date".to_string()),
+            },
+            ExecPrimOp::AtMidnightInTz => match args {
+                [Val::Date(d), Val::Text(zone)] => match d.to_i64() {
+                    Some(days) => match midnight_in_tz(days, zone) {
+                        Ok(us) => EvalOut::Ok(Val::Timestamp(BigInt::from(us))),
+                        Err(e) => EvalOut::Stopped(Bug {
+                            kind: BugKind::OutsideBoundary,
+                            message: e.message,
+                        }),
+                    },
+                    None => EvalOut::Stopped(Bug {
+                        kind: BugKind::OutsideBoundary,
+                        message: "AtMidnightInTz Date overflow".to_string(),
+                    }),
+                },
+                _ => EvalOut::Failed("AtMidnightInTz requires (Date, Text)".to_string()),
             },
             ExecPrimOp::ListFirst => match args {
                 [Val::List(xs)] => match xs.first() {

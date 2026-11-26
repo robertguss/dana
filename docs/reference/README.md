@@ -183,10 +183,12 @@ immediately before a closing delimiter, `.`, `|>`, or any binary operator other 
      `.round_to(...)` marks the resulting column as coarsened (`bucketed = true`).
    - **List membership:** `val.in?(list) : Bool` works across `Bool`, `Int`, `Decimal`, `Float`,
      `Text`, `Date`, `Timestamp`, `Duration`, and `Option(T)` (returning `false` when `none`).
-   - `Date` / `Timestamp`: `date_trunc(.d, :month)` (also `:year`, `:day`, `:hour`, `:minute`),
-     `date_trunc(.ts, 5.minutes)`, `months_between(.d1, .d2) : Int`,
-     `.ts.in_tz("America/Chicago") : Text`, `.ts.date_in_tz("America/Chicago") : Date`,
-     `ts + dur : Timestamp`, `ts1 - ts2 : Duration`.
+   - `Date` / `Timestamp`: `.year : Int`, `.add_days(n: Int) : Date` (or `add_days(d, n)`),
+     `days_between(.d1, .d2) : Int`, `months_between(.d1, .d2) : Int`,
+     `date_trunc(.d, :month)` (also `:year`, `:day`, `:hour`, `:minute`),
+     `date_trunc(.ts, 5.minutes)`, `.d.at_midnight_in_tz("America/New_York") : Timestamp`
+     (or `at_midnight_in_tz(d, tz)`), `.ts.in_tz("America/Chicago") : Text`,
+     `.ts.date_in_tz("America/Chicago") : Date`, `ts + dur : Timestamp`, `ts1 - ts2 : Duration`.
 
 <!-- dana-example: fragment -->
 ```dana

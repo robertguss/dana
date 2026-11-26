@@ -3842,16 +3842,77 @@ impl<'a> Checker<'a> {
             return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
         }
 
-        if fname == "months_between"
-            && let [CallArg::Positional(b)] = rest_args
-        {
+        if fname == "months_between" || fname == "days_between" {
+            let [CallArg::Positional(b)] = rest_args else {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("`{fname}` expects 2 `Date` arguments"),
+                    )
+                    .with_span(span),
+                );
+                return (ExecExpr::Lit(Literal::int(0i64)), LTy::public(Ty::Int));
+            };
+            if first_lty.ty != Ty::Date {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("`{fname}` expects `Date` as first argument"),
+                    )
+                    .with_span(first_span),
+                );
+            }
             let (eb, lb) = self.check_expr(b, env, Some(&Ty::Date), pc, scope, ret_ctx);
+            if lb.ty != Ty::Date {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!("`{fname}` expects `Date` as second argument"),
+                    )
+                    .with_span(b.span),
+                );
+            }
+            let op = if fname == "months_between" {
+                ExecPrimOp::MonthsBetween
+            } else {
+                ExecPrimOp::DaysBetween
+            };
             return (
                 ExecExpr::Prim {
-                    op: ExecPrimOp::MonthsBetween,
+                    op,
                     args: vec![first_ex, eb],
                 },
                 LTy::new(Ty::Int, first_lty.tags.union(&lb.tags)),
+            );
+        }
+        if fname == "add_days" {
+            let Some(days_e) = extract_one_arg(rest_args, "days") else {
+                self.diags.push(
+                    Diagnostic::error(DiagCode::TypeError, "`add_days` expects `(Date, Int)`")
+                        .with_span(span),
+                );
+                return (first_ex, first_lty);
+            };
+            return self.check_date_add_days_expr(
+                first_ex, first_lty, first_span, days_e, env, pc, scope, ret_ctx,
+            );
+        }
+        if fname == "at_midnight_in_tz" {
+            let Some(tz_e) = extract_one_arg(rest_args, "tz") else {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`at_midnight_in_tz` expects `(Date, Text)`",
+                    )
+                    .with_span(span),
+                );
+                return (
+                    ExecExpr::Lit(Literal::timestamp(0i64)),
+                    LTy::new(Ty::Timestamp, first_lty.tags),
+                );
+            };
+            return self.check_date_midnight_tz_expr(
+                first_ex, first_lty, first_span, tz_e, env, pc, scope, ret_ctx,
             );
         }
         if (fname == "in_tz" || fname == "date_in_tz")
@@ -7571,6 +7632,17 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
+            (Ty::Date, prop) if date_prop_op(prop).is_some() => {
+                if let Some((op, out_ty)) = date_prop_op(prop) {
+                    return (
+                        ExecExpr::Prim {
+                            op,
+                            args: vec![rex],
+                        },
+                        LTy::new(out_ty, rlty.tags),
+                    );
+                }
+            }
             (Ty::Option(_), "some?") => {
                 return (
                     ExecExpr::Prim {
@@ -7889,18 +7961,61 @@ impl<'a> Checker<'a> {
             if fname == "date_trunc" {
                 return self.check_date_trunc_expr(args, span, env, pc, scope, ret_ctx);
             }
-            if fname == "months_between"
+            if (fname == "months_between" || fname == "days_between")
                 && let [CallArg::Positional(a), CallArg::Positional(b)] = args
             {
                 let (ea, la) = self.check_expr(a, env, Some(&Ty::Date), pc, scope, ret_ctx);
+                if la.ty != Ty::Date {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`{fname}` expects `Date` as first argument"),
+                        )
+                        .with_span(a.span),
+                    );
+                }
                 let (eb, lb) = self.check_expr(b, env, Some(&Ty::Date), pc, scope, ret_ctx);
+                if lb.ty != Ty::Date {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`{fname}` expects `Date` as second argument"),
+                        )
+                        .with_span(b.span),
+                    );
+                }
+                let op = if fname == "months_between" {
+                    ExecPrimOp::MonthsBetween
+                } else {
+                    ExecPrimOp::DaysBetween
+                };
                 return (
                     ExecExpr::Prim {
-                        op: ExecPrimOp::MonthsBetween,
+                        op,
                         args: vec![ea, eb],
                     },
                     LTy::new(Ty::Int, la.tags.union(&lb.tags)),
                 );
+            }
+            if fname == "add_days"
+                && let (Some(CallArg::Positional(d)), Some(days_e)) = (
+                    args.first(),
+                    extract_one_arg(&args[1.min(args.len())..], "days"),
+                )
+            {
+                let (ed, ld) = self.check_expr(d, env, Some(&Ty::Date), pc, scope, ret_ctx);
+                return self
+                    .check_date_add_days_expr(ed, ld, d.span, days_e, env, pc, scope, ret_ctx);
+            }
+            if fname == "at_midnight_in_tz"
+                && let (Some(CallArg::Positional(d)), Some(tz_e)) = (
+                    args.first(),
+                    extract_one_arg(&args[1.min(args.len())..], "tz"),
+                )
+            {
+                let (ed, ld) = self.check_expr(d, env, Some(&Ty::Date), pc, scope, ret_ctx);
+                return self
+                    .check_date_midnight_tz_expr(ed, ld, d.span, tz_e, env, pc, scope, ret_ctx);
             }
             if (fname == "in_tz" || fname == "date_in_tz")
                 && let [CallArg::Positional(a), CallArg::Positional(z)] = args
@@ -9554,7 +9669,9 @@ impl<'a> Checker<'a> {
                                     continue;
                                 };
                                 let locked_ty = locked_col.effective_scalar_ty();
-                                if locked_ty != col.ty {
+                                if !crate::db::schema_lock::read_lock_ty_compatible(
+                                    &locked_ty, &col.ty,
+                                ) {
                                     self.diags.push(
                                         Diagnostic::error(
                                             DiagCode::SchemaError,
@@ -10277,6 +10394,37 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
+            (Ty::Date, "add_days") => {
+                if let Some(e) = extract_one_arg(args, "days") {
+                    return self
+                        .check_date_add_days_expr(rex, rlty, span, e, env, pc, scope, ret_ctx);
+                }
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`Date.add_days` expects 1 `Int` argument",
+                    )
+                    .with_span(span),
+                );
+                return (rex, rlty);
+            }
+            (Ty::Date, "at_midnight_in_tz") => {
+                if let Some(e) = extract_one_arg(args, "tz") {
+                    return self
+                        .check_date_midnight_tz_expr(rex, rlty, span, e, env, pc, scope, ret_ctx);
+                }
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`Date.at_midnight_in_tz` expects a `Text` IANA timezone name",
+                    )
+                    .with_span(span),
+                );
+                return (
+                    ExecExpr::Lit(Literal::timestamp(0i64)),
+                    LTy::new(Ty::Timestamp, rlty.tags),
+                );
+            }
             (Ty::Float | Ty::Decimal, "round") => {
                 let is_dec = rlty.ty == Ty::Decimal;
                 let (places_opt, half_even) = self.parse_round_args(args, span);
@@ -10754,6 +10902,185 @@ impl<'a> Checker<'a> {
                 args: vec![ea, eb],
             },
             LTy::new(la.ty, la.tags.union(&lb.tags)),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "expression temporal checker threads environment, sensitivity pc, and return context"
+    )]
+    fn check_date_add_days_expr(
+        &mut self,
+        rex: ExecExpr,
+        rlty: LTy,
+        recv_span: Span,
+        days_e: &Expr,
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        if rlty.ty != Ty::Date {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!("`add_days` requires a `Date`, found `{:?}`", rlty.ty),
+                )
+                .with_span(recv_span),
+            );
+        }
+        let (aex, alty) = self.check_expr(days_e, env, Some(&Ty::Int), pc, scope, ret_ctx);
+        if alty.ty != Ty::Int {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!("`add_days` `days` must be `Int`, found `{:?}`", alty.ty),
+                )
+                .with_span(days_e.span),
+            );
+        }
+        (
+            ExecExpr::Prim {
+                op: ExecPrimOp::AddDays,
+                args: vec![rex, aex],
+            },
+            LTy::new(Ty::Date, rlty.tags.union(&alty.tags)),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "expression timezone checker threads environment, sensitivity pc, and return context"
+    )]
+    fn check_date_midnight_tz_expr(
+        &mut self,
+        rex: ExecExpr,
+        rlty: LTy,
+        recv_span: Span,
+        tz_e: &Expr,
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, LTy) {
+        if rlty.ty != Ty::Date {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!(
+                        "`at_midnight_in_tz` requires a `Date`, found `{:?}`",
+                        rlty.ty
+                    ),
+                )
+                .with_span(recv_span),
+            );
+        }
+        let (aex, alty) = self.check_expr(tz_e, env, Some(&Ty::Text), pc, scope, ret_ctx);
+        if alty.ty != Ty::Text {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    "`at_midnight_in_tz` expects a `Text` IANA timezone name",
+                )
+                .with_span(tz_e.span),
+            );
+        }
+        (
+            ExecExpr::Prim {
+                op: ExecPrimOp::AtMidnightInTz,
+                args: vec![rex, aex],
+            },
+            LTy::new(Ty::Timestamp, rlty.tags.union(&alty.tags)),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "row temporal checker threads table columns and outer scope"
+    )]
+    fn check_row_date_add_days(
+        &mut self,
+        re: ExecRowExpr,
+        rty: Ty,
+        rtags: TagSet,
+        recv_span: Span,
+        days_e: &Expr,
+        cols: &[ColSpec],
+        outer_env: &HashMap<Ident, VarBinding>,
+        allow_dot_self: bool,
+    ) -> (ExecRowExpr, Ty, TagSet) {
+        if rty != Ty::Date {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!("`add_days` requires a `Date`, found `{rty:?}`"),
+                )
+                .with_span(recv_span),
+            );
+        }
+        let (are, aty, atags) =
+            self.check_row_expr(days_e, cols, outer_env, Some(&Ty::Int), allow_dot_self);
+        if aty != Ty::Int {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!("`add_days` `days` must be `Int`, found `{aty:?}`"),
+                )
+                .with_span(days_e.span),
+            );
+        }
+        (
+            ExecRowExpr::Prim {
+                op: ExecPrimOp::AddDays,
+                args: vec![re, are],
+            },
+            Ty::Date,
+            rtags.union(&atags),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "row timezone checker threads table columns and outer scope"
+    )]
+    fn check_row_date_midnight_tz(
+        &mut self,
+        re: ExecRowExpr,
+        rty: Ty,
+        rtags: TagSet,
+        recv_span: Span,
+        tz_e: &Expr,
+        cols: &[ColSpec],
+        outer_env: &HashMap<Ident, VarBinding>,
+        allow_dot_self: bool,
+    ) -> (ExecRowExpr, Ty, TagSet) {
+        if rty != Ty::Date {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!("`at_midnight_in_tz` requires a `Date`, found `{rty:?}`"),
+                )
+                .with_span(recv_span),
+            );
+        }
+        let (are, aty, atags) =
+            self.check_row_expr(tz_e, cols, outer_env, Some(&Ty::Text), allow_dot_self);
+        if aty != Ty::Text {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    "`at_midnight_in_tz` expects a `Text` IANA timezone name",
+                )
+                .with_span(tz_e.span),
+            );
+        }
+        (
+            ExecRowExpr::Prim {
+                op: ExecPrimOp::AtMidnightInTz,
+                args: vec![re, are],
+            },
+            Ty::Timestamp,
+            rtags.union(&atags),
         )
     }
 
@@ -11910,6 +12237,54 @@ impl<'a> Checker<'a> {
                     rtags.union(&atags),
                 ))
             }
+            "add_days" => {
+                if let Some(a0) = extract_one_arg(args, "days") {
+                    return Some(self.check_row_date_add_days(
+                        re,
+                        rty,
+                        rtags,
+                        recv_span,
+                        a0,
+                        cols,
+                        outer_env,
+                        allow_dot_self,
+                    ));
+                }
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`Date.add_days` expects 1 `Int` argument",
+                    )
+                    .with_span(call_span),
+                );
+                Some((re, rty, rtags))
+            }
+            "at_midnight_in_tz" => {
+                if let Some(a0) = extract_one_arg(args, "tz") {
+                    return Some(self.check_row_date_midnight_tz(
+                        re,
+                        rty,
+                        rtags,
+                        recv_span,
+                        a0,
+                        cols,
+                        outer_env,
+                        allow_dot_self,
+                    ));
+                }
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        "`Date.at_midnight_in_tz` expects a `Text` IANA timezone name",
+                    )
+                    .with_span(call_span),
+                );
+                Some((
+                    ExecRowExpr::Lit(Literal::timestamp(0i64)),
+                    Ty::Timestamp,
+                    rtags,
+                ))
+            }
             "predict" if rty == Ty::LinearModel => {
                 let Some(CallArg::Positional(a0)) = args.first() else {
                     return None;
@@ -12492,30 +12867,101 @@ impl<'a> Checker<'a> {
                             tga.union(&tgb),
                         );
                     }
-                    if fname == "months_between"
+                    if (fname == "months_between" || fname == "days_between")
                         && let [CallArg::Positional(a), CallArg::Positional(b)] = args.as_slice()
                     {
-                        let (ea, _, tga) = self.check_row_expr(
+                        let (ea, ta, tga) = self.check_row_expr(
                             a,
                             cols,
                             outer_env,
                             Some(&Ty::Date),
                             allow_dot_self,
                         );
-                        let (eb, _, tgb) = self.check_row_expr(
+                        if ta != Ty::Date {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("`{fname}` expects `Date` as first argument"),
+                                )
+                                .with_span(a.span),
+                            );
+                        }
+                        let (eb, tb, tgb) = self.check_row_expr(
                             b,
                             cols,
                             outer_env,
                             Some(&Ty::Date),
                             allow_dot_self,
                         );
+                        if tb != Ty::Date {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("`{fname}` expects `Date` as second argument"),
+                                )
+                                .with_span(b.span),
+                            );
+                        }
+                        let op = if fname == "months_between" {
+                            ExecPrimOp::MonthsBetween
+                        } else {
+                            ExecPrimOp::DaysBetween
+                        };
                         return (
                             ExecRowExpr::Prim {
-                                op: ExecPrimOp::MonthsBetween,
+                                op,
                                 args: vec![ea, eb],
                             },
                             Ty::Int,
                             tga.union(&tgb),
+                        );
+                    }
+                    if fname == "add_days"
+                        && let (Some(CallArg::Positional(d)), Some(days_e)) = (
+                            args.first(),
+                            extract_one_arg(&args[1.min(args.len())..], "days"),
+                        )
+                    {
+                        let (re, rty, rtags) = self.check_row_expr(
+                            d,
+                            cols,
+                            outer_env,
+                            Some(&Ty::Date),
+                            allow_dot_self,
+                        );
+                        return self.check_row_date_add_days(
+                            re,
+                            rty,
+                            rtags,
+                            d.span,
+                            days_e,
+                            cols,
+                            outer_env,
+                            allow_dot_self,
+                        );
+                    }
+                    if fname == "at_midnight_in_tz"
+                        && let (Some(CallArg::Positional(d)), Some(tz_e)) = (
+                            args.first(),
+                            extract_one_arg(&args[1.min(args.len())..], "tz"),
+                        )
+                    {
+                        let (re, rty, rtags) = self.check_row_expr(
+                            d,
+                            cols,
+                            outer_env,
+                            Some(&Ty::Date),
+                            allow_dot_self,
+                        );
+                        return self.check_row_date_midnight_tz(
+                            re,
+                            rty,
+                            rtags,
+                            d.span,
+                            tz_e,
+                            cols,
+                            outer_env,
+                            allow_dot_self,
                         );
                     }
                     if (fname == "in_tz" || fname == "date_in_tz")
@@ -13825,6 +14271,9 @@ fn row_property(re: ExecRowExpr, ty: &Ty, prop: &str) -> Option<(ExecRowExpr, Ty
     if let (Ty::Text, Some((op, out_ty))) = (ty, text_prop_op(prop)) {
         return Some((ExecRowExpr::Prim { op, args: vec![re] }, out_ty));
     }
+    if let (Ty::Date, Some((op, out_ty))) = (ty, date_prop_op(prop)) {
+        return Some((ExecRowExpr::Prim { op, args: vec![re] }, out_ty));
+    }
     if let Some((op, out_ty)) = numeric_prop_op(ty, prop) {
         return Some((ExecRowExpr::Prim { op, args: vec![re] }, out_ty));
     }
@@ -14529,6 +14978,13 @@ impl Checker<'_> {
             | ExprKind::TableLit { .. } => expr.kind.clone(),
         };
         Expr { kind, span: sp }
+    }
+}
+
+fn date_prop_op(prop: &str) -> Option<(ExecPrimOp, Ty)> {
+    match prop {
+        "year" => Some((ExecPrimOp::DateYear, Ty::Int)),
+        _ => None,
     }
 }
 

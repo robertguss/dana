@@ -85,6 +85,10 @@ pub enum ExecPrimOp {
     MonthsBetween,
     InTz,
     DateInTz,
+    AddDays,
+    DaysBetween,
+    DateYear,
+    AtMidnightInTz,
     // Collection & Table surface helpers
     ListFirst,
     ListFirstBang,

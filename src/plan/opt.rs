@@ -2719,6 +2719,9 @@ const fn exec_prim_op_may_stop(op: &ExecPrimOp) -> bool {
         | ExecPrimOp::AbsInt
         | ExecPrimOp::InTz
         | ExecPrimOp::DateInTz
+        | ExecPrimOp::AddDays
+        | ExecPrimOp::DaysBetween
+        | ExecPrimOp::AtMidnightInTz
         | ExecPrimOp::ListFirstBang
         | ExecPrimOp::TableFirstBang
         | ExecPrimOp::OptSubInt
