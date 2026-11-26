@@ -1469,7 +1469,7 @@ fn check_src_with_lock(
 
 #[test]
 fn v06_sqlite_attach_and_unattached_schema_table_fallback() -> TestResult {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.6");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.7");
     let tmp = TempDir::new("sqlite_attach")?;
     let main_db = tmp.path().join("main.db");
     let populi_db = tmp.path().join("populi.db");
@@ -2777,12 +2777,12 @@ end
     let db_out = assert_oracle_vm_parity(db_src, Some(("DB", &uri)))?;
     assert_eq!(db_out, vec!["2"]);
 
-    // 5. CLI --version prints `dana v0.6.6`
+    // 5. CLI --version prints `dana v0.6.7`
     let ver = Command::new(env!("CARGO_BIN_EXE_dana"))
         .arg("--version")
         .output()?;
     assert_eq!(ver.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.6");
+    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.7");
 
     Ok(())
 }
@@ -4125,11 +4125,13 @@ end
         sq_q.sql
     );
 
-    // 2. Postgres must materialize the batched `_dana_iso_*` CTE once with both BTRIM expressions.
+    // 2. Postgres must materialize both the batched `_dana_iso_*` BTRIM CTE and the
+    //    following TryParseIsoDate regex/CASE evaluation CTE so downstream joins/filters
+    //    never re-expand either one per row.
     assert_eq!(
         pg_q.sql.matches("AS MATERIALIZED (").count(),
-        1,
-        "expected exactly 1 AS MATERIALIZED CTE bundling both ISO date trims in Postgres:\n{}",
+        2,
+        "expected exactly 2 AS MATERIALIZED CTEs (ISO BTRIM + TryParseIsoDate regex eval) in Postgres:\n{}",
         pg_q.sql
     );
     let mat_body = pg_q
@@ -4147,6 +4149,16 @@ end
         mat_body.matches("\"_dana_iso_").count(),
         2,
         "expected 2 hoisted _dana_iso_* aliases inside single AS MATERIALIZED CTE:\n{mat_body}"
+    );
+    let mat_parse_body = pg_q
+        .sql
+        .split("AS MATERIALIZED (")
+        .nth(2)
+        .and_then(|s| s.split("), \"").next())
+        .ok_or("missing materialized parse CTE body")?;
+    assert!(
+        mat_parse_body.contains("~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'"),
+        "expected TryParseIsoDate regex eval CTE to be materialized:\n{mat_parse_body}"
     );
 
     // 3. Independent derive wave coalescing keeps CTE count well below uncoalesced count (~26+).
@@ -5105,6 +5117,324 @@ end
             "unexpected newline cases id=17/18: {:?}",
             &out[16..18]
         );
+        Ok(())
+    })();
+
+    let _ = open_connection(&url).and_then(|mut pg| {
+        pg.execute(
+            &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+            &[],
+        )
+    });
+
+    test_res
+}
+
+// ===========================================================================
+// v0.6.7: Materialize PG CTEs computing TryParseIsoDate / TryParseDecimal / AtTimeZone
+// ===========================================================================
+
+#[test]
+fn v067_postgres_materialize_parse_and_timezone_ctes() -> TestResult {
+    let src = r##"module V067MatParseTzTest
+
+schema EnrRow
+  sid: Text?
+  t_start: Text?
+end
+
+schema SubRow
+  sid: Text?
+  due_ts: Timestamp?
+  raw_dec: Text?
+end
+
+fn join_tz(db: ReadDB(DB))
+  enr = (db.table(EnrRow, from: "enr")
+    |> where(.sid.some?)
+    |> derive(s: .sid ?? "", d_opt: (.t_start ?? "").slice(0, 10).try_parse_date)
+    |> where(.d_opt.some?)
+    |> derive(d0: (.d_opt ?? 1970-01-01).at_midnight_in_tz("America/New_York"))
+    |> select(.s, .d0))
+
+  subs = (db.table(SubRow, from: "subs")
+    |> where(.sid.some? and .due_ts.some?)
+    |> derive(
+      s: .sid ?? "",
+      d_ts: .due_ts ?? 1970-01-01T00:00:00Z,
+      amt: (.raw_dec ?? "").try_parse_decimal
+    )
+    |> select(.s, .d_ts, .amt))
+
+  enr
+    |> join_many(subs, on: [.s])
+    |> where(.d_ts >= .d0)
+    |> select(.s, .d_ts, .amt)
+    |> sort_by(.s, .d_ts, .amt)
+end
+"##;
+
+    let checked = check_src(src)?;
+    let (opt_prog, _) = dana::plan::optimize_exec_program(&checked.exec);
+    let f = opt_prog.find_fun("join_tz").ok_or("missing join_tz")?;
+    let plan = find_first_plan(&f.body).ok_or("missing join_tz plan")?;
+
+    let pg_q = match split_exec_plan_pushdown(plan, &opt_prog, "DB", SqlDialect::Postgres, None) {
+        SplitPlan::FullyPushed(q) => q,
+        other => return Err(format!("expected FullyPushed for Postgres, got {other:?}").into()),
+    };
+
+    let mat_bodies: Vec<&str> = pg_q
+        .sql
+        .split("AS MATERIALIZED (")
+        .skip(1)
+        .filter_map(|s| s.split("), \"").next())
+        .collect();
+    assert!(
+        mat_bodies.len() >= 4,
+        "expected >= 4 AS MATERIALIZED CTEs (ISO trim, ISO parse, AtTimeZone, Dec trim/parse), got {}:\n{}",
+        mat_bodies.len(),
+        pg_q.sql
+    );
+    assert!(
+        mat_bodies
+            .iter()
+            .any(|b| b.contains("~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'")),
+        "expected TryParseIsoDate CTE materialized:\n{}",
+        pg_q.sql
+    );
+    assert!(
+        mat_bodies.iter().any(|b| b.contains("AT TIME ZONE")),
+        "expected AtTimeZone CTE materialized:\n{}",
+        pg_q.sql
+    );
+    assert!(
+        mat_bodies
+            .iter()
+            .any(|b| b.contains("^[+-]?[0-9]+(\\.[0-9]{0,18})?$")),
+        "expected TryParseDecimal CTE materialized:\n{}",
+        pg_q.sql
+    );
+
+    let tz_only_src = r##"module V067SqNoMat
+schema R
+  d: Date
+end
+fn tz_q(db: ReadDB(DB))
+  db.table(R, from: "r")
+    |> derive(ts: .d.at_midnight_in_tz("America/New_York"))
+    |> select(.ts)
+    |> sort_by(.ts)
+end
+"##;
+    let sq_checked = check_src(tz_only_src)?;
+    let (sq_opt, _) = dana::plan::optimize_exec_program(&sq_checked.exec);
+    let sq_f = sq_opt.find_fun("tz_q").ok_or("missing tz_q")?;
+    let sq_p = find_first_plan(&sq_f.body).ok_or("missing tz_q plan")?;
+    let sq_split = split_exec_plan_pushdown(sq_p, &sq_opt, "DB", SqlDialect::Sqlite, None);
+    if let SplitPlan::FullyPushed(sq_q) = sq_split {
+        assert!(
+            !sq_q.sql.contains("MATERIALIZED"),
+            "SQLite must never emit MATERIALIZED:\n{}",
+            sq_q.sql
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL server via DANA_TEST_POSTGRES_URL"]
+fn v067_postgres_live_no_regex_or_tz_reexpansion_in_join_filter() -> TestResult {
+    let url = std::env::var("DANA_TEST_POSTGRES_URL").map_err(|_| {
+        "DANA_TEST_POSTGRES_URL must be set to run v067_postgres_live_no_regex_or_tz_reexpansion_in_join_filter"
+    })?;
+    let tmp = TempDir::new("v067_live_pg_mat")?;
+    let schema_name = format!(
+        "dana_v067_mat_{}_{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let lock_path = tmp.path().join("schema.lock");
+
+    {
+        let mut pg = open_connection(&url)?;
+        pg.execute(
+            &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+            &[],
+        )?;
+        pg.execute(&format!(r#"CREATE SCHEMA "{schema_name}""#), &[])?;
+        pg.execute(
+            &format!(
+                r#"CREATE TABLE "{schema_name}"."enr" (
+                    "sid" TEXT,
+                    "t_start" TEXT
+                )"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"CREATE TABLE "{schema_name}"."subs" (
+                    "sid" TEXT,
+                    "due_ts" TIMESTAMPTZ,
+                    "raw_dec" TEXT
+                )"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"INSERT INTO "{schema_name}"."enr"
+                   SELECT ('s' || g)::text, '2025-03-01'
+                   FROM generate_series(1, 50) g"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"INSERT INTO "{schema_name}"."subs"
+                   SELECT ('s' || ((g % 50) + 1))::text,
+                          TIMESTAMPTZ '2025-03-10 12:00:00Z',
+                          '12.50'
+                   FROM generate_series(1, 100) g"#
+            ),
+            &[],
+        )?;
+        pg.execute(&format!(r#"ANALYZE "{schema_name}"."enr""#), &[])?;
+        pg.execute(&format!(r#"ANALYZE "{schema_name}"."subs""#), &[])?;
+    }
+
+    let sync = Command::new(env!("CARGO_BIN_EXE_dana"))
+        .args([
+            "schema-sync",
+            "--db",
+            &format!("PG={url}"),
+            "--schemas",
+            &schema_name,
+            "--out",
+            &lock_path.display().to_string(),
+        ])
+        .output()?;
+    if sync.status.code() != Some(0) {
+        let _ = open_connection(&url).and_then(|mut pg| {
+            pg.execute(
+                &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+                &[],
+            )
+        });
+        return Err(format!(
+            "dana schema-sync failed: {}",
+            String::from_utf8_lossy(&sync.stderr)
+        )
+        .into());
+    }
+
+    let lock = dana::db::schema_lock::parse_schema_lock(&fs::read_to_string(&lock_path)?)?;
+    let src = format!(
+        r##"module LivePgV067Mat
+
+schema EnrRow
+  sid: Text?
+  t_start: Text?
+end
+
+schema SubRow
+  sid: Text?
+  due_ts: Timestamp?
+  raw_dec: Text?
+end
+
+fn join_tz(db: ReadDB(PG))
+  enr = (db.table(EnrRow, from: "{schema_name}.enr")
+    |> where(.sid.some?)
+    |> derive(s: .sid ?? "", d_opt: (.t_start ?? "").slice(0, 10).try_parse_date)
+    |> where(.d_opt.some?)
+    |> derive(d0: (.d_opt ?? 1970-01-01).at_midnight_in_tz("America/New_York"))
+    |> select(.s, .d0))
+
+  subs = (db.table(SubRow, from: "{schema_name}.subs")
+    |> where(.sid.some? and .due_ts.some?)
+    |> derive(
+      s: .sid ?? "",
+      d_ts: .due_ts ?? 1970-01-01T00:00:00Z,
+      amt: (.raw_dec ?? "").try_parse_decimal
+    )
+    |> select(.s, .d_ts, .amt))
+
+  enr
+    |> join_many(subs, on: [.s])
+    |> where(.d_ts >= .d0)
+    |> select(.s, .d_ts, .amt)
+    |> sort_by(.s, .d_ts, .amt)
+end
+
+fn main(db: ReadDB(PG), console: Console) : Int
+  rows = (join_tz(db)
+    |> summarize(n: count(), tot: sum(.amt ?? 0.0)))
+  for r in rows
+    console.print("#{{r.n}}:#{{r.tot}}")
+  end
+  0
+end
+"##
+    );
+
+    let test_res = (|| -> TestResult {
+        let checked = check_src_with_lock(&src, &lock)?;
+        let (opt_prog, _) = dana::plan::optimize_exec_program(&checked.exec);
+        let qf = opt_prog.find_fun("join_tz").ok_or("missing join_tz")?;
+        let plan = find_first_plan(&qf.body).ok_or("missing ExecPlan")?;
+        let sp = split_exec_plan_pushdown(plan, &opt_prog, "PG", SqlDialect::Postgres, Some(&lock));
+        let q = match sp {
+            SplitPlan::FullyPushed(q) => q,
+            other => return Err(format!("expected FullyPushed live PG SQL, got {other:?}").into()),
+        };
+
+        let explain_schema = dana::core::syntax::TableTy {
+            cols: vec![dana::core::syntax::ColSpec {
+                name: "QUERY PLAN".to_string(),
+                ty: dana::core::syntax::ScalarTy::Text,
+                tags: dana::core::syntax::TagSet::empty(),
+                bucketed: false,
+                agg_kind: dana::core::syntax::AggKind::Raw,
+            }],
+            row_tags: dana::core::syntax::TagSet::empty(),
+            order_tags: dana::core::syntax::TagSet::empty(),
+            grouped_by: None,
+            summarized: false,
+            distinct_by: None,
+        };
+        let params = q.resolve_params(|_| None, |_| None)?;
+        let mut pg = open_connection(&url)?;
+        let explain_tbl = pg.query_rows(
+            &format!("EXPLAIN (FORMAT TEXT) {}", q.sql),
+            &params,
+            &explain_schema,
+        )?;
+        let plan_lines: Vec<String> = explain_tbl
+            .rows
+            .iter()
+            .filter_map(|r| match r.cells.first() {
+                Some(dana::oracle::value::Val::Text(line)) => Some(line.clone()),
+                _ => None,
+            })
+            .collect();
+        let joined_plan = plan_lines.join("\n");
+        assert!(
+            joined_plan.contains("CTE Scan"),
+            "expected materialized CTE Scan in PG plan:\n{joined_plan}"
+        );
+        for line in &plan_lines {
+            if line.contains("Join Filter:") || line.trim_start().starts_with("Filter:") {
+                assert!(
+                    !line.contains("~ '^[0-9]{4}") && !line.contains("AT TIME ZONE"),
+                    "regex or AT TIME ZONE re-expanded in filter/join line:\n{line}\nfull plan:\n{joined_plan}"
+                );
+            }
+        }
+
+        let out = assert_oracle_vm_parity(&src, Some(("PG", &url)))?;
+        assert_eq!(out, vec!["100:1250.0"]);
         Ok(())
     })();
 

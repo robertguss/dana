@@ -746,7 +746,62 @@ fn sql_query_subquery_depth(query: &SqlQuery) -> usize {
     }
 }
 
-fn select_defines_hoisted_iso(query: &SqlQuery) -> bool {
+fn sql_expr_contains_expensive_pg_eval(expr: &SqlExpr) -> bool {
+    match expr {
+        SqlExpr::TryParseIsoDate { .. }
+        | SqlExpr::TryParseDecimal { .. }
+        | SqlExpr::AtTimeZone { .. } => true,
+        SqlExpr::Col { .. }
+        | SqlExpr::Param { .. }
+        | SqlExpr::CountStar
+        | SqlExpr::BoolLit(_)
+        | SqlExpr::IntLit(_) => false,
+        SqlExpr::Unary { arg, .. }
+        | SqlExpr::IsNull { arg, .. }
+        | SqlExpr::CollateC(arg)
+        | SqlExpr::Cast { expr: arg, .. }
+        | SqlExpr::Agg { arg, .. }
+        | SqlExpr::TrimAscii(arg)
+        | SqlExpr::TrimUnicode(arg)
+        | SqlExpr::ExtractYear(arg) => sql_expr_contains_expensive_pg_eval(arg),
+        SqlExpr::Binary { left, right, .. }
+        | SqlExpr::NullSafeEq { left, right, .. }
+        | SqlExpr::Coalesce(left, right) => {
+            sql_expr_contains_expensive_pg_eval(left) || sql_expr_contains_expensive_pg_eval(right)
+        }
+        SqlExpr::Func { args, .. } => args.iter().any(sql_expr_contains_expensive_pg_eval),
+        SqlExpr::Case { whens, else_br } => {
+            whens.iter().any(|(w, t)| {
+                sql_expr_contains_expensive_pg_eval(w) || sql_expr_contains_expensive_pg_eval(t)
+            }) || sql_expr_contains_expensive_pg_eval(else_br)
+        }
+        SqlExpr::Exists { subquery, .. } => sql_query_should_materialize_pg(subquery),
+        SqlExpr::Substring {
+            str_expr,
+            start,
+            len,
+        } => {
+            sql_expr_contains_expensive_pg_eval(str_expr)
+                || sql_expr_contains_expensive_pg_eval(start)
+                || sql_expr_contains_expensive_pg_eval(len)
+        }
+        SqlExpr::InList { expr, items } => {
+            sql_expr_contains_expensive_pg_eval(expr)
+                || items.iter().any(sql_expr_contains_expensive_pg_eval)
+        }
+        SqlExpr::RowNumber {
+            partition_by,
+            order_by,
+        } => {
+            partition_by.iter().any(sql_expr_contains_expensive_pg_eval)
+                || order_by
+                    .iter()
+                    .any(|item| sql_expr_contains_expensive_pg_eval(&item.expr))
+        }
+    }
+}
+
+fn select_should_materialize_pg(query: &SqlQuery) -> bool {
     matches!(
         query,
         SqlQuery::Select { items, .. }
@@ -755,28 +810,29 @@ fn select_defines_hoisted_iso(query: &SqlQuery) -> bool {
                     && matches!(item.expr, SqlExpr::TrimAscii(_)))
                     || (item.alias.starts_with("_dana_dec_")
                         && matches!(item.expr, SqlExpr::TrimUnicode(_)))
+                    || sql_expr_contains_expensive_pg_eval(&item.expr)
             })
     )
 }
 
-fn sql_from_has_hoisted_iso(from: &SqlFrom) -> bool {
+fn sql_from_should_materialize_pg(from: &SqlFrom) -> bool {
     match from {
         SqlFrom::Table { .. } | SqlFrom::CteRef { .. } => false,
-        SqlFrom::Subquery { query, .. } => sql_query_has_hoisted_iso(query),
+        SqlFrom::Subquery { query, .. } => sql_query_should_materialize_pg(query),
         SqlFrom::Join { left, right, .. } => {
-            sql_from_has_hoisted_iso(left) || sql_from_has_hoisted_iso(right)
+            sql_from_should_materialize_pg(left) || sql_from_should_materialize_pg(right)
         }
     }
 }
 
-fn sql_query_has_hoisted_iso(query: &SqlQuery) -> bool {
-    if select_defines_hoisted_iso(query) {
+fn sql_query_should_materialize_pg(query: &SqlQuery) -> bool {
+    if select_should_materialize_pg(query) {
         return true;
     }
     match query {
-        SqlQuery::Select { from, .. } => sql_from_has_hoisted_iso(from),
+        SqlQuery::Select { from, .. } => sql_from_should_materialize_pg(from),
         SqlQuery::UnionAll { left, right, .. } => {
-            sql_query_has_hoisted_iso(left) || sql_query_has_hoisted_iso(right)
+            sql_query_should_materialize_pg(left) || sql_query_should_materialize_pg(right)
         }
     }
 }
@@ -883,7 +939,7 @@ impl<'a> SqlRenderState<'a> {
 
     fn render_root_query(&mut self, query: &SqlQuery) {
         let should_lift = sql_query_subquery_depth(query) >= 4
-            || (self.dialect == SqlDialect::Postgres && sql_query_has_hoisted_iso(query));
+            || (self.dialect == SqlDialect::Postgres && sql_query_should_materialize_pg(query));
         if should_lift {
             let (ctes, root) = lift_subqueries_to_ctes(query);
             self.sql.push_str("WITH ");
@@ -892,7 +948,7 @@ impl<'a> SqlRenderState<'a> {
                     self.sql.push_str(", ");
                 }
                 self.sql.push_str(&quote_sql_ident(cte_name));
-                if self.dialect == SqlDialect::Postgres && select_defines_hoisted_iso(cte_query) {
+                if self.dialect == SqlDialect::Postgres && select_should_materialize_pg(cte_query) {
                     self.sql.push_str(" AS MATERIALIZED (");
                 } else {
                     self.sql.push_str(" AS (");
