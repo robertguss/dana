@@ -90,3 +90,94 @@ jobs:
             dist/dana-*.tar.gz
             dist/SHA256SUMS.txt
           generate_release_notes: true
+
+  homebrew:
+    name: Update Homebrew Tap
+    needs: [build, publish]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Homebrew tap token
+        id: check_token
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "HOMEBREW_TAP_TOKEN is not set; skipping automatic formula bump. Update robertguss/homebrew-tap Formula/dana.rb manually or add HOMEBREW_TAP_TOKEN (Contents: Read & Write on robertguss/homebrew-tap)."
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v4
+        if: steps.check_token.outputs.enabled == 'true'
+        with:
+          name: dana-x86_64-linux
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        if: steps.check_token.outputs.enabled == 'true'
+        with:
+          name: dana-aarch64-macos
+          path: dist
+
+      - name: Update robertguss/homebrew-tap Formula/dana.rb
+        if: steps.check_token.outputs.enabled == 'true'
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          SRC_URL="https://github.com/robertguss/dana/archive/refs/tags/${TAG}.tar.gz"
+          curl -fsSL "$SRC_URL" -o src.tar.gz
+          SRC_SHA=$(sha256sum src.tar.gz | awk '{print $1}')
+          MAC_ARM_SHA=$(sha256sum "dist/dana-${TAG}-aarch64-macos.tar.gz" | awk '{print $1}')
+          LINUX_INTEL_SHA=$(sha256sum "dist/dana-${TAG}-x86_64-linux.tar.gz" | awk '{print $1}')
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/robertguss/homebrew-tap.git" tap
+          python3 - "$VERSION" "$TAG" "$MAC_ARM_SHA" "$LINUX_INTEL_SHA" "$SRC_SHA" <<'PY'
+          import pathlib, re, sys
+          version, tag, mac_sha, lin_sha, src_sha = sys.argv[1:6]
+          formula_path = pathlib.Path("tap/Formula/dana.rb")
+          text = formula_path.read_text(encoding="utf-8")
+
+          text, n_ver = re.subn(r'(?m)^(\s*version\s+)"[^"]+"$', rf'\1"{version}"', text)
+          assert n_ver == 1, f"Expected 1 version line, got {n_ver}"
+
+          text, n_mac = re.subn(
+              r'(url "https://github\.com/robertguss/dana/releases/download/)[^/]+(/dana-)[^-]+(-aarch64-macos\.tar\.gz"\n\s*sha256 ")[0-9a-f]{64}(")',
+              rf'\g<1>{tag}\g<2>{tag}\g<3>{mac_sha}\g<4>',
+              text,
+          )
+          assert n_mac == 1, f"Expected 1 mac_arm url+sha block, got {n_mac}"
+
+          text, n_lin = re.subn(
+              r'(url "https://github\.com/robertguss/dana/releases/download/)[^/]+(/dana-)[^-]+(-x86_64-linux\.tar\.gz"\n\s*sha256 ")[0-9a-f]{64}(")',
+              rf'\g<1>{tag}\g<2>{tag}\g<3>{lin_sha}\g<4>',
+              text,
+          )
+          assert n_lin == 1, f"Expected 1 linux_intel url+sha block, got {n_lin}"
+
+          text, n_src = re.subn(
+              r'(url "https://github\.com/robertguss/dana/archive/refs/tags/)[^"]+(\.tar\.gz"\n\s*sha256 ")[0-9a-f]{64}(")',
+              rf'\g<1>{tag}\g<2>{src_sha}\g<3>',
+              text,
+          )
+          assert n_src == 2, f"Expected 2 source fallback blocks, got {n_src}"
+
+          formula_path.write_text(text, encoding="utf-8")
+          PY
+          if command -v ruby >/dev/null 2>&1; then
+            ruby -c tap/Formula/dana.rb
+          fi
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/dana.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date for ${VERSION}."
+            exit 0
+          fi
+          git commit -m "dana ${VERSION}"
+          git push origin main

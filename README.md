@@ -105,7 +105,19 @@ end
 
 ## Install
 
-Download prebuilt release archives (`x86_64-linux` / `aarch64-macos`) from
+Install on macOS (Apple Silicon / Intel) or Linux via [Homebrew](https://github.com/robertguss/homebrew-tap):
+
+```sh
+brew install robertguss/tap/dana
+```
+
+Upgrade later with:
+
+```sh
+brew update && brew upgrade dana
+```
+
+Or download prebuilt release archives (`x86_64-linux` / `aarch64-macos`) from
 [GitHub Releases](https://github.com/robertguss/dana/releases), or build from source with
 Rust 1.90+ and the system C libraries behind `src/ffi/` (`zlib`, `zstd`, `sqlite3`, `openssl`):
 
