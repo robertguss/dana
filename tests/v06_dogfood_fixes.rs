@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use dana::base::{DiagCode, Severity, SourceMap};
 use dana::check::check_module;
-use dana::core::syntax::BugKind;
+use dana::core::syntax::{BugKind, TagSet};
 use dana::db::{SqlDialect, SqlParam, open_connection};
 use dana::plan::{SplitPlan, split_exec_plan_pushdown};
 use dana::runtime::{RunConfig, RunResult, run_exec_program};
@@ -1469,7 +1469,7 @@ fn check_src_with_lock(
 
 #[test]
 fn v06_sqlite_attach_and_unattached_schema_table_fallback() -> TestResult {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.7");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.8");
     let tmp = TempDir::new("sqlite_attach")?;
     let main_db = tmp.path().join("main.db");
     let populi_db = tmp.path().join("populi.db");
@@ -2777,12 +2777,12 @@ end
     let db_out = assert_oracle_vm_parity(db_src, Some(("DB", &uri)))?;
     assert_eq!(db_out, vec!["2"]);
 
-    // 5. CLI --version prints `dana v0.6.7`
+    // 5. CLI --version prints `dana v0.6.8`
     let ver = Command::new(env!("CARGO_BIN_EXE_dana"))
         .arg("--version")
         .output()?;
     assert_eq!(ver.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.7");
+    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.8");
 
     Ok(())
 }
@@ -5435,6 +5435,399 @@ end
 
         let out = assert_oracle_vm_parity(&src, Some(("PG", &url)))?;
         assert_eq!(out, vec!["100:1250.0"]);
+        Ok(())
+    })();
+
+    let _ = open_connection(&url).and_then(|mut pg| {
+        pg.execute(
+            &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+            &[],
+        )
+    });
+
+    test_res
+}
+
+// ===========================================================================
+// Patch v0.6.8 Tests: MakeDuration & Pseudonymize Order-Insensitive Forwarding
+// ===========================================================================
+
+#[test]
+fn v068_dynamic_int_duration_suffixes_and_row_exprs() -> TestResult {
+    let src = r##"module V068MakeDuration
+
+schema RowIn
+  ts: Timestamp
+  d: Int
+  h: Int
+  m: Int
+  s: Int
+end
+
+fn shift_dyn(ts: Timestamp, d: Int, h: Int, m: Int, s: Int) : Timestamp
+  ts + d.days + h.hours + m.minutes + s.seconds
+end
+
+fn main(console: Console) : Int
+  base = 2026-01-10T12:00:00Z
+  s1 = shift_dyn(base, 2, 3, 4, 5)
+  n_neg = -2
+  s2 = base + n_neg.days
+  console.print("#{s1}|#{s2}")
+
+  tbl = table
+    | ts                   | d  | h  | m  | s  |
+    | 2026-01-10T12:00:00Z | 1  | 2  | 30 | 15 |
+    | 2026-01-10T12:00:00Z | -3 | 0  | 0  | -5 |
+  end
+  rows = tbl |> derive(out: .ts + .d.days + .h.hours + .m.minutes + .s.seconds)
+  for r in rows
+    console.print("#{r.out}")
+  end
+  0
+end
+"##;
+
+    let out = assert_oracle_vm_parity(src, None)?;
+    assert_eq!(
+        out,
+        vec![
+            "2026-01-12T15:04:05Z|2026-01-08T12:00:00Z",
+            "2026-01-11T14:30:15Z",
+            "2026-01-07T11:59:55Z",
+        ]
+    );
+
+    let lit_overflow = r##"module V068LitDurOverflow
+fn main(console: Console) : Int
+  d = 1_000_000_000_000.days
+  console.print("#{2026-01-10T00:00:00Z + d}")
+  0
+end
+"##;
+    assert_oracle_vm_trap_kind(lit_overflow, BugKind::IntOverflow)?;
+
+    let dyn_scalar_overflow = r##"module V068DynDurOverflow
+fn boom(n: Int) : Duration
+  n.days
+end
+
+fn main(console: Console) : Int
+  console.print("#{2026-01-10T00:00:00Z + boom(1_000_000_000_000)}")
+  0
+end
+"##;
+    assert_oracle_vm_trap_kind(dyn_scalar_overflow, BugKind::IntOverflow)?;
+
+    let dyn_row_overflow = r##"module V068RowDurOverflow
+fn main(console: Console) : Int
+  raw = table
+    | ts                   | d                 |
+    | 2026-01-10T00:00:00Z | 1_000_000_000_000 |
+  end
+  t = raw |> derive(out: .ts + .d.days)
+  console.print_table(t)
+  0
+end
+"##;
+    assert_oracle_vm_trap_kind(dyn_row_overflow, BugKind::IntOverflow)?;
+
+    Ok(())
+}
+
+#[test]
+fn v068_pseudonymize_forwards_order_insensitive_to_sql_pushdown() -> TestResult {
+    let tmp = TempDir::new("pseudonymize_order_fwd")?;
+    let db_path = tmp.path().join("pseudo.db");
+    let uri = sqlite_uri(&db_path);
+    {
+        let mut conn = open_connection(&uri)?;
+        conn.execute(
+            r#"CREATE TABLE "users" ("id" INTEGER NOT NULL, "grp" TEXT NOT NULL)"#,
+            &[],
+        )?;
+        for (id, grp) in [(1i64, "a"), (1, "a"), (2, "a"), (3, "b"), (4, "a")] {
+            conn.execute(
+                r#"INSERT INTO "users" VALUES (?, ?)"#,
+                &[SqlParam::Int(id), SqlParam::Text(grp.to_string())],
+            )?;
+        }
+    }
+
+    let src = r##"module V068PseudoPush
+
+schema UserRow
+  id: Int [pii]
+  grp: Text
+end
+
+fn q_agg(db: ReadDB(DB), k: Secret("salt_k"))
+  db.table(UserRow, from: "users")
+    |> where(.grp == "a")
+    |> distinct()
+    |> pseudonymize(.id, key: k)
+    |> group_by(.grp)
+    |> summarize(n: count())
+    |> sort_by(.grp, .n)
+end
+
+fn q_ordered(db: ReadDB(DB), k: Secret("salt_k"))
+  db.table(UserRow, from: "users")
+    |> where(.grp == "a")
+    |> distinct()
+    |> pseudonymize(.id, key: k)
+end
+
+fn q_sorted(db: ReadDB(DB), k: Secret("salt_k"))
+  db.table(UserRow, from: "users")
+    |> where(.grp == "a")
+    |> distinct()
+    |> pseudonymize(.id, key: k)
+    |> sort_by(.id, .grp)
+end
+
+fn main(db: ReadDB(DB), k: Secret("salt_k"), out: WriteFiles("out/", allows: [pii])) : Int
+  rows = q_agg(db, k)
+  try out.write_csv("agg.csv", rows, private: true)
+  0
+end
+"##;
+
+    let checked = check_src(src)?;
+    let (opt_prog, _) = dana::plan::optimize_exec_program(&checked.exec);
+
+    for fn_name in ["q_agg", "q_sorted"] {
+        let f = opt_prog
+            .find_fun(fn_name)
+            .ok_or_else(|| format!("missing {fn_name}"))?;
+        let plan = find_first_plan(&f.body).ok_or_else(|| format!("missing plan {fn_name}"))?;
+        for dialect in [SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let split = split_exec_plan_pushdown(plan, &opt_prog, "DB", dialect, None);
+            match split {
+                SplitPlan::Hybrid { pushdown, .. } => {
+                    assert!(
+                        pushdown
+                            .pushed_ops
+                            .iter()
+                            .any(|op| op.starts_with("Distinct")),
+                        "{fn_name} ({dialect:?}) should push Distinct through Pseudonymize:\nops={:?}\nsql={}",
+                        pushdown.pushed_ops,
+                        pushdown.sql
+                    );
+                    assert!(
+                        pushdown.sql.contains("DISTINCT") && pushdown.sql.contains("WHERE"),
+                        "{fn_name} ({dialect:?}) should emit SELECT DISTINCT + WHERE:\n{}",
+                        pushdown.sql
+                    );
+                }
+                other => {
+                    return Err(format!(
+                        "{fn_name} ({dialect:?}) expected Hybrid pushdown, got {other:?}"
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+
+    let f_ord = opt_prog.find_fun("q_ordered").ok_or("missing q_ordered")?;
+    let plan_ord = find_first_plan(&f_ord.body).ok_or("missing q_ordered plan")?;
+    match split_exec_plan_pushdown(plan_ord, &opt_prog, "DB", SqlDialect::Postgres, None) {
+        SplitPlan::Hybrid { pushdown, .. } => {
+            assert!(
+                !pushdown
+                    .pushed_ops
+                    .iter()
+                    .any(|op| op.starts_with("Distinct")),
+                "q_ordered without outer sort/agg must NOT push order-insensitive Distinct:\nops={:?}\nsql={}",
+                pushdown.pushed_ops,
+                pushdown.sql
+            );
+        }
+        other => {
+            return Err(format!(
+                "q_ordered expected Hybrid(Filter) with local Distinct/Pseudonymize, got {other:?}"
+            )
+            .into());
+        }
+    }
+
+    let ora_dir = tmp.path().join("ora");
+    let vm_dir = tmp.path().join("vm");
+    fs::create_dir_all(&ora_dir)?;
+    fs::create_dir_all(&vm_dir)?;
+    let mut db_bindings = HashMap::new();
+    db_bindings.insert("DB".to_string(), uri);
+    let ora_cfg = RunConfig {
+        live_io: true,
+        work_dir: Some(ora_dir.clone()),
+        allow_export: TagSet::singleton("pii"),
+        db_bindings: db_bindings.clone(),
+        ..RunConfig::default()
+    };
+    let vm_cfg = RunConfig {
+        live_io: true,
+        work_dir: Some(vm_dir.clone()),
+        allow_export: TagSet::singleton("pii"),
+        db_bindings,
+        ..RunConfig::default()
+    };
+    let ora = run_exec_program(&checked.exec, &ora_cfg);
+    let vm = run_exec_program_vm(&checked.exec, &vm_cfg, &VmConfig::default());
+    match (ora, vm) {
+        (RunResult::Ok { exit_code: 0, .. }, RunResult::Ok { exit_code: 0, .. }) => {
+            let oc = fs::read_to_string(ora_dir.join("out/agg.csv"))?;
+            let vc = fs::read_to_string(vm_dir.join("out/agg.csv"))?;
+            assert_eq!(oc, "grp,n\na,3\n");
+            assert_eq!(oc, vc);
+        }
+        other => return Err(format!("expected Ok parity, got {other:?}").into()),
+    }
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL server via DANA_TEST_POSTGRES_URL"]
+fn v068_postgres_live_pseudonymize_order_insensitive_pushdown() -> TestResult {
+    let url = std::env::var("DANA_TEST_POSTGRES_URL").map_err(|_| {
+        "DANA_TEST_POSTGRES_URL must be set to run v068_postgres_live_pseudonymize_order_insensitive_pushdown"
+    })?;
+    let tmp = TempDir::new("v068_live_pg_pseudo")?;
+    let schema_name = format!(
+        "dana_v068_ps_{}_{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let lock_path = tmp.path().join("schema.lock");
+
+    {
+        let mut pg = open_connection(&url)?;
+        pg.execute(
+            &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+            &[],
+        )?;
+        pg.execute(&format!(r#"CREATE SCHEMA "{schema_name}""#), &[])?;
+        pg.execute(
+            &format!(
+                r#"CREATE TABLE "{schema_name}"."users" ("id" BIGINT NOT NULL, "grp" TEXT NOT NULL)"#
+            ),
+            &[],
+        )?;
+        pg.execute(
+            &format!(
+                r#"INSERT INTO "{schema_name}"."users"
+                   SELECT g, CASE WHEN g % 2 = 0 THEN 'even' ELSE 'odd' END
+                   FROM generate_series(1, 30) g"#
+            ),
+            &[],
+        )?;
+    }
+
+    let sync = Command::new(env!("CARGO_BIN_EXE_dana"))
+        .args([
+            "schema-sync",
+            "--db",
+            &format!("PG={url}"),
+            "--schemas",
+            &schema_name,
+            "--out",
+            &lock_path.display().to_string(),
+        ])
+        .output()?;
+    if sync.status.code() != Some(0) {
+        let _ = open_connection(&url).and_then(|mut pg| {
+            pg.execute(
+                &format!(r#"DROP SCHEMA IF EXISTS "{schema_name}" CASCADE"#),
+                &[],
+            )
+        });
+        return Err(format!(
+            "dana schema-sync failed: {}",
+            String::from_utf8_lossy(&sync.stderr)
+        )
+        .into());
+    }
+
+    let lock = dana::db::schema_lock::parse_schema_lock(&fs::read_to_string(&lock_path)?)?;
+    let src = format!(
+        r##"module LivePgV068Pseudo
+
+schema UserRow
+  id: Int [pii]
+  grp: Text
+end
+
+fn q_agg(db: ReadDB(PG), k: Secret("salt_k"))
+  db.table(UserRow, from: "{schema_name}.users")
+    |> where(.grp == "even")
+    |> distinct()
+    |> pseudonymize(.id, key: k)
+    |> group_by(.grp)
+    |> summarize(n: count())
+    |> sort_by(.grp, .n)
+end
+
+fn main(db: ReadDB(PG), k: Secret("salt_k"), out: WriteFiles("out/", allows: [pii])) : Int
+  try out.write_csv("agg.csv", q_agg(db, k), private: true)
+  0
+end
+"##
+    );
+
+    let test_res = (|| -> TestResult {
+        let checked = check_src_with_lock(&src, &lock)?;
+        let (opt_prog, _) = dana::plan::optimize_exec_program(&checked.exec);
+        let qf = opt_prog.find_fun("q_agg").ok_or("missing q_agg")?;
+        let plan = find_first_plan(&qf.body).ok_or("missing ExecPlan")?;
+        match split_exec_plan_pushdown(plan, &opt_prog, "PG", SqlDialect::Postgres, Some(&lock)) {
+            SplitPlan::Hybrid { pushdown, .. } => {
+                assert!(
+                    pushdown
+                        .pushed_ops
+                        .iter()
+                        .any(|op| op.starts_with("Distinct"))
+                        && pushdown.sql.contains("DISTINCT")
+                        && pushdown.sql.contains("WHERE"),
+                    "expected pushed Distinct + WHERE in PG query:\nops={:?}\nsql={}",
+                    pushdown.pushed_ops,
+                    pushdown.sql
+                );
+            }
+            other => return Err(format!("expected Hybrid pushdown for PG, got {other:?}").into()),
+        }
+
+        let ora_dir = tmp.path().join("ora");
+        let vm_dir = tmp.path().join("vm");
+        fs::create_dir_all(&ora_dir)?;
+        fs::create_dir_all(&vm_dir)?;
+        let mut db_bindings = HashMap::new();
+        db_bindings.insert("PG".to_string(), url.clone());
+        let ora_cfg = RunConfig {
+            live_io: true,
+            work_dir: Some(ora_dir.clone()),
+            allow_export: TagSet::singleton("pii"),
+            db_bindings: db_bindings.clone(),
+            ..RunConfig::default()
+        };
+        let vm_cfg = RunConfig {
+            live_io: true,
+            work_dir: Some(vm_dir.clone()),
+            allow_export: TagSet::singleton("pii"),
+            db_bindings,
+            ..RunConfig::default()
+        };
+        let ora = run_exec_program(&checked.exec, &ora_cfg);
+        let vm = run_exec_program_vm(&checked.exec, &vm_cfg, &VmConfig::default());
+        match (ora, vm) {
+            (RunResult::Ok { exit_code: 0, .. }, RunResult::Ok { exit_code: 0, .. }) => {
+                let oc = fs::read_to_string(ora_dir.join("out/agg.csv"))?;
+                let vc = fs::read_to_string(vm_dir.join("out/agg.csv"))?;
+                assert_eq!(oc, "grp,n\neven,15\n");
+                assert_eq!(oc, vc);
+            }
+            other => return Err(format!("expected PG Ok parity, got {other:?}").into()),
+        }
         Ok(())
     })();
 

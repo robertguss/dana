@@ -7,7 +7,7 @@ long-running systems and living services, Dana is built for databases, ETL pipel
 operational and financial analytics, practical statistics, and clean reporting—fast by
 default, batteries included, and safe around sensitive data like PII and FERPA records.
 
-> **Status: Dana v0.6 (`v0.6.7`, pre-1.0) — Exact Numerics, CSV Quarantine/Coercion, `coarsen`, SQLite `--attach`, PostgreSQL `TryParseIsoDate`/`TryParseDecimal`/DST Pushdown, PG Arrays, Covariant `ReadDB` `schema.lock`, & `dedupe_by` Complete (`v1.0` GA held for production soak).**
+> **Status: Dana v0.6 (`v0.6.8`, pre-1.0) — Exact Numerics, CSV Quarantine/Coercion, `coarsen`, SQLite `--attach`, PostgreSQL `TryParseIsoDate`/`TryParseDecimal`/DST Pushdown, PG Arrays, Covariant `ReadDB` `schema.lock`, & `dedupe_by` Complete (`v1.0` GA held for production soak).**
 > Dana's 0-conflict Bison IELR(1) executable grammar (`make grammar`), Lean 4 formal core with
 > soundness & non-interference proofs (`make formal`), **Zero-Crate Rust** compiler, 2,048-row
 > vectorized columnar VM with pure-UDF bytecode inlining, direct streaming-columnar CSV/TSV &
@@ -112,11 +112,11 @@ Rust 1.90+ and the system C libraries behind `src/ffi/` (`zlib`, `zstd`, `sqlite
 ```sh
 # macOS (Apple Silicon / Intel)
 brew install pkg-config openssl@3 zstd
-cargo install --git https://github.com/robertguss/dana --tag v0.6.7
+cargo install --git https://github.com/robertguss/dana --tag v0.6.8
 
 # Ubuntu / Debian
 sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev libzstd-dev zlib1g-dev
-cargo install --git https://github.com/robertguss/dana --tag v0.6.7
+cargo install --git https://github.com/robertguss/dana --tag v0.6.8
 ```
 
 ## Quickstart CLI

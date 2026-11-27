@@ -7595,15 +7595,16 @@ impl<'a> Checker<'a> {
             if let Some(m) = mult {
                 if let ExecExpr::Lit(Literal::Int(n)) = &rex
                     && let Some(v) = n.to_i64()
+                    && let Some(us) = v.checked_mul(m)
                 {
                     return (
-                        ExecExpr::Lit(Literal::duration(v.saturating_mul(m))),
+                        ExecExpr::Lit(Literal::duration(us)),
                         LTy::new(Ty::Duration, rlty.tags),
                     );
                 }
                 return (
                     ExecExpr::Prim {
-                        op: ExecPrimOp::Core(PrimOp::MulInt),
+                        op: ExecPrimOp::MakeDuration,
                         args: vec![rex, ExecExpr::Lit(Literal::int(m))],
                     },
                     LTy::new(Ty::Duration, rlty.tags),
@@ -14268,6 +14269,24 @@ fn eval_const_duration_micros(expr: &Expr) -> Option<i64> {
 }
 
 fn row_property(re: ExecRowExpr, ty: &Ty, prop: &str) -> Option<(ExecRowExpr, Ty)> {
+    if *ty == Ty::Int {
+        let mult = match prop {
+            "seconds" => Some(MICROS_PER_SECOND),
+            "minutes" => Some(MICROS_PER_MINUTE),
+            "hours" => Some(MICROS_PER_HOUR),
+            "days" => Some(MICROS_PER_DAY),
+            _ => None,
+        };
+        if let Some(m) = mult {
+            return Some((
+                ExecRowExpr::Prim {
+                    op: ExecPrimOp::MakeDuration,
+                    args: vec![re, ExecRowExpr::Lit(Literal::int(m))],
+                },
+                Ty::Duration,
+            ));
+        }
+    }
     if let (Ty::Text, Some((op, out_ty))) = (ty, text_prop_op(prop)) {
         return Some((ExecRowExpr::Prim { op, args: vec![re] }, out_ty));
     }

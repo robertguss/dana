@@ -8048,9 +8048,9 @@ fn split_exec_node(
             plan,
             input,
             ctx,
-            false,
+            order_insensitive,
             SuppressPushCtx::None,
-            false,
+            parent_has_sort,
             "keyed pseudonymize requires local VM",
         ),
     }

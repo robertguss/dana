@@ -2021,6 +2021,13 @@ impl<'a> Evaluator<'a> {
                 },
                 _ => EvalOut::Failed("AddDays requires (Date, Int)".to_string()),
             },
+            ExecPrimOp::MakeDuration => match args {
+                [Val::Int(n), Val::Int(mult)] => match make_duration_checked(n, mult) {
+                    Ok(v) => EvalOut::Ok(v),
+                    Err(bug) => EvalOut::Stopped(bug),
+                },
+                _ => EvalOut::Failed("MakeDuration requires (Int, Int)".to_string()),
+            },
             ExecPrimOp::DaysBetween => match args {
                 [Val::Date(d1), Val::Date(d2)] => match (d1.to_i64(), d2.to_i64()) {
                     (Some(a), Some(b)) => match days_between_days(a, b) {
@@ -6831,6 +6838,18 @@ pub(crate) fn decimal_to_int_checked(d: &BigInt, kind: DecimalIntKind) -> Result
         });
     }
     Ok(n)
+}
+
+pub(crate) fn make_duration_checked(n: &BigInt, mult: &BigInt) -> Result<Val, Bug> {
+    if let (Some(v), Some(m)) = (n.to_i64(), mult.to_i64())
+        && let Some(us) = v.checked_mul(m)
+    {
+        return Ok(Val::Duration(BigInt::from(us)));
+    }
+    Err(Bug {
+        kind: BugKind::IntOverflow,
+        message: "duration arithmetic overflow".to_string(),
+    })
 }
 
 pub(crate) fn round_to_float_val(x: Float64, step: Float64) -> Result<Float64, Bug> {

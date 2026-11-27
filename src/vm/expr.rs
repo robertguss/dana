@@ -21,8 +21,8 @@ use crate::oracle::eval::{PrimResult, eval_literal, eval_prim_op};
 use crate::oracle::value::{Bug, Val, float_order_key, render_decimal};
 use crate::runtime::exec::{
     bigint_to_slice_bound, clamp_decimal_val, clamp_float_val, clamp_int_bigint,
-    decimal_to_int_checked, eval_in_list, float_to_int_checked, round_float_val,
-    round_to_float_even_val, round_to_float_val, slice_text, try_parse_date_text,
+    decimal_to_int_checked, eval_in_list, float_to_int_checked, make_duration_checked,
+    round_float_val, round_to_float_even_val, round_to_float_val, slice_text, try_parse_date_text,
     try_parse_decimal_text, try_parse_float_text, try_parse_int_text,
 };
 use crate::runtime::ir::{ExecExpr, ExecPrimOp, ExecProgram, ExecRowExpr};
@@ -2910,6 +2910,14 @@ pub fn eval_scalar_exec_prim(
             },
             _ => Err(RowEvalErr::Failed(
                 "AddDays requires (Date, Int)".to_string(),
+            )),
+        },
+        ExecPrimOp::MakeDuration => match args {
+            [Val::Int(n), Val::Int(mult)] => {
+                make_duration_checked(n, mult).map_err(|bug| RowEvalErr::Stopped { lane, bug })
+            }
+            _ => Err(RowEvalErr::Failed(
+                "MakeDuration requires (Int, Int)".to_string(),
             )),
         },
         ExecPrimOp::DaysBetween => match args {
