@@ -744,18 +744,27 @@ secondary databases, or env var `DANA_DB_<NAME>`.
   (not a `Result`). Unattached SQLite databases also fall back from `"schema.table"` to literal
   `"schema.table"` then flattened `"schema_table"` in `main`. Eligible `where`, `select`, `drop`,
   `rename`, `derive` (including `bucket`, `coarsen`, `.lower`/`.upper`/`.slice`, `.in?`,
-  `Int`/`Decimal` `.clamp`, exact proleptic Gregorian `.try_parse_date`), `join_*`, `distinct`,
-  `dedupe_by` (`ROW_NUMBER()` on SQLite; `DISTINCT ON` on PostgreSQL when key/order uniquely
-  identifies rows), `group_by`/`summarize` (including `count_if`), `sort_by`, and `limit`
-  prefixes compile automatically into 100% parameterized SQL (`?` on SQLite, `$1..$n` on PostgreSQL)
-  and stream 2,048-row batches into the columnar VM (`shuffle` and `suppress_small_cells` act as
-  local VM boundaries). To get live runtime SQL pushdown inside a helper function, pass
+  `Int`/`Decimal` `.clamp`, exact proleptic Gregorian `.try_parse_date`, plus PostgreSQL
+  `.try_parse_decimal` [`_dana_dec_*` `AS MATERIALIZED` CTE with 25-char Unicode `White_Space` trim
+  and nested `CASE`] and calendar/DST primitives `Date.year`, `add_days`, `days_between`,
+  `at_midnight_in_tz`), `join_*`, `distinct`, `dedupe_by` (`ROW_NUMBER()` on SQLite; `DISTINCT ON`
+  on PostgreSQL when key/order uniquely identifies rows), `group_by`/`summarize` (including
+  `count_if`), `sort_by`, and `limit` prefixes compile automatically into 100% parameterized SQL
+  (`?` on SQLite, `$1..$n` on PostgreSQL) and stream 2,048-row batches into the columnar VM
+  (`shuffle`, `pseudonymize`, and `suppress_small_cells` act as local VM boundaries). On PostgreSQL,
+  Dana also tracks `known_not_null` to eliminate redundant `COALESCE` / simplify non-null join keys
+  from `IS NOT DISTINCT FROM` to `=`, materializes `SELECT` CTEs evaluating `TryParseIsoDate`,
+  `TryParseDecimal`, or `AtTimeZone` (`AS MATERIALIZED`) to prevent inline re-expansion across
+  multi-million-row joins, and decodes PostgreSQL `TEXT[]`/`VARCHAR[]` array columns cleanly into
+  `Text` literals. To get live runtime SQL pushdown inside a helper function, pass
   `db: ReadDB(MyDb)` and start the pipeline with `db.table(Schema) |> ...` (passing `db.table(Schema)`
   into a `Table(Schema)` parameter materializes the scan before the call). Inspect pushdown
   boundaries with `dana explain --dialect sqlite|postgres FILE`.
-- **Offline `schema.lock`:** Run `dana schema-sync --db Seminary=... [--attach [DB:]schema=PATH]... [--schemas s1,s2,...] --out schema.lock` to
+- **Offline `schema.lock` (covariant `ReadDB`, strict `WriteTable`):** Run `dana schema-sync --db Seminary=... [--attach [DB:]schema=PATH]... [--schemas s1,s2,...] --out schema.lock` to
   snapshot table schemas while preserving human-authored `[pii]`/`[ferpa]` annotations. `dana check`
-  verifies every `db.table(Schema)` and `WriteTable.upsert(...)` offline against `schema.lock`.
+  verifies every `db.table(Schema)` and `WriteTable.upsert(...)` offline against `schema.lock`:
+  `ReadDB` checks column nullability covariantly (`T?` schema fields may read `NOT NULL` DB columns
+  cleanly), whereas `WriteTable.upsert` remains strict.
 - **Typed upsert & `dana dry-run`:** `stats = try db_write.upsert(rows, key: .student_id)`
   returns `Result(UpsertStats, Text)` with `stats.inserted`, `stats.updated`, `stats.unchanged`.
   Running under `dana dry-run` executes strictly read-only and prints redacted insert/update
@@ -1086,6 +1095,11 @@ dana --version | -V
 14. **`pseudonymize` and `redact` are `|>` table pipeline verbs (not row functions):** Pipe them
     directly (`tbl |> pseudonymize(.col, key: secret) |> redact(.notes)`) instead of calling them
     inside `derive(...)`. Only `bucket(.col, cuts: [...], labels: [...])` is called inside `derive(...)`.
+15. **Row-level `k`-anonymity from `ReadDB` with `[pii]` join keys:** `suppress_small_cells`
+    rejects tables carrying `[pii]` in columns OR `row_tags` (`where`/`group_by`/`join_*` on a
+    `[pii]` column adds `[pii]` to `row_tags`). Push non-PII `where(...)` filters down to SQL first,
+    then run `|> pseudonymize(.id, key: secret)` *before* filtering/joining/grouping on `.id` (compute
+    sentinel tokens for `none` / `""` via `pseudonymize` so null/blank filtering compares public tokens).
 
 ---
 
