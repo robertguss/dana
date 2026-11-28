@@ -7,7 +7,7 @@ long-running systems and living services, Dana is built for databases, ETL pipel
 operational and financial analytics, practical statistics, and clean reporting—fast by
 default, batteries included, and safe around sensitive data like PII and FERPA records.
 
-> **Status: Dana v0.7 (`v0.7.0`, pre-1.0) — Capability-Gated Local HTTP (`LocalHttpAllow`) & Unix Domain Sockets (`LocalSocketAllow`), `ready:FILE` Dynamic Ephemeral Port Binding, Redacted `dry-run` Network Writes & Exact Numerics / CSV Quarantine / SQL Pushdown (`v1.0` GA held for production soak).**
+> **Status: Dana v0.7 (`v0.7.1`, pre-1.0) — Capability-Gated Local HTTP (`LocalHttpAllow`) & Unix Domain Sockets (`LocalSocketAllow`), Typed `Json.encode` & `struct`/Row/`Map` JSON HTTP Bodies, `ready:FILE` Dynamic Port Binding, Redacted `dry-run` Network & SQLite Previews, 13-Parser Fuzzer (`v1.0` GA held for production soak).**
 > Dana's 0-conflict Bison IELR(1) executable grammar (`make grammar`), Lean 4 formal core with
 > soundness & non-interference proofs (`make formal`), **Zero-Crate Rust** compiler, 2,048-row
 > vectorized columnar VM with pure-UDF bytecode inlining, direct streaming-columnar CSV/TSV &
@@ -18,11 +18,12 @@ default, batteries included, and safe around sensitive data like PII and FERPA r
 > runtime (`dedupe_by`, `coarsen`, `try_parse_date`, `try_parse_decimal`, calendar/DST ops,
 > `known_not_null` join simplification, materialized parse/timezone CTEs, PG array decoding, and
 > covariant `ReadDB` `schema.lock`), native Excel (`.xlsx`), capability-gated HTTPS + local
-> loopback HTTP (`LocalHttpAllow`) & Unix domain sockets (`LocalSocketAllow`), columnar
-> `Stats` & `profile()`, standalone SVG/HTML/Markdown reporting, safe read-only `dana repl`,
-> SHA-256 hash-pinned `vendor/` modules, 12-parser zero-crate fuzzer + adversarial privacy
-> hardening suite, and prospective 4-model / 2-family AI learnability gate (`24/24` strict pass,
-> `0` privacy leaks) are complete and verified. `v1.0` GA is intentionally held for production soak.
+> loopback HTTP (`LocalHttpAllow`) & Unix domain sockets (`LocalSocketAllow`), `Json.encode` &
+> typed JSON HTTP bodies, columnar `Stats` & `profile()`, standalone SVG/HTML/Markdown reporting,
+> safe read-only `dana repl`, SHA-256 hash-pinned `vendor/` modules, 13-parser zero-crate fuzzer
+> + adversarial privacy hardening suite, and prospective 4-model / 2-family AI learnability gate
+> (`24/24` strict pass, `0` privacy leaks) are complete and verified. `v1.0` GA is intentionally held
+> for production soak.
 
 ## Why Dana
 
@@ -125,11 +126,11 @@ Rust 1.90+ and the system C libraries behind `src/ffi/` (`zlib`, `zstd`, `sqlite
 ```sh
 # macOS (Apple Silicon / Intel)
 brew install pkg-config openssl@3 zstd
-cargo install --git https://github.com/robertguss/dana --tag v0.7.0
+cargo install --git https://github.com/robertguss/dana --tag v0.7.1
 
 # Ubuntu / Debian
 sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev libzstd-dev zlib1g-dev
-cargo install --git https://github.com/robertguss/dana --tag v0.7.0
+cargo install --git https://github.com/robertguss/dana --tag v0.7.1
 ```
 
 ## Quickstart CLI

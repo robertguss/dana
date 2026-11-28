@@ -19,7 +19,7 @@ use crate::core::bigint::{BigInt, DEC_MAX, DEC_MIN, DEC_SCALE, INT64_MAX, INT64_
 use crate::core::check::{check_cap_against_policy, is_safe_relative_path, join_confined_path};
 use crate::core::syntax::*;
 use crate::db::schema_lock::{SchemaLockFile, to_snake_case};
-use crate::db::{DbError, DbRegistry, SqlDialect, SqlParam, quote_sql_ident};
+use crate::db::{DbError, DbRegistry, DbUri, SqlDialect, SqlParam, quote_sql_ident};
 use crate::formats::compress::{
     AutoDecodeReader, AutoEncodeWriter, CompressionKind, detect_compression_path,
     open_auto_decoded_file, strip_compression_ext,
@@ -32,8 +32,9 @@ use crate::formats::csv::{
     write_csv_table_with_options, write_csv_vm_table_with_options,
 };
 use crate::formats::json::{
-    format_json_array_table, format_json_array_vm_table, format_jsonl_table, format_jsonl_vm_table,
-    read_jsonl_stream_with_schema, write_jsonl_table, write_jsonl_vm_table,
+    encode_dana_val_to_json, format_json_array_table, format_json_array_vm_table,
+    format_jsonl_table, format_jsonl_vm_table, read_jsonl_stream_with_schema, write_jsonl_table,
+    write_jsonl_vm_table,
 };
 use crate::formats::parquet::{
     ParquetCompression, read_parquet_bytes_to_vm_table, read_parquet_bytes_with_schema,
@@ -2269,6 +2270,17 @@ impl<'a> Evaluator<'a> {
                 )),
                 _ => EvalOut::Failed("format_csv expects (Table, Bool)".to_string()),
             },
+            ExecPrimOp::JsonEncode { row_fields } => match args {
+                [val] => match encode_dana_val_to_json(
+                    val,
+                    row_fields.as_deref(),
+                    &self.prog.struct_layouts,
+                ) {
+                    Ok(s) => EvalOut::Ok(Val::Text(s)),
+                    Err(e) => EvalOut::Failed(format!("Json.encode failed: {e}")),
+                },
+                _ => EvalOut::Failed("Json.encode requires 1 argument".to_string()),
+            },
             ExecPrimOp::RecordField { field_idx, .. } => match args {
                 [Val::Ctor { fields, .. }] => fields.get(*field_idx).cloned().map_or_else(
                     || EvalOut::Failed("record field index out of bounds".to_string()),
@@ -3092,13 +3104,34 @@ impl<'a> Evaluator<'a> {
                         .and_then(|d| d.resolve_table(table_name).ok())
                         .map_or_else(|| table_name.clone(), |t| t.name.clone());
                     let dry_run = self.ew.dry_run;
-                    let conn = match self.ew.db_registry.open(db) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string()))));
+                    let upsert_res = if dry_run
+                        && let Ok(uri) = self.ew.db_registry.resolve_uri(db)
+                        && let Ok(DbUri::Sqlite(ref s)) = DbUri::parse(&uri)
+                        && s.path != ":memory:"
+                        && !Path::new(&s.path).exists()
+                    {
+                        if tv.cols.is_empty() {
+                            Err(DbError::Query(
+                                "cannot upsert table with zero columns".to_string(),
+                            ))
+                        } else if let Some(key_idx) =
+                            tv.cols.iter().position(|c| c.name == *key_col)
+                        {
+                            crate::db::compute_upsert_diff(&effective_table, key_idx, tv, |_| {
+                                Ok(None)
+                            })
+                        } else {
+                            Err(DbError::Query(format!(
+                                "upsert key column `{key_col}` not found in table `{effective_table}`"
+                            )))
+                        }
+                    } else {
+                        match self.ew.db_registry.open(db) {
+                            Ok(c) => c.upsert_table(&effective_table, key_col, tv, dry_run),
+                            Err(e) => Err(e),
                         }
                     };
-                    match conn.upsert_table(&effective_table, key_col, tv, dry_run) {
+                    match upsert_res {
                         Ok(diff) => {
                             if dry_run {
                                 let display_allow = match &self.prog.policy {

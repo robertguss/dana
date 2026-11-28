@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! Phase 5A — Zero-Crate 12-Parser Structure-Aware Mutation Fuzzer.
+//! Phase 5A / v0.7.1 — Zero-Crate 13-Parser Structure-Aware Mutation Fuzzer.
 //!
-//! Exercises all 12 untrusted parser boundaries in Dana inside bounded 2 MiB stack threads
+//! Exercises all 13 untrusted parser boundaries in Dana inside bounded 2 MiB stack threads
 //! using a deterministic seeded Xoshiro256++ PRNG mutator seeded from real in-memory corpus
 //! artifacts:
 //! 1. Dana Source Lexer, Parser & Canonical Formatter (with formatter idempotence check)
@@ -17,9 +17,10 @@
 //! 10. HTTP/1.1 & HTTPS (`ParsedHttpsUrl`, `parse_http_response_from_reader` chunked/gzip/cap)
 //! 11. PostgreSQL Wire Protocol v3.0 (`parse_pg_wire_frame`, `fuzz_decode_pg_payload`)
 //! 12. Safe Interactive REPL Input Splitter & Evaluator (`ReplSession`)
+//! 13. Loopback `LocalHttpAllow` & UDS `LocalSocketAllow` Authority/Path/Ready-File Parsers
 //!
 //! Iteration count is configurable via `DANA_FUZZ_ITERS` (default `2_500` per parser family ->
-//! `30_000+` fuzzed inputs in fast CI; supports `DANA_FUZZ_ITERS=100000` for overnight soak).
+//! `32_500+` fuzzed inputs in fast CI; supports `DANA_FUZZ_ITERS=100000` for overnight soak).
 
 use std::fs;
 use std::io::{Cursor, Read, Write};
@@ -60,7 +61,11 @@ use dana::formats::xlsx::{
     infer_xlsx_schema_from_bytes, read_xlsx_bytes_with_schema, write_xlsx_sheets,
 };
 use dana::formats::zip::{ZipArchive, ZipCompression, ZipLimits, write_zip_bytes};
-use dana::net::{HttpsConfig, JsonResponse, ParsedHttpsUrl, parse_http_response_from_reader};
+use dana::net::{
+    HttpsConfig, JsonResponse, ParsedHttpsUrl, parse_http_response_from_reader,
+    parse_local_http_binding_value, parse_loopback_authority, resolve_local_http_url,
+    resolve_local_socket_path_and_query, validate_local_socket_path,
+};
 use dana::oracle::value::{TableRow, TableVal, Val};
 use dana::repl::{ReplConfig, ReplSession};
 use dana::syntax::{format_module, parse_fragment_bytes, parse_module, parse_module_bytes};
@@ -2303,4 +2308,128 @@ end
     let _ = read_parquet_bytes_with_schema(&bad_pq, &rich_table_schema(), |_, _| true);
 
     Ok(())
+}
+
+// ===========================================================================
+// 13. Loopback LocalHttpAllow & UDS LocalSocketAllow Authority/Path Fuzzer
+// ===========================================================================
+
+#[test]
+fn fuzz_13_local_http_and_socket_parsers() -> TestResult {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::path::Component;
+
+    let iters = fuzz_iters();
+    let seed = fuzz_base_seed().wrapping_add(13);
+    run_bounded_2mib("13_local_http_socket", move || {
+        let tmp = TempDir::new("local_http_ready")?;
+        let ready_file = tmp.path().join("ready.json");
+        let pinned = parse_loopback_authority("127.0.0.1:8091")
+            .map_err(|e| format!("failed baseline pinned authority: {e}"))?;
+
+        let corpus = vec![
+            b"127.0.0.1:8091".to_vec(),
+            b"localhost:8091".to_vec(),
+            b"[::1]:8091".to_vec(),
+            b"http://127.0.0.1:8091/products?limit=10#frag".to_vec(),
+            b"http://localhost:8091/health".to_vec(),
+            b"https://127.0.0.1:8091/health".to_vec(),
+            b"/var/run/mo.sock".to_vec(),
+            b"/admin/verify?mode=fast".to_vec(),
+            b"../escape.sock".to_vec(),
+            br#"{"url":"http://127.0.0.1:8091","port":8091}"#.to_vec(),
+            br#"{"port":8091}"#.to_vec(),
+        ];
+        let dict: &[&[u8]] = &[
+            b"127.0.0.1",
+            b"127.0.0.2:8091",
+            b"localhost:8080",
+            b"[::1]:8091",
+            b"[::ffff:127.0.0.1]:80",
+            b"169.254.169.254:80",
+            b"0.0.0.0:8080",
+            b"http://",
+            b"https://",
+            b"/../",
+            b":0",
+            b"\r\n",
+            b"\0",
+            b"@",
+            b"*",
+        ];
+
+        let mut rng = Xoshiro256Pp::from_seed(seed);
+        let (mut auth_ok, mut url_ok, mut sock_ok) = (0usize, 0usize, 0usize);
+        let ready_binding = format!("ready:{}", ready_file.display());
+
+        let is_loopback_host = |h: &str| -> bool {
+            h.eq_ignore_ascii_case("localhost")
+                || h.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+                || h.parse::<Ipv6Addr>().is_ok_and(|ip| ip.is_loopback())
+        };
+
+        for i in 0..iters {
+            let input = mutate_bytes(&mut rng, &corpus, dict, i);
+            let s = String::from_utf8_lossy(&input);
+
+            if let Ok(a) = parse_loopback_authority(&s) {
+                auth_ok += 1;
+                if a.port == 0 || !is_loopback_host(&a.host) {
+                    return Err(format!(
+                        "non-loopback or zero-port authority accepted: {a:?}"
+                    ));
+                }
+            }
+
+            if let Ok(a) = parse_local_http_binding_value(&s)
+                && (a.port == 0 || !is_loopback_host(&a.host))
+            {
+                return Err(format!("invalid local_http binding accepted: {a:?}"));
+            }
+
+            fs::write(&ready_file, &input).map_err(|e| format!("write ready_file: {e}"))?;
+            if let Ok(a) = parse_local_http_binding_value(&ready_binding)
+                && (a.port == 0 || !is_loopback_host(&a.host))
+            {
+                return Err(format!("invalid ready_file authority accepted: {a:?}"));
+            }
+
+            if let Ok(r) = resolve_local_http_url(&s, &pinned) {
+                url_ok += 1;
+                if s.to_ascii_lowercase().starts_with("https://")
+                    || r.authority != pinned
+                    || !r.path_and_query.starts_with('/')
+                    || r.path_and_query.contains('#')
+                {
+                    return Err(format!("unsafe resolved local http url from `{s}`: {r:?}"));
+                }
+            }
+
+            if let Ok(p) = validate_local_socket_path(&s) {
+                sock_ok += 1;
+                if p.is_empty()
+                    || p.contains("://")
+                    || p.bytes().any(|b| b < 0x20 || b == 0x7F)
+                    || Path::new(&p)
+                        .components()
+                        .any(|c| matches!(c, Component::ParentDir))
+                {
+                    return Err(format!("unsafe local socket path accepted: `{p}`"));
+                }
+            }
+
+            if let Ok(pq) = resolve_local_socket_path_and_query(&s)
+                && (!pq.starts_with('/')
+                    || pq.contains("://")
+                    || pq.contains('#')
+                    || pq.bytes().any(|b| b <= 0x20 || b == 0x7F))
+            {
+                return Err(format!("unsafe local socket request path accepted: `{pq}`"));
+            }
+        }
+
+        Ok(format!(
+            "iters={iters}, auth_ok={auth_ok}, url_ok={url_ok}, sock_ok={sock_ok}"
+        ))
+    })
 }

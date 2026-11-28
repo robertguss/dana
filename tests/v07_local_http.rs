@@ -881,3 +881,330 @@ end
 
     Ok(())
 }
+
+// ===========================================================================
+// 6. v0.7.1: `Json.encode`, Typed `struct`/Row/`Map` HTTP Bodies & Dry-Run Polish
+// ===========================================================================
+
+#[test]
+fn v071_json_encode_and_typed_struct_row_map_http_bodies_vm_oracle_parity() -> TestResult {
+    // 1. Static privacy propagation & invalid type rejections on `Json.encode` and HTTP bodies
+    let bad_pii_encode = r#"
+module BadJsonEncodePii
+struct SecretUser
+  email: Text [pii]
+  count: Int
+end
+fn main(u: SecretUser, console: Console) : Int
+  s = Json.encode(u)
+  console.print(s)
+  0
+end
+"#;
+    let d1 = check_src_with_policy(bad_pii_encode, None)
+        .err()
+        .ok_or("expected PrivacyError when printing Json.encode of [pii] struct")?;
+    assert!(d1.iter().any(|d| d.code() == DiagCode::PrivacyError));
+
+    let bad_pii_post = r#"
+module BadPostStructPii
+struct SecretUser
+  email: Text [pii]
+end
+fn main(api: LocalHttpAllow("127.0.0.1:8091"), u: SecretUser) : Int
+  _ = api.post_json("/users", body: u)
+  0
+end
+"#;
+    let d2 = check_src_with_policy(bad_pii_post, None)
+        .err()
+        .ok_or("expected PrivacyError for [pii] struct body on LocalHttpAllow")?;
+    assert!(d2.iter().any(|d| d.code() == DiagCode::PrivacyError));
+
+    let bad_row_post = r#"
+module BadPostRowPii
+schema Row
+  email: Text [pii]
+end
+fn main(api: LocalHttpAllow("127.0.0.1:8091"), rows: Table(Row)) : Int
+  for r in rows
+    _ = api.post_json("/users", body: r)
+  end
+  0
+end
+"#;
+    let d3 = check_src_with_policy(bad_row_post, None)
+        .err()
+        .ok_or("expected PrivacyError for [pii] table row body on LocalHttpAllow")?;
+    assert!(d3.iter().any(|d| d.code() == DiagCode::PrivacyError));
+
+    for (label, bad_ty_src) in [
+        (
+            "secret",
+            "module BadSec\nfn main(tok: Secret(\"t\"), c: Console) : Int\n  c.print(Json.encode(tok))\n  0\nend\n",
+        ),
+        (
+            "enum",
+            "module BadEnum\nenum K\n  A\nend\nfn main(c: Console) : Int\n  c.print(Json.encode(A))\n  0\nend\n",
+        ),
+        (
+            "int_map",
+            "module BadIntMap\nfn main(c: Console) : Int\n  c.print(Json.encode({1: \"a\"}))\n  0\nend\n",
+        ),
+    ] {
+        let dt = check_src_with_policy(bad_ty_src, None)
+            .err()
+            .ok_or_else(|| format!("expected TypeError for {label}"))?;
+        assert!(
+            dt.iter().any(|d| d.code() == DiagCode::TypeError),
+            "expected TypeError for {label}, got {dt:?}"
+        );
+    }
+
+    // 2. Offline `.fake` specs + `Json.encode` covering Decimal, Float (.0), Date, Timestamp,
+    //    Option, List, Map, nested struct, table row, and special JSON escapes (" \ \n Unicode)
+    let spec_src = r#"
+module JsonEncodeAndFakeSpecs
+
+struct MetaTag
+  source: Text
+  priority: Int
+end
+
+struct ProductPayload
+  sku: Text
+  title: Text
+  price: Decimal
+  weight: Float
+  day: Date
+  ts: Timestamp
+  note: Text?
+  meta: MetaTag
+  tags: List(Text)
+end
+
+schema CatRow
+  sku: Text
+  title: Text
+  price: Decimal
+  stock: Int
+end
+
+fn run_push(
+  api: LocalHttpAllow(MoShop),
+  sock: LocalSocketAllow(MoAdmin),
+  https: HttpsAllow("api.example.com"),
+  console: Console
+) : Result(Int, Text)
+  p = ProductPayload(
+    sku: "q1",
+    title: "10km \"Volcano\" \\ Peak\nLine2 café",
+    price: 24.50,
+    weight: 4.0,
+    day: 2026-11-28,
+    ts: 2026-11-28T02:00:00Z,
+    note: none,
+    meta: MetaTag(source: "usgs", priority: 1),
+    tags: ["geo", "beans"]
+  )
+  encoded = Json.encode(p)
+  console.print("ENC=#{encoded}")
+
+  _ = try api.post_json("/products", body: p)
+  rows = table
+    | sku    | title          | price | stock |
+    | "row1" | "Row \"Title\"" | 18.75 | 7     |
+  end
+  for item in rows
+    _ = try api.put_json("/products/row1", body: item)
+    _ = try https.post_json("https://api.example.com/ingest", body: item)
+  end
+  _ = try sock.post_json("/admin/meta", body: {"mode": "strict", "owner": "dana"})
+  Ok(0)
+end
+
+test "Json.encode and typed bodies match across LocalHttp, LocalSocket, and Https fakes"
+  api = LocalHttp.fake(MoShop, responses: {
+    "POST /products": "{\"ok\":true}",
+    "PUT /products/row1": "{\"ok\":true}"
+  })
+  sock = LocalSocket.fake(MoAdmin, responses: {"POST /admin/meta": "{\"ok\":true}"})
+  https = Https.fake("api.example.com", responses: {"POST https://api.example.com/ingest": "{\"ok\":true}"})
+  console = Console.fake()
+  rc = try run_push(api, sock, https, console)
+  assert rc == 0
+
+  enc = console.printed_lines.first!
+  assert enc.contains?("\"price\":\"24.5\"")
+  assert enc.contains?("\"weight\":4.0")
+  assert enc.contains?("\"day\":\"2026-11-28\"")
+  assert enc.contains?("\"ts\":\"2026-11-28T02:00:00Z\"")
+  assert enc.contains?("\"note\":null")
+  assert enc.contains?("\"meta\":{\"source\":\"usgs\",\"priority\":1}")
+  assert enc.contains?("\"tags\":[\"geo\",\"beans\"]")
+  assert enc.contains?("10km \\\"Volcano\\\" \\\\ Peak\\nLine2 café")
+
+  assert api.request_bodies.size == 2
+  b0 = api.request_bodies.first!
+  assert b0.contains?("\"sku\":\"q1\"") and b0.contains?("\"price\":\"24.5\"")
+  assert https.request_bodies.first!.contains?("\"price\":\"18.75\"")
+  assert https.request_bodies.first!.contains?("\\\"Title\\\"")
+  assert sock.request_bodies.first! == "{\"mode\":\"strict\",\"owner\":\"dana\"}"
+end
+"#;
+    let checked_spec = check_src_with_policy(spec_src, None).map_err(|ds| format!("{ds:?}"))?;
+    let ora_tests = run_program_tests(&checked_spec.exec, None, &RunConfig::default());
+    let vm_tests = run_program_tests_vm(
+        &checked_spec.exec,
+        None,
+        &RunConfig::default(),
+        &VmConfig::default(),
+    );
+    assert_eq!(ora_tests.len(), 1);
+    assert_eq!(vm_tests.len(), 1);
+    assert!(ora_tests[0].passed, "{ora_tests:?}");
+    assert!(vm_tests[0].passed, "{vm_tests:?}");
+
+    // 3. Live loopback TCP E2E sending `struct` and table-row bodies directly (VM == Oracle)
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let cap_srv = Arc::clone(&captured);
+    let srv = thread::spawn(move || {
+        for _ in 0..4 {
+            let Ok((tcp, _)) = listener.accept() else {
+                break;
+            };
+            if let Some(req) = read_http_req_from_stream(
+                tcp,
+                "200 OK",
+                "Content-Type: application/json\r\n",
+                br#"{"ok":true}"#,
+            ) && let Ok(mut g) = cap_srv.lock()
+            {
+                g.push(req);
+            }
+        }
+    });
+
+    let live_src = format!(
+        r#"
+module LiveTypedBodies
+struct ItemIn
+  sku: Text
+  title: Text
+  price: Decimal
+  stock: Int
+end
+schema BatchRow
+  sku: Text
+  qty: Int
+end
+fn main(api: LocalHttpAllow("127.0.0.1:{port}"), console: Console) : Int
+  item = ItemIn(sku: "k-1", title: "Live \"Quoted\"", price: 19.50, stock: 12)
+  r1 = try api.post_json("/products", body: item)
+  rows = table
+    | sku  | qty |
+    | "b1" | 9   |
+  end
+  for r in rows
+    _ = try api.put_json("/batch", body: r)
+  end
+  ok_flag = r1.bool_at("ok")
+  console.print("LIVE_OK=#{{ok_flag}}")
+  0
+end
+"#
+    );
+    let out = assert_oracle_vm_parity_with_cfg(
+        &live_src,
+        &RunConfig {
+            live_io: true,
+            ..RunConfig::default()
+        },
+    )?;
+    let _ = srv.join();
+    assert_eq!(out, vec!["LIVE_OK=true"]);
+    let log = captured.lock().map_err(|e| format!("{e}"))?;
+    assert_eq!(log.len(), 4);
+    assert_eq!(
+        log[0].body,
+        r#"{"sku":"k-1","title":"Live \"Quoted\"","price":"19.5","stock":12}"#
+    );
+    assert_eq!(log[1].body, r#"{"sku":"b1","qty":9}"#);
+    Ok(())
+}
+
+#[test]
+fn v071_dry_run_readable_float_date_and_missing_sqlite_zero_mutation() -> TestResult {
+    let tmp = TempDir::new("dry_run_sqlite")?;
+    let script_path = tmp.path().join("dry_check.dana");
+    let missing_db = tmp.path().join("nonexistent_dir").join("brand_new.sqlite");
+    let empty_db = tmp.path().join("empty_existing.sqlite");
+    fs::write(&empty_db, b"")?;
+
+    let src = r#"
+module DryRunReadableAndMissingSqlite
+
+schema Reading
+  id: Text
+  mag: Float
+  seen_on: Date
+  logged_at: Timestamp
+end
+
+fn main(w: WriteTable(Warehouse, "readings"), console: Console) : Int
+  rows = table
+    | id   | mag | seen_on    | logged_at            |
+    | "q1" | 4.8 | 2026-11-28 | 2026-11-28T02:00:00Z |
+  end
+  st = try w.upsert(rows, key: .id)
+  console.print("INS=#{st.inserted}")
+  0
+end
+"#;
+    fs::write(&script_path, src)?;
+
+    for (label, db_path, must_not_exist) in [
+        ("missing_dir_and_file", &missing_db, true),
+        ("empty_file_no_table", &empty_db, false),
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_dana"))
+            .args([
+                "dry-run",
+                "--db",
+                &format!("Warehouse=sqlite://{}", db_path.display()),
+            ])
+            .arg(&script_path)
+            .output()?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{label} dry-run failed:\nstdout={stdout}\nstderr={stderr}"
+        );
+        assert!(stdout.contains("mag: 4.8"), "{label} stdout:\n{stdout}");
+        assert!(
+            stdout.contains("seen_on: 2026-11-28"),
+            "{label} stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("logged_at: 2026-11-28T02:00:00Z"),
+            "{label} stdout:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("float64(") && !stdout.contains("date("),
+            "{label} still printed raw internal repr:\n{stdout}"
+        );
+        assert!(stdout.contains("INS=1"), "{label} stdout:\n{stdout}");
+        if must_not_exist {
+            assert!(
+                !missing_db.exists() && !missing_db.parent().is_some_and(Path::exists),
+                "dry-run must NOT create missing SQLite DB or directory!"
+            );
+        }
+    }
+
+    Ok(())
+}

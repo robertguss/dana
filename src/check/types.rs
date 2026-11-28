@@ -894,6 +894,131 @@ impl<'a> Checker<'a> {
         (resp_ex, allows)
     }
 
+    fn collect_json_encodable_tags(
+        &mut self,
+        lty: &LTy,
+        span: Span,
+        context: &str,
+        depth: usize,
+    ) -> Result<(TagSet, Option<Vec<Ident>>), ()> {
+        const MAX_JSON_TYPE_DEPTH: usize = 64;
+        if depth > MAX_JSON_TYPE_DEPTH {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!(
+                        "{context} exceeded maximum JSON type nesting depth ({MAX_JSON_TYPE_DEPTH})"
+                    ),
+                )
+                .with_span(span),
+            );
+            return Err(());
+        }
+        let own = lty.effective_tags();
+        match &lty.ty {
+            Ty::Unit
+            | Ty::Bool
+            | Ty::Int
+            | Ty::Decimal
+            | Ty::Float
+            | Ty::Text
+            | Ty::Bytes
+            | Ty::Date
+            | Ty::Timestamp
+            | Ty::Duration => Ok((own, None)),
+            Ty::Option(inner) => {
+                let sub = LTy::new(inner.as_ref().clone(), lty.tags.clone());
+                let (sub_tags, _) =
+                    self.collect_json_encodable_tags(&sub, span, context, depth + 1)?;
+                Ok((own.union(&sub_tags), None))
+            }
+            Ty::List(elem) => {
+                let (sub_tags, _) =
+                    self.collect_json_encodable_tags(elem, span, context, depth + 1)?;
+                Ok((own.union(&sub_tags), None))
+            }
+            Ty::Map { key, val } => {
+                if key.ty != Ty::Text {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!(
+                                "{context} requires `Map(Text, ...)` keys, found `{:?}`",
+                                key.ty
+                            ),
+                        )
+                        .with_span(span),
+                    );
+                    return Err(());
+                }
+                let (val_tags, _) =
+                    self.collect_json_encodable_tags(val, span, context, depth + 1)?;
+                Ok((own.union(&key.effective_tags()).union(&val_tags), None))
+            }
+            Ty::Table(tt) => {
+                let mut combined = own.union(&tt.row_tags).union(&tt.order_tags);
+                for c in &tt.cols {
+                    combined = combined.union(&c.tags);
+                }
+                Ok((combined, None))
+            }
+            Ty::Data(name) if name == TY_UNRESOLVED_LIST_ELEM => Ok((own, None)),
+            Ty::Data(name) => {
+                if let Some(tt) = self.table_row_schemas.get(name).cloned() {
+                    if depth == 0 {
+                        let mut combined = own.union(&tt.row_tags).union(&tt.order_tags);
+                        for c in &tt.cols {
+                            combined = combined.union(&c.tags);
+                        }
+                        let cols = tt.cols.iter().map(|c| c.name.clone()).collect();
+                        return Ok((combined, Some(cols)));
+                    }
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!(
+                                "{context} cannot JSON-encode a nested table row `{name}`; pass the row directly or pack rows into a `Table` or `struct`"
+                            ),
+                        )
+                        .with_span(span),
+                    );
+                    return Err(());
+                }
+                if let Some(layout) = self.structs.get(name).cloned() {
+                    let mut combined = own;
+                    for flty in &layout.field_ltys {
+                        let (ftags, _) =
+                            self.collect_json_encodable_tags(flty, span, context, depth + 1)?;
+                        combined = combined.union(&ftags);
+                    }
+                    return Ok((combined, None));
+                }
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!(
+                            "{context} cannot JSON-encode type `{name}` (supported: scalars, `Option`, `List`, `Map(Text, V)`, `Table`, `struct`, and table rows)"
+                        ),
+                    )
+                    .with_span(span),
+                );
+                Err(())
+            }
+            other => {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!(
+                            "{context} cannot JSON-encode value of type `{other:?}` (supported: scalars, `Option`, `List`, `Map(Text, V)`, `Table`, `struct`, and table rows)"
+                        ),
+                    )
+                    .with_span(span),
+                );
+                Err(())
+            }
+        }
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "shared privacy/type check across HttpsAllow, LocalHttpAllow, and LocalSocketAllow"
@@ -962,7 +1087,7 @@ impl<'a> Checker<'a> {
                     Diagnostic::error(
                         DiagCode::TypeError,
                         format!(
-                            "`{cap_label}.{method}` requires a `body` (`Text` or `Table`) argument"
+                            "`{cap_label}.{method}` requires a `body` (`Text`, `Table`, `struct`, `Map`, or scalar) argument"
                         ),
                     )
                     .with_span(span),
@@ -970,27 +1095,28 @@ impl<'a> Checker<'a> {
                 return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
             };
             let (bex, blty) = self.check_expr(be, env, None, pc, scope, ret_ctx);
-            let body_tags = match &blty.ty {
-                Ty::Text => blty.effective_tags().union(pc),
+            let (body_tags, encoded_body) = match &blty.ty {
+                Ty::Text => (blty.effective_tags().union(pc), bex),
                 Ty::Table(tt) => {
                     let mut combined = blty.effective_tags().union(pc);
                     combined = combined.union(&tt.row_tags).union(&tt.order_tags);
                     for c in &tt.cols {
                         combined = combined.union(&c.tags);
                     }
-                    combined
+                    (combined, bex)
                 }
-                other => {
-                    self.diags.push(
-                        Diagnostic::error(
-                            DiagCode::TypeError,
-                            format!(
-                                "`{cap_label}.{method}` body must be `Text` or `Table(...)`, found `{other:?}`"
-                            ),
-                        )
-                        .with_span(be.span),
-                    );
-                    TagSet::empty()
+                _ => {
+                    let ctx_msg = format!("`{cap_label}.{method}` body");
+                    match self.collect_json_encodable_tags(&blty, be.span, &ctx_msg, 0) {
+                        Ok((tags, row_fields)) => (
+                            tags.union(pc),
+                            ExecExpr::Prim {
+                                op: ExecPrimOp::JsonEncode { row_fields },
+                                args: vec![bex],
+                            },
+                        ),
+                        Err(()) => (TagSet::empty(), ExecExpr::Lit(Literal::Text(String::new()))),
+                    }
                 }
             };
             if !body_tags.is_subset(allows) {
@@ -1006,7 +1132,7 @@ impl<'a> Checker<'a> {
                     .with_span(be.span),
                 );
             }
-            Some(bex)
+            Some(encoded_body)
         };
 
         let hdr_ex = if let Some(he) = named_expr_arg(args, "headers") {
@@ -8642,6 +8768,47 @@ impl<'a> Checker<'a> {
         ret_ctx: Option<(&str, Option<&Ty>)>,
     ) -> (ExecExpr, LTy) {
         match (ns, method) {
+            ("Json", "encode") => {
+                if args.len() != 1 {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`Json.encode` requires exactly 1 positional argument",
+                        )
+                        .with_span(span),
+                    );
+                    return (
+                        ExecExpr::Lit(Literal::Text(String::new())),
+                        LTy::public(Ty::Text),
+                    );
+                }
+                let Some(CallArg::Positional(arg_e)) = args.first() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`Json.encode` requires a positional argument",
+                        )
+                        .with_span(span),
+                    );
+                    return (
+                        ExecExpr::Lit(Literal::Text(String::new())),
+                        LTy::public(Ty::Text),
+                    );
+                };
+                let (vex, vlty) = self.check_expr(arg_e, env, None, pc, scope, ret_ctx);
+                let (tags, row_fields) =
+                    match self.collect_json_encodable_tags(&vlty, arg_e.span, "`Json.encode`", 0) {
+                        Ok(res) => res,
+                        Err(()) => (TagSet::empty(), None),
+                    };
+                (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::JsonEncode { row_fields },
+                        args: vec![vex],
+                    },
+                    LTy::new(Ty::Text, tags.union(pc)),
+                )
+            }
             ("Report", "new") => {
                 let (tex, tlty) = match args.first() {
                     Some(CallArg::Positional(e)) => {

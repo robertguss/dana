@@ -85,7 +85,7 @@ use Helpers
 use Helpers { helper_a, HelperType }
 ```
 
-- Built-in stdlib namespaces (`Stats`, `Report`, `Table`, `Args`, `Files`, `DB`, `Console`,
+- Built-in stdlib namespaces (`Stats`, `Report`, `Table`, `Json`, `Args`, `Files`, `DB`, `Console`,
   `Https`, `LocalHttp`, `LocalSocket`, `Secret`) require no disk files; declare `use Stats` when calling `Stats.*`.
 - Source files are UTF-8. Invisible formatting/bidi/zero-width control characters are a lexing
   error anywhere in source, including comments and strings; write `"\u{200B}"` instead.
@@ -146,7 +146,7 @@ immediately before a closing delimiter, `.`, `|>`, or any binary operator other 
 | `Int` | `0`, `42`, `1_000_000`, `-7` | Checked 64-bit signed integer; overflow stops |
 | `Decimal` | `12.50`, `0.00`, `100.0` | Exact fixed-point (`10⁻¹⁸` scale, `±(2¹²⁷ − 1)`) |
 | `Float` | `1.5e-4`, `1e-9`, `0.95` (in `Float` context) | IEEE-754 binary64 for statistical/scientific math |
-| `Text` | `"hello"`, `"""..."""`, `"x=#{v}"` | UTF-8 string; triple-quoted blocks auto-dedent |
+| `Text` | `"hello"`, `"""..."""`, `"x=#{v}"` | UTF-8 string; triple-quoted blocks auto-dedent and process standard backslash escapes (`\"`, `\\`, `\n`) |
 | `Bytes` | Binary payloads (Parquet / SQLite `BLOB`) | Raw byte sequence |
 | `Date` | `2026-10-01` | Proleptic Gregorian calendar date (`YYYY-MM-DD`) |
 | `Timestamp` | `2026-10-01T14:30:00Z` | UTC instant (microsecond precision) |
@@ -840,11 +840,14 @@ end
 - `resp.bool_at("field") : Bool`, `resp.text_at("field") : Text`, `resp.int_at("field") : Int`.
 - `api.post_json(url, body, [headers: {...}])` and `api.put_json(url, body, [headers: {...}])`
   return `Result(JsonResponse, Text)`. `body` may be `Text` (sent verbatim with
-  `Content-Type: application/json`) or a `Table(...)` (serialized as a compact JSON array of row
-  objects). Empty `2xx` / `204 No Content` responses succeed with a null JSON body. Sensitive bodies
-  or headers require **both** compile-time `allows: [...]` and runtime `--allow-export`. Running
-  under `dana dry-run` intercepts writes cleanly and prints `[DRY-RUN] would POST/PUT ...` with
-  headers/sensitive payloads redacted.
+  `Content-Type: application/json`), `Table(...)` (serialized as a compact JSON array `[...]`), or
+  any typed JSON-encodable value (`struct`, table row from `for row in tbl`, `Map(Text, ...)`,
+  `List`, `Option`, or scalar — encoded automatically via `Json.encode(...)` with `Decimal`
+  represented as an exact JSON string). Empty `2xx` / `204 No Content` responses succeed with a null
+  JSON body. Use `Json.encode(value) : Text` directly whenever explicit JSON serialization (with
+  privacy-tag propagation) is needed. Sensitive bodies or headers require **both** compile-time
+  `allows: [...]` and runtime `--allow-export`. Running under `dana dry-run` intercepts writes
+  cleanly and prints `[DRY-RUN] would POST/PUT ...` with headers/sensitive payloads redacted.
 
 <!-- dana-example: file -->
 ```dana
@@ -918,6 +921,14 @@ co-resident services (for example `mo serve` or local Unix admin sockets) **with
 ```dana
 module LocalHttpAndSocketDemo
 
+struct ProductIn
+  sku: Text
+  title: Text
+  category: Text
+  price: Decimal
+  stock: Int
+end
+
 schema ProductOut
   sku: Text
   stock: Int
@@ -930,8 +941,9 @@ fn sync_local_mo(
 ) : Result(Int, Text)
   _ = try mo.get_json("/health")
   auth = {"Authorization": "Bearer #{token}"}
-  _ = try mo.post_json("/products", body: "{\"sku\":\"blend-1\",\"stock\":12}", headers: auth)
-  _ = try admin.post_json("/admin/verify", body: "{\"check\":true}")
+  item = ProductIn(sku: "blend-1", title: "House \"Roast\"", category: "beans", price: 16.50, stock: 12)
+  _ = try mo.post_json("/products", body: item, headers: auth)
+  _ = try admin.post_json("/admin/verify", body: {"check": true})
   resp = try mo.get_json("/products", headers: auth)
   (rows, _bad) = resp.parse_table("", as: ProductOut)
   Ok(rows.count())
@@ -949,6 +961,7 @@ test "LocalHttp.fake and LocalSocket.fake run offline cleanly"
   admin = LocalSocket.fake(MoAdmin, responses: {"POST /admin/verify": "{\"ok\":true}"})
   assert (try sync_local_mo(mo, admin, Secret.fake("dev"))) == 1
   assert mo.requests.size == 3
+  assert mo.request_bodies.first!.contains?("\"price\":\"16.5\"")
   assert admin.requests.size == 1
 end
 ```

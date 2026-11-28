@@ -1,8 +1,8 @@
 //! Multi-module loader and name resolver for Dana.
 //!
 //! Resolves:
-//! - Built-in standard library namespaces (`Stats`, `Report`, `Table`, `Args`, `Files`,
-//!   `DB`, `Console`, `Https`, `Secret`, `Math`, `Text`, `Date`, `Timestamp`).
+//! - Built-in standard library namespaces (`Stats`, `Report`, `Table`, `Json`, `Args`, `Files`,
+//!   `DB`, `Console`, `Https`, `LocalHttp`, `LocalSocket`, `Secret`, `Math`, `Text`, `Date`, `Timestamp`).
 //! - Local project modules: `Seminary.Enrollment` -> `seminary/enrollment.dana` (CapCase
 //!   segments map to lowercase hyphenated directories/files per Reference §2.1).
 //! - Hash-pinned `vendor/` modules (enforced **pure by default**: cannot mint ambient I/O).
@@ -21,6 +21,7 @@ pub const STDLIB_MODULES: &[&str] = &[
     "Stats",
     "Report",
     "Table",
+    "Json",
     "Args",
     "Files",
     "DB",

@@ -1,18 +1,20 @@
 //! Strict RFC 8259 iterative (O(1)-stack) JSON parser & serializer and streaming JSONL
 //! schema-validated quarantine reader/writer.
 
+use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 
 use crate::core::bigint::BigInt;
 use crate::core::check::quarantine_bad_row_table_ty;
-use crate::core::syntax::{ColSpec, Float64, ScalarTy, TableTy};
+use crate::core::syntax::{ColSpec, Float64, Ident, ScalarTy, TableTy};
 use crate::formats::crypto::to_hex_lower;
 use crate::formats::time::{
     format_iso_date, format_iso_timestamp, parse_decimal_bigint_strict, parse_iso_date,
     parse_iso_timestamp,
 };
 use crate::oracle::value::{TableRow, TableVal, Val, render_public_val};
+use crate::runtime::ir::StructLayout;
 
 /// Maximum JSON container nesting depth (prevents pathological inputs without overflowing stack).
 pub const MAX_JSON_DEPTH: usize = 256;
@@ -1056,4 +1058,128 @@ pub fn format_jsonl_vm_table(vm: &crate::vm::ops::VmTable) -> String {
     let mut buf = Vec::new();
     let _ = write_jsonl_vm_table(&mut buf, vm);
     String::from_utf8(buf).unwrap_or_default()
+}
+
+/// Serialize any JSON-compatible Dana [`Val`] (`struct`, table row, `Map`, `List`, `Table`,
+/// `Option`, or scalar) into compact RFC 8259 JSON text.
+///
+/// # Errors
+/// Returns an error if `v` exceeds nesting limits or contains a non-JSON-encodable runtime value.
+pub fn encode_dana_val_to_json(
+    v: &Val,
+    top_row_fields: Option<&[Ident]>,
+    struct_layouts: &HashMap<Ident, StructLayout>,
+) -> Result<String, String> {
+    let mut out = String::new();
+    push_dana_val_to_json_rec(&mut out, v, top_row_fields, struct_layouts, 0)?;
+    Ok(out)
+}
+
+fn push_dana_val_to_json_rec(
+    out: &mut String,
+    v: &Val,
+    row_fields: Option<&[Ident]>,
+    struct_layouts: &HashMap<Ident, StructLayout>,
+    depth: usize,
+) -> Result<(), String> {
+    const MAX_ENCODE_DEPTH: usize = 64;
+    if depth > MAX_ENCODE_DEPTH {
+        return Err(format!(
+            "JSON encoding exceeded maximum nesting depth ({MAX_ENCODE_DEPTH})"
+        ));
+    }
+    match v {
+        Val::Unit | Val::OptNone => {
+            out.push_str("null");
+            Ok(())
+        }
+        Val::OptSome(inner) => {
+            push_dana_val_to_json_rec(out, inner, None, struct_layouts, depth + 1)
+        }
+        Val::Bool(_)
+        | Val::Int(_)
+        | Val::Decimal(_)
+        | Val::Float(_)
+        | Val::Text(_)
+        | Val::Bytes(_)
+        | Val::Date(_)
+        | Val::Timestamp(_)
+        | Val::Duration(_) => {
+            push_dana_val_as_json(out, v);
+            Ok(())
+        }
+        Val::List(items) => {
+            out.push('[');
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                push_dana_val_to_json_rec(out, item, None, struct_layouts, depth + 1)?;
+            }
+            out.push(']');
+            Ok(())
+        }
+        Val::Map(pairs) => {
+            out.push('{');
+            for (idx, (k, val)) in pairs.iter().enumerate() {
+                let Val::Text(key_str) = k else {
+                    return Err("JSON object encoding requires `Text` keys in `Map`".to_string());
+                };
+                if idx > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, key_str);
+                out.push(':');
+                push_dana_val_to_json_rec(out, val, None, struct_layouts, depth + 1)?;
+            }
+            out.push('}');
+            Ok(())
+        }
+        Val::Table(tv) => {
+            out.push_str(&format_json_array_table(tv));
+            Ok(())
+        }
+        Val::Columnar(vm) => {
+            out.push_str(&format_json_array_vm_table(vm));
+            Ok(())
+        }
+        Val::Ctor {
+            type_name, fields, ..
+        } => {
+            if type_name == "__TableRow"
+                && let Some(cols) = row_fields
+                && cols.len() == fields.len()
+            {
+                out.push('{');
+                for (idx, (col, cell)) in cols.iter().zip(fields.iter()).enumerate() {
+                    if idx > 0 {
+                        out.push(',');
+                    }
+                    push_json_string(out, col);
+                    out.push(':');
+                    push_dana_val_to_json_rec(out, cell, None, struct_layouts, depth + 1)?;
+                }
+                out.push('}');
+                return Ok(());
+            }
+            if let Some(layout) = struct_layouts.get(type_name)
+                && layout.field_names.len() == fields.len()
+            {
+                out.push('{');
+                for (idx, (fname, fval)) in layout.field_names.iter().zip(fields.iter()).enumerate()
+                {
+                    if idx > 0 {
+                        out.push(',');
+                    }
+                    push_json_string(out, fname);
+                    out.push(':');
+                    push_dana_val_to_json_rec(out, fval, None, struct_layouts, depth + 1)?;
+                }
+                out.push('}');
+                return Ok(());
+            }
+            Err(format!("cannot JSON-encode value of type `{type_name}`"))
+        }
+        _ => Err("cannot JSON-encode non-data Dana value".to_string()),
+    }
 }

@@ -996,6 +996,7 @@ impl ReplSession {
             "List",
             "Map",
             "Table",
+            "Json",
             "DynamicTable",
             "Chart",
             "Report",

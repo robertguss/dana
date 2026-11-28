@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::core::bigint::BigInt;
 use crate::core::syntax::{BugKind, ColSpec, Expr, Float64, Ident, PrimOp, Program, RowExpr};
+use crate::formats::json::encode_dana_val_to_json;
 use crate::formats::time::{
     DecimalIntKind, add_days_checked, date_trunc_date, date_trunc_timestamp_duration,
     date_trunc_timestamp_unit, date_year, days_between_days, format_timestamp_in_tz,
@@ -3211,6 +3212,14 @@ pub fn eval_scalar_exec_prim(
                 .map_err(|bug| RowEvalErr::Stopped { lane, bug }),
             _ => Err(RowEvalErr::Failed(
                 "RoundToFloatEven requires (Float, Float)".to_string(),
+            )),
+        },
+        ExecPrimOp::JsonEncode { row_fields } => match args {
+            [val] => encode_dana_val_to_json(val, row_fields.as_deref(), &HashMap::new())
+                .map(Val::Text)
+                .map_err(|e| RowEvalErr::Failed(format!("Json.encode failed: {e}"))),
+            _ => Err(RowEvalErr::Failed(
+                "Json.encode requires 1 argument".to_string(),
             )),
         },
         _ => Err(RowEvalErr::Failed(format!(

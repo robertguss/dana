@@ -161,6 +161,10 @@ pub enum ExecPrimOp {
     TableEq,
     /// Format a `Table` as RFC 4180 CSV text (`format_csv(tbl, sanitize_formulas: Bool)` -> `Text`).
     FormatCsv,
+    /// Encode a JSON-compatible value (`struct`, table row, `Map`, `List`, `Table`, scalar) to JSON text.
+    JsonEncode {
+        row_fields: Option<Vec<Ident>>,
+    },
     /// Promise helpers evaluated on a table value.
     PromiseUnique(Vec<Ident>),
     /// Check `all(pred)` over every row of a table.

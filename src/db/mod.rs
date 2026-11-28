@@ -14,7 +14,7 @@ use std::fmt::{self, Write as _};
 use crate::core::bigint::{BigInt, DEC_MAX, DEC_MIN, DEC_SCALE};
 use crate::core::syntax::{ColSpec, Float64, Ident, ScalarTy, TableTy, TagSet};
 use crate::formats::time::{
-    format_iso_timestamp, parse_decimal_bigint_strict, parse_iso_timestamp,
+    format_iso_date, format_iso_timestamp, parse_decimal_bigint_strict, parse_iso_timestamp,
 };
 use crate::oracle::value::{
     TableRow, TableVal, Val, redact_tags, render_decimal, render_public_val, val_eq,
@@ -634,9 +634,21 @@ impl UpsertDiff {
 
 fn render_diff_public_val(val: &Val) -> String {
     match val {
+        Val::Date(d) => d.to_i64().map_or_else(|| d.to_string(), format_iso_date),
         Val::Timestamp(us) => us
             .to_i64()
             .map_or_else(|| us.to_string(), format_iso_timestamp),
+        Val::Float(f) => {
+            let fv = f.to_f64();
+            if fv.is_finite() {
+                let norm = if fv == 0.0 { 0.0 } else { fv };
+                format!("{norm}")
+            } else if fv.is_nan() {
+                "NaN".to_string()
+            } else {
+                format!("{fv}")
+            }
+        }
         Val::OptSome(inner) => format!("some({})", render_diff_public_val(inner)),
         other => render_public_val(other),
     }

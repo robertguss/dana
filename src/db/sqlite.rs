@@ -505,9 +505,8 @@ impl DbConnection for SqliteDriver {
             "SELECT {} FROM {quoted_table} WHERE {quoted_key} = ?",
             quoted_cols.join(", ")
         );
-        let diff = {
-            let mut select_stmt = self.conn.prepare(&select_sql).map_err(map_query_err)?;
-            compute_upsert_diff(table, key_idx, data, |key_val| {
+        let diff = match self.conn.prepare(&select_sql) {
+            Ok(mut select_stmt) => compute_upsert_diff(table, key_idx, data, |key_val| {
                 select_stmt.reset().map_err(map_query_err)?;
                 select_stmt.clear_bindings().map_err(map_query_err)?;
                 let key_param = SqlParam::from_val(key_val)?;
@@ -521,7 +520,11 @@ impl DbConnection for SqliteDriver {
                 } else {
                     Ok(None)
                 }
-            })?
+            })?,
+            Err(err) if dry_run && err.message.to_ascii_lowercase().contains("no such table") => {
+                compute_upsert_diff(table, key_idx, data, |_| Ok(None))?
+            }
+            Err(err) => return Err(map_query_err(err)),
         };
 
         if dry_run || data.rows.is_empty() {
