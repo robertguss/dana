@@ -1,6 +1,6 @@
 //! End-to-end tests for Slice 2A:
-//! - `dana check --policy examples/dana.policy` passes on ALL 10 `examples/*.dana`
-//! - `dana test --policy examples/dana.policy` passes every `examples` and `test` block across ALL 10 `examples/*.dana`
+//! - `dana check --policy examples/dana.policy` passes on ALL 11 `examples/*.dana`
+//! - `dana test --policy examples/dana.policy` passes every `examples` and `test` block across ALL 11 `examples/*.dana`
 //! - Negative privacy & policy enforcement tests (unauthorized PII console leak, below-floor suppression,
 //!   non-blending median leak under `suppress_small_groups`, policy ceiling violation, spec-only fake isolation)
 //! - Live `dana run examples/expenses.dana` on a temporary CSV file with valid + quarantined rows.
@@ -37,7 +37,7 @@ fn all_ten_examples_check_and_pass_all_tests() -> Result<(), String> {
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("dana"))
         .collect();
     files.sort();
-    assert_eq!(files.len(), 10, "expected 10 example programs");
+    assert_eq!(files.len(), 11, "expected 11 example programs");
 
     let cfg = RunConfig::default();
     let vm_default = VmConfig::default();
@@ -119,7 +119,7 @@ fn all_ten_examples_check_and_pass_all_tests() -> Result<(), String> {
     }
     assert!(
         total_tests >= 12,
-        "expected >= 12 tests/examples across 10 programs, ran {total_tests}"
+        "expected >= 12 tests/examples across 11 programs, ran {total_tests}"
     );
     Ok(())
 }

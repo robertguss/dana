@@ -10,7 +10,13 @@ cmd = "\"$DANA_BIN\" format --check qa_pipeline.dana"
 id = "dana_check_and_test"
 kind = "shell"
 depends_on = ["dana_format_check"]
-cmd = "\"$DANA_BIN\" check --policy dana.policy qa_pipeline.dana && \"$DANA_BIN\" test --policy dana.policy qa_pipeline.dana"
+cmd = "\"$DANA_BIN\" check --policy dana.policy qa_pipeline.dana && \"$DANA_BIN\" test --policy dana.policy qa_pipeline.dana && \"$DANA_BIN\" test --oracle --policy dana.policy qa_pipeline.dana"
+
+[[steps]]
+id = "dana_dry_run_fresh_sqlite"
+kind = "shell"
+depends_on = ["dana_check_and_test"]
+cmd = "dry_fresh=$(\"$DANA_BIN\" dry-run --policy dana.policy --db QaDb=sqlite://qa-out-fresh/fresh.sqlite qa_pipeline.dana) && printf '%s' \"$dry_fresh\" | grep -q \"UPSERT inserted=30 updated=0 unchanged=0\" && ! printf '%s' \"$dry_fresh\" | grep -q \"float64(\" && test ! -e qa-out-fresh"
 
 [[steps]]
 id = "dana_explain"

@@ -1208,3 +1208,118 @@ end
 
     Ok(())
 }
+
+#[test]
+fn v072_list_join_and_json_response_has_vm_oracle_parity() -> TestResult {
+    // 1. Static checks: non-Text element rejection and [pii] propagation on `List(Text).join`
+    let bad_int_join = r#"
+module BadIntJoin
+fn main(console: Console) : Int
+  console.print([1, 2].join(","))
+  0
+end
+"#;
+    let dt = check_src_with_policy(bad_int_join, None)
+        .err()
+        .ok_or("expected TypeError for [1, 2].join")?;
+    assert!(dt.iter().any(|d| d.code() == DiagCode::TypeError));
+
+    let bad_pii_join = r#"
+module BadPiiJoin
+schema UserRow
+  email: Text [pii]
+end
+fn main(rows: Table(UserRow), console: Console) : Int
+  var emails = []
+  for r in rows
+    emails = emails.append(r.email)
+  end
+  console.print(emails.join(", "))
+  0
+end
+"#;
+    let dp = check_src_with_policy(bad_pii_join, None)
+        .err()
+        .ok_or("expected PrivacyError when printing joined [pii] strings")?;
+    assert!(dp.iter().any(|d| d.code() == DiagCode::PrivacyError));
+
+    // 2. VM == Oracle parity across `List(Text).join` + `JsonResponse.has?` (live fake & dry-run null)
+    let parity_src = r#"
+module ListJoinAndJsonHasParity
+
+struct Ping
+  sku: Text
+  stock: Int
+end
+
+test "List.join and JsonResponse.has? behave identically across VM and Oracle"
+  empty_xs = []
+  assert empty_xs.join("|") == ""
+  assert ["only"].join("|") == "only"
+  assert ["a", "b", "c"].join(", ") == "a, b, c"
+  assert ["x", "y"].join(sep: "-") == "x-y"
+
+  mo = LocalHttp.fake(
+    MoShop,
+    responses: {
+      "GET /health": "{\"status\":\"ok\",\"result\":{\"rows\":[{\"sku\":\"a1\"}]},\"next_cursor\":null}",
+      "POST /products": "{\"ok\":true}",
+      "PUT /products/a1": "{\"ok\":true}"
+    }
+  )
+  h = try mo.get_json("/health")
+  assert h.has?("status")
+  assert h.has?("result.rows")
+  assert not h.has?("next_cursor")
+  assert not h.has?("missing.nested")
+
+  _ = try mo.post_json("/products", body: Ping(sku: "a1", stock: 3))
+  _ = try mo.put_json("/products/a1", body: {"stock": 5})
+  joined_bodies = mo.request_bodies.join("|")
+  assert joined_bodies.contains?("\"sku\":\"a1\"")
+  assert joined_bodies.contains?("\"stock\":5")
+  assert joined_bodies.contains?("|")
+end
+"#;
+    let checked = check_src_with_policy(parity_src, None).map_err(|ds| format!("{ds:?}"))?;
+    let ora = run_program_tests(&checked.exec, None, &RunConfig::default());
+    let vm = run_program_tests_vm(
+        &checked.exec,
+        None,
+        &RunConfig::default(),
+        &VmConfig::default(),
+    );
+    assert_eq!(ora.len(), 1);
+    assert_eq!(vm.len(), 1);
+    assert!(ora[0].passed, "{ora:?}");
+    assert!(vm[0].passed, "{vm:?}");
+
+    // 3. Dry-run `post_json` returns null JsonResponse where `resp.has?("result.rows") == false`
+    let tmp = TempDir::new("json_has_dry_run")?;
+    let dry_script = tmp.path().join("dry_has.dana");
+    let dry_src = r#"
+module DryRunJsonHas
+
+fn main(mo: LocalHttpAllow("127.0.0.1:8099"), console: Console) : Int
+  resp = try mo.post_json("/views/query/paged", body: {"page_size": 3})
+  has_rows = resp.has?("result.rows")
+  console.print("HAS_ROWS=#{has_rows}")
+  0
+end
+"#;
+    fs::write(&dry_script, dry_src)?;
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dana"))
+        .args(["dry-run"])
+        .arg(&dry_script)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dry-run failed:\nstdout={stdout}\nstderr={stderr}"
+    );
+    assert!(stdout.contains("HAS_ROWS=false"), "stdout:\n{stdout}");
+
+    Ok(())
+}

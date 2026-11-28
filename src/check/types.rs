@@ -10778,6 +10778,43 @@ impl<'a> Checker<'a> {
                     LTy::public(Ty::Int),
                 );
             }
+            (Ty::Data(dname), "has?") if dname == TY_JSON_RESPONSE => {
+                let (fex, flty) = match args {
+                    [CallArg::Positional(e)] => {
+                        let (fx, ft) = self.check_expr(e, env, Some(&Ty::Text), pc, scope, ret_ctx);
+                        if ft.ty != Ty::Text {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    "`JsonResponse.has?` path must be `Text`",
+                                )
+                                .with_span(e.span),
+                            );
+                        }
+                        (fx, ft)
+                    }
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`JsonResponse.has?` requires 1 `Text` path argument",
+                            )
+                            .with_span(span),
+                        );
+                        (
+                            ExecExpr::Lit(Literal::Text(String::new())),
+                            LTy::public(Ty::Text),
+                        )
+                    }
+                };
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::JsonHas,
+                        args: vec![rex, fex],
+                    },
+                    LTy::new(Ty::Bool, rlty.tags.union(&flty.effective_tags()).union(pc)),
+                );
+            }
             (Ty::Option(inner), "or_return") => {
                 let Some(CallArg::Positional(ret_e)) = args.first() else {
                     return (rex, LTy::new(inner.as_ref().clone(), rlty.tags));
@@ -11121,6 +11158,57 @@ impl<'a> Checker<'a> {
                         LTy::new(Ty::List(Box::new(new_el)), rlty.tags),
                     );
                 }
+            }
+            (Ty::List(el), "join") => {
+                if !is_unresolved_list(&rlty.ty) && el.ty != Ty::Text {
+                    self.diags.push(
+                        Diagnostic::error(DiagCode::TypeError, "`List.join` requires `List(Text)`")
+                            .with_span(member.span),
+                    );
+                }
+                let sep_arg = match args {
+                    [CallArg::Positional(e)] => Some(e),
+                    [CallArg::Named { name, value, .. }] if name.name == "sep" => Some(value),
+                    _ => None,
+                };
+                let (sep_ex, sep_lty) = if let Some(se) = sep_arg {
+                    let (sx, st) = self.check_expr(se, env, Some(&Ty::Text), pc, scope, ret_ctx);
+                    if st.ty != Ty::Text {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`List.join` separator must be `Text`",
+                            )
+                            .with_span(se.span),
+                        );
+                    }
+                    (sx, st)
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            "`List.join` expects 1 `Text` separator argument (positional or `sep:`)",
+                        )
+                        .with_span(span),
+                    );
+                    (
+                        ExecExpr::Lit(Literal::Text(String::new())),
+                        LTy::public(Ty::Text),
+                    )
+                };
+                return (
+                    ExecExpr::Prim {
+                        op: ExecPrimOp::ListJoin,
+                        args: vec![rex, sep_ex],
+                    },
+                    LTy::new(
+                        Ty::Text,
+                        rlty.tags
+                            .union(&el.effective_tags())
+                            .union(&sep_lty.effective_tags())
+                            .union(pc),
+                    ),
+                );
             }
             (Ty::LinearModel, "predict") => {
                 let Some(CallArg::Positional(x_e)) = args.first() else {

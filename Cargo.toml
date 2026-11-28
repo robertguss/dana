@@ -1,6 +1,6 @@
 [package]
 name = "dana"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 description = "Dana v0.7 (pre-1.0) — zero-crate AI-first data language compiler, vectorized columnar VM, streaming columnar CSV/Parquet I/O, SQL pushdown, privacy checker, capability-gated networking, and differential oracle"
 license = "MIT OR Apache-2.0"

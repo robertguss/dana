@@ -2281,6 +2281,13 @@ impl<'a> Evaluator<'a> {
                 },
                 _ => EvalOut::Failed("Json.encode requires 1 argument".to_string()),
             },
+            ExecPrimOp::ListJoin => match args {
+                [Val::List(items), Val::Text(sep)] => match join_text_list(items, sep) {
+                    Ok(joined) => EvalOut::Ok(Val::Text(joined)),
+                    Err(e) => EvalOut::Failed(e),
+                },
+                _ => EvalOut::Failed("List.join expects (List(Text), Text)".to_string()),
+            },
             ExecPrimOp::RecordField { field_idx, .. } => match args {
                 [Val::Ctor { fields, .. }] => fields.get(*field_idx).cloned().map_or_else(
                     || EvalOut::Failed("record field index out of bounds".to_string()),
@@ -3505,6 +3512,16 @@ impl<'a> Evaluator<'a> {
                     "parse_table expects (JsonResponse, field[, fields])".to_string(),
                 ),
             },
+            ExecHostOp::JsonHas => {
+                if let [resp_val, Val::Text(field)] = args {
+                    let Some(jresp) = self.extract_json_response(resp_val) else {
+                        return EvalOut::Failed("invalid JsonResponse handle".to_string());
+                    };
+                    EvalOut::Ok(Val::Bool(jresp.has_path(field)))
+                } else {
+                    EvalOut::Failed("has? expects (JsonResponse, field)".to_string())
+                }
+            }
             ExecHostOp::JsonBoolAt => {
                 if let [resp_val, Val::Text(field)] = args {
                     let Some(jresp) = self.extract_json_response(resp_val) else {
@@ -8151,3 +8168,21 @@ fn encode_http_json_body(body_val: &Val, cap_label: &str, method: &str) -> Resul
 // Keep reference constants visible for checked range consistency.
 const _: (i64, i64, i128, i128) = (INT64_MIN, INT64_MAX, DEC_MIN, DEC_MAX);
 const _: fn(&[Val]) -> u64 = hash_val_slice;
+
+/// Join a slice of [`Val::Text`] values using separator `sep`.
+///
+/// # Errors
+/// Returns an error if any list element is not [`Val::Text`].
+pub fn join_text_list(items: &[Val], sep: &str) -> Result<String, String> {
+    let mut out = String::new();
+    for (idx, item) in items.iter().enumerate() {
+        let Val::Text(s) = item else {
+            return Err("List.join requires List(Text) elements".to_string());
+        };
+        if idx > 0 {
+            out.push_str(sep);
+        }
+        out.push_str(s);
+    }
+    Ok(out)
+}

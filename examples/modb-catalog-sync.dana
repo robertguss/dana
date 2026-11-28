@@ -1,0 +1,179 @@
+## Syncs live USGS earthquake feeds with a local MoDB service (`LocalHttpAllow`),
+## records run receipts to a local Unix socket (`LocalSocketAllow`), upserts into
+## SQLite (`WriteTable`), and writes public Parquet + HTML reports (`WriteFiles`).
+module ModbCatalogSync
+
+schema QuakeRaw
+  id: Text where not .empty?
+  place: Text?
+  mag: Float where . >= 0.0
+  lon: Float
+end
+
+schema QuakeClean
+  id: Text
+  place: Text
+  mag: Float
+  mag_band: Text
+  lon: Float
+end
+
+schema CatalogItem
+  sku: Text
+  title: Text
+  category: Text
+  price: Decimal
+  stock: Int
+end
+
+schema MoProductOut
+  sku: Text
+  title: Text
+  category: Text
+  price: Text
+  stock: Int
+end
+
+struct RunAudit
+  pipeline: Text
+  synced_rows: Int
+  skus_summary: Text
+end
+
+fn fetch_quakes(api: HttpsAllow("earthquake.usgs.gov")) : Result((Table(QuakeRaw), Table(BadRow(QuakeRaw))), Text)
+  resp = try api.get_json("https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&limit=10")
+  Ok(
+    resp.parse_table(
+      "features",
+      as: QuakeRaw,
+      fields: {"place": "properties.place", "mag": "properties.mag", "lon": "geometry.coordinates.0"}
+    )
+  )
+end
+
+fn clean_quakes(raw: Table(QuakeRaw)) : Table(QuakeClean)
+  promise unique(.id)
+
+  raw
+    |> dedupe_by(.id)
+    |> derive(
+      place: (.place ?? "Unknown").trim,
+      raw_band: if .mag >= 4.5: "M4.5+" else if .mag >= 3.5: "M3.5-4.4" else: "M2.5-3.4"
+    )
+    |> derive(mag_band: coarsen(.raw_band, allow: ["M4.5+", "M3.5-4.4", "M2.5-3.4"], other: "minor"))
+    |> select(.id, .place, .mag, .mag_band, .lon)
+    |> sort_by(desc(.mag), asc(.id))
+end
+
+fn build_catalog_items(quakes: Table(QuakeClean)) : Table(CatalogItem)
+  top = quakes.first!
+  table
+    | sku             | title                                   | category | price | stock          |
+    | "etl-usgs-peak" | "Quake Peak: " + top.place.slice(0, 32) | "beans"  | 24.50 | quakes.count() |
+  end
+end
+
+fn sync_mo_and_audit(
+  mo: LocalHttpAllow(MoShop),
+  sock: LocalSocketAllow(AuditSock),
+  token: Secret("shop_admin_token"),
+  catalog: Table(CatalogItem),
+  console: Console
+) : Result((Table(MoProductOut), Text), Text)
+  auth = {"Authorization": "Bearer #{token}", "X-Reason": "dana-example-sync"}
+  health = try mo.get_json("/health")
+  if health.text_at("status") != "ok"
+    _ = try mo.post_json("/admin/init", body: "", headers: auth)
+  end
+
+  var skus = []
+  for item in catalog
+    _ = try mo.post_json("/products", body: item, headers: auth)
+    skus = skus.append(item.sku)
+  end
+
+  prods = try mo.get_json("/products", headers: auth)
+  rows = if prods.has?("0.sku")
+    (parsed, bad) = prods.parse_table("", as: MoProductOut)
+    assert bad.empty?
+    parsed |> sort_by(.sku)
+  else
+    console.print("MoShop read skipped cleanly in dry-run (status=#{health.text_at("status")})")
+    table
+      | sku            | title     | category | price  | stock |
+      | "dry-run-stub" | "Preview" | "beans"  | "0.00" | 0     |
+    end
+  end
+
+  receipt = RunAudit(pipeline: "modb-catalog-sync", synced_rows: rows.count(), skus_summary: skus.join(","))
+  ack = try sock.post_json("/audit/run", body: receipt)
+  Ok((rows, Json.encode(receipt) + "|ack=#{ack.bool_at("ok")}"))
+end
+
+fn main(
+  usgs: HttpsAllow("earthquake.usgs.gov"),
+  mo: LocalHttpAllow(MoShop),
+  sock: LocalSocketAllow(AuditSock),
+  token: Secret("shop_admin_token"),
+  w_quakes: WriteTable(Warehouse, "quakes"),
+  w_prods: WriteTable(Warehouse, "mo_products"),
+  out: WriteFiles("catalog-out/"),
+  console: Console
+) : Int
+  (raw_q, bad_q) = try fetch_quakes(usgs)
+  if not bad_q.empty?
+    console.print("quarantined #{bad_q.count()} quake rows")
+  end
+  quakes = clean_quakes(raw_q)
+  catalog = build_catalog_items(quakes)
+  (mo_rows, audit_note) = try sync_mo_and_audit(mo, sock, token, catalog, console)
+
+  st_q = try w_quakes.upsert(quakes, key: .id)
+  st_p = try w_prods.upsert(mo_rows, key: .sku)
+  try out.write_parquet("quakes.parquet", quakes)
+
+  band_counts = quakes
+    |> group_by(.mag_band)
+    |> summarize(n: count())
+    |> sort_by(.mag_band)
+  chart = band_counts |> chart_bar(x: .mag_band, y: .n, title: "Quakes by Band")
+  rep = Report.new("MoDB Catalog Sync Report")
+    |> add_summary(
+      "quakes=#{quakes.count()} synced=#{st_p.inserted + st_p.updated + st_p.unchanged} #{audit_note}"
+    )
+    |> add_chart(chart)
+    |> add_table(mo_rows)
+  try out.write_html("catalog_report.html", rep)
+
+  console.print("synced quakes=#{st_q.inserted}/#{st_q.updated}/#{st_q.unchanged}")
+  0
+end
+
+test "offline USGS + MoDB + UDS catalog sync runs cleanly"
+  quakes_json = """{"features":[{"id":"q1","properties":{"place":"10km N of Volcano","mag":4.8},"geometry":{"coordinates":[-155.2,19.4]}},{"id":"q2","properties":{"place":"Seattle WA","mag":2.9},"geometry":{"coordinates":[-122.3,47.6]}}]}"""
+  usgs = Https.fake(
+    "earthquake.usgs.gov",
+    responses: {"https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&limit=10": quakes_json}
+  )
+  (raw_q, bad_q) = try fetch_quakes(usgs)
+  assert bad_q.empty?
+  quakes = clean_quakes(raw_q)
+  catalog = build_catalog_items(quakes)
+
+  mo = LocalHttp.fake(
+    MoShop,
+    responses: {
+      "GET /health": "{\"status\":\"ok\"}",
+      "POST /products": "{\"ok\":true}",
+      "GET /products": "[{\"sku\":\"etl-usgs-peak\",\"title\":\"Quake Peak: 10km N of Volcano\",\"category\":\"beans\",\"price\":\"24.50\",\"stock\":2}]"
+    }
+  )
+  sock = LocalSocket.fake(AuditSock, responses: {"POST /audit/run": "{\"ok\":true}"})
+  console = Console.fake()
+
+  (rows, audit_note) = try sync_mo_and_audit(mo, sock, Secret.fake("tok"), catalog, console)
+  assert rows.count() == 1
+  assert audit_note.contains?("ack=true")
+  assert mo.request_bodies.join("|").contains?("\"price\":\"24.5\"")
+  assert sock.request_bodies.first!.contains?("\"skus_summary\":\"etl-usgs-peak\"")
+end

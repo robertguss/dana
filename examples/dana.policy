@@ -11,10 +11,18 @@ forbid repl_show_sensitive
 allow export "ir-exports/"        tags [counseling]
 allow export "finance-audit/"     tags [donor, financial]
 allow export "reports/"           tags []
+allow export "catalog-out/"       tags []
 
 # Authorized HTTPS endpoints
 allow https  "api.populiweb.com"  tags [pii]
+allow https  "earthquake.usgs.gov" tags []
+
+# Authorized local services
+allow local_http   MoShop         tags []
+allow local_socket AuditSock      tags []
 
 # Authorized database table writes
 allow write  Seminary.students    tags [pii, ferpa]
 allow write  AuditDB.ledger_runs  tags []
+allow write  Warehouse.quakes     tags []
+allow write  Warehouse.mo_products tags []

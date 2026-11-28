@@ -35,6 +35,26 @@ schema FerpaBandRow
   score_f: Float
 end
 
+struct QaTelemetry
+  stream: Text
+  valid_rows: Int
+  bad_rows: Int
+  outliers: Int
+end
+
+fn push_qa_telemetry(
+  mo: LocalHttpAllow(QaSvc),
+  sock: LocalSocketAllow(QaAdmin),
+  summary: QaTelemetry
+) : Result((Text, Bool, Bool), Text)
+  encoded = Json.encode(summary)
+  m_resp = try mo.post_json("/telemetry", body: summary)
+  accepted = m_resp.has?("accepted")
+  s_resp = try sock.post_json("/audit/qa", body: {"stream": summary.stream, "ok": accepted})
+  audited = s_resp.bool_at("ok")
+  Ok((encoded, accepted, audited))
+end
+
 fn summarize_ferpa_bands(rows: Table(FerpaBandRow))
   promise all(.distinct_ids >= 5)
 
@@ -161,4 +181,18 @@ test "QA transforms dedupe, quarantine, pseudonymize, coarsen, and suppress smal
   bands = summarize_ferpa_bands(raw |> select(.id, .age_years, .region, .score_f))
   assert bands.count() == 1
   assert bands.first!.age_band == "20_39"
+end
+
+test "v0.7 Json.encode, List.join, JsonResponse.has?, and LocalHttp/LocalSocket fakes pass"
+  summary = QaTelemetry(stream: "readings", valid_rows: 6, bad_rows: 1, outliers: 1)
+  mo = LocalHttp.fake(QaSvc, responses: {"POST /telemetry": "{\"accepted\":true,\"cursor\":null}"})
+  sock = LocalSocket.fake(QaAdmin, responses: {"POST /audit/qa": "{\"ok\":true}"})
+  (encoded, accepted, audited) = try push_qa_telemetry(mo, sock, summary)
+  assert encoded.contains?("\"valid_rows\":6")
+  assert accepted and audited
+
+  h = try mo.post_json("/telemetry", body: summary)
+  assert h.has?("accepted") and not h.has?("cursor")
+  assert ["north", "south", "east"].join(",") == "north,south,east"
+  assert mo.request_bodies.join("|").contains?("\"stream\":\"readings\"")
 end

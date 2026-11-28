@@ -888,6 +888,12 @@ impl JsonResponse {
         ))
     }
 
+    /// Return `true` iff dotted `field` exists in the JSON response and is not `null`.
+    #[must_use]
+    pub fn has_path(&self, field: &str) -> bool {
+        matches!(self.resolve_path(field), Some(v) if !matches!(v, JsonValue::Null))
+    }
+
     /// Read a `Bool` at `field` (supports dotted keys; missing or `null` returns `false`).
     ///
     /// # Errors

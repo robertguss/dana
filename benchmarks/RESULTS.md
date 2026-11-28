@@ -1,13 +1,13 @@
-# Dana v0.4 End-to-End Benchmarks vs. Python
+# Dana v0.7.2 End-to-End Benchmarks vs. Python
 
-Reproducible end-to-end pipeline benchmarks comparing **Dana v0.4 (pre-1.0, Zero-Crate Rust)** against **Python stdlib / `sqlite3`**, **Pandas**, and **Polars** across four realistic data-engineering, SQL-pushdown privacy, and statistical-reporting workloads.
+Reproducible end-to-end pipeline benchmarks comparing **Dana v0.7.2 (pre-1.0, Zero-Crate Rust)** against **Python stdlib / `sqlite3`**, **Pandas**, and **Polars** across four realistic data-engineering, SQL-pushdown privacy, and statistical-reporting workloads.
 
 ## Methodology & Environment
 
 - **CPU:** AMD EPYC 9554P 64-Core Processor (8 logical cores)
 - **Memory:** 31.3 GiB
 - **OS:** Linux 6.12.115 (x86_64)
-- **Toolchain:** `rustc 1.97.1 (8bab26f4f 2026-07-14)` (`target/release/dana`, zero external Rust crates)
+- **Toolchain:** `rustc 1.100.0 (0ef1bc386 2026-11-09)` (`target/release/dana`, zero external Rust crates)
 - **Python baselines:** Python `3.15.2`, Pandas `3.1.1`, Polars `2.2.0`, PyArrow `26.0.1` (installed solely in ephemeral `/tmp/dana-bench-venv`)
 - **Timing protocol:** 1 warmup run + 5 timed runs per engine, each in a **fresh child subprocess** timed end-to-end with wall-clock `perf_counter` and isolated per-process kernel peak RSS (`/usr/bin/time -f %M`, falling back to `os.wait4`), capturing full cold-start CLI / interpreter startup, parsing/compilation, I/O, execution, and output writing.
 - **Output parity:** Every Python baseline is verified cell-for-cell against Dana's outputs after execution (exact keys, counts, FERPA suppressions, exact `Decimal` against Python `Decimal`, and strict floating-point tolerances).
@@ -21,21 +21,21 @@ python3 benchmarks/run_benchmarks.py
 
 ## Headline Results (Median End-to-End Wall-Clock)
 
-| Workload | Rows | Dana v0.4 (ms) | Python stdlib (ms) | Pandas (ms) | Polars (ms) | Dana vs. stdlib | Dana vs. Pandas | Dana vs. Polars |
+| Workload | Rows | Dana v0.7.2 (ms) | Python stdlib (ms) | Pandas (ms) | Polars (ms) | Dana vs. stdlib | Dana vs. Pandas | Dana vs. Polars |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| W1: CSV + UDF ETL | 500,500 | **317.0** | 1420.0 | 1717.8 | 282.0 | **4.48× faster** | **5.42× faster** | 1.12× slower |
-| W2: 500k×50k Join + UDF | 500,000 | **135.4** | 1129.3 | 676.5 | 306.5 | **8.34× faster** | **5.00× faster** | **2.26× faster** |
-| W3: SQLite + FERPA Privacy | 250,000 | **96.0** | 176.5 | 660.7 | 539.4 | **1.84× faster** | **6.88× faster** | **5.62× faster** |
-| W4: Parquet + Stats + HTML | 200,000 | **185.1** | 1027.2 | 728.9 | 309.9 | **5.55× faster** | **3.94× faster** | **1.67× faster** |
+| W1: CSV + UDF ETL | 500,500 | **368.3** | 1366.3 | 1856.7 | 322.2 | **3.71× faster** | **5.04× faster** | 1.14× slower |
+| W2: 500k×50k Join + UDF | 500,000 | **152.8** | 992.3 | 522.0 | 280.2 | **6.49× faster** | **3.42× faster** | **1.83× faster** |
+| W3: SQLite + FERPA Privacy | 250,000 | **107.8** | 160.3 | 595.0 | 360.6 | **1.49× faster** | **5.52× faster** | **3.35× faster** |
+| W4: Parquet + Stats + HTML | 200,000 | **125.1** | 645.5 | 519.6 | 243.4 | **5.16× faster** | **4.15× faster** | **1.95× faster** |
 
-## Dana v0.3.0 -> v0.4.0 Speedup & Peak-RSS Improvement
+## Dana v0.3.0 -> v0.7.2 Speedup & Peak-RSS Improvement
 
-| Workload | v0.3.0 Median (ms) | v0.4.0 Median (ms) | Latency Speedup | v0.3.0 Peak RSS (MiB) | v0.4.0 Peak RSS (MiB) | Peak-RSS Reduction |
+| Workload | v0.3.0 Median (ms) | v0.7.2 Median (ms) | Latency Speedup | v0.3.0 Peak RSS (MiB) | v0.7.2 Peak RSS (MiB) | Peak-RSS Reduction |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| W1: CSV + UDF ETL | 3602.9 | **317.0** | **11.37× faster** | 1325.1 | **116.2** | **11.41× smaller (−91.2%)** |
-| W2: 500k×50k Join + UDF | 1504.0 | **135.4** | **11.11× faster** | 781.8 | **98.4** | **7.94× smaller (−87.4%)** |
-| W3: SQLite + FERPA Privacy | 127.1 | **96.0** | **1.32× faster** | 29.0 | **21.3** | **1.36× smaller (−26.4%)** |
-| W4: Parquet + Stats + HTML | 1110.2 | **185.1** | **6.00× faster** | 350.1 | **52.3** | **6.70× smaller (−85.1%)** |
+| W1: CSV + UDF ETL | 3602.9 | **368.3** | **9.78× faster** | 1325.1 | **116.9** | **11.34× smaller (−91.2%)** |
+| W2: 500k×50k Join + UDF | 1504.0 | **152.8** | **9.84× faster** | 781.8 | **99.2** | **7.88× smaller (−87.3%)** |
+| W3: SQLite + FERPA Privacy | 127.1 | **107.8** | **1.18× faster** | 29.0 | **22.2** | **1.31× smaller (−23.5%)** |
+| W4: Parquet + Stats + HTML | 1110.2 | **125.1** | **8.88× faster** | 350.1 | **53.2** | **6.58× smaller (−84.8%)** |
 
 ## W1: 500,000-Row CSV Quarantine + Pure Dana UDF + GroupBy/Sort
 
@@ -43,10 +43,10 @@ python3 benchmarks/run_benchmarks.py
 
 | Engine | Median (ms) | Min (ms) | Max (ms) | Throughput (rows/s) | Peak RSS (MiB) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Dana v0.4 (exact `Decimal`, columnar CSV + inlined UDF) | 317.0 | 307.1 | 331.9 | 1,579,074 | 116.2 |
-| Python stdlib (`csv` + `decimal.Decimal`) | 1420.0 | 1386.5 | 1514.5 | 352,469 | 21.4 |
-| Pandas (`float64` + Python UDF loop) | 1717.8 | 1654.8 | 2144.9 | 291,367 | 311.7 |
-| Polars (native `pl.when/then` `Float64` expr) | 282.0 | 270.2 | 316.1 | 1,775,048 | 274.5 |
+| Dana v0.7.2 (exact `Decimal`, columnar CSV + inlined UDF) | 368.3 | 350.4 | 393.9 | 1,358,996 | 116.9 |
+| Python stdlib (`csv` + `decimal.Decimal`) | 1366.3 | 1317.5 | 1435.5 | 366,321 | 21.6 |
+| Pandas (`float64` + Python UDF loop) | 1856.7 | 1661.9 | 2009.7 | 269,558 | 311.9 |
+| Polars (native `pl.when/then` `Float64` expr) | 322.2 | 283.5 | 332.9 | 1,553,259 | 273.5 |
 
 ## W2: 500,000-Row Fact × 50,000-Row Dim Parquet `join_many_to_one` + UDF + Agg
 
@@ -54,10 +54,10 @@ python3 benchmarks/run_benchmarks.py
 
 | Engine | Median (ms) | Min (ms) | Max (ms) | Throughput (rows/s) | Peak RSS (MiB) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Dana v0.4 (columnar Zstd Parquet + zero-copy N:1 join + inlined UDF) | 135.4 | 128.0 | 141.2 | 3,692,761 | 98.4 |
-| Python stdlib (CSV mirror + `dict` join) | 1129.3 | 1103.0 | 1243.1 | 442,751 | 35.1 |
-| Pandas (`read_parquet` + `merge(validate='many_to_one')`) | 676.5 | 575.0 | 719.7 | 739,059 | 252.4 |
-| Polars (`read_parquet` + `join(validate='m:1')`) | 306.5 | 286.2 | 355.6 | 1,631,085 | 212.2 |
+| Dana v0.7.2 (columnar Zstd Parquet + zero-copy N:1 join + inlined UDF) | 152.8 | 120.4 | 168.9 | 3,271,762 | 99.2 |
+| Python stdlib (CSV mirror + `dict` join) | 992.3 | 979.2 | 1008.8 | 503,892 | 35.1 |
+| Pandas (`read_parquet` + `merge(validate='many_to_one')`) | 522.0 | 506.2 | 578.6 | 957,815 | 252.9 |
+| Polars (`read_parquet` + `join(validate='m:1')`) | 280.2 | 255.4 | 312.8 | 1,784,689 | 212.4 |
 
 ## W3: 250,000-Row SQLite Pushdown + `[pii]`/`[ferpa]` Suppression + Rolling Window
 
@@ -65,10 +65,10 @@ python3 benchmarks/run_benchmarks.py
 
 | Engine | Median (ms) | Min (ms) | Max (ms) | Throughput (rows/s) | Peak RSS (MiB) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Dana v0.4 (SQLite pushdown + compile-time `[pii]`/`[ferpa]` + VM window) | 96.0 | 90.4 | 99.3 | 2,603,226 | 21.3 |
-| Python stdlib (`sqlite3` + pure Python aggregation/window) | 176.5 | 171.7 | 207.0 | 1,416,230 | 24.6 |
-| Pandas (`read_sql_query` + `pd.cut` + `groupby` + `rolling`) | 660.7 | 627.5 | 746.7 | 378,404 | 153.0 |
-| Polars (`read_database` + `group_by` + `rolling_mean.over`) | 539.4 | 423.9 | 597.3 | 463,435 | 99.5 |
+| Dana v0.7.2 (SQLite pushdown + compile-time `[pii]`/`[ferpa]` + VM window) | 107.8 | 85.0 | 111.4 | 2,319,986 | 22.2 |
+| Python stdlib (`sqlite3` + pure Python aggregation/window) | 160.3 | 154.9 | 180.1 | 1,559,487 | 24.6 |
+| Pandas (`read_sql_query` + `pd.cut` + `groupby` + `rolling`) | 595.0 | 582.2 | 608.4 | 420,199 | 153.0 |
+| Polars (`read_database` + `group_by` + `rolling_mean.over`) | 360.6 | 355.8 | 397.3 | 693,375 | 98.5 |
 
 ## W4: 200,000-Row Native Zstd Parquet Round-Trip + Stats + Profile + HTML Report
 
@@ -76,10 +76,10 @@ python3 benchmarks/run_benchmarks.py
 
 | Engine | Median (ms) | Min (ms) | Max (ms) | Throughput (rows/s) | Peak RSS (MiB) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Dana v0.4 (columnar Zstd Parquet + `Stats` + `profile()` + SVG/HTML5) | 185.1 | 152.6 | 223.8 | 1,080,322 | 52.3 |
-| Python (`pyarrow` Parquet I/O + pure Python stats/HTML) | 1027.2 | 979.7 | 1169.2 | 194,710 | 241.2 |
-| Pandas (`read_parquet`/`to_parquet` + NumPy OLS + HTML) | 728.9 | 659.4 | 872.7 | 274,403 | 211.4 |
-| Polars (`read_parquet`/`write_parquet` + `corr`/`cov` + HTML) | 309.9 | 284.6 | 347.8 | 645,324 | 125.7 |
+| Dana v0.7.2 (columnar Zstd Parquet + `Stats` + `profile()` + SVG/HTML5) | 125.1 | 101.4 | 148.5 | 1,599,134 | 53.2 |
+| Python (`pyarrow` Parquet I/O + pure Python stats/HTML) | 645.5 | 611.3 | 662.3 | 309,838 | 240.2 |
+| Pandas (`read_parquet`/`to_parquet` + NumPy OLS + HTML) | 519.6 | 496.2 | 559.6 | 384,897 | 208.1 |
+| Polars (`read_parquet`/`write_parquet` + `corr`/`cov` + HTML) | 243.4 | 241.0 | 250.9 | 821,664 | 125.4 |
 
 ## Exact Output Parity Checks
 
@@ -124,7 +124,7 @@ python3 benchmarks/run_benchmarks.py
   ?6 = Text("30_to_44")
   ?7 = Text("45_plus")
   ?8 = Int(2024)
-[PUSHDOWN BOUNDARY: suppress_small_groups requires local group cardinality metadata from summarize]
+[PUSHDOWN BOUNDARY: aggregate `Mean` requires local VM]
 [LOCAL VM SUFFIX]
   Window([rolling_3t_gpa])
     Sort([department:Asc, age_band:Asc, term_seq:Asc])
@@ -144,7 +144,7 @@ python3 benchmarks/run_benchmarks.py
 
 ## Honest Engineering Analysis
 
-1. **Direct streaming-columnar CSV ingestion + exact `Decimal` UDF (W1):** Streaming CSV directly into 2,048-row `VmTable` batches (`Val::Columnar(Arc<VmTable>)`) with zero-allocation `parse_decimal_i128` and unboxed `FastColConstraint` validation cut Dana from `3602.9 ms / 1325.1 MiB` (v0.3.0) down to **`317.0 ms / 116.2 MiB`** (**11.37× faster**, **11.41× lower peak RSS**). Dana v0.4 is **4.48× faster** than Python `csv` + `decimal.Decimal` (1420.0 ms), **5.42× faster** than Pandas (`float64` + Python UDF loop) (1717.8 ms, 311.7 MiB RSS), and **1.12× slower** than Polars (native `pl.when/then` `Float64` expr) (282.0 ms, 274.5 MiB RSS) — while preserving exact 128-bit 18-digit fixed-point `Decimal` arithmetic (0-ulp parity with Python `Decimal`) and full `bad_rows` quarantine.
-2. **Direct columnar Parquet + zero-copy N:1 hash join + unboxed aggregation (W2):** Decoding Zstd Parquet directly into `VmTable` batches, borrowing `Val::Columnar` join inputs without cloning, specializing single non-null `Int` keys + columnar gather in `op_hash_join`, and streaming unboxed `ExecSurface` aggregates cut Dana from `1504.0 ms / 781.8 MiB` (v0.3.0) to **`135.4 ms / 98.4 MiB`** (**11.11× faster**, **7.94× lower peak RSS**). Dana v0.4 is **8.34× faster** than Python stdlib (CSV + `dict` join) (1129.3 ms), **5.00× faster** than Pandas (676.5 ms, 252.4 MiB RSS), and **2.26× faster** than Polars (306.5 ms, 212.2 MiB RSS) in a zero-crate Rust binary with checked N:1 uniqueness verification.
-3. **SQLite pushdown + compile-time FERPA privacy (W3):** Dana v0.4 (**96.0 ms, 21.3 MiB peak RSS**; v0.3.0 was `127.1 ms / 29.0 MiB`) preserves and extends its decisive lead: **1.84× faster** than Python `sqlite3` stdlib (176.5 ms), **5.62× faster** than Polars (539.4 ms, 99.5 MiB RSS), and **6.88× faster** than Pandas (660.7 ms, 153.0 MiB RSS) — while statically proving `[pii]`/`[ferpa]` declassification (`suppress_small_groups(min: 5, distinct_by: .student_id)` -> `OUTPUT: PUBLIC`).
-4. **Direct columnar Parquet round-trip + columnar `Stats` / `profile()` + HTML5 report (W4):** Eliminating `TableVal` boxing across `read_parquet`, `write_parquet`, `profile()`, `Stats.corr`, `Stats.linear_regression`, and grouped zone aggregation cut Dana from `1110.2 ms / 350.1 MiB` (v0.3.0) to **`185.1 ms / 52.3 MiB`** (**6.00× faster**, **6.70× lower peak RSS**). Dana v0.4 is **5.55× faster** than Python (`pyarrow` + pure Python stats/HTML) (1027.2 ms), **3.94× faster** than Pandas + NumPy (728.9 ms, 211.4 MiB RSS), and **1.67× faster** than Polars (309.9 ms, 125.7 MiB RSS) with zero external Rust crates and full cell-for-cell parity.
+1. **Direct streaming-columnar CSV ingestion + exact `Decimal` UDF (W1):** Streaming CSV directly into 2,048-row `VmTable` batches (`Val::Columnar(Arc<VmTable>)`) with zero-allocation `parse_decimal_i128` and unboxed `FastColConstraint` validation cut Dana from `3602.9 ms / 1325.1 MiB` (v0.3.0) down to **`368.3 ms / 116.9 MiB`** (**9.78× faster**, **11.34× lower peak RSS**). Dana v0.7.2 is **3.71× faster** than Python `csv` + `decimal.Decimal` (1366.3 ms), **5.04× faster** than Pandas (`float64` + Python UDF loop) (1856.7 ms, 311.9 MiB RSS), and **1.14× slower** than Polars (native `pl.when/then` `Float64` expr) (322.2 ms, 273.5 MiB RSS) — while preserving exact 128-bit 18-digit fixed-point `Decimal` arithmetic (0-ulp parity with Python `Decimal`) and full `bad_rows` quarantine.
+2. **Direct columnar Parquet + zero-copy N:1 hash join + unboxed aggregation (W2):** Decoding Zstd Parquet directly into `VmTable` batches, borrowing `Val::Columnar` join inputs without cloning, specializing single non-null `Int` keys + columnar gather in `op_hash_join`, and streaming unboxed `ExecSurface` aggregates cut Dana from `1504.0 ms / 781.8 MiB` (v0.3.0) to **`152.8 ms / 99.2 MiB`** (**9.84× faster**, **7.88× lower peak RSS**). Dana v0.7.2 is **6.49× faster** than Python stdlib (CSV + `dict` join) (992.3 ms), **3.42× faster** than Pandas (522.0 ms, 252.9 MiB RSS), and **1.83× faster** than Polars (280.2 ms, 212.4 MiB RSS) in a zero-crate Rust binary with checked N:1 uniqueness verification.
+3. **SQLite pushdown + compile-time FERPA privacy (W3):** Dana v0.7.2 (**107.8 ms, 22.2 MiB peak RSS**; v0.3.0 was `127.1 ms / 29.0 MiB`) preserves and extends its decisive lead: **1.49× faster** than Python `sqlite3` stdlib (160.3 ms), **3.35× faster** than Polars (360.6 ms, 98.5 MiB RSS), and **5.52× faster** than Pandas (595.0 ms, 153.0 MiB RSS) — while statically proving `[pii]`/`[ferpa]` declassification (`suppress_small_groups(min: 5, distinct_by: .student_id)` -> `OUTPUT: PUBLIC`).
+4. **Direct columnar Parquet round-trip + columnar `Stats` / `profile()` + HTML5 report (W4):** Eliminating `TableVal` boxing across `read_parquet`, `write_parquet`, `profile()`, `Stats.corr`, `Stats.linear_regression`, and grouped zone aggregation cut Dana from `1110.2 ms / 350.1 MiB` (v0.3.0) to **`125.1 ms / 53.2 MiB`** (**8.88× faster**, **6.58× lower peak RSS**). Dana v0.7.2 is **5.16× faster** than Python (`pyarrow` + pure Python stats/HTML) (645.5 ms), **4.15× faster** than Pandas + NumPy (519.6 ms, 208.1 MiB RSS), and **1.95× faster** than Polars (243.4 ms, 125.4 MiB RSS) with zero external Rust crates and full cell-for-cell parity.

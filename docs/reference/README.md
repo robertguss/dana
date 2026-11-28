@@ -218,7 +218,8 @@ Dana unifies SQL `NULL`, empty CSV cells, JSON `null`, Parquet nulls, and Excel 
 
 - **Tuples:** `(A, B)`, destructured via `(rows, bad_rows) = ...`.
 - **Lists:** `[1, 2, 3] : List(Int)` with `.size` (or `.len`), `.empty?`, `.first : T?`,
-  `.first! : T`, and immutable `.append(x)`.
+  `.first! : T`, and immutable `.append(x)`. `List(Text)` also supports `.join(sep)` (or
+  `.join(sep: ",")`), concatenating elements with separator `sep` while propagating sensitivity tags.
 - **Maps:** `{"Authorization": "Bearer #{token}"}` or `{requests: 0}` (`Map(K, V)`), indexed
   via `m[key] : V?`.
 - **Named records (`struct`) & tagged unions (`enum`):**
@@ -680,7 +681,9 @@ allow export       "reports/"          tags []
 allow export       "ir-exports/"       tags [counseling]
 allow https        "api.populiweb.com" tags [pii]
 allow local_http   "127.0.0.1:8091"    tags []
+allow local_http   FeedApi             tags []
 allow local_socket "/run/mo.sock"      tags []
+allow local_socket MoAdmin             tags []
 allow write        Seminary.students   tags [pii, ferpa]
 ```
 
@@ -716,7 +719,7 @@ rows        = try files.read_csv("data/in.csv", as: MySchema, on_bad_rows: :erro
 `read_csv` accepts `on_bad_rows: :quarantine` (default, returning `(rows, bad_rows)` and warning
 when a non-`_` `bad_rows` binding is left uninspected) or `:error` (returning `Result(Table(S), Text)`
 directly with privacy-redacted row diagnostics), plus `coerce_integral_floats: true|false` (default
-`false`; `true` accepts integral tokens like `"1"` for `Float` columns).
+`false`; `true` accepts exact integral decimal strings like `"5.0"` or `"-42.00"` for `Int` columns while rejecting non-integral values like `"5.5"`).
 
 **Direct Parquet reader** returns `Result(Table(S), Text)` (no quarantine tuple — binary typed
 Parquet enforces schema types directly; supports `UNCOMPRESSED`, `SNAPPY`, `GZIP`, `ZSTD`,
@@ -837,7 +840,9 @@ end
   (direct tuple, not `Result`; optional `fields:` maps schema columns to dotted object paths and
   0-based JSON array indices — e.g. `"lon": "geometry.coordinates.0"`). Pass `""` as the
   container key when the JSON root itself is an array (`[...]`).
-- `resp.bool_at("field") : Bool`, `resp.text_at("field") : Text`, `resp.int_at("field") : Int`.
+- `resp.has?("field") : Bool` (returns `true` if dotted `"field"` exists and is not `null` — useful before
+  `parse_table` on optional responses or `dry-run` stubs), `resp.bool_at("field") : Bool`,
+  `resp.text_at("field") : Text`, `resp.int_at("field") : Int`.
 - `api.post_json(url, body, [headers: {...}])` and `api.put_json(url, body, [headers: {...}])`
   return `Result(JsonResponse, Text)`. `body` may be `Text` (sent verbatim with
   `Content-Type: application/json`), `Table(...)` (serialized as a compact JSON array `[...]`), or

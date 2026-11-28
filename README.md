@@ -7,22 +7,22 @@ long-running systems and living services, Dana is built for databases, ETL pipel
 operational and financial analytics, practical statistics, and clean reporting—fast by
 default, batteries included, and safe around sensitive data like PII and FERPA records.
 
-> **Status: Dana v0.7 (`v0.7.1`, pre-1.0) — Capability-Gated Local HTTP (`LocalHttpAllow`) & Unix Domain Sockets (`LocalSocketAllow`), Typed `Json.encode` & `struct`/Row/`Map` JSON HTTP Bodies, `ready:FILE` Dynamic Port Binding, Redacted `dry-run` Network & SQLite Previews, 13-Parser Fuzzer (`v1.0` GA held for production soak).**
+> **Status: Dana v0.7 (`v0.7.2`, pre-1.0) — Capability-Gated Local HTTP (`LocalHttpAllow`) & Unix Domain Sockets (`LocalSocketAllow`), Typed `Json.encode` & `struct`/Row/`Map` JSON HTTP Bodies, `List(Text).join`, `JsonResponse.has?`, `ready:FILE` Dynamic Port Binding, Redacted `dry-run` Network & SQLite Previews, 13-Parser Fuzzer (`v1.0` GA held for production soak).**
 > Dana's 0-conflict Bison IELR(1) executable grammar (`make grammar`), Lean 4 formal core with
 > soundness & non-interference proofs (`make formal`), **Zero-Crate Rust** compiler, 2,048-row
 > vectorized columnar VM with pure-UDF bytecode inlining, direct streaming-columnar CSV/TSV &
-> Apache Parquet I/O into `Val::Columnar(Arc<VmTable>)` (6.0×–11.4× faster and 6.7×–11.4× lower
-> peak RSS than `v0.3.0`, outperforming Pandas by 3.9×–6.9× across all 4 workloads and beating
-> Polars on W2 500k×50k Parquet join, W3 SQLite pushdown, and W4 Zstd Parquet + Stats + HTML5
-> report), embedded SQLite (with `--attach` / `?attach=`) + native PostgreSQL v3.0 SQL pushdown
+> Apache Parquet I/O into `Val::Columnar(Arc<VmTable>)` (`8.9×–9.8×` faster and `6.6×–11.3×` lower
+> peak RSS than `v0.3.0` on W1/W2/W4, outperforming Pandas by `3.4×–5.5×` across all 4 workloads and
+> beating Polars on W2 500k×50k Parquet join (`1.83×`), W3 SQLite pushdown (`3.35×`), and W4 Zstd
+> Parquet + Stats + HTML5 report (`1.95×`)), embedded SQLite (with `--attach` / `?attach=`) + native PostgreSQL v3.0 SQL pushdown
 > runtime (`dedupe_by`, `coarsen`, `try_parse_date`, `try_parse_decimal`, calendar/DST ops,
 > `known_not_null` join simplification, materialized parse/timezone CTEs, PG array decoding, and
 > covariant `ReadDB` `schema.lock`), native Excel (`.xlsx`), capability-gated HTTPS + local
 > loopback HTTP (`LocalHttpAllow`) & Unix domain sockets (`LocalSocketAllow`), `Json.encode` &
 > typed JSON HTTP bodies, columnar `Stats` & `profile()`, standalone SVG/HTML/Markdown reporting,
 > safe read-only `dana repl`, SHA-256 hash-pinned `vendor/` modules, 13-parser zero-crate fuzzer
-> + adversarial privacy hardening suite, and prospective 4-model / 2-family AI learnability gate
-> (`24/24` strict pass, `0` privacy leaks) are complete and verified. `v1.0` GA is intentionally held
+> + adversarial privacy hardening suite, and prospective 4-model / 2-family AI learnability gates
+> (`v0.3`: `24/24` strict pass; `v0.7`: `16/16` strict pass, `0` privacy leaks) are complete and verified. `v1.0` GA is intentionally held
 > for production soak.
 
 ## Why Dana
@@ -126,11 +126,11 @@ Rust 1.90+ and the system C libraries behind `src/ffi/` (`zlib`, `zstd`, `sqlite
 ```sh
 # macOS (Apple Silicon / Intel)
 brew install pkg-config openssl@3 zstd
-cargo install --git https://github.com/robertguss/dana --tag v0.7.1
+cargo install --git https://github.com/robertguss/dana --tag v0.7.2
 
 # Ubuntu / Debian
 sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev libzstd-dev zlib1g-dev
-cargo install --git https://github.com/robertguss/dana --tag v0.7.1
+cargo install --git https://github.com/robertguss/dana --tag v0.7.2
 ```
 
 ## Quickstart CLI
@@ -170,20 +170,26 @@ dana repl --db Seminary=sqlite:///path/to/seminary.db
   parsed by the [0-conflict Bison IELR(1) grammar](grammar/README.md) (`make grammar`) and
   type-checked under `dana check`.
 - [End-to-End Benchmarks vs. Python](benchmarks/RESULTS.md): reproducible real-world pipeline
-  benchmarks comparing Dana v0.4 against Python stdlib/`sqlite3`, Pandas, and Polars across
-  CSV+UDF ETL (`317.0 ms / 116.2 MiB`), 500k×50k columnar Parquet joins (`135.4 ms / 98.4 MiB`,
-  **2.26× faster than Polars**), 250k-row SQLite pushdown + FERPA privacy (`96.0 ms / 21.3 MiB`,
-  **5.62× faster than Polars**), and 200k-row Zstd Parquet stats & HTML5 reporting
-  (`185.1 ms / 52.3 MiB`, **1.67× faster than Polars**), with exact cell-for-cell parity
-  assertions and full `v0.3.0 -> v0.4.0` speedup & RSS comparisons.
+  benchmarks comparing Dana `v0.7.2` against Python stdlib/`sqlite3`, Pandas, and Polars across
+  CSV+UDF ETL (`368.3 ms / 116.9 MiB`, **5.04× faster than Pandas**), 500k×50k columnar Parquet joins
+  (`152.8 ms / 99.2 MiB`, **1.83× faster than Polars**), 250k-row SQLite pushdown + FERPA privacy
+  (`107.8 ms / 22.2 MiB`, **3.35× faster than Polars**), and 200k-row Zstd Parquet stats & HTML5
+  reporting (`125.1 ms / 53.2 MiB`, **1.95× faster than Polars**), with exact cell-for-cell parity
+  assertions and full `v0.3.0 -> v0.7.2` speedup & RSS comparisons.
+- [AI Learnability Evaluation v0.7](docs/evals/learnability-v0.7-results.md)
+  ([Prospective Protocol](docs/evals/learnability-v0.7.md)): blind 4-model / 2-family
+  evaluation (`claude-sonnet-5-5`, `claude-haiku-5-5`, `gemini-4-neon`, `gemini-4-argon`)
+  covering `v0.5–v0.7.2` features solely from `dana guide` — **16/16 (100%)** Stage 2 strict pass,
+  **15/16 (93.8%)** Attempt-1 hidden E2E + privacy pass, **0** privacy/policy/secret leaks, and
+  **100%** canonical formatting compliance.
 - [AI Learnability Evaluation v0.3](docs/evals/learnability-v0.3-results.md)
   ([Prospective Protocol](docs/evals/learnability-v0.3.md)): blind 4-model / 2-family
   evaluation (`claude-sonnet-5-5`, `claude-haiku-5-5`, `gemini-4-neon`, `gemini-4-argon`)
   writing 6 unseen pipelines solely from `dana guide` — **24/24 (100%)** Stage 2 strict pass,
   **21/24 (87.5%)** Stage 1 first-shot functional pass, **0** privacy/policy leaks, and
   **100%** canonical formatting compliance.
-- [Ten Sample Programs](examples/README.md): realistic `.dana` scripts across higher ed,
-  SaaS, fintech, DevOps logs, healthcare, and exploratory statistics.
+- [Eleven Sample Programs](examples/README.md): realistic `.dana` scripts across higher ed,
+  SaaS, fintech, DevOps logs, healthcare, exploratory statistics, and local service/MoDB ETL sync.
 - [Design Charter v1](docs/CHARTER.md): locked-in design pillars, non-goals, and principles.
 - [Privacy & Declassification Model](docs/design/privacy.md): sensitivity tag algebra,
   implicit flows, audited declassifiers, optional `dana.policy`, runtime redaction, and Lean

@@ -22,9 +22,10 @@ use crate::oracle::eval::{PrimResult, eval_literal, eval_prim_op};
 use crate::oracle::value::{Bug, Val, float_order_key, render_decimal};
 use crate::runtime::exec::{
     bigint_to_slice_bound, clamp_decimal_val, clamp_float_val, clamp_int_bigint,
-    decimal_to_int_checked, eval_in_list, float_to_int_checked, make_duration_checked,
-    round_float_val, round_to_float_even_val, round_to_float_val, slice_text, try_parse_date_text,
-    try_parse_decimal_text, try_parse_float_text, try_parse_int_text,
+    decimal_to_int_checked, eval_in_list, float_to_int_checked, join_text_list,
+    make_duration_checked, round_float_val, round_to_float_even_val, round_to_float_val,
+    slice_text, try_parse_date_text, try_parse_decimal_text, try_parse_float_text,
+    try_parse_int_text,
 };
 use crate::runtime::ir::{ExecExpr, ExecPrimOp, ExecProgram, ExecRowExpr};
 use crate::vm::batch::{Batch, Column, ColumnData, NullBitmap};
@@ -3220,6 +3221,14 @@ pub fn eval_scalar_exec_prim(
                 .map_err(|e| RowEvalErr::Failed(format!("Json.encode failed: {e}"))),
             _ => Err(RowEvalErr::Failed(
                 "Json.encode requires 1 argument".to_string(),
+            )),
+        },
+        ExecPrimOp::ListJoin => match args {
+            [Val::List(items), Val::Text(sep)] => join_text_list(items, sep)
+                .map(Val::Text)
+                .map_err(RowEvalErr::Failed),
+            _ => Err(RowEvalErr::Failed(
+                "List.join expects (List(Text), Text)".to_string(),
             )),
         },
         _ => Err(RowEvalErr::Failed(format!(

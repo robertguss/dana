@@ -1,8 +1,7 @@
 # Dana Sample Programs (Phase 0 Syntax Corpus)
 
-These 10 sample programs pressure-test Dana's syntax, structural table typing, privacy and
-declassification rules, SQL pushdown, statistics, charting, and testing ergonomics before
-freezing the v0.1 Language Reference and Dana Core IR.
+These 11 sample programs pressure-test Dana's syntax, structural table typing, privacy and
+declassification rules, SQL pushdown, local service integration, statistics, charting, and testing ergonomics.
 
 Once the Phase 0 executable grammar (`grammar/`) and Phase 2 compiler exist, every file here
 will parse, type-check, and pass its inline `examples` and `test` blocks in CI.
@@ -14,6 +13,7 @@ will parse, type-check, and pass its inline `examples` and `test` blocks in CI.
 | [expenses.dana](expenses.dana) | General CLI (sibling to Mo's `expenses.mo`) | Zero-friction public data, CSV quarantine `bad_rows`, `Decimal`, Markdown `table` literals, `Files.in_memory` |
 | [enrollment-report.dana](enrollment-report.dana) | Higher Ed / FERPA Analytics | Postgres SQL pushdown, `[pii]`/`[ferpa]` taint, `suppress_small_groups(min: 5, distinct_by: .id)`, window functions, SVG charts, HTML `Report`, `DB.in_memory` |
 | [registrar-sync.dana](registrar-sync.dana) | Higher Ed / API-to-DB ETL | Paginated `HttpsAllow` glue outside pure pipelines, quarantine parsing, `anti_join`, column-matched `WriteTable` upsert, `dana dry-run`, [dana.policy](dana.policy) |
+| [modb-catalog-sync.dana](modb-catalog-sync.dana) | Local Service + Multi-API ETL | Live `HttpsAllow` (`fields:` mapping) -> `LocalHttpAllow` (`MoShop`) & `LocalSocketAllow` (`AuditSock`), `Json.encode`, typed row/struct JSON bodies, `JsonResponse.has?`, `List.join`, SQLite `WriteTable` upsert, Parquet + HTML report |
 | [research-export.dana](research-export.dana) | Institutional Research | Schema-level `[counseling]` tag, `Secret` + `pseudonymize`, Parquet & `.xlsx` export, authorized non-PII sink |
 | [donor-reconciliation.dana](donor-reconciliation.dana) | Higher Ed / Finance | Custom `tag donor`, `.xlsx` read/write, exact `Decimal` conservation `promise`, `left_join_one` & `anti_join` |
 | [course-outcomes-stats.dana](course-outcomes-stats.dana) | Exploratory Statistics | Public Parquet/CSV, `profile()`, `T?` missing values, `corr`, `linear_regression`, `t_test`, z-score outliers, SVG scatter chart |

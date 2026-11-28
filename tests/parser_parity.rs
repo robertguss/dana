@@ -1,5 +1,5 @@
 //! Parser parity and formatter idempotence tests against the entire Phase 0 Bison corpus:
-//! - All 10 `examples/*.dana`
+//! - All 11 `examples/*.dana`
 //! - All fenced ```dana blocks in `docs/reference/README.md` and `README.md`
 //! - All `grammar/tests/{good,bad,bad-files}/*.dana`
 
@@ -63,7 +63,7 @@ fn extract_markdown_blocks(md_path: &Path) -> Result<Vec<(usize, bool, String)>,
 fn examples_parse_and_format_idempotently() -> Result<(), String> {
     let root = repo_root();
     let examples = collect_dana_files(&root.join("examples"))?;
-    assert_eq!(examples.len(), 10, "expected all 10 Phase 0 examples");
+    assert_eq!(examples.len(), 11, "expected all 11 examples");
 
     let mut sm = SourceMap::new();
     for path in examples {

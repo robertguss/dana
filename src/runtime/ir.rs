@@ -165,6 +165,8 @@ pub enum ExecPrimOp {
     JsonEncode {
         row_fields: Option<Vec<Ident>>,
     },
+    /// Join a `List(Text)` with a `Text` separator (`list.join(sep)` -> `Text`).
+    ListJoin,
     /// Promise helpers evaluated on a table value.
     PromiseUnique(Vec<Ident>),
     /// Check `all(pred)` over every row of a table.
@@ -258,8 +260,9 @@ pub enum ExecHostOp {
     LocalSocketPostJson,
     LocalSocketPutJson,
     LocalSocketDeleteJson,
-    /// `response.parse_table(field, as: S[, fields: {...}])` / `bool_at` / `text_at` / `int_at`.
+    /// `response.parse_table(field, as: S[, fields: {...}])` / `has?` / `bool_at` / `text_at` / `int_at`.
     JsonParseTable(Ident),
+    JsonHas,
     JsonBoolAt,
     JsonTextAt,
     JsonIntAt,
