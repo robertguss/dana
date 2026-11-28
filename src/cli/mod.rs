@@ -62,7 +62,8 @@ COMMANDS:
       Parse, type-check, privacy-check, and verify Dana source file(s) (with offline schema.lock).
   run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]
       Compile and execute a Dana program's `main` function (vectorized columnar VM + SQL pushdown
-      by default; pass `--oracle` for the reference row-by-row engine).
+      by default; pass `--oracle` for the reference row-by-row engine). `Secret(\"name\")` resolves
+      from uppercase environment variable `NAME` (e.g. `FERPA_SALT=...` for `Secret(\"ferpa_salt\")`).
   dry-run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]
       Execute strictly read-only, printing redacted WriteTable diffs and suppressing disk/DB writes.
   schema-sync --db Name=URI [--db Name2=URI2 ...] [--attach [DB:]schema=PATH]... [--schemas s1,s2,...] [--out schema.lock]

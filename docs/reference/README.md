@@ -657,7 +657,7 @@ explicit tag allowlists:
 | `WriteTable(DbName, "table_name", allows: [...])` | Typed DB upsert (`try w.upsert(tbl, key: .id)`) with column-by-column `schema.lock` tag verification |
 | `RawReadDB(DbName)` | Capability-gated parameterized raw SQL (`try raw.raw_sql("...", params: [...], as: Schema)`) |
 | `HttpsAllow("host", allows: [...])` | Exact-host HTTPS JSON client (no redirects to other hosts; sensitive egress requires `--allow-export=...`) |
-| `Secret("env_name")` | Key material from env var `ENV_NAME` (allowed in `pseudonymize` and `HttpsAllow` `headers:`) |
+| `Secret("env_name")` | Key material from uppercase env var `ENV_NAME` (e.g. `FERPA_SALT=...` for `Secret("ferpa_salt")`; no CLI `--secret` flag; allowed in `pseudonymize` and `HttpsAllow` `headers:`) |
 
 **Optional `dana.policy` ceiling:** When `dana.policy` sits beside a `.dana` file (or is passed
 via `--policy FILE`), Dana enforces it as a hard upper bound during both `dana check` and

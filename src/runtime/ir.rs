@@ -190,7 +190,8 @@ pub enum ExecHostOp {
     FakeConsoleLines,
     FakeConsoleErrors,
     FakeConsoleTables,
-    /// `console.print_chart(c)` / `console.print_profile(p)`.
+    /// `console.print_table(ct)` on a `DynamicTable` (`crosstab`), `console.print_chart(c)`, and `console.print_profile(p)`.
+    ConsolePrintDynamicTable,
     ConsolePrintChart,
     ConsolePrintProfile,
     /// `files.read_jsonl(path, as: Schema)` -> `Result((Table(S), Table(BadRow(S))), Text)`.

@@ -2731,6 +2731,19 @@ impl<'a> Evaluator<'a> {
                 }
                 _ => EvalOut::Failed("printed_tables requires fake Console".to_string()),
             },
+            ExecHostOp::ConsolePrintDynamicTable => {
+                if let [
+                    Val::CapConsole { handle, allows },
+                    Val::DynTable { headers, rows },
+                ] = args
+                {
+                    self.emit_console_dyn_table(*handle, allows, headers, rows)
+                } else {
+                    EvalOut::Failed(
+                        "console.print_table expects (Console, DynamicTable)".to_string(),
+                    )
+                }
+            }
             ExecHostOp::ConsolePrintChart => {
                 if let [Val::CapConsole { handle, .. }, payload] = args {
                     let rendered = match payload {
@@ -3350,6 +3363,13 @@ impl<'a> Evaluator<'a> {
             (
                 HostOp::ConsolePrintTable,
                 [
+                    Val::CapConsole { handle, allows },
+                    Val::DynTable { headers, rows },
+                ],
+            ) => self.emit_console_dyn_table(*handle, allows, headers, rows),
+            (
+                HostOp::ConsolePrintTable,
+                [
                     Val::CapConsole { handle, .. },
                     tbl_val @ (Val::Table(_) | Val::Columnar(_)),
                 ],
@@ -3453,6 +3473,28 @@ impl<'a> Evaluator<'a> {
                 }
             }
         }
+    }
+
+    fn emit_console_dyn_table(
+        &mut self,
+        handle: CapHandle,
+        allows: &TagSet,
+        headers: &[String],
+        rows: &[Vec<Val>],
+    ) -> EvalOut {
+        if let Some(bug) = self.check_export_gate(handle, allows, "Console") {
+            return EvalOut::Stopped(bug);
+        }
+        let rendered = format_pretty_dyn_table(headers, rows);
+        match handle {
+            CapHandle::Real => self.ew.world.stdout.push(rendered),
+            CapHandle::Fake(idx) => {
+                if let Some(fc) = self.ew.world.fake_consoles.get_mut(idx) {
+                    fc.stdout.push(rendered);
+                }
+            }
+        }
+        EvalOut::Ok(Val::Unit)
     }
 
     fn eval_read_csv_with_opts(
@@ -6894,13 +6936,14 @@ fn format_display_val(v: &Val) -> String {
     }
 }
 
-fn format_pretty_table(tv: &TableVal) -> String {
-    let mut widths: Vec<usize> = tv.cols.iter().map(|c| c.name.len()).collect();
-    let rendered: Vec<Vec<String>> = tv
-        .rows
-        .iter()
-        .map(|r| {
-            r.cells
+fn format_pretty_grid<'a>(
+    header_names: &[&'a str],
+    rows: impl Iterator<Item = &'a [Val]>,
+) -> String {
+    let mut widths: Vec<usize> = header_names.iter().map(|h| h.len()).collect();
+    let rendered: Vec<Vec<String>> = rows
+        .map(|cells| {
+            cells
                 .iter()
                 .enumerate()
                 .map(|(i, c)| {
@@ -6915,9 +6958,9 @@ fn format_pretty_table(tv: &TableVal) -> String {
         .collect();
     let mut out = String::new();
     out.push('|');
-    for (i, c) in tv.cols.iter().enumerate() {
+    for (i, h) in header_names.iter().enumerate() {
         let w = widths[i];
-        out.push_str(&format!(" {:<w$} |", c.name));
+        out.push_str(&format!(" {h:<w$} |"));
     }
     out.push('\n');
     out.push('|');
@@ -6937,6 +6980,16 @@ fn format_pretty_table(tv: &TableVal) -> String {
         }
     }
     out
+}
+
+fn format_pretty_table(tv: &TableVal) -> String {
+    let headers: Vec<&str> = tv.cols.iter().map(|c| c.name.as_str()).collect();
+    format_pretty_grid(&headers, tv.rows.iter().map(|r| r.cells.as_slice()))
+}
+
+fn format_pretty_dyn_table(headers: &[String], rows: &[Vec<Val>]) -> String {
+    let header_strs: Vec<&str> = headers.iter().map(String::as_str).collect();
+    format_pretty_grid(&header_strs, rows.iter().map(Vec::as_slice))
 }
 
 pub(crate) fn bigint_to_slice_bound(n: &BigInt) -> i64 {

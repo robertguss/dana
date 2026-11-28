@@ -1473,7 +1473,7 @@ fn check_src_with_lock(
 
 #[test]
 fn v06_sqlite_attach_and_unattached_schema_table_fallback() -> TestResult {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.9");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.10");
     let tmp = TempDir::new("sqlite_attach")?;
     let main_db = tmp.path().join("main.db");
     let populi_db = tmp.path().join("populi.db");
@@ -2781,12 +2781,12 @@ end
     let db_out = assert_oracle_vm_parity(db_src, Some(("DB", &uri)))?;
     assert_eq!(db_out, vec!["2"]);
 
-    // 5. CLI --version prints `dana v0.6.9`
+    // 5. CLI --version prints `dana v0.6.10`
     let ver = Command::new(env!("CARGO_BIN_EXE_dana"))
         .arg("--version")
         .output()?;
     assert_eq!(ver.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.9");
+    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.10");
 
     Ok(())
 }
@@ -6586,6 +6586,105 @@ fn v069_repl_schema_lock_auto_schemas_and_table_string_shorthand() -> TestResult
         }
         other => return Err(format!("expected unknown table error, got {other:?}").into()),
     }
+
+    Ok(())
+}
+
+// ===========================================================================
+// Patch v0.6.10 Tests: console.print_table(DynamicTable) + privacy/fake parity
+// ===========================================================================
+
+#[test]
+fn v0610_console_print_table_handles_crosstab_dynamic_table_vm_and_oracle() -> TestResult {
+    let src = r#"
+module CrosstabPrintDemo
+
+schema RevRow
+  region: Text
+  quarter: Text
+  revenue: Decimal
+end
+
+fn make_ct(rows: Table(RevRow)) : DynamicTable
+  rows |> crosstab(rows: .region, cols: .quarter, values: .revenue, fill: 0.00)
+end
+
+fn main(console: Console) : Int
+  rows = table
+    | region  | quarter | revenue |
+    | "north" | "Q1"    | 120.50  |
+    | "north" | "Q2"    | 80.25   |
+    | "south" | "Q1"    | 90.00   |
+  end
+  ct = make_ct(rows)
+  console.print_table(ct)
+  0
+end
+
+test "Console.fake captures console.print_table on crosstab DynamicTable"
+  rows = table
+    | region | quarter | revenue |
+    | "east" | "Q1"    | 10.00   |
+    | "west" | "Q2"    | 25.50   |
+  end
+  console = Console.fake()
+  ct = make_ct(rows)
+  console.print_table(ct)
+  assert console.printed_lines.size == 1
+  line = console.printed_lines.first!
+  assert line.contains?("region")
+  assert line.contains?("Q1") and line.contains?("Q2")
+  assert line.contains?("east") and line.contains?("25.5")
+end
+"#;
+
+    let stdout = assert_oracle_vm_parity(src, None)?;
+    assert_eq!(stdout.len(), 1);
+    assert!(
+        stdout[0].contains("| region")
+            && stdout[0].contains("| Q1")
+            && stdout[0].contains("| Q2")
+            && stdout[0].contains("north")
+            && stdout[0].contains("120.5")
+            && stdout[0].contains("south"),
+        "unexpected printed crosstab table:\n{}",
+        stdout[0]
+    );
+
+    let checked = check_src(src)?;
+    let ora_tests = dana::runtime::run_program_tests(&checked.exec, None, &RunConfig::default());
+    let vm_tests = dana::vm::run_program_tests_vm(
+        &checked.exec,
+        None,
+        &RunConfig::default(),
+        &VmConfig::default(),
+    );
+    assert_eq!(ora_tests.len(), 1);
+    assert_eq!(vm_tests.len(), 1);
+    assert!(ora_tests[0].passed, "{ora_tests:?}");
+    assert!(vm_tests[0].passed, "{vm_tests:?}");
+
+    // Negative privacy test: [pii] crosstab DynamicTable cannot print to plain Console
+    let bad_src = r#"
+module CrosstabPrivacyNeg
+
+schema SensitiveRev
+  region: Text [pii]
+  quarter: Text
+  revenue: Decimal
+end
+
+fn leak(rows: Table(SensitiveRev), console: Console) : Int
+  ct = rows |> crosstab(rows: .region, cols: .quarter, values: .revenue, fill: 0.00)
+  console.print_table(ct)
+  0
+end
+"#;
+    let diags = check_src_diags(bad_src)?;
+    assert!(
+        diags.iter().any(|d| d.code() == DiagCode::PrivacyError),
+        "expected PrivacyError for [pii] DynamicTable on plain Console, got: {diags:?}"
+    );
 
     Ok(())
 }

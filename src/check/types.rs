@@ -9119,6 +9119,9 @@ impl<'a> Checker<'a> {
                 let hop = match member.name.as_str() {
                     "print" => ExecHostOp::Core(HostOp::ConsolePrint),
                     "error" => ExecHostOp::Core(HostOp::ConsoleError),
+                    "print_table" if matches!(alty.ty, Ty::DynamicTable(_)) => {
+                        ExecHostOp::ConsolePrintDynamicTable
+                    }
                     "print_table" => ExecHostOp::Core(HostOp::ConsolePrintTable),
                     "print_chart" => ExecHostOp::ConsolePrintChart,
                     _ => ExecHostOp::ConsolePrintProfile,
