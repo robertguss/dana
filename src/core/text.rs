@@ -734,6 +734,16 @@ fn encode_ty_iter(init: EncodeTyTask<'_>) -> SExp {
                     SExp::Str(host.clone()),
                     encode_tag_set(allows),
                 ])),
+                Ty::LocalHttpAllow { target, allows } => vals.push(SExp::List(vec![
+                    atom("local-http-allow"),
+                    SExp::Str(target.display_label()),
+                    encode_tag_set(allows),
+                ])),
+                Ty::LocalSocketAllow { target, allows } => vals.push(SExp::List(vec![
+                    atom("local-socket-allow"),
+                    SExp::Str(target.display_label()),
+                    encode_tag_set(allows),
+                ])),
                 Ty::Secret(name) => {
                     vals.push(SExp::List(vec![atom("secret"), SExp::Str(name.clone())]));
                 }
@@ -3257,6 +3267,10 @@ fn decode_policy(s: &SExp) -> Result<Policy, WireError> {
             };
             Ok((decode_str_only(h)?, decode_tag_set(ts)?))
         })?,
+        forbid_local_http: false,
+        forbid_local_socket: false,
+        allow_local_http: Vec::new(),
+        allow_local_socket: Vec::new(),
         allow_write: map_decode(as_list(aw)?, |rule| {
             let [db, tbl, ts] = as_list(rule)? else {
                 return err("invalid allow-write rule");

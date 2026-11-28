@@ -1,6 +1,6 @@
-# Dana Language Reference, v0.6
+# Dana Language Reference, v0.7
 
-**Version 0.6 (pre-1.0).** This is the complete, authoritative language reference for Dana,
+**Version 0.7 (pre-1.0).** This is the complete, authoritative language reference for Dana,
 embedded directly into `dana guide` for human authors and AI coding agents.
 
 Every rule is illustrated with real syntax checked by Dana's 0-conflict IELR(1) grammar
@@ -51,8 +51,9 @@ Key design rules:
   may precede it).
 - **Explicit capabilities, zero ambient authority.** `main` receives every I/O capability as a
   typed parameter (`Args`, `ReadFiles`, `WriteFiles(...)`, `ReadDB(...)`, `WriteTable(...)`,
-  `RawReadDB(...)`, `HttpsAllow(...)`, `Console`, `Secret(...)`). Functions without capability
-  parameters are **pure** and can run inside vectorized table pipelines.
+  `RawReadDB(...)`, `HttpsAllow(...)`, `LocalHttpAllow(...)`, `LocalSocketAllow(...)`, `Console`,
+  `Secret(...)`). Functions without capability parameters are **pure** and can run inside
+  vectorized table pipelines.
 - **Keyword-delimited blocks.** Blocks open with `schema`, `struct`, `enum`, `fn`, `if`
   (block form), `case`, `for`, `while`, `table`, `examples`, or `test`, and close with `end`.
   Indentation is purely stylistic (`dana format` uses 2 spaces).
@@ -85,7 +86,7 @@ use Helpers { helper_a, HelperType }
 ```
 
 - Built-in stdlib namespaces (`Stats`, `Report`, `Table`, `Args`, `Files`, `DB`, `Console`,
-  `Https`, `Secret`) require no disk files; declare `use Stats` when calling `Stats.*`.
+  `Https`, `LocalHttp`, `LocalSocket`, `Secret`) require no disk files; declare `use Stats` when calling `Stats.*`.
 - Source files are UTF-8. Invisible formatting/bidi/zero-width control characters are a lexing
   error anywhere in source, including comments and strings; write `"\u{200B}"` instead.
 
@@ -657,7 +658,9 @@ explicit tag allowlists:
 | `WriteTable(DbName, "table_name", allows: [...])` | Typed DB upsert (`try w.upsert(tbl, key: .id)`) with column-by-column `schema.lock` tag verification |
 | `RawReadDB(DbName)` | Capability-gated parameterized raw SQL (`try raw.raw_sql("...", params: [...], as: Schema)`) |
 | `HttpsAllow("host", allows: [...])` | Exact-host HTTPS JSON client (no redirects to other hosts; sensitive egress requires `--allow-export=...`) |
-| `Secret("env_name")` | Key material from uppercase env var `ENV_NAME` (e.g. `FERPA_SALT=...` for `Secret("ferpa_salt")`; no CLI `--secret` flag; allowed in `pseudonymize` and `HttpsAllow` `headers:`) |
+| `LocalHttpAllow("host:port" \| Name, allows: [...])` | Capability-gated plaintext HTTP/1.1 client strictly confined to loopback hosts (`127.0.0.1:PORT`, `localhost:PORT`, `[::1]:PORT`) or CLI/env-bound service names (`--local-http Name=URL\|ready:FILE` / `DANA_LOCAL_HTTP_<NAME>`) |
+| `LocalSocketAllow("/path.sock" \| Name, allows: [...])` | Capability-gated HTTP/1.1 client over a non-symlinked Unix domain socket (`"/path.sock"` or `--local-socket Name=PATH` / `DANA_LOCAL_SOCKET_<NAME>`) |
+| `Secret("env_name")` | Key material from uppercase env var `ENV_NAME` (e.g. `FERPA_SALT=...` for `Secret("ferpa_salt")`; no CLI `--secret` flag; allowed in `pseudonymize`, `HttpsAllow`, `LocalHttpAllow`, and `LocalSocketAllow` `headers:`) |
 
 **Optional `dana.policy` ceiling:** When `dana.policy` sits beside a `.dana` file (or is passed
 via `--policy FILE`), Dana enforces it as a hard upper bound during both `dana check` and
@@ -669,12 +672,16 @@ version 1
 min_group_size 5
 forbid manual_declassify
 forbid repl_show_sensitive
+forbid local_http
+forbid local_socket
 
 allow console tags []
-allow export  "reports/"          tags []
-allow export  "ir-exports/"       tags [counseling]
-allow https   "api.populiweb.com" tags [pii]
-allow write   Seminary.students   tags [pii, ferpa]
+allow export       "reports/"          tags []
+allow export       "ir-exports/"       tags [counseling]
+allow https        "api.populiweb.com" tags [pii]
+allow local_http   "127.0.0.1:8091"    tags []
+allow local_socket "/run/mo.sock"      tags []
+allow write        Seminary.students   tags [pii, ferpa]
 ```
 
 > **Note:** In Dana code, `WriteTable` takes two arguments: `WriteTable(Seminary, "students", allows: [pii, ferpa])`.
@@ -686,8 +693,9 @@ allow write   Seminary.students   tags [pii, ferpa]
   public while tagging `raw_value: Text` and `raw_line: Text` with the schema's tags.
 - Runtime errors, `dana dry-run` diffs, `table.profile()`, and `dana repl` automatically render
   unauthorized sensitive values as `[REDACTED:<sorted,tags>]`.
-- Exporting sensitive data to `WriteFiles` or `HttpsAllow` requires **both** compile-time
-  `allows: [...]` (permitted by `dana.policy`) **and** runtime `--allow-export=tag1,tag2`.
+- Exporting sensitive data to `WriteFiles`, `HttpsAllow`, `LocalHttpAllow`, or `LocalSocketAllow`
+  requires **both** compile-time `allows: [...]` (permitted by `dana.policy`) **and** runtime
+  `--allow-export=tag1,tag2`.
 
 ---
 
@@ -871,6 +879,80 @@ test "nested fields mapping and table post_json work with Https.fake"
 end
 ```
 
+### 8.4 Capability-Gated Local HTTP (`LocalHttpAllow`) & Unix Domain Sockets (`LocalSocketAllow`)
+
+`LocalHttpAllow` and `LocalSocketAllow` enable strict plaintext HTTP/1.1 integration with local
+co-resident services (for example `mo serve` or local Unix admin sockets) **without** weakening
+`HttpsAllow` TLS enforcement:
+
+- **Pinned vs. named endpoints:**
+  - `LocalHttpAllow("127.0.0.1:8091", [allows: [...]])` pins an explicit loopback authority
+    (`127.0.0.0/8`, `localhost`, or `[::1]`) **with an explicit non-zero `:port`** (wildcard
+    portless loopback authorities, non-loopback IPs, hostnames, schemes, userinfo, and paths are
+    rejected at compile time).
+  - `LocalHttpAllow(MoShop, [allows: [...]])` binds dynamically at runtime via
+    `--local-http MoShop=http://127.0.0.1:8091` or `--local-http MoShop=ready:/path/ready.json`
+    (reads `{"url": ...}` or `{"port": ...}` such as `mo serve --ready-file`) or env var
+    `DANA_LOCAL_HTTP_MOSHOP`.
+  - `LocalSocketAllow("/run/mo.sock", [allows: [...]])` or `LocalSocketAllow(MoAdmin)` binds via
+    `--local-socket MoAdmin=/run/mo.sock` or `DANA_LOCAL_SOCKET_MOADMIN`. Paths with `..` or URL
+    schemes are rejected at compile time; live connects canonicalize parent directories and reject
+    symlinks or non-socket files via `lstat`.
+- **Methods & URL rules:** Both capabilities provide `.get_json(target, [headers: {...}])`,
+  `.post_json(target, body, [headers: {...}])`, `.put_json(target, body, [headers: {...}])`, and
+  `.delete_json(target, [headers: {...}])` returning `Result(JsonResponse, Text)`.
+  `LocalHttpAllow` accepts relative `/path[?query]` or exact `http://<same-authority>/path` URLs
+  and forbids `https://`; `LocalSocketAllow` requires relative `/path[?query]`.
+- **Security & `dry-run` invariants:**
+  - `HttpsAllow` continues to reject `http://` URLs unconditionally.
+  - `LocalHttpAllow` verifies every post-DNS `SocketAddr::ip().is_loopback()` before TCP connect,
+    forbids `Host`/`Content-Length`/`Transfer-Encoding` overrides and CR/LF/NUL headers, and never
+    follows 3xx redirects.
+  - Sensitive data requires both compile-time `allows: [...]` (within `dana.policy`) and runtime
+    `--allow-export=...`. `Secret("name")` headers remain permitted for bearer auth.
+  - Under `dana dry-run`, `GET` executes read-only while `POST`/`PUT`/`DELETE` are suppressed cleanly
+    and print `[DRY-RUN] would POST/PUT/DELETE ... (headers: [...])` with header values and
+    sensitive bodies redacted.
+
+<!-- dana-example: file -->
+```dana
+module LocalHttpAndSocketDemo
+
+schema ProductOut
+  sku: Text
+  stock: Int
+end
+
+fn sync_local_mo(
+  mo: LocalHttpAllow(MoShop),
+  admin: LocalSocketAllow(MoAdmin),
+  token: Secret("shop_token")
+) : Result(Int, Text)
+  _ = try mo.get_json("/health")
+  auth = {"Authorization": "Bearer #{token}"}
+  _ = try mo.post_json("/products", body: "{\"sku\":\"blend-1\",\"stock\":12}", headers: auth)
+  _ = try admin.post_json("/admin/verify", body: "{\"check\":true}")
+  resp = try mo.get_json("/products", headers: auth)
+  (rows, _bad) = resp.parse_table("", as: ProductOut)
+  Ok(rows.count())
+end
+
+test "LocalHttp.fake and LocalSocket.fake run offline cleanly"
+  mo = LocalHttp.fake(
+    MoShop,
+    responses: {
+      "GET /health": "{\"status\":\"ok\"}",
+      "POST /products": "{\"ok\":true}",
+      "GET /products": "[{\"sku\":\"blend-1\",\"stock\":12}]"
+    }
+  )
+  admin = LocalSocket.fake(MoAdmin, responses: {"POST /admin/verify": "{\"ok\":true}"})
+  assert (try sync_local_mo(mo, admin, Secret.fake("dev"))) == 1
+  assert mo.requests.size == 3
+  assert admin.requests.size == 1
+end
+```
+
 ---
 
 ## 9. Statistics, Charts & Reports
@@ -976,6 +1058,8 @@ production code is a compile error):
 | `DB.in_memory(DbName, {Schema1: tbl1, ...})` | `ReadDB(DbName)` | Serves typed in-memory tables |
 | `Console.fake()` | `Console` | `.printed_lines : List(Text)`, `.printed_errors : List(Text)`, `.printed_tables : List(Table)` |
 | `Https.fake("host", responses: {"https://host/...": "{...}"}, allows: [pii])` | `HttpsAllow` | Stubbed JSON responses (`allows:` optional); `.requests : List(Text)` & `.request_bodies : List(Text)` |
+| `LocalHttp.fake(Name \| "127.0.0.1:8091", responses: {"GET /p": "{...}"}, allows: [pii])` | `LocalHttpAllow` | Stubbed local HTTP JSON (`allows:` optional); `.requests : List(Text)` & `.request_bodies : List(Text)` |
+| `LocalSocket.fake(Name \| "/run/mo.sock", responses: {"POST /p": "{...}"}, allows: [pii])` | `LocalSocketAllow` | Stubbed local UDS JSON (`allows:` optional); `.requests : List(Text)` & `.request_bodies : List(Text)` |
 | `Secret.fake("test-key")` | `Secret` | Deterministic test secret for `pseudonymize` / HTTPS |
 | `Args.of(["a.csv", "b.csv"])` | `Args` | Supplies CLI args to `main(...)` in tests |
 
@@ -1073,8 +1157,8 @@ Every `dana <subcommand>` accepts `-h` or `--help` to print its usage summary.
 
 ```sh
 dana check [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--json] <FILE...>
-dana run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]
-dana dry-run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]
+dana run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--local-http Name=URL|ready:FILE]... [--local-socket Name=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]
+dana dry-run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--local-http Name=URL|ready:FILE]... [--local-socket Name=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]
 dana test [--oracle] [--oracle-steps N] [--policy FILE] [--filter SUBSTR] [PATH...]
 dana explain [--dialect sqlite|postgres] [--schema-lock FILE] [--policy FILE] <FILE>
 dana schema-sync --db Name=URI [--db Name2=URI2 ...] [--attach [DB:]schema=PATH]... [--schemas s1,s2,...] [--out schema.lock]

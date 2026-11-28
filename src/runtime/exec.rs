@@ -49,7 +49,10 @@ use crate::formats::time::{
 use crate::formats::xlsx::{read_xlsx_bytes_with_schema, write_xlsx_sheets};
 use crate::net::{
     HttpsClientConfig, JsonResponse, ParsedHttpsUrl, https_get_json, https_post_json,
-    https_put_json,
+    https_put_json, local_http_delete_json, local_http_get_json, local_http_write_json,
+    local_socket_delete_json, local_socket_get_json, local_socket_write_json,
+    parse_local_http_binding_value, parse_loopback_authority, resolve_local_http_url,
+    resolve_local_socket_path_and_query, validate_local_socket_path,
 };
 use crate::oracle::eval::{PrimResult, eval_literal, eval_prim_op, pseudonymize_token};
 use crate::oracle::value::{
@@ -79,11 +82,15 @@ pub struct RunConfig {
     pub pseudonymize_mode: PseudonymizeMode,
     /// Logical Dana DB name -> connection URI bindings (e.g. `"Seminary" -> "sqlite:///..."`).
     pub db_bindings: HashMap<String, String>,
+    /// Named `LocalHttpAllow(Name)` bindings (`"MoShop" -> "http://127.0.0.1:PORT"` or `"ready:..."`).
+    pub local_http_bindings: HashMap<String, String>,
+    /// Named `LocalSocketAllow(Name)` bindings (`"MoAdmin" -> "/path/to/admin.sock"`).
+    pub local_socket_bindings: HashMap<String, String>,
     /// SQLite `ATTACH DATABASE` specifications (`(optional db_name filter, schema, file path)`).
     pub sqlite_attachments: Vec<(Option<String>, String, String)>,
     /// Optional offline `schema.lock` snapshot for table-name resolution and pushdown PK proofs.
     pub schema_lock: Option<SchemaLockFile>,
-    /// When `true`, suppresses all live DB/filesystem mutations and prints redacted dry-run diffs.
+    /// When `true`, suppresses all live DB/filesystem/network writes and prints redacted dry-run logs.
     pub dry_run: bool,
     /// Optional PEM CA certificate file used by `HttpsAllow` (falls back to `DANA_HTTPS_CA_CERT`).
     pub https_ca_cert: Option<std::path::PathBuf>,
@@ -99,6 +106,8 @@ impl Default for RunConfig {
             fuel: DEFAULT_FUEL,
             pseudonymize_mode: PseudonymizeMode::HmacSha256,
             db_bindings: HashMap::new(),
+            local_http_bindings: HashMap::new(),
+            local_socket_bindings: HashMap::new(),
             sqlite_attachments: Vec::new(),
             schema_lock: None,
             dry_run: false,
@@ -157,6 +166,13 @@ pub struct TestOutcome {
     pub message: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct FakeLocalEndpointState {
+    responses: Vec<(String, String)>,
+    requests: Vec<String>,
+    request_bodies: Vec<String>,
+}
+
 #[derive(Debug)]
 struct ExecWorld {
     world: World,
@@ -166,10 +182,14 @@ struct ExecWorld {
     written_binary_files: Vec<(String, Vec<u8>)>,
     json_responses: Vec<JsonResponse>,
     fake_https_bodies: HashMap<usize, Vec<String>>,
+    fake_local_http: Vec<FakeLocalEndpointState>,
+    fake_local_socket: Vec<FakeLocalEndpointState>,
     work_dir: Option<std::path::PathBuf>,
     live_io: bool,
     pseudonymize_mode: PseudonymizeMode,
     db_registry: DbRegistry,
+    local_http_bindings: HashMap<String, String>,
+    local_socket_bindings: HashMap<String, String>,
     schema_lock: Option<SchemaLockFile>,
     dry_run: bool,
     https_ca_cert: Option<std::path::PathBuf>,
@@ -201,10 +221,14 @@ impl ExecWorld {
             written_binary_files: Vec::new(),
             json_responses: Vec::new(),
             fake_https_bodies: HashMap::new(),
+            fake_local_http: Vec::new(),
+            fake_local_socket: Vec::new(),
             work_dir: cfg.work_dir.clone(),
             live_io: cfg.live_io,
             pseudonymize_mode: cfg.pseudonymize_mode,
             db_registry,
+            local_http_bindings: cfg.local_http_bindings.clone(),
+            local_socket_bindings: cfg.local_socket_bindings.clone(),
             schema_lock: cfg.schema_lock.clone(),
             dry_run: cfg.dry_run,
             https_ca_cert,
@@ -505,6 +529,16 @@ fn real_cap_for_ty(ty: &Ty) -> Val {
         Ty::HttpsAllow { host, allows } => Val::CapHttpsAllow {
             handle: CapHandle::Real,
             host: host.clone(),
+            allows: allows.clone(),
+        },
+        Ty::LocalHttpAllow { target, allows } => Val::CapLocalHttpAllow {
+            handle: CapHandle::Real,
+            target: target.clone(),
+            allows: allows.clone(),
+        },
+        Ty::LocalSocketAllow { target, allows } => Val::CapLocalSocketAllow {
+            handle: CapHandle::Real,
+            target: target.clone(),
             allows: allows.clone(),
         },
         Ty::Secret(name) => Val::CapSecret {
@@ -3257,6 +3291,176 @@ impl<'a> Evaluator<'a> {
                     )),
                 }
             }
+            ExecHostOp::FakeLocalHttp { target } => {
+                let responses = match parse_fake_responses_arg(args) {
+                    Ok(r) => r,
+                    Err(e) => return EvalOut::Failed(format!("LocalHttp.fake {e}")),
+                };
+                let idx = self.ew.fake_local_http.len();
+                self.ew.fake_local_http.push(FakeLocalEndpointState {
+                    responses,
+                    requests: Vec::new(),
+                    request_bodies: Vec::new(),
+                });
+                EvalOut::Ok(Val::CapLocalHttpAllow {
+                    handle: CapHandle::Fake(idx),
+                    target: target.clone(),
+                    allows: TagSet::empty(),
+                })
+            }
+            ExecHostOp::FakeLocalSocket { target } => {
+                let responses = match parse_fake_responses_arg(args) {
+                    Ok(r) => r,
+                    Err(e) => return EvalOut::Failed(format!("LocalSocket.fake {e}")),
+                };
+                let idx = self.ew.fake_local_socket.len();
+                self.ew.fake_local_socket.push(FakeLocalEndpointState {
+                    responses,
+                    requests: Vec::new(),
+                    request_bodies: Vec::new(),
+                });
+                EvalOut::Ok(Val::CapLocalSocketAllow {
+                    handle: CapHandle::Fake(idx),
+                    target: target.clone(),
+                    allows: TagSet::empty(),
+                })
+            }
+            ExecHostOp::FakeLocalHttpRequests | ExecHostOp::FakeLocalHttpBodies => {
+                let want_bodies = matches!(op, ExecHostOp::FakeLocalHttpBodies);
+                match args {
+                    [
+                        Val::CapLocalHttpAllow {
+                            handle: CapHandle::Fake(idx),
+                            ..
+                        },
+                    ] => {
+                        let list = self
+                            .ew
+                            .fake_local_http
+                            .get(*idx)
+                            .map(|st| {
+                                if want_bodies {
+                                    &st.request_bodies
+                                } else {
+                                    &st.requests
+                                }
+                            })
+                            .map(|v| v.iter().cloned().map(Val::Text).collect())
+                            .unwrap_or_default();
+                        EvalOut::Ok(Val::List(list))
+                    }
+                    _ => EvalOut::Failed(
+                        "LocalHttp.{requests,request_bodies} requires fake LocalHttpAllow"
+                            .to_string(),
+                    ),
+                }
+            }
+            ExecHostOp::FakeLocalSocketRequests | ExecHostOp::FakeLocalSocketBodies => {
+                let want_bodies = matches!(op, ExecHostOp::FakeLocalSocketBodies);
+                match args {
+                    [
+                        Val::CapLocalSocketAllow {
+                            handle: CapHandle::Fake(idx),
+                            ..
+                        },
+                    ] => {
+                        let list = self
+                            .ew
+                            .fake_local_socket
+                            .get(*idx)
+                            .map(|st| {
+                                if want_bodies {
+                                    &st.request_bodies
+                                } else {
+                                    &st.requests
+                                }
+                            })
+                            .map(|v| v.iter().cloned().map(Val::Text).collect())
+                            .unwrap_or_default();
+                        EvalOut::Ok(Val::List(list))
+                    }
+                    _ => EvalOut::Failed(
+                        "LocalSocket.{requests,request_bodies} requires fake LocalSocketAllow"
+                            .to_string(),
+                    ),
+                }
+            }
+            ExecHostOp::LocalHttpGetJson
+            | ExecHostOp::LocalHttpPostJson
+            | ExecHostOp::LocalHttpPutJson
+            | ExecHostOp::LocalHttpDeleteJson => {
+                let method = match op {
+                    ExecHostOp::LocalHttpGetJson => "GET",
+                    ExecHostOp::LocalHttpPostJson => "POST",
+                    ExecHostOp::LocalHttpPutJson => "PUT",
+                    _ => "DELETE",
+                };
+                let (cap, url, body_opt, hdr_val) = match (op, args) {
+                    (
+                        ExecHostOp::LocalHttpGetJson | ExecHostOp::LocalHttpDeleteJson,
+                        [cap, Val::Text(url), hdr_val],
+                    ) => (cap, url, None, hdr_val),
+                    (
+                        ExecHostOp::LocalHttpPostJson | ExecHostOp::LocalHttpPutJson,
+                        [cap, Val::Text(url), body_val, hdr_val],
+                    ) => (cap, url, Some(body_val), hdr_val),
+                    _ => {
+                        return EvalOut::Failed(format!(
+                            "LocalHttpAllow.{method} invalid runtime arguments"
+                        ));
+                    }
+                };
+                match cap {
+                    Val::CapLocalHttpAllow {
+                        handle,
+                        target,
+                        allows,
+                    } => self.eval_local_http_json(
+                        method, *handle, target, allows, url, body_opt, hdr_val,
+                    ),
+                    _ => EvalOut::Failed(format!(
+                        "LocalHttpAllow.{method} expects LocalHttpAllow capability"
+                    )),
+                }
+            }
+            ExecHostOp::LocalSocketGetJson
+            | ExecHostOp::LocalSocketPostJson
+            | ExecHostOp::LocalSocketPutJson
+            | ExecHostOp::LocalSocketDeleteJson => {
+                let method = match op {
+                    ExecHostOp::LocalSocketGetJson => "GET",
+                    ExecHostOp::LocalSocketPostJson => "POST",
+                    ExecHostOp::LocalSocketPutJson => "PUT",
+                    _ => "DELETE",
+                };
+                let (cap, url, body_opt, hdr_val) = match (op, args) {
+                    (
+                        ExecHostOp::LocalSocketGetJson | ExecHostOp::LocalSocketDeleteJson,
+                        [cap, Val::Text(url), hdr_val],
+                    ) => (cap, url, None, hdr_val),
+                    (
+                        ExecHostOp::LocalSocketPostJson | ExecHostOp::LocalSocketPutJson,
+                        [cap, Val::Text(url), body_val, hdr_val],
+                    ) => (cap, url, Some(body_val), hdr_val),
+                    _ => {
+                        return EvalOut::Failed(format!(
+                            "LocalSocketAllow.{method} invalid runtime arguments"
+                        ));
+                    }
+                };
+                match cap {
+                    Val::CapLocalSocketAllow {
+                        handle,
+                        target,
+                        allows,
+                    } => self.eval_local_socket_json(
+                        method, *handle, target, allows, url, body_opt, hdr_val,
+                    ),
+                    _ => EvalOut::Failed(format!(
+                        "LocalSocketAllow.{method} expects LocalSocketAllow capability"
+                    )),
+                }
+            }
             ExecHostOp::JsonParseTable(schema_name) => match args {
                 [resp_val, Val::Text(field)] => {
                     self.eval_json_parse_table(resp_val, field, schema_name, None)
@@ -4361,6 +4565,397 @@ impl<'a> Evaluator<'a> {
                     }
                     Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string())))),
                 }
+            }
+        }
+    }
+
+    fn finish_json_response(
+        &mut self,
+        res: Result<JsonResponse, crate::net::HttpsError>,
+    ) -> EvalOut {
+        match res {
+            Ok(jresp) => {
+                let resp_idx = self.ew.json_responses.len();
+                self.ew.json_responses.push(jresp);
+                EvalOut::Ok(Val::ResOk(Box::new(make_json_response_val(resp_idx))))
+            }
+            Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string())))),
+        }
+    }
+
+    fn match_fake_net_response(
+        &mut self,
+        responses: &[(String, String)],
+        method: &str,
+        raw_target: &str,
+        path_and_query: &str,
+        label: &str,
+    ) -> EvalOut {
+        let method_url = format!("{method} {raw_target}");
+        let method_path = format!("{method} {path_and_query}");
+        let resp_opt = responses
+            .iter()
+            .find(|(k, _)| k == &method_url || k == &method_path)
+            .or_else(|| {
+                responses
+                    .iter()
+                    .find(|(k, _)| k == raw_target || k == path_and_query)
+            })
+            .map(|(_, v)| v.clone());
+        let Some(resp_raw) = resp_opt else {
+            return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                "no fake {label} response registered for `{method} {raw_target}`"
+            )))));
+        };
+        let jresp = if resp_raw.trim().is_empty() {
+            Ok(JsonResponse::from_value(
+                crate::formats::json::JsonValue::Null,
+            ))
+        } else {
+            JsonResponse::from_json_str(&resp_raw)
+        };
+        self.finish_json_response(jresp)
+    }
+
+    fn emit_local_net_dry_run(
+        &mut self,
+        method: &str,
+        target_desc: &str,
+        body_len: Option<usize>,
+        req_headers: &[(String, String)],
+    ) -> EvalOut {
+        let hdr_names: Vec<&str> = req_headers.iter().map(|(k, _)| k.as_str()).collect();
+        let line = match body_len {
+            Some(len) => format!(
+                "[DRY-RUN] would {method} {target_desc} ({len} bytes, headers: [{}])",
+                hdr_names.join(", ")
+            ),
+            None => format!(
+                "[DRY-RUN] would {method} {target_desc} (headers: [{}])",
+                hdr_names.join(", ")
+            ),
+        };
+        self.ew.world.stdout.push(line);
+        let resp_idx = self.ew.json_responses.len();
+        self.ew.json_responses.push(JsonResponse::from_value(
+            crate::formats::json::JsonValue::Null,
+        ));
+        EvalOut::Ok(Val::ResOk(Box::new(make_json_response_val(resp_idx))))
+    }
+
+    fn resolve_local_http_target(
+        &self,
+        target: &LocalHttpTarget,
+    ) -> Result<crate::net::ParsedLoopbackAuthority, Bug> {
+        match target {
+            LocalHttpTarget::Pinned(auth) => parse_loopback_authority(auth).map_err(|e| Bug {
+                kind: BugKind::OutsideBoundary,
+                message: e.to_string(),
+            }),
+            LocalHttpTarget::Named(name) => {
+                let env_key = format!("DANA_LOCAL_HTTP_{}", name.to_ascii_uppercase());
+                let raw = self
+                    .ew
+                    .local_http_bindings
+                    .get(name)
+                    .cloned()
+                    .or_else(|| std::env::var(&env_key).ok())
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| Bug {
+                        kind: BugKind::OutsideBoundary,
+                        message: format!(
+                            "live `LocalHttpAllow({name})` requires a bound loopback URL (`--local-http {name}=http://127.0.0.1:PORT|ready:FILE` or `{env_key}`)"
+                        ),
+                    })?;
+                parse_local_http_binding_value(&raw).map_err(|e| Bug {
+                    kind: BugKind::OutsideBoundary,
+                    message: e.to_string(),
+                })
+            }
+        }
+    }
+
+    fn resolve_local_socket_target(&self, target: &LocalSocketTarget) -> Result<String, Bug> {
+        match target {
+            LocalSocketTarget::Pinned(p) => validate_local_socket_path(p).map_err(|e| Bug {
+                kind: BugKind::OutsideBoundary,
+                message: e.to_string(),
+            }),
+            LocalSocketTarget::Named(name) => {
+                let env_key = format!("DANA_LOCAL_SOCKET_{}", name.to_ascii_uppercase());
+                let raw = self
+                    .ew
+                    .local_socket_bindings
+                    .get(name)
+                    .cloned()
+                    .or_else(|| std::env::var(&env_key).ok())
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| Bug {
+                        kind: BugKind::OutsideBoundary,
+                        message: format!(
+                            "live `LocalSocketAllow({name})` requires a bound socket path (`--local-socket {name}=/path/to.sock` or `{env_key}`)"
+                        ),
+                    })?;
+                validate_local_socket_path(&raw).map_err(|e| Bug {
+                    kind: BugKind::OutsideBoundary,
+                    message: e.to_string(),
+                })
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "local HTTP handler receives method, handle, target, tags, URL, optional body, and headers"
+    )]
+    fn eval_local_http_json(
+        &mut self,
+        method: &str,
+        handle: CapHandle,
+        target: &LocalHttpTarget,
+        allows: &TagSet,
+        url: &str,
+        body_opt: Option<&Val>,
+        hdr_val: &Val,
+    ) -> EvalOut {
+        let cap_label = format!("LocalHttpAllow({})", target.display_label());
+        let req_headers = match extract_http_headers(hdr_val, &cap_label, method) {
+            Ok(h) => h,
+            Err(msg) => return EvalOut::Failed(msg),
+        };
+        let body_json = match body_opt {
+            Some(bv) => match encode_http_json_body(bv, &cap_label, method) {
+                Ok(b) => Some(b),
+                Err(msg) => return EvalOut::Failed(msg),
+            },
+            None => None,
+        };
+
+        match handle {
+            CapHandle::Fake(idx) => {
+                let path_and_query = match target {
+                    LocalHttpTarget::Pinned(auth) => {
+                        let Ok(allowed) = parse_loopback_authority(auth) else {
+                            return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(
+                                "invalid fake LocalHttpAllow target".to_string(),
+                            ))));
+                        };
+                        match resolve_local_http_url(url, &allowed) {
+                            Ok(r) => r.path_and_query,
+                            Err(e) => {
+                                return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(
+                                    e.to_string(),
+                                ))));
+                            }
+                        }
+                    }
+                    LocalHttpTarget::Named(_) => {
+                        if url.starts_with('/') {
+                            url.split_once('#').map_or(url, |(b, _)| b).to_string()
+                        } else if let Some((_, rest)) = url.split_once("://") {
+                            let without_frag = rest.split_once('#').map_or(rest, |(b, _)| b);
+                            let split_pos =
+                                without_frag.find(['/', '?']).unwrap_or(without_frag.len());
+                            let auth = &without_frag[..split_pos];
+                            if !url[..url.find("://").unwrap_or(0)].eq_ignore_ascii_case("http") {
+                                return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(
+                                    "`LocalHttpAllow` forbids non-http:// schemes".to_string(),
+                                ))));
+                            }
+                            if let Err(e) = parse_loopback_authority(auth) {
+                                return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(
+                                    e.to_string(),
+                                ))));
+                            }
+                            let tail = &without_frag[split_pos..];
+                            if tail.is_empty() {
+                                "/".to_string()
+                            } else if tail.starts_with('?') {
+                                format!("/{tail}")
+                            } else {
+                                tail.to_string()
+                            }
+                        } else {
+                            return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                                "invalid local HTTP fake URL `{url}`"
+                            )))));
+                        }
+                    }
+                };
+                let responses = {
+                    let Some(st) = self.ew.fake_local_http.get_mut(idx) else {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(
+                            "invalid fake LocalHttpAllow handle".to_string(),
+                        ))));
+                    };
+                    st.requests.push(url.to_string());
+                    if let Some(ref body) = body_json {
+                        st.request_bodies.push(body.clone());
+                    }
+                    st.responses.clone()
+                };
+                self.match_fake_net_response(&responses, method, url, &path_and_query, "local HTTP")
+            }
+            CapHandle::Real => {
+                let cap_ty = Ty::LocalHttpAllow {
+                    target: target.clone(),
+                    allows: allows.clone(),
+                };
+                if let Err(err) = check_cap_against_policy(self.prog.policy.as_ref(), &cap_ty) {
+                    return EvalOut::Stopped(Bug {
+                        kind: BugKind::ExportGateDenied,
+                        message: err.message,
+                    });
+                }
+                let allowed = match self.resolve_local_http_target(target) {
+                    Ok(a) => a,
+                    Err(bug) => return EvalOut::Stopped(bug),
+                };
+                let resolved = match resolve_local_http_url(url, &allowed) {
+                    Ok(r) => r,
+                    Err(e) => return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string())))),
+                };
+                if self.ew.dry_run && method != "GET" {
+                    let desc = format!(
+                        "http://{}{}",
+                        resolved.authority.canonical_authority(),
+                        resolved.path_and_query
+                    );
+                    return self.emit_local_net_dry_run(
+                        method,
+                        &desc,
+                        body_json.as_ref().map(String::len),
+                        &req_headers,
+                    );
+                }
+                if let Some(bug) = self.check_export_gate(handle, allows, &cap_label) {
+                    return EvalOut::Stopped(bug);
+                }
+                if !self.ew.live_io {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                        "local HTTP I/O disabled in spec mode: {url}"
+                    )))));
+                }
+                let cfg = HttpsClientConfig::default();
+                let res = match (method, body_json.as_deref()) {
+                    ("GET", _) => local_http_get_json(url, &allowed, &req_headers, &cfg),
+                    ("POST" | "PUT", Some(b)) => {
+                        local_http_write_json(method, url, &allowed, b, &req_headers, &cfg)
+                    }
+                    ("DELETE", _) => local_http_delete_json(url, &allowed, &req_headers, &cfg),
+                    _ => Err(crate::net::HttpsError::new(
+                        "unexpected local HTTP method/body",
+                    )),
+                };
+                self.finish_json_response(res)
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "local socket handler receives method, handle, target, tags, path, optional body, and headers"
+    )]
+    fn eval_local_socket_json(
+        &mut self,
+        method: &str,
+        handle: CapHandle,
+        target: &LocalSocketTarget,
+        allows: &TagSet,
+        path: &str,
+        body_opt: Option<&Val>,
+        hdr_val: &Val,
+    ) -> EvalOut {
+        let cap_label = format!("LocalSocketAllow({})", target.display_label());
+        let req_headers = match extract_http_headers(hdr_val, &cap_label, method) {
+            Ok(h) => h,
+            Err(msg) => return EvalOut::Failed(msg),
+        };
+        let body_json = match body_opt {
+            Some(bv) => match encode_http_json_body(bv, &cap_label, method) {
+                Ok(b) => Some(b),
+                Err(msg) => return EvalOut::Failed(msg),
+            },
+            None => None,
+        };
+
+        match handle {
+            CapHandle::Fake(idx) => {
+                let clean_path = match resolve_local_socket_path_and_query(path) {
+                    Ok(p) => p,
+                    Err(e) => return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string())))),
+                };
+                let responses = {
+                    let Some(st) = self.ew.fake_local_socket.get_mut(idx) else {
+                        return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(
+                            "invalid fake LocalSocketAllow handle".to_string(),
+                        ))));
+                    };
+                    st.requests.push(path.to_string());
+                    if let Some(ref body) = body_json {
+                        st.request_bodies.push(body.clone());
+                    }
+                    st.responses.clone()
+                };
+                self.match_fake_net_response(&responses, method, path, &clean_path, "local socket")
+            }
+            CapHandle::Real => {
+                let cap_ty = Ty::LocalSocketAllow {
+                    target: target.clone(),
+                    allows: allows.clone(),
+                };
+                if let Err(err) = check_cap_against_policy(self.prog.policy.as_ref(), &cap_ty) {
+                    return EvalOut::Stopped(Bug {
+                        kind: BugKind::ExportGateDenied,
+                        message: err.message,
+                    });
+                }
+                let sock_path = match self.resolve_local_socket_target(target) {
+                    Ok(p) => p,
+                    Err(bug) => return EvalOut::Stopped(bug),
+                };
+                let clean_path = match resolve_local_socket_path_and_query(path) {
+                    Ok(p) => p,
+                    Err(e) => return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string())))),
+                };
+                if self.ew.dry_run && method != "GET" {
+                    let desc = format!("unix:{sock_path}:{clean_path}");
+                    return self.emit_local_net_dry_run(
+                        method,
+                        &desc,
+                        body_json.as_ref().map(String::len),
+                        &req_headers,
+                    );
+                }
+                if let Some(bug) = self.check_export_gate(handle, allows, &cap_label) {
+                    return EvalOut::Stopped(bug);
+                }
+                if !self.ew.live_io {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                        "local socket I/O disabled in spec mode: {path}"
+                    )))));
+                }
+                let cfg = HttpsClientConfig::default();
+                let res = match (method, body_json.as_deref()) {
+                    ("GET", _) => {
+                        local_socket_get_json(&clean_path, &sock_path, &req_headers, &cfg)
+                    }
+                    ("POST" | "PUT", Some(b)) => local_socket_write_json(
+                        method,
+                        &clean_path,
+                        &sock_path,
+                        b,
+                        &req_headers,
+                        &cfg,
+                    ),
+                    ("DELETE", _) => {
+                        local_socket_delete_json(&clean_path, &sock_path, &req_headers, &cfg)
+                    }
+                    _ => Err(crate::net::HttpsError::new(
+                        "unexpected local socket method/body",
+                    )),
+                };
+                self.finish_json_response(res)
             }
         }
     }
@@ -7479,6 +8074,45 @@ fn eval_suppress_small_cells_table(
         cols: out_cols,
         rows: kept_rows,
     }))
+}
+
+fn parse_fake_responses_arg(args: &[Val]) -> Result<Vec<(String, String)>, &'static str> {
+    match args {
+        [Val::Map(pairs)] => Ok(pairs
+            .iter()
+            .map(|(k, v)| (format_display_val(k), format_display_val(v)))
+            .collect()),
+        [Val::Unit] | [] => Ok(Vec::new()),
+        _ => Err("requires `responses: Map(Text, Text)`"),
+    }
+}
+
+fn extract_http_headers(
+    hdr_val: &Val,
+    cap_label: &str,
+    method: &str,
+) -> Result<Vec<(String, String)>, String> {
+    match hdr_val {
+        Val::Unit => Ok(Vec::new()),
+        Val::Map(pairs) => Ok(pairs
+            .iter()
+            .map(|(k, v)| (format_display_val(k), format_display_val(v)))
+            .collect()),
+        _ => Err(format!(
+            "`{cap_label}.{method}` `headers:` must be a Map(Text, Text)"
+        )),
+    }
+}
+
+fn encode_http_json_body(body_val: &Val, cap_label: &str, method: &str) -> Result<String, String> {
+    match body_val {
+        Val::Text(s) => Ok(s.clone()),
+        Val::Table(tv) => Ok(format_json_array_table(tv)),
+        Val::Columnar(vm) => Ok(format_json_array_vm_table(vm)),
+        _ => Err(format!(
+            "`{cap_label}.{method}` body must be `Text` or `Table`"
+        )),
+    }
 }
 
 // Keep reference constants visible for checked range consistency.

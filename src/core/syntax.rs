@@ -347,6 +347,52 @@ impl TableTy {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LocalHttpTarget {
+    Pinned(String),
+    Named(Ident),
+}
+
+impl LocalHttpTarget {
+    #[must_use]
+    pub fn policy_key(&self) -> &str {
+        match self {
+            Self::Pinned(s) | Self::Named(s) => s.as_str(),
+        }
+    }
+
+    #[must_use]
+    pub fn display_label(&self) -> String {
+        match self {
+            Self::Pinned(s) => format!("\"{s}\""),
+            Self::Named(n) => n.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LocalSocketTarget {
+    Pinned(String),
+    Named(Ident),
+}
+
+impl LocalSocketTarget {
+    #[must_use]
+    pub fn policy_key(&self) -> &str {
+        match self {
+            Self::Pinned(s) | Self::Named(s) => s.as_str(),
+        }
+    }
+
+    #[must_use]
+    pub fn display_label(&self) -> String {
+        match self {
+            Self::Pinned(s) => format!("\"{s}\""),
+            Self::Named(n) => n.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Default, Eq)]
 pub enum Ty {
     #[default]
@@ -403,6 +449,14 @@ pub enum Ty {
     RawReadDB(Ident),
     HttpsAllow {
         host: String,
+        allows: TagSet,
+    },
+    LocalHttpAllow {
+        target: LocalHttpTarget,
+        allows: TagSet,
+    },
+    LocalSocketAllow {
+        target: LocalSocketTarget,
         allows: TagSet,
     },
     Secret(String),
@@ -479,6 +533,16 @@ impl Clone for Ty {
                         host: host.clone(),
                         allows: allows.clone(),
                     }),
+                    Self::LocalHttpAllow { target, allows } => vals.push(Self::LocalHttpAllow {
+                        target: target.clone(),
+                        allows: allows.clone(),
+                    }),
+                    Self::LocalSocketAllow { target, allows } => {
+                        vals.push(Self::LocalSocketAllow {
+                            target: target.clone(),
+                            allows: allows.clone(),
+                        })
+                    }
                     Self::Option(inner) => {
                         tasks.push(Task::Build(Build::Option));
                         tasks.push(Task::Ty(inner));
@@ -737,6 +801,34 @@ impl PartialEq for Ty {
                         return false;
                     }
                 }
+                (
+                    Self::LocalHttpAllow {
+                        target: t1,
+                        allows: a1,
+                    },
+                    Self::LocalHttpAllow {
+                        target: t2,
+                        allows: a2,
+                    },
+                ) => {
+                    if t1 != t2 || a1 != a2 {
+                        return false;
+                    }
+                }
+                (
+                    Self::LocalSocketAllow {
+                        target: t1,
+                        allows: a1,
+                    },
+                    Self::LocalSocketAllow {
+                        target: t2,
+                        allows: a2,
+                    },
+                ) => {
+                    if t1 != t2 || a1 != a2 {
+                        return false;
+                    }
+                }
                 _ => return false,
             }
         }
@@ -811,6 +903,14 @@ impl Hash for Ty {
                 }
                 Self::HttpsAllow { host, allows } => {
                     host.hash(state);
+                    allows.hash(state);
+                }
+                Self::LocalHttpAllow { target, allows } => {
+                    target.hash(state);
+                    allows.hash(state);
+                }
+                Self::LocalSocketAllow { target, allows } => {
+                    target.hash(state);
                     allows.hash(state);
                 }
                 _ => {}
@@ -897,7 +997,9 @@ impl Ty {
             | Self::Declassify(ts) => ts.clone(),
             Self::WriteFiles { allows, .. }
             | Self::WriteTable { allows, .. }
-            | Self::HttpsAllow { allows, .. } => allows.clone(),
+            | Self::HttpsAllow { allows, .. }
+            | Self::LocalHttpAllow { allows, .. }
+            | Self::LocalSocketAllow { allows, .. } => allows.clone(),
             Self::Secret(_) => TagSet::singleton("secret"),
             Self::Fn { params, pc, ret } => TagSet::union_owned(params.iter().map(LTy::all_tags))
                 .union(&pc.union(&ret.all_tags())),
@@ -1501,9 +1603,13 @@ pub struct Policy {
     pub min_group_size: BigInt,
     pub forbid_manual_declassify: bool,
     pub forbid_repl_sensitive: bool,
+    pub forbid_local_http: bool,
+    pub forbid_local_socket: bool,
     pub allow_console: TagSet,
     pub allow_export: Vec<(String, TagSet)>,
     pub allow_https: Vec<(String, TagSet)>,
+    pub allow_local_http: Vec<(String, TagSet)>,
+    pub allow_local_socket: Vec<(String, TagSet)>,
     pub allow_write: Vec<PolicyWriteRule>,
 }
 
@@ -1513,9 +1619,13 @@ impl Default for Policy {
             min_group_size: BigInt::from(5u64),
             forbid_manual_declassify: false,
             forbid_repl_sensitive: false,
+            forbid_local_http: false,
+            forbid_local_socket: false,
             allow_console: TagSet::empty(),
             allow_export: Vec::new(),
             allow_https: Vec::new(),
+            allow_local_http: Vec::new(),
+            allow_local_socket: Vec::new(),
             allow_write: Vec::new(),
         }
     }

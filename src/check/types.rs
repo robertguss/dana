@@ -625,6 +625,72 @@ impl<'a> Checker<'a> {
                 let allows = self.extract_allows_arg(&args[1.min(args.len())..], span);
                 Ty::HttpsAllow { host, allows }
             }
+            "LocalHttpAllow" => {
+                let target = match args.first() {
+                    Some(ast::TypeArg::Text {
+                        value, span: tspan, ..
+                    }) => match crate::net::parse_loopback_authority(value) {
+                        Ok(parsed) => LocalHttpTarget::Pinned(parsed.canonical_authority()),
+                        Err(err) => {
+                            self.diags.push(
+                                Diagnostic::error(DiagCode::CapabilityError, err.message)
+                                    .with_span(*tspan),
+                            );
+                            LocalHttpTarget::Pinned(String::new())
+                        }
+                    },
+                    Some(ast::TypeArg::Type(ast::TypeExpr {
+                        kind: ast::TypeKind::Named { name, args: targs },
+                        optional: false,
+                        ..
+                    })) if targs.is_empty() => LocalHttpTarget::Named(name.name.clone()),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::CapabilityError,
+                                "`LocalHttpAllow` requires a loopback `\"host:port\"` literal or bound service name (e.g. `LocalHttpAllow(\"127.0.0.1:8091\")` or `LocalHttpAllow(MoShop)`)",
+                            )
+                            .with_span(span),
+                        );
+                        LocalHttpTarget::Pinned(String::new())
+                    }
+                };
+                let allows = self.extract_allows_arg(&args[1.min(args.len())..], span);
+                Ty::LocalHttpAllow { target, allows }
+            }
+            "LocalSocketAllow" => {
+                let target = match args.first() {
+                    Some(ast::TypeArg::Text {
+                        value, span: tspan, ..
+                    }) => match crate::net::validate_local_socket_path(value) {
+                        Ok(valid) => LocalSocketTarget::Pinned(valid),
+                        Err(err) => {
+                            self.diags.push(
+                                Diagnostic::error(DiagCode::CapabilityError, err.message)
+                                    .with_span(*tspan),
+                            );
+                            LocalSocketTarget::Pinned(String::new())
+                        }
+                    },
+                    Some(ast::TypeArg::Type(ast::TypeExpr {
+                        kind: ast::TypeKind::Named { name, args: targs },
+                        optional: false,
+                        ..
+                    })) if targs.is_empty() => LocalSocketTarget::Named(name.name.clone()),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::CapabilityError,
+                                "`LocalSocketAllow` requires a Unix socket path literal or bound service name (e.g. `LocalSocketAllow(\"/run/mo.sock\")` or `LocalSocketAllow(MoAdmin)`)",
+                            )
+                            .with_span(span),
+                        );
+                        LocalSocketTarget::Pinned(String::new())
+                    }
+                };
+                let allows = self.extract_allows_arg(&args[1.min(args.len())..], span);
+                Ty::LocalSocketAllow { target, allows }
+            }
             "Secret" => {
                 let sname = match args.first() {
                     Some(ast::TypeArg::Text { value, .. }) => value.clone(),
@@ -791,6 +857,189 @@ impl<'a> Checker<'a> {
                 String::new()
             }
         }
+    }
+
+    fn extract_fake_net_args(
+        &mut self,
+        args: &[CallArg],
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+    ) -> (ExecExpr, TagSet) {
+        let resp_expr = named_expr_arg(args, "responses").or_else(|| match args.get(1) {
+            Some(CallArg::Positional(e)) => Some(e),
+            _ => None,
+        });
+        let resp_ex = if let Some(re) = resp_expr {
+            let (ex, _) = self.check_expr(re, env, None, pc, scope, ret_ctx);
+            ex
+        } else {
+            ExecExpr::Lit(Literal::Unit)
+        };
+        let mut allows = TagSet::empty();
+        if let Some(Expr {
+            kind: ExprKind::List(items),
+            ..
+        }) = named_expr_arg(args, "allows")
+        {
+            let mut tags = Vec::new();
+            for item in items {
+                if let ExprKind::Ident(t) = &item.kind {
+                    tags.push(t.clone());
+                }
+            }
+            allows = TagSet::of_list(tags);
+        }
+        (resp_ex, allows)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shared privacy/type check across HttpsAllow, LocalHttpAllow, and LocalSocketAllow"
+    )]
+    fn check_http_json_call(
+        &mut self,
+        cap_label: &str,
+        target_word: &str,
+        rex: ExecExpr,
+        allows: &TagSet,
+        method: &str,
+        op: ExecHostOp,
+        args: &[CallArg],
+        env: &HashMap<Ident, VarBinding>,
+        pc: &TagSet,
+        scope: LocalScopeKind,
+        ret_ctx: Option<(&str, Option<&Ty>)>,
+        span: Span,
+    ) -> (ExecExpr, LTy) {
+        let Some(CallArg::Positional(url_e)) = args.first() else {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::TypeError,
+                    format!("`{cap_label}.{method}` requires a {target_word} argument"),
+                )
+                .with_span(span),
+            );
+            return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+        };
+        let (uex, ulty) = self.check_expr(url_e, env, Some(&Ty::Text), pc, scope, ret_ctx);
+        let url_tags = ulty.effective_tags().union(pc);
+        if !url_tags.is_subset(allows) {
+            self.diags.push(
+                Diagnostic::error(
+                    DiagCode::PrivacyError,
+                    format!(
+                        "cannot send {target_word} tagged {:?} to `{cap_label}` (allows: {:?})",
+                        url_tags.elems(),
+                        allows.elems()
+                    ),
+                )
+                .with_span(url_e.span),
+            );
+        }
+
+        let body_ex = if matches!(method, "get_json" | "delete_json") {
+            None
+        } else {
+            let body_e = match (args.get(1), named_expr_arg(args, "body")) {
+                (Some(CallArg::Positional(e)), None) => Some(e),
+                (None | Some(CallArg::Named { .. }), Some(e)) => Some(e),
+                (Some(CallArg::Positional(_)), Some(ne)) => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("duplicate `body:` argument in `{cap_label}.{method}`"),
+                        )
+                        .with_span(ne.span),
+                    );
+                    None
+                }
+                _ => None,
+            };
+            let Some(be) = body_e else {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::TypeError,
+                        format!(
+                            "`{cap_label}.{method}` requires a `body` (`Text` or `Table`) argument"
+                        ),
+                    )
+                    .with_span(span),
+                );
+                return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+            };
+            let (bex, blty) = self.check_expr(be, env, None, pc, scope, ret_ctx);
+            let body_tags = match &blty.ty {
+                Ty::Text => blty.effective_tags().union(pc),
+                Ty::Table(tt) => {
+                    let mut combined = blty.effective_tags().union(pc);
+                    combined = combined.union(&tt.row_tags).union(&tt.order_tags);
+                    for c in &tt.cols {
+                        combined = combined.union(&c.tags);
+                    }
+                    combined
+                }
+                other => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!(
+                                "`{cap_label}.{method}` body must be `Text` or `Table(...)`, found `{other:?}`"
+                            ),
+                        )
+                        .with_span(be.span),
+                    );
+                    TagSet::empty()
+                }
+            };
+            if !body_tags.is_subset(allows) {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::PrivacyError,
+                        format!(
+                            "cannot send body tagged {:?} via `{method}` to `{cap_label}` (allows: {:?})",
+                            body_tags.elems(),
+                            allows.elems()
+                        ),
+                    )
+                    .with_span(be.span),
+                );
+            }
+            Some(bex)
+        };
+
+        let hdr_ex = if let Some(he) = named_expr_arg(args, "headers") {
+            let (hex, hlty) = self.check_expr(he, env, None, pc, scope, ret_ctx);
+            let non_secret = hlty.effective_tags().remove("secret");
+            if !non_secret.is_subset(allows) {
+                self.diags.push(
+                    Diagnostic::error(
+                        DiagCode::PrivacyError,
+                        format!(
+                            "cannot send headers tagged {:?} to `{cap_label}` (allows: {:?})",
+                            non_secret.elems(),
+                            allows.elems()
+                        ),
+                    )
+                    .with_span(he.span),
+                );
+            }
+            hex
+        } else {
+            ExecExpr::Lit(Literal::Unit)
+        };
+
+        let res_ty = Ty::Result {
+            ok_ty: Box::new(Ty::Data(TY_JSON_RESPONSE.to_string())),
+            err_ty: Box::new(Ty::Text),
+        };
+        let op_args = if let Some(bex) = body_ex {
+            vec![rex, uex, bex, hdr_ex]
+        } else {
+            vec![rex, uex, hdr_ex]
+        };
+        (ExecExpr::Host { op, args: op_args }, LTy::public(res_ty))
     }
 
     // -----------------------------------------------------------------------
@@ -7862,6 +8111,46 @@ impl<'a> Checker<'a> {
                     LTy::public(Ty::List(Box::new(LTy::public(Ty::Text)))),
                 );
             }
+            (Ty::LocalHttpAllow { .. }, "requests") => {
+                self.require_spec_scope(scope, span, "`local_http.requests`");
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::FakeLocalHttpRequests,
+                        args: vec![rex],
+                    },
+                    LTy::public(Ty::List(Box::new(LTy::public(Ty::Text)))),
+                );
+            }
+            (Ty::LocalHttpAllow { .. }, "request_bodies") => {
+                self.require_spec_scope(scope, span, "`local_http.request_bodies`");
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::FakeLocalHttpBodies,
+                        args: vec![rex],
+                    },
+                    LTy::public(Ty::List(Box::new(LTy::public(Ty::Text)))),
+                );
+            }
+            (Ty::LocalSocketAllow { .. }, "requests") => {
+                self.require_spec_scope(scope, span, "`local_socket.requests`");
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::FakeLocalSocketRequests,
+                        args: vec![rex],
+                    },
+                    LTy::public(Ty::List(Box::new(LTy::public(Ty::Text)))),
+                );
+            }
+            (Ty::LocalSocketAllow { .. }, "request_bodies") => {
+                self.require_spec_scope(scope, span, "`local_socket.request_bodies`");
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::FakeLocalSocketBodies,
+                        args: vec![rex],
+                    },
+                    LTy::public(Ty::List(Box::new(LTy::public(Ty::Text)))),
+                );
+            }
             (Ty::LinearModel, "slope" | "intercept" | "r_squared") => {
                 let idx = match member.name.as_str() {
                     "slope" => 0,
@@ -8488,36 +8777,97 @@ impl<'a> Checker<'a> {
                         String::new()
                     }
                 };
-                let resp_expr = named_expr_arg(args, "responses").or_else(|| match args.get(1) {
-                    Some(CallArg::Positional(e)) => Some(e),
-                    _ => None,
-                });
-                let resp_ex = if let Some(re) = resp_expr {
-                    let (ex, _) = self.check_expr(re, env, None, pc, scope, ret_ctx);
-                    ex
-                } else {
-                    ExecExpr::Lit(Literal::Unit)
-                };
-                let mut allows = TagSet::empty();
-                if let Some(Expr {
-                    kind: ExprKind::List(items),
-                    ..
-                }) = named_expr_arg(args, "allows")
-                {
-                    let mut tags = Vec::new();
-                    for item in items {
-                        if let ExprKind::Ident(t) = &item.kind {
-                            tags.push(t.clone());
-                        }
-                    }
-                    allows = TagSet::of_list(tags);
-                }
+                let (resp_ex, allows) = self.extract_fake_net_args(args, env, pc, scope, ret_ctx);
                 (
                     ExecExpr::Host {
                         op: ExecHostOp::FakeHttps { host: host.clone() },
                         args: vec![resp_ex],
                     },
                     LTy::public(Ty::HttpsAllow { host, allows }),
+                )
+            }
+            ("LocalHttp", "fake") => {
+                self.require_spec_scope(scope, span, "`LocalHttp.fake(...)`");
+                let target = match args.first() {
+                    Some(CallArg::Positional(Expr {
+                        kind: ExprKind::Text { value, .. },
+                        span: arg_span,
+                    })) => match crate::net::parse_loopback_authority(value) {
+                        Ok(parsed) => LocalHttpTarget::Pinned(parsed.canonical_authority()),
+                        Err(err) => {
+                            self.diags.push(
+                                Diagnostic::error(DiagCode::CapabilityError, err.message)
+                                    .with_span(*arg_span),
+                            );
+                            LocalHttpTarget::Pinned(String::new())
+                        }
+                    },
+                    Some(CallArg::Positional(Expr {
+                        kind: ExprKind::CapName(name),
+                        ..
+                    })) => LocalHttpTarget::Named(name.clone()),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::CapabilityError,
+                                "`LocalHttp.fake` requires a `\"host:port\"` literal or service name as its first argument",
+                            )
+                            .with_span(span),
+                        );
+                        LocalHttpTarget::Pinned(String::new())
+                    }
+                };
+                let (resp_ex, allows) = self.extract_fake_net_args(args, env, pc, scope, ret_ctx);
+                (
+                    ExecExpr::Host {
+                        op: ExecHostOp::FakeLocalHttp {
+                            target: target.clone(),
+                        },
+                        args: vec![resp_ex],
+                    },
+                    LTy::public(Ty::LocalHttpAllow { target, allows }),
+                )
+            }
+            ("LocalSocket", "fake") => {
+                self.require_spec_scope(scope, span, "`LocalSocket.fake(...)`");
+                let target = match args.first() {
+                    Some(CallArg::Positional(Expr {
+                        kind: ExprKind::Text { value, .. },
+                        span: arg_span,
+                    })) => match crate::net::validate_local_socket_path(value) {
+                        Ok(valid) => LocalSocketTarget::Pinned(valid),
+                        Err(err) => {
+                            self.diags.push(
+                                Diagnostic::error(DiagCode::CapabilityError, err.message)
+                                    .with_span(*arg_span),
+                            );
+                            LocalSocketTarget::Pinned(String::new())
+                        }
+                    },
+                    Some(CallArg::Positional(Expr {
+                        kind: ExprKind::CapName(name),
+                        ..
+                    })) => LocalSocketTarget::Named(name.clone()),
+                    _ => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::CapabilityError,
+                                "`LocalSocket.fake` requires a socket path literal or service name as its first argument",
+                            )
+                            .with_span(span),
+                        );
+                        LocalSocketTarget::Pinned(String::new())
+                    }
+                };
+                let (resp_ex, allows) = self.extract_fake_net_args(args, env, pc, scope, ret_ctx);
+                (
+                    ExecExpr::Host {
+                        op: ExecHostOp::FakeLocalSocket {
+                            target: target.clone(),
+                        },
+                        args: vec![resp_ex],
+                    },
+                    LTy::public(Ty::LocalSocketAllow { target, allows }),
                 )
             }
             ("DB", "in_memory") => {
@@ -10087,139 +10437,45 @@ impl<'a> Checker<'a> {
                 );
             }
             (Ty::HttpsAllow { host, allows }, method @ ("get_json" | "post_json" | "put_json")) => {
-                let Some(CallArg::Positional(url_e)) = args.first() else {
-                    self.diags.push(
-                        Diagnostic::error(
-                            DiagCode::TypeError,
-                            format!("`HttpsAllow.{method}` requires a URL argument"),
-                        )
-                        .with_span(span),
-                    );
-                    return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                let op = match method {
+                    "get_json" => ExecHostOp::Core(HostOp::HttpsGetJson),
+                    "post_json" => ExecHostOp::HttpsPostJson,
+                    _ => ExecHostOp::HttpsPutJson,
                 };
-                let (uex, ulty) = self.check_expr(url_e, env, Some(&Ty::Text), pc, scope, ret_ctx);
-                let url_tags = ulty.effective_tags().union(pc);
-                if !url_tags.is_subset(allows) {
-                    self.diags.push(
-                        Diagnostic::error(
-                            DiagCode::PrivacyError,
-                            format!(
-                                "cannot send URL tagged {:?} to `HttpsAllow(\"{host}\", allows: {:?})`",
-                                url_tags.elems(),
-                                allows.elems()
-                            ),
-                        )
-                        .with_span(url_e.span),
-                    );
-                }
-
-                let body_ex = if method == "get_json" {
-                    None
-                } else {
-                    let body_e = match (args.get(1), named_expr_arg(args, "body")) {
-                        (Some(CallArg::Positional(e)), None) => Some(e),
-                        (None | Some(CallArg::Named { .. }), Some(e)) => Some(e),
-                        (Some(CallArg::Positional(_)), Some(ne)) => {
-                            self.diags.push(
-                                Diagnostic::error(
-                                    DiagCode::TypeError,
-                                    format!("duplicate `body:` argument in `HttpsAllow.{method}`"),
-                                )
-                                .with_span(ne.span),
-                            );
-                            None
-                        }
-                        _ => None,
-                    };
-                    let Some(be) = body_e else {
-                        self.diags.push(
-                            Diagnostic::error(
-                                DiagCode::TypeError,
-                                format!("`HttpsAllow.{method}` requires a `body` (`Text` or `Table`) argument"),
-                            )
-                            .with_span(span),
-                        );
-                        return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
-                    };
-                    let (bex, blty) = self.check_expr(be, env, None, pc, scope, ret_ctx);
-                    let body_tags = match &blty.ty {
-                        Ty::Text => blty.effective_tags().union(pc),
-                        Ty::Table(tt) => {
-                            let mut combined = blty.effective_tags().union(pc);
-                            combined = combined.union(&tt.row_tags).union(&tt.order_tags);
-                            for c in &tt.cols {
-                                combined = combined.union(&c.tags);
-                            }
-                            combined
-                        }
-                        other => {
-                            self.diags.push(
-                                Diagnostic::error(
-                                    DiagCode::TypeError,
-                                    format!(
-                                        "`HttpsAllow.{method}` body must be `Text` or `Table(...)`, found `{other:?}`"
-                                    ),
-                                )
-                                .with_span(be.span),
-                            );
-                            TagSet::empty()
-                        }
-                    };
-                    if !body_tags.is_subset(allows) {
-                        self.diags.push(
-                            Diagnostic::error(
-                                DiagCode::PrivacyError,
-                                format!(
-                                    "cannot send body tagged {:?} via `{method}` to `HttpsAllow(\"{host}\", allows: {:?})`",
-                                    body_tags.elems(),
-                                    allows.elems()
-                                ),
-                            )
-                            .with_span(be.span),
-                        );
-                    }
-                    Some(bex)
+                let label = format!("HttpsAllow(\"{host}\")");
+                return self.check_http_json_call(
+                    &label, "URL", rex, allows, method, op, args, env, pc, scope, ret_ctx, span,
+                );
+            }
+            (
+                Ty::LocalHttpAllow { target, allows },
+                method @ ("get_json" | "post_json" | "put_json" | "delete_json"),
+            ) => {
+                let op = match method {
+                    "get_json" => ExecHostOp::LocalHttpGetJson,
+                    "post_json" => ExecHostOp::LocalHttpPostJson,
+                    "put_json" => ExecHostOp::LocalHttpPutJson,
+                    _ => ExecHostOp::LocalHttpDeleteJson,
                 };
-
-                let hdr_ex = if let Some(he) = named_expr_arg(args, "headers") {
-                    let (hex, hlty) = self.check_expr(he, env, None, pc, scope, ret_ctx);
-                    // Secrets are permitted in Authorization headers for authenticated HTTPS calls.
-                    let non_secret = hlty.effective_tags().remove("secret");
-                    if !non_secret.is_subset(allows) {
-                        self.diags.push(
-                            Diagnostic::error(
-                                DiagCode::PrivacyError,
-                                format!(
-                                    "cannot send headers tagged {:?} to `HttpsAllow(\"{host}\", allows: {:?})`",
-                                    non_secret.elems(),
-                                    allows.elems()
-                                ),
-                            )
-                            .with_span(he.span),
-                        );
-                    }
-                    hex
-                } else {
-                    ExecExpr::Lit(Literal::Unit)
+                let label = format!("LocalHttpAllow({})", target.display_label());
+                return self.check_http_json_call(
+                    &label, "URL", rex, allows, method, op, args, env, pc, scope, ret_ctx, span,
+                );
+            }
+            (
+                Ty::LocalSocketAllow { target, allows },
+                method @ ("get_json" | "post_json" | "put_json" | "delete_json"),
+            ) => {
+                let op = match method {
+                    "get_json" => ExecHostOp::LocalSocketGetJson,
+                    "post_json" => ExecHostOp::LocalSocketPostJson,
+                    "put_json" => ExecHostOp::LocalSocketPutJson,
+                    _ => ExecHostOp::LocalSocketDeleteJson,
                 };
-                let res_ty = Ty::Result {
-                    ok_ty: Box::new(Ty::Data(TY_JSON_RESPONSE.to_string())),
-                    err_ty: Box::new(Ty::Text),
-                };
-                let (op, op_args) = match (method, body_ex) {
-                    ("get_json", _) => (
-                        ExecHostOp::Core(HostOp::HttpsGetJson),
-                        vec![rex, uex, hdr_ex],
-                    ),
-                    ("post_json", Some(bex)) => {
-                        (ExecHostOp::HttpsPostJson, vec![rex, uex, bex, hdr_ex])
-                    }
-                    ("put_json", Some(bex)) => {
-                        (ExecHostOp::HttpsPutJson, vec![rex, uex, bex, hdr_ex])
-                    }
-                    _ => return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit)),
-                };
-                return (ExecExpr::Host { op, args: op_args }, LTy::public(res_ty));
+                let label = format!("LocalSocketAllow({})", target.display_label());
+                return self.check_http_json_call(
+                    &label, "path", rex, allows, method, op, args, env, pc, scope, ret_ctx, span,
+                );
             }
             (Ty::Data(dname), "parse_table") if dname == TY_JSON_RESPONSE => {
                 let (fex, _) = match args.first() {
@@ -14447,6 +14703,8 @@ fn is_capability_ty(ty: &Ty) -> bool {
             | Ty::WriteTable { .. }
             | Ty::RawReadDB(_)
             | Ty::HttpsAllow { .. }
+            | Ty::LocalHttpAllow { .. }
+            | Ty::LocalSocketAllow { .. }
             | Ty::Secret(_)
             | Ty::Declassify(_)
     )

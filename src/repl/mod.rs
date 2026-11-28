@@ -1010,6 +1010,8 @@ impl ReplSession {
             "RawReadDB",
             "WriteTable",
             "HttpsAllow",
+            "LocalHttpAllow",
+            "LocalSocketAllow",
             "Declassify",
         ] {
             used_names.insert(reserved.to_string());
@@ -1641,6 +1643,12 @@ fn format_ty_human(ty: &Ty) -> String {
         Ty::RawReadDB(db) => format!("RawReadDB({db})"),
         Ty::WriteTable { db, table_name, .. } => format!("WriteTable({db}, \"{table_name}\")"),
         Ty::HttpsAllow { host, .. } => format!("HttpsAllow(\"{host}\")"),
+        Ty::LocalHttpAllow { target, .. } => {
+            format!("LocalHttpAllow({})", target.display_label())
+        }
+        Ty::LocalSocketAllow { target, .. } => {
+            format!("LocalSocketAllow({})", target.display_label())
+        }
         Ty::Secret(name) => format!("Secret(\"{name}\")"),
         Ty::Declassify(allows) => fmt_cap_allows("Declassify", allows),
     }

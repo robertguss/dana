@@ -4429,6 +4429,16 @@ fn build_entry_cap_val(ty: &Ty) -> Option<Val> {
             host: host.clone(),
             allows: allows.clone(),
         }),
+        Ty::LocalHttpAllow { target, allows } => Some(Val::CapLocalHttpAllow {
+            handle: CapHandle::Real,
+            target: target.clone(),
+            allows: allows.clone(),
+        }),
+        Ty::LocalSocketAllow { target, allows } => Some(Val::CapLocalSocketAllow {
+            handle: CapHandle::Real,
+            target: target.clone(),
+            allows: allows.clone(),
+        }),
         Ty::Secret(name) => Some(Val::CapSecret {
             handle: CapHandle::Real,
             name: name.clone(),
@@ -4440,9 +4450,11 @@ fn build_entry_cap_val(ty: &Ty) -> Option<Val> {
 
 fn entry_cap_required_export_tags(ty: &Ty) -> TagSet {
     match ty {
-        Ty::Console(allows) | Ty::WriteFiles { allows, .. } | Ty::HttpsAllow { allows, .. } => {
-            allows.clone()
-        }
+        Ty::Console(allows)
+        | Ty::WriteFiles { allows, .. }
+        | Ty::HttpsAllow { allows, .. }
+        | Ty::LocalHttpAllow { allows, .. }
+        | Ty::LocalSocketAllow { allows, .. } => allows.clone(),
         _ => TagSet::empty(),
     }
 }

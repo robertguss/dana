@@ -9,7 +9,8 @@ use std::sync::Arc;
 use crate::core::bigint::{BigInt, DEC_SCALE};
 use crate::core::check::{ArcTyEnv, TyEnv};
 use crate::core::syntax::{
-    BugKind, ChartKind, ColSpec, Expr, Float64, Ident, LTy, ScalarTy, TagSet,
+    BugKind, ChartKind, ColSpec, Expr, Float64, Ident, LTy, LocalHttpTarget, LocalSocketTarget,
+    ScalarTy, TagSet,
 };
 use crate::vm::key::eq_col_cells;
 use crate::vm::ops::VmTable;
@@ -332,6 +333,16 @@ pub enum Val {
         host: String,
         allows: TagSet,
     },
+    CapLocalHttpAllow {
+        handle: CapHandle,
+        target: LocalHttpTarget,
+        allows: TagSet,
+    },
+    CapLocalSocketAllow {
+        handle: CapHandle,
+        target: LocalSocketTarget,
+        allows: TagSet,
+    },
     CapSecret {
         handle: CapHandle,
         name: String,
@@ -602,6 +613,8 @@ fn val_rank(v: &Val) -> u8 {
         | Val::CapWriteTable { .. }
         | Val::CapRawReadDB(_)
         | Val::CapHttpsAllow { .. }
+        | Val::CapLocalHttpAllow { .. }
+        | Val::CapLocalSocketAllow { .. }
         | Val::CapSecret { .. }
         | Val::CapDeclassify(_) => 25,
     }
@@ -1346,6 +1359,8 @@ pub fn render_public_val(val: &Val) -> String {
                 | Val::CapWriteTable { .. }
                 | Val::CapRawReadDB(_)
                 | Val::CapHttpsAllow { .. }
+                | Val::CapLocalHttpAllow { .. }
+                | Val::CapLocalSocketAllow { .. }
                 | Val::CapSecret { .. }
                 | Val::CapDeclassify(_) => out.push_str("<value>"),
             },

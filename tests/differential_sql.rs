@@ -1055,6 +1055,7 @@ fn wrap_core_program(plan: &Plan, outer_vars: &[(Ident, LTy, Val)], include_udf:
             allow_export: Vec::new(),
             allow_https: Vec::new(),
             allow_write: Vec::new(),
+            ..Policy::default()
         }),
         datas: Vec::new(),
         schemas: Vec::new(),

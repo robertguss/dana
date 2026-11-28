@@ -183,14 +183,18 @@ impl ParsedHttpsUrl {
     }
 }
 
-fn parse_port(s: &str) -> Result<u16, HttpsError> {
+pub(crate) fn parse_nonzero_port(s: &str, scheme_label: &str) -> Result<u16, HttpsError> {
     let p: u16 = s
         .parse()
-        .map_err(|_| HttpsError::new(format!("invalid HTTPS port `{s}`")))?;
+        .map_err(|_| HttpsError::new(format!("invalid {scheme_label} port `{s}`")))?;
     if p == 0 {
-        return Err(HttpsError::new("HTTPS port cannot be 0"));
+        return Err(HttpsError::new(format!("{scheme_label} port cannot be 0")));
     }
     Ok(p)
+}
+
+fn parse_port(s: &str) -> Result<u16, HttpsError> {
+    parse_nonzero_port(s, "HTTPS")
 }
 
 /// Client configuration for capability-gated HTTPS requests.
@@ -233,16 +237,14 @@ pub struct HttpsResponse {
 /// # Errors
 /// Returns [`HttpsError`] on scheme/host policy denial, invalid headers, TLS handshake or
 /// certificate failure, non-2xx status (including redirects), malformed HTTP framing, or size cap breach.
-pub fn https_request_bytes(
+pub(crate) fn build_http_request_head(
     method: &str,
-    url: &str,
-    allowed_host: &str,
+    path_and_query: &str,
+    host_header: &str,
     headers: &[(String, String)],
     body: Option<&[u8]>,
-    cfg: &HttpsClientConfig,
-) -> Result<HttpsResponse, HttpsError> {
-    let parsed = ParsedHttpsUrl::parse_and_check_host(url, allowed_host)?;
-
+    cap_label: &str,
+) -> Result<String, HttpsError> {
     let mut has_content_type = false;
     for (k, v) in headers {
         if k.is_empty()
@@ -257,19 +259,77 @@ pub fn https_request_bytes(
             )));
         }
         if k.eq_ignore_ascii_case("host") {
-            return Err(HttpsError::new(
-                "overriding the `Host` header is forbidden on `HttpsAllow` requests",
-            ));
+            return Err(HttpsError::new(format!(
+                "overriding the `Host` header is forbidden on `{cap_label}` requests"
+            )));
         }
         if k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("transfer-encoding") {
             return Err(HttpsError::new(format!(
-                "overriding `{k}` header is forbidden on `HttpsAllow` requests"
+                "overriding `{k}` header is forbidden on `{cap_label}` requests"
             )));
         }
         if k.eq_ignore_ascii_case("content-type") {
             has_content_type = true;
         }
     }
+
+    let mut req = String::new();
+    let _ = write!(
+        req,
+        "{method} {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: dana/0.2\r\nAccept: application/json\r\nAccept-Encoding: gzip\r\nConnection: close\r\n",
+    );
+    if let Some(payload) = body {
+        if !has_content_type {
+            req.push_str("Content-Type: application/json\r\n");
+        }
+        let _ = write!(req, "Content-Length: {}\r\n", payload.len());
+    }
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("connection") || k.eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
+        let _ = write!(req, "{k}: {v}\r\n");
+    }
+    req.push_str("\r\n");
+    Ok(req)
+}
+
+pub(crate) fn write_http_request<W: Write>(
+    stream: &mut W,
+    head: &str,
+    body: Option<&[u8]>,
+    cap_label: &str,
+) -> Result<(), HttpsError> {
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|e| HttpsError::new(format!("{cap_label} request write failed: {e}")))?;
+    if let Some(payload) = body
+        && !payload.is_empty()
+    {
+        stream
+            .write_all(payload)
+            .map_err(|e| HttpsError::new(format!("{cap_label} body write failed: {e}")))?;
+    }
+    Ok(())
+}
+
+pub fn https_request_bytes(
+    method: &str,
+    url: &str,
+    allowed_host: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    cfg: &HttpsClientConfig,
+) -> Result<HttpsResponse, HttpsError> {
+    let parsed = ParsedHttpsUrl::parse_and_check_host(url, allowed_host)?;
+    let req_head = build_http_request_head(
+        method,
+        &parsed.path_and_query,
+        &parsed.host_header(),
+        headers,
+        body,
+        "HttpsAllow",
+    )?;
 
     let tcp = TcpStream::connect((parsed.host.as_str(), parsed.port))
         .map_err(|e| HttpsError::new(format!("HTTPS TCP connect failed: {e}")))?;
@@ -285,35 +345,7 @@ pub fn https_request_bytes(
     let mut tls = TlsStream::connect(tcp, &parsed.host, &tls_cfg)
         .map_err(|e| HttpsError::new(format!("HTTPS TLS handshake failed: {e}")))?;
 
-    let mut req = String::new();
-    let _ = write!(
-        req,
-        "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: dana/0.2\r\nAccept: application/json\r\nAccept-Encoding: gzip\r\nConnection: close\r\n",
-        parsed.path_and_query,
-        parsed.host_header()
-    );
-    if let Some(payload) = body {
-        if !has_content_type {
-            req.push_str("Content-Type: application/json\r\n");
-        }
-        let _ = write!(req, "Content-Length: {}\r\n", payload.len());
-    }
-    for (k, v) in headers {
-        if k.eq_ignore_ascii_case("connection") || k.eq_ignore_ascii_case("accept-encoding") {
-            continue;
-        }
-        let _ = write!(req, "{k}: {v}\r\n");
-    }
-    req.push_str("\r\n");
-
-    tls.write_all(req.as_bytes())
-        .map_err(|e| HttpsError::new(format!("HTTPS request write failed: {e}")))?;
-    if let Some(payload) = body
-        && !payload.is_empty()
-    {
-        tls.write_all(payload)
-            .map_err(|e| HttpsError::new(format!("HTTPS body write failed: {e}")))?;
-    }
+    write_http_request(&mut tls, &req_head, body, "HttpsAllow")?;
     tls.flush()
         .map_err(|e| HttpsError::new(format!("HTTPS request flush failed: {e}")))?;
 
@@ -594,6 +626,22 @@ fn read_to_eof_capped<R: Read>(reader: &mut R, max_bytes: usize) -> Result<Vec<u
     Ok(out)
 }
 
+pub(crate) fn decode_json_response(
+    resp: HttpsResponse,
+    scheme_label: &str,
+    allow_empty_null: bool,
+) -> Result<JsonResponse, HttpsError> {
+    if allow_empty_null && resp.body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(JsonResponse::from_value(JsonValue::Null));
+    }
+    let text = String::from_utf8(resp.body).map_err(|e| {
+        HttpsError::new(format!(
+            "{scheme_label} JSON response is not valid UTF-8: {e}"
+        ))
+    })?;
+    JsonResponse::from_json_str(&text)
+}
+
 /// Perform a capability-gated HTTPS `GET` and parse the UTF-8 JSON body into a [`JsonResponse`].
 ///
 /// # Errors
@@ -605,9 +653,7 @@ pub fn https_get_json(
     cfg: &HttpsClientConfig,
 ) -> Result<JsonResponse, HttpsError> {
     let resp = https_get_bytes(url, allowed_host, headers, cfg)?;
-    let text = String::from_utf8(resp.body)
-        .map_err(|e| HttpsError::new(format!("HTTPS JSON response is not valid UTF-8: {e}")))?;
-    JsonResponse::from_json_str(&text)
+    decode_json_response(resp, "HTTPS", false)
 }
 
 fn https_write_json(
@@ -626,12 +672,7 @@ fn https_write_json(
         Some(body_json.as_bytes()),
         cfg,
     )?;
-    if resp.body.iter().all(u8::is_ascii_whitespace) {
-        return Ok(JsonResponse::from_value(JsonValue::Null));
-    }
-    let text = String::from_utf8(resp.body)
-        .map_err(|e| HttpsError::new(format!("HTTPS JSON response is not valid UTF-8: {e}")))?;
-    JsonResponse::from_json_str(&text)
+    decode_json_response(resp, "HTTPS", true)
 }
 
 /// Perform a capability-gated HTTPS `POST` with a JSON payload and parse the response JSON (empty

@@ -6,7 +6,7 @@
 //! - `ffi`: audited RAII FFI wrappers around allowlisted system `zlib`, `libzstd`, `sqlite3`, and OpenSSL TLS
 //! - `db`: SQLite and native PostgreSQL v3.0 drivers, offline `schema.lock`, and privacy-redacted dry-run diffs
 //! - `formats`: built-in calendar/TZif temporal math, HMAC-SHA256, streaming CSV/TSV, JSON/JSONL, PKZIP, XLSX, Parquet, schema inference & fake data generation
-//! - `net`: capability-gated HTTP/1.1 HTTPS client (`HttpsAllow`) & `JsonResponse` helpers
+//! - `net`: capability-gated HTTP/1.1 clients (`HttpsAllow` over TLS, `LocalHttpAllow`, `LocalSocketAllow`) & `JsonResponse` helpers
 //! - `stats`: statistical analytics stdlib (Pearson/Spearman correlation, OLS regression, Welch t-test, chi-square, outlier detection) & privacy-safe dataset profiler
 //! - `viz`: zero-dependency standalone SVG & Unicode terminal charts, plus self-contained HTML5 & Markdown reports
 //! - `plan`: relational query optimizer (filter fusion, predicate pushdown, dead-derive pruning) & plan explainer

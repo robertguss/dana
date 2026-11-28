@@ -48,11 +48,11 @@ use crate::runtime::{RunConfig, RunResult, run_exec_program, run_program_tests};
 use crate::syntax::{format_module, parse_module};
 use crate::vm::{VmConfig, run_exec_program_vm, run_program_tests_vm};
 
-/// Authoritative Dana Language Reference v0.6 embedded for offline `dana guide`.
+/// Authoritative Dana Language Reference v0.7 embedded for offline `dana guide`.
 pub const EMBEDDED_GUIDE: &str = include_str!("../../docs/reference/README.md");
 
 const USAGE: &str = "\
-dana — fast, private, database-native data language toolchain (v0.6)
+dana — fast, private, database-native data language toolchain (v0.7)
 
 USAGE:
   dana <COMMAND> [OPTIONS]
@@ -60,12 +60,12 @@ USAGE:
 COMMANDS:
   check [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--json] <FILE...>
       Parse, type-check, privacy-check, and verify Dana source file(s) (with offline schema.lock).
-  run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]
+  run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--local-http Name=URL|ready:FILE]... [--local-socket Name=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]
       Compile and execute a Dana program's `main` function (vectorized columnar VM + SQL pushdown
       by default; pass `--oracle` for the reference row-by-row engine). `Secret(\"name\")` resolves
       from uppercase environment variable `NAME` (e.g. `FERPA_SALT=...` for `Secret(\"ferpa_salt\")`).
-  dry-run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]
-      Execute strictly read-only, printing redacted WriteTable diffs and suppressing disk/DB writes.
+  dry-run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--local-http Name=URL|ready:FILE]... [--local-socket Name=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]
+      Execute strictly read-only, printing redacted WriteTable diffs and suppressing disk/DB/network writes.
   schema-sync --db Name=URI [--db Name2=URI2 ...] [--attach [DB:]schema=PATH]... [--schemas s1,s2,...] [--out schema.lock]
       Introspect live SQLite/PostgreSQL databases and update schema.lock while preserving sensitivity tags.
   explain [--dialect sqlite|postgres] [--schema-lock FILE] [--policy FILE] <FILE>
@@ -719,6 +719,8 @@ fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
     let mut policy_path: Option<PathBuf> = None;
     let mut lock_path: Option<PathBuf> = None;
     let mut db_bindings: HashMap<String, String> = HashMap::new();
+    let mut local_http_bindings: HashMap<String, String> = HashMap::new();
+    let mut local_socket_bindings: HashMap<String, String> = HashMap::new();
     let mut sqlite_attachments: Vec<(Option<String>, String, String)> = Vec::new();
     let mut allow_export = TagSet::empty();
     let mut emit_core = false;
@@ -748,6 +750,27 @@ fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
             match parse_db_binding(val) {
                 Ok((name, uri)) => {
                     db_bindings.insert(name, uri);
+                }
+                Err(e) => {
+                    eprintln!("{cmd_name}: {e}");
+                    return 2;
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--local-http=") {
+            match parse_cap_kv_binding(val, "--local-http", "Name=http://127.0.0.1:PORT|ready:FILE")
+            {
+                Ok((name, target)) => {
+                    local_http_bindings.insert(name, target);
+                }
+                Err(e) => {
+                    eprintln!("{cmd_name}: {e}");
+                    return 2;
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--local-socket=") {
+            match parse_cap_kv_binding(val, "--local-socket", "Name=/path/to/socket.sock") {
+                Ok((name, target)) => {
+                    local_socket_bindings.insert(name, target);
                 }
                 Err(e) => {
                     eprintln!("{cmd_name}: {e}");
@@ -842,6 +865,46 @@ fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
                         }
                     }
                 }
+                "--local-http" => {
+                    i += 1;
+                    let Some(raw) = args.get(i) else {
+                        eprintln!(
+                            "{cmd_name}: `--local-http` requires `Name=http://127.0.0.1:PORT|ready:FILE`"
+                        );
+                        return 2;
+                    };
+                    match parse_cap_kv_binding(
+                        raw,
+                        "--local-http",
+                        "Name=http://127.0.0.1:PORT|ready:FILE",
+                    ) {
+                        Ok((name, target)) => {
+                            local_http_bindings.insert(name, target);
+                        }
+                        Err(e) => {
+                            eprintln!("{cmd_name}: {e}");
+                            return 2;
+                        }
+                    }
+                }
+                "--local-socket" => {
+                    i += 1;
+                    let Some(raw) = args.get(i) else {
+                        eprintln!(
+                            "{cmd_name}: `--local-socket` requires `Name=/path/to/socket.sock`"
+                        );
+                        return 2;
+                    };
+                    match parse_cap_kv_binding(raw, "--local-socket", "Name=/path/to/socket.sock") {
+                        Ok((name, target)) => {
+                            local_socket_bindings.insert(name, target);
+                        }
+                        Err(e) => {
+                            eprintln!("{cmd_name}: {e}");
+                            return 2;
+                        }
+                    }
+                }
                 "--allow-export" => {
                     i += 1;
                     let Some(ts) = args.get(i) else {
@@ -859,11 +922,11 @@ fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
                 "--help" | "-h" if script_path.is_none() => {
                     if dry_run {
                         println!(
-                            "usage: dana dry-run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]"
+                            "usage: dana dry-run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--local-http Name=URL|ready:FILE]... [--local-socket Name=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]"
                         );
                     } else {
                         println!(
-                            "usage: dana run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]"
+                            "usage: dana run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--local-http Name=URL|ready:FILE]... [--local-socket Name=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]"
                         );
                     }
                     return 0;
@@ -951,6 +1014,8 @@ fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
         live_io: true,
         fuel: oracle_steps.unwrap_or(def_cfg.fuel),
         db_bindings,
+        local_http_bindings,
+        local_socket_bindings,
         sqlite_attachments,
         schema_lock,
         dry_run,
@@ -2307,19 +2372,44 @@ fn cmd_fake(args: &[String]) -> i32 {
 }
 
 fn parse_db_binding(raw: &str) -> Result<(String, String), String> {
-    let Some((name, uri)) = raw.split_once('=') else {
+    parse_named_kv_binding(
+        raw,
+        "--db",
+        "Name=URI",
+        "both database name and URI must be non-empty",
+    )
+}
+
+fn parse_cap_kv_binding(raw: &str, flag: &str, expected: &str) -> Result<(String, String), String> {
+    let (name, val) =
+        parse_named_kv_binding(raw, flag, expected, "both name and value must be non-empty")?;
+    if !name.starts_with(|c: char| c.is_ascii_uppercase())
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
         return Err(format!(
-            "invalid `--db` argument `{raw}` (expected `Name=URI`)"
+            "invalid `{flag}` capability name `{name}` (expected CapName like `MoShop`)"
+        ));
+    }
+    Ok((name, val))
+}
+
+fn parse_named_kv_binding(
+    raw: &str,
+    flag: &str,
+    expected: &str,
+    empty_err: &str,
+) -> Result<(String, String), String> {
+    let Some((name, val)) = raw.split_once('=') else {
+        return Err(format!(
+            "invalid `{flag}` argument `{raw}` (expected `{expected}`)"
         ));
     };
     let name = name.trim();
-    let uri = uri.trim();
-    if name.is_empty() || uri.is_empty() {
-        return Err(format!(
-            "invalid `--db` argument `{raw}` (both database name and URI must be non-empty)"
-        ));
+    let val = val.trim();
+    if name.is_empty() || val.is_empty() {
+        return Err(format!("invalid `{flag}` argument `{raw}` ({empty_err})"));
     }
-    Ok((name.to_string(), uri.to_string()))
+    Ok((name.to_string(), val.to_string()))
 }
 
 fn parse_dialect(raw: &str) -> Result<SqlDialect, String> {

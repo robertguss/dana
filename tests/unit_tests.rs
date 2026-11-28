@@ -187,6 +187,7 @@ fn wire_roundtrip_and_strict_rejections() {
                 table: "cohorts".to_string(),
                 tags: ts(&["ferpa"]),
             }],
+            ..Policy::default()
         }),
         datas: vec![DataDecl {
             name: "Status".to_string(),

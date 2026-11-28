@@ -2968,6 +2968,16 @@ fn build_core_entry_cap(ty: &Ty) -> Option<Val> {
             host: host.clone(),
             allows: allows.clone(),
         }),
+        Ty::LocalHttpAllow { target, allows } => Some(Val::CapLocalHttpAllow {
+            handle: CapHandle::Real,
+            target: target.clone(),
+            allows: allows.clone(),
+        }),
+        Ty::LocalSocketAllow { target, allows } => Some(Val::CapLocalSocketAllow {
+            handle: CapHandle::Real,
+            target: target.clone(),
+            allows: allows.clone(),
+        }),
         Ty::Secret(name) => Some(Val::CapSecret {
             handle: CapHandle::Real,
             name: name.clone(),
@@ -2979,9 +2989,11 @@ fn build_core_entry_cap(ty: &Ty) -> Option<Val> {
 
 fn check_core_entry_export_gate(params: &[(Ident, LTy)], w: &World) -> Option<Bug> {
     let req = TagSet::union_owned(params.iter().map(|(_, l)| match &l.ty {
-        Ty::Console(allows) | Ty::WriteFiles { allows, .. } | Ty::HttpsAllow { allows, .. } => {
-            allows.clone()
-        }
+        Ty::Console(allows)
+        | Ty::WriteFiles { allows, .. }
+        | Ty::HttpsAllow { allows, .. }
+        | Ty::LocalHttpAllow { allows, .. }
+        | Ty::LocalSocketAllow { allows, .. } => allows.clone(),
         _ => TagSet::empty(),
     }));
     if req.is_empty() || req.is_subset(&w.runtime_allow_export) {

@@ -234,6 +234,26 @@ pub enum ExecHostOp {
     /// `https.post_json(url, body, headers:)` / `https.put_json(...)` (Phase 4 HTTPS writes).
     HttpsPostJson,
     HttpsPutJson,
+    /// `LocalHttp.fake("127.0.0.1:PORT" | Name, responses: {...})` / `LocalSocket.fake(...)`.
+    FakeLocalHttp {
+        target: LocalHttpTarget,
+    },
+    FakeLocalSocket {
+        target: LocalSocketTarget,
+    },
+    FakeLocalHttpRequests,
+    FakeLocalHttpBodies,
+    FakeLocalSocketRequests,
+    FakeLocalSocketBodies,
+    /// `local_http.{get_json,post_json,put_json,delete_json}` & `local_socket.*` (v0.7.0).
+    LocalHttpGetJson,
+    LocalHttpPostJson,
+    LocalHttpPutJson,
+    LocalHttpDeleteJson,
+    LocalSocketGetJson,
+    LocalSocketPostJson,
+    LocalSocketPutJson,
+    LocalSocketDeleteJson,
     /// `response.parse_table(field, as: S[, fields: {...}])` / `bool_at` / `text_at` / `int_at`.
     JsonParseTable(Ident),
     JsonBoolAt,
@@ -2090,8 +2110,23 @@ impl ExecProgram {
     /// the Lean-verified Core IR v0.1 subset. Returns `None` if Phase 2 runtime extensions are used.
     #[must_use]
     pub fn try_to_core_program(&self) -> Option<Program> {
+        if let Some(p) = &self.policy
+            && (p.forbid_local_http
+                || p.forbid_local_socket
+                || !p.allow_local_http.is_empty()
+                || !p.allow_local_socket.is_empty())
+        {
+            return None;
+        }
         let mut funs = Vec::with_capacity(self.funs.len());
         for f in &self.funs {
+            if f.params
+                .iter()
+                .any(|(_, l)| ty_uses_phase7_local_cap(&l.ty))
+                || ty_uses_phase7_local_cap(&f.ret.ty)
+            {
+                return None;
+            }
             let body = try_exec_expr_to_core(&f.body)?;
             funs.push(FunDecl {
                 name: f.name.clone(),
@@ -2139,6 +2174,38 @@ impl ExecProgram {
             metadata: self.metadata.clone(),
         })
     }
+}
+
+fn ty_uses_phase7_local_cap(ty: &Ty) -> bool {
+    let mut stack = vec![ty];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            Ty::LocalHttpAllow { .. } | Ty::LocalSocketAllow { .. } => return true,
+            Ty::Option(inner) => stack.push(inner),
+            Ty::Result { ok_ty, err_ty } => {
+                stack.push(ok_ty);
+                stack.push(err_ty);
+            }
+            Ty::Tuple(elems) => {
+                for e in elems {
+                    stack.push(&e.ty);
+                }
+            }
+            Ty::List(elem) => stack.push(&elem.ty),
+            Ty::Map { key, val } => {
+                stack.push(&key.ty);
+                stack.push(&val.ty);
+            }
+            Ty::Fn { params, ret, .. } => {
+                for p in params {
+                    stack.push(&p.ty);
+                }
+                stack.push(&ret.ty);
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 enum ConvTask<'a> {

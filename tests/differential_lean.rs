@@ -2706,6 +2706,7 @@ fn build_curated_corpus() -> Vec<CorpusCase> {
             allow_export: vec![("reports/".into(), ts(&["ferpa"]))],
             allow_https: vec![],
             allow_write: vec![],
+            ..Policy::default()
         };
         add!(
             "58_policy_subpath_ok",

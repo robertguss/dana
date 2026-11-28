@@ -10,8 +10,8 @@ use crate::core::bigint::BigInt;
 use crate::core::stack::with_large_stack;
 use crate::core::syntax::{
     AggItem, AggKind, BUILT_IN_TAGS, CaseArm, ColSpec, ConstDecl, DeriveItem, Expr, FunDecl,
-    HostOp, Ident, JoinKind, JoinOn, LTy, Literal, Plan, Policy, PrimOp, Program, RowExpr, RowLit,
-    ScalarTy, TableTy, TagSet, Ty, WindowFn, WindowItem,
+    HostOp, Ident, JoinKind, JoinOn, LTy, Literal, LocalHttpTarget, LocalSocketTarget, Plan,
+    Policy, PrimOp, Program, RowExpr, RowLit, ScalarTy, TableTy, TagSet, Ty, WindowFn, WindowItem,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,7 +187,10 @@ pub fn valid_ty(prog: &Program, ty: &Ty) -> bool {
                     return false;
                 }
             }
-            Ty::WriteFiles { allows, .. } | Ty::HttpsAllow { allows, .. } => {
+            Ty::WriteFiles { allows, .. }
+            | Ty::HttpsAllow { allows, .. }
+            | Ty::LocalHttpAllow { allows, .. }
+            | Ty::LocalSocketAllow { allows, .. } => {
                 if !valid_tag_set(prog, allows) {
                     return false;
                 }
@@ -277,6 +280,8 @@ pub fn is_equatable_ty(ty: &Ty) -> bool {
             | Ty::WriteTable { .. }
             | Ty::RawReadDB(_)
             | Ty::HttpsAllow { .. }
+            | Ty::LocalHttpAllow { .. }
+            | Ty::LocalSocketAllow { .. }
             | Ty::Secret(_)
             | Ty::Declassify(_) => return false,
         }
@@ -1594,6 +1599,28 @@ fn policy_allows_https(p: &Policy, host: &str, allows: &TagSet) -> bool {
             .any(|(h, pol_tags)| h == host && allows.is_subset(pol_tags))
 }
 
+fn policy_allows_local_http(p: &Policy, target: &LocalHttpTarget, allows: &TagSet) -> bool {
+    if p.forbid_local_http {
+        return false;
+    }
+    let key = target.policy_key();
+    (allows.is_empty() && p.allow_local_http.is_empty())
+        || p.allow_local_http
+            .iter()
+            .any(|(t, pol_tags)| t.eq_ignore_ascii_case(key) && allows.is_subset(pol_tags))
+}
+
+fn policy_allows_local_socket(p: &Policy, target: &LocalSocketTarget, allows: &TagSet) -> bool {
+    if p.forbid_local_socket {
+        return false;
+    }
+    let key = target.policy_key();
+    (allows.is_empty() && p.allow_local_socket.is_empty())
+        || p.allow_local_socket
+            .iter()
+            .any(|(t, pol_tags)| t == key && allows.is_subset(pol_tags))
+}
+
 fn policy_allows_write(p: &Policy, db: &str, tbl: &str, allows: &TagSet) -> bool {
     allows.is_empty()
         || p.allow_write
@@ -1635,6 +1662,26 @@ pub fn check_cap_against_policy(pol: Option<&Policy>, ty: &Ty) -> Result<(), Che
             } else {
                 err(format!(
                     "HttpsAllow(\"{host}\") capability exceeds dana.policy"
+                ))
+            }
+        }
+        Ty::LocalHttpAllow { target, allows } => {
+            if policy_allows_local_http(p, target, allows) {
+                Ok(())
+            } else {
+                err(format!(
+                    "LocalHttpAllow({}) capability exceeds dana.policy",
+                    target.display_label()
+                ))
+            }
+        }
+        Ty::LocalSocketAllow { target, allows } => {
+            if policy_allows_local_socket(p, target, allows) {
+                Ok(())
+            } else {
+                err(format!(
+                    "LocalSocketAllow({}) capability exceeds dana.policy",
+                    target.display_label()
                 ))
             }
         }
@@ -6349,6 +6396,8 @@ pub fn is_capability_ty(ty: &Ty) -> bool {
             | Ty::WriteTable { .. }
             | Ty::RawReadDB(_)
             | Ty::HttpsAllow { .. }
+            | Ty::LocalHttpAllow { .. }
+            | Ty::LocalSocketAllow { .. }
             | Ty::Secret(_)
             | Ty::Declassify(_)
     )
@@ -6412,6 +6461,12 @@ fn check_policy_wf(prog: &Program) -> Result<(), CheckError> {
         && valid_tag_set(prog, &p.allow_console)
         && p.allow_export.iter().all(|(_, ts)| valid_tag_set(prog, ts))
         && p.allow_https.iter().all(|(_, ts)| valid_tag_set(prog, ts))
+        && p.allow_local_http
+            .iter()
+            .all(|(_, ts)| valid_tag_set(prog, ts))
+        && p.allow_local_socket
+            .iter()
+            .all(|(_, ts)| valid_tag_set(prog, ts))
         && p.allow_write.iter().all(|r| valid_tag_set(prog, &r.tags))
     {
         Ok(())

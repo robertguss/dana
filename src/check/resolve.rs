@@ -26,6 +26,8 @@ pub const STDLIB_MODULES: &[&str] = &[
     "DB",
     "Console",
     "Https",
+    "LocalHttp",
+    "LocalSocket",
     "Secret",
     "Math",
     "Text",

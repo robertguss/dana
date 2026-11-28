@@ -6,9 +6,13 @@
 //! min_group_size 5
 //! forbid manual_declassify
 //! forbid repl_show_sensitive
+//! forbid local_http
+//! forbid local_socket
 //! allow console tags [...]
 //! allow export "prefix/" tags [...]
 //! allow https  "host"    tags [...]
+//! allow local_http   "127.0.0.1:8091" tags [...]
+//! allow local_socket "/run/mo.sock"   tags [...]
 //! allow write  Db.table  tags [...]
 //! ```
 
@@ -85,6 +89,8 @@ pub fn parse_policy(file: FileId, src: &str) -> Result<Policy, Diagnostic> {
             match rest.trim() {
                 "manual_declassify" => policy.forbid_manual_declassify = true,
                 "repl_show_sensitive" => policy.forbid_repl_sensitive = true,
+                "local_http" => policy.forbid_local_http = true,
+                "local_socket" => policy.forbid_local_socket = true,
                 other => {
                     return Err(Diagnostic::error(
                         DiagCode::PolicyError,
@@ -121,6 +127,20 @@ pub fn parse_policy(file: FileId, src: &str) -> Result<Policy, Diagnostic> {
                 let (host, tail) = parse_quoted_string(after.trim(), span)?;
                 let tags = parse_tags_clause(tail.trim(), span)?;
                 policy.allow_https.push((host, tags));
+                continue;
+            }
+            if let Some(after) = rest.strip_prefix("local_http")
+                && after.starts_with(char::is_whitespace)
+            {
+                let (target, tags) = parse_policy_target_and_tags(after.trim(), span)?;
+                policy.allow_local_http.push((target, tags));
+                continue;
+            }
+            if let Some(after) = rest.strip_prefix("local_socket")
+                && after.starts_with(char::is_whitespace)
+            {
+                let (target, tags) = parse_policy_target_and_tags(after.trim(), span)?;
+                policy.allow_local_socket.push((target, tags));
                 continue;
             }
             if let Some(after) = rest.strip_prefix("write")
@@ -236,6 +256,37 @@ fn parse_quoted_string(s: &str, span: Span) -> Result<(String, &str), Diagnostic
         Diagnostic::error(DiagCode::PolicyError, "unterminated string in dana.policy")
             .with_span(span),
     )
+}
+
+fn parse_policy_target_and_tags(s: &str, span: Span) -> Result<(String, TagSet), Diagnostic> {
+    if s.starts_with('"') {
+        let (target, tail) = parse_quoted_string(s, span)?;
+        let tags = parse_tags_clause(tail.trim(), span)?;
+        Ok((target, tags))
+    } else {
+        let split_idx = s.find(char::is_whitespace).ok_or_else(|| {
+            Diagnostic::error(
+                DiagCode::PolicyError,
+                format!("expected `tags [...]` after target `{s}`"),
+            )
+            .with_span(span)
+        })?;
+        let target = &s[..split_idx];
+        let tail = s[split_idx..].trim();
+        if target.is_empty()
+            || !target
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(Diagnostic::error(
+                DiagCode::PolicyError,
+                format!("invalid named local target `{target}` in dana.policy"),
+            )
+            .with_span(span));
+        }
+        let tags = parse_tags_clause(tail, span)?;
+        Ok((target.to_string(), tags))
+    }
 }
 
 fn parse_tags_clause(s: &str, span: Span) -> Result<TagSet, Diagnostic> {
