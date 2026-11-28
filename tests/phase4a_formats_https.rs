@@ -43,7 +43,10 @@ use dana::formats::xlsx::{
 };
 use dana::formats::zip::{ZipArchive, ZipCompression, ZipLimits, crc32, write_zip_bytes};
 use dana::lower::lower_program;
-use dana::net::{HttpsClientConfig, ParsedHttpsUrl, https_get_json};
+use dana::net::{
+    HttpsClientConfig, JsonResponse, ParsedHttpsUrl, https_get_json, https_post_json,
+    https_put_json,
+};
 use dana::oracle::value::{TableRow, TableVal, Val, val_eq};
 use dana::runtime::{RunConfig, RunResult, run_exec_program, run_program_tests};
 use dana::syntax::parse_module;
@@ -2123,4 +2126,353 @@ end
         }
     }
     Ok(())
+}
+
+#[test]
+fn https_post_json_put_json_fake_dry_run_privacy_and_loopback_tls() -> TestResult {
+    // 1. Offline `Https.fake` test exercising `post_json` (`Text`) and `put_json` (`Table`)
+    let fake_src = r#"
+module HttpsWriteFakeSpec
+
+test "post_json Text and put_json Table record requests and request_bodies"
+  api = Https.fake(
+    "api.modb.local",
+    responses: {
+      "POST https://api.modb.local/v1/events": "{\"ok\":true,\"inserted\":1}",
+      "PUT https://api.modb.local/v1/rows": ""
+    }
+  )
+  r1 = try api.post_json("https://api.modb.local/v1/events", "{\"kind\":\"sync\"}", headers: {"X-Trace": "t1"})
+  assert r1.bool_at("ok")
+  assert r1.int_at("inserted") == 1
+
+  rows = table
+    | id | label   |
+    | 1  | "alpha" |
+    | 2  | "beta"  |
+  end
+  r2 = try api.put_json("https://api.modb.local/v1/rows", body: rows)
+  assert not r2.bool_at("anything")
+
+  assert api.requests == ["https://api.modb.local/v1/events", "https://api.modb.local/v1/rows"]
+  assert api.request_bodies.len == 2
+  assert api.request_bodies.first! == "{\"kind\":\"sync\"}"
+  expected_json = "[{\"id\":1,\"label\":\"alpha\"},{\"id\":2,\"label\":\"beta\"}]"
+  assert api.request_bodies == ["{\"kind\":\"sync\"}", expected_json]
+end
+"#;
+    let fake_prog = compile_source(fake_src, None)?;
+    let cfg = RunConfig::default();
+    let vm_tests = run_program_tests_vm(&fake_prog, None, &cfg, &VmConfig::default());
+    let ora_tests = run_program_tests(&fake_prog, None, &cfg);
+    assert_eq!(vm_tests.len(), 1);
+    assert_eq!(ora_tests.len(), 1);
+    assert!(vm_tests[0].passed, "vm test: {:?}", vm_tests[0].message);
+    assert!(ora_tests[0].passed, "ora test: {:?}", ora_tests[0].message);
+
+    // 2. Compile-time privacy rejection for `[pii]` Text / Table bodies on undeclared HttpsAllow
+    for (label, bad_src) in [
+        (
+            "pii_text",
+            r#"
+module BadPostText
+fn main(api: HttpsAllow("api.example.com"), ssn: Text [pii]) : Int
+  _ = api.post_json("https://api.example.com/ingest", ssn)
+  0
+end
+"#,
+        ),
+        (
+            "pii_table",
+            r#"
+module BadPutTable
+schema Row
+  ssn: Text [pii]
+end
+fn main(api: HttpsAllow("api.example.com"), t: Table(Row)) : Int
+  _ = api.put_json("https://api.example.com/rows", t)
+  0
+end
+"#,
+        ),
+    ] {
+        let mut sm = SourceMap::new();
+        let fid = sm.add_file(format!("{label}.dana"), bad_src.to_string());
+        let ast = parse_module(fid, bad_src).map_err(|d| render_diagnostic(&d, &sm))?;
+        let diags = check_module(fid, ast, None, &sm)
+            .err()
+            .ok_or_else(|| format!("{label} should have failed privacy check"))?;
+        assert!(
+            diags.iter().any(|d| d.code() == DiagCode::PrivacyError),
+            "{label} expected PrivacyError, got {diags:?}"
+        );
+    }
+
+    // 3. `dry-run` intercepts `post_json`/`put_json` cleanly with zero network traffic
+    let dry_src = r#"
+module DryRunPost
+fn main(api: HttpsAllow("unreachable.invalid", allows: [pii]), console: Console) : Int
+  _ = try api.post_json("https://unreachable.invalid/ingest", "{\"a\":1}")
+  rows = table
+    | id |
+    | 7  |
+  end
+  _ = try api.put_json("https://unreachable.invalid/rows", rows)
+  console.print("done")
+  0
+end
+"#;
+    let dry_prog = compile_source(dry_src, None)?;
+    let dry_cfg = RunConfig {
+        live_io: true,
+        dry_run: true,
+        ..RunConfig::default()
+    };
+    for (label, res) in [
+        (
+            "vm",
+            run_exec_program_vm(&dry_prog, &dry_cfg, &VmConfig::default()),
+        ),
+        ("oracle", run_exec_program(&dry_prog, &dry_cfg)),
+    ] {
+        match res {
+            RunResult::Ok {
+                exit_code: 0,
+                stdout,
+                ..
+            } => {
+                assert!(
+                    stdout.iter().any(|l| l
+                        .starts_with("[DRY-RUN] would POST https://unreachable.invalid/ingest")),
+                    "{label} missing POST dry-run line: {stdout:?}"
+                );
+                assert!(
+                    stdout
+                        .iter()
+                        .any(|l| l
+                            .starts_with("[DRY-RUN] would PUT https://unreachable.invalid/rows")),
+                    "{label} missing PUT dry-run line: {stdout:?}"
+                );
+            }
+            other => return Err(format!("{label} dry-run failed: {other:?}").into()),
+        }
+    }
+
+    // 4. Real loopback OpenSSL TLS POST (200 JSON) + PUT (204 empty -> null) + header checks
+    let dir = TempDir::new("https_write_tls")?;
+    let (cert_path, key_path) = generate_self_signed_cert(dir.path())?;
+    let acceptor = TlsServerAcceptor::from_pem_files(&cert_path, &key_path)
+        .map_err(|e| format!("acceptor: {e}"))?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let captured = Arc::new(Mutex::new(Vec::<(String, String, String)>::new()));
+    let captured_srv = Arc::clone(&captured);
+
+    let srv = thread::spawn(move || {
+        for _ in 0..2 {
+            let Ok((tcp, _)) = listener.accept() else {
+                break;
+            };
+            let Ok(tls) = acceptor.accept(tcp) else {
+                continue;
+            };
+            let mut reader = BufReader::new(tls);
+            let mut req_line = String::new();
+            if reader.read_line(&mut req_line).is_err() {
+                continue;
+            }
+            let method = req_line
+                .split_ascii_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let mut content_len = 0usize;
+            let mut content_type = String::new();
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).is_err() {
+                    break;
+                }
+                let t = h.trim();
+                if t.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = t.split_once(':') {
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        content_len = v.trim().parse().unwrap_or(0);
+                    } else if k.trim().eq_ignore_ascii_case("content-type") {
+                        content_type = v.trim().to_string();
+                    }
+                }
+            }
+            let mut body_buf = vec![0u8; content_len];
+            let _ = std::io::Read::read_exact(&mut reader, &mut body_buf);
+            let body_str = String::from_utf8_lossy(&body_buf).into_owned();
+            if let Ok(mut guard) = captured_srv.lock() {
+                guard.push((method.clone(), content_type, body_str));
+            }
+            let mut tls = reader.into_inner();
+            if method == "POST" {
+                let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"accepted\":true}";
+                let _ = tls.write_all(resp.as_bytes());
+            } else {
+                let resp = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+                let _ = tls.write_all(resp.as_bytes());
+            }
+            let _ = tls.flush();
+        }
+    });
+
+    let client_cfg = HttpsClientConfig {
+        ca_cert_path: Some(cert_path),
+        ..HttpsClientConfig::default()
+    };
+    let post_resp = https_post_json(
+        &format!("https://127.0.0.1:{port}/api/ingest"),
+        "127.0.0.1",
+        r#"{"event":"boot"}"#,
+        &[],
+        &client_cfg,
+    )?;
+    assert!(post_resp.bool_at("accepted")?);
+
+    let put_resp = https_put_json(
+        &format!("https://127.0.0.1:{port}/api/rows"),
+        "127.0.0.1",
+        r#"[{"id":1}]"#,
+        &[(
+            "Content-Type".to_string(),
+            "application/merge-patch+json".to_string(),
+        )],
+        &client_cfg,
+    )?;
+    assert_eq!(put_resp.value(), &dana::formats::json::JsonValue::Null);
+
+    let _ = srv.join();
+    {
+        let guard = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(guard.len(), 2);
+        assert_eq!(guard[0].0, "POST");
+        assert_eq!(guard[0].1, "application/json");
+        assert_eq!(guard[0].2, r#"{"event":"boot"}"#);
+        assert_eq!(guard[1].0, "PUT");
+        assert_eq!(guard[1].1, "application/merge-patch+json");
+        assert_eq!(guard[1].2, r#"[{"id":1}]"#);
+    }
+
+    // Overriding `Host` or `Content-Length` is rejected before TCP.
+    assert!(
+        https_post_json(
+            &format!("https://127.0.0.1:{port}/api/ingest"),
+            "127.0.0.1",
+            "{}",
+            &[("Content-Length".to_string(), "999".to_string())],
+            &client_cfg,
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn parse_table_nested_fields_map_geojson_and_errors() -> TestResult {
+    // 1. Unit check on `JsonResponse::parse_table_with_fields` + array index paths
+    let geo_json = r#"{
+      "type": "FeatureCollection",
+      "features": [
+        {
+          "id": "eq-1",
+          "properties": { "place": "12 km NNW of The Geysers, CA", "mag": 2.4 },
+          "geometry": { "type": "Point", "coordinates": [-122.8, 38.8, 1.5] }
+        },
+        {
+          "id": "eq-2",
+          "properties": { "place": "Negative Mag", "mag": -0.5 },
+          "geometry": { "type": "Point", "coordinates": [-150.1, 61.2, 10.0] }
+        }
+      ]
+    }"#;
+    let jresp = JsonResponse::from_json_str(geo_json)?;
+    assert_eq!(
+        jresp.text_at("features.0.properties.place")?,
+        "12 km NNW of The Geysers, CA"
+    );
+
+    // 2. End-to-end Dana execution via `Https.fake`
+    let dana_src = format!(
+        r#"
+module GeoJsonTest
+
+schema Quake
+  id: Text
+  place: Text
+  mag: Float where . >= 0.0
+  lon: Float
+  lat: Float
+end
+
+test "parse_table extracts nested GeoJSON properties and coordinate array indices"
+  api = Https.fake(
+    "earthquake.usgs.gov",
+    responses: {{
+      "https://earthquake.usgs.gov/feed.geojson": {geo_lit}
+    }}
+  )
+  resp = try api.get_json("https://earthquake.usgs.gov/feed.geojson")
+  (good, bad) = resp.parse_table("features", as: Quake, fields: {{
+    "place": "properties.place",
+    "mag": "properties.mag",
+    "lon": "geometry.coordinates.0",
+    "lat": "geometry.coordinates.1"
+  }})
+  assert good.count() == 1
+  assert bad.count() == 1
+  assert good.first!.id == "eq-1"
+  assert good.first!.place == "12 km NNW of The Geysers, CA"
+  assert good.first!.lon == -122.8
+  assert good.first!.lat == 38.8
+  assert bad.first!.column == "mag"
+  assert bad.first!.error_kind == "ConstraintFailed"
+end
+"#,
+        geo_lit = serde_escape(geo_json)
+    );
+    let prog = compile_source(&dana_src, None)?;
+    let cfg = RunConfig::default();
+    let vm_out = run_program_tests_vm(&prog, None, &cfg, &VmConfig::default());
+    let ora_out = run_program_tests(&prog, None, &cfg);
+    assert!(vm_out[0].passed, "vm: {:?}", vm_out[0].message);
+    assert!(ora_out[0].passed, "ora: {:?}", ora_out[0].message);
+
+    // 3. Unknown schema column in `fields:` must fail statically with SchemaError
+    let bad_fields_src = r#"
+module BadFieldsMap
+schema Quake
+  id: Text
+end
+fn main(api: HttpsAllow("example.com")) : Int
+  resp = try api.get_json("https://example.com/q")
+  (good, _bad) = resp.parse_table("features", as: Quake, fields: {"unknown_col": "properties.foo"})
+  0
+end
+"#;
+    let mut sm = SourceMap::new();
+    let fid = sm.add_file("bad_fields.dana".to_string(), bad_fields_src.to_string());
+    let ast = parse_module(fid, bad_fields_src).map_err(|d| render_diagnostic(&d, &sm))?;
+    let diags = check_module(fid, ast, None, &sm)
+        .err()
+        .ok_or("expected unknown fields: key to emit SchemaError")?;
+    assert!(
+        diags.iter().any(|d| d.code() == DiagCode::SchemaError),
+        "expected SchemaError, got {diags:?}"
+    );
+    Ok(())
+}
+
+fn serde_escape(s: &str) -> String {
+    let mut out = String::new();
+    dana::formats::json::push_json_string(&mut out, s);
+    out
 }

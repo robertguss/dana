@@ -2021,6 +2021,23 @@ fn eval_vec_prim(
                 });
             }
         }
+        (ExecPrimOp::TextLen, &[ra]) => {
+            if let RegVal::Text { offsets, data } = &regs[ra] {
+                let mut is_active = vec![false; batch_len];
+                for &l in active {
+                    is_active[usize::from(l)] = true;
+                }
+                let mut out = vec![0i64; batch_len];
+                for (i, &active_lane) in is_active.iter().enumerate() {
+                    if active_lane
+                        && let Ok(s) = std::str::from_utf8(&data[offsets[i]..offsets[i + 1]])
+                    {
+                        out[i] = i64::try_from(s.chars().count()).unwrap_or(i64::MAX);
+                    }
+                }
+                return Ok(RegVal::Int(out));
+            }
+        }
         (op_sw @ (ExecPrimOp::StartsWithText | ExecPrimOp::EndsWithText), &[ra, rb]) => {
             let is_starts = matches!(op_sw, ExecPrimOp::StartsWithText);
             match (&regs[ra], &regs[rb]) {
@@ -3103,6 +3120,10 @@ pub fn eval_scalar_exec_prim(
         ExecPrimOp::UpperText => match args {
             [Val::Text(s)] => Ok(Val::Text(s.to_uppercase())),
             _ => Err(RowEvalErr::Failed("UpperText requires Text".to_string())),
+        },
+        ExecPrimOp::TextLen => match args {
+            [Val::Text(s)] => Ok(Val::Int(BigInt::from(s.chars().count()))),
+            _ => Err(RowEvalErr::Failed("TextLen requires Text".to_string())),
         },
         ExecPrimOp::SliceText => match args {
             [Val::Text(s), Val::Int(start), Val::Int(len)] => {

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use dana::base::{DiagCode, SourceMap, render_diagnostic};
 use dana::check::check_module;
 use dana::core::bigint::BigInt;
-use dana::core::syntax::{AggKind, ColSpec, ScalarTy, TableTy, TagSet};
+use dana::core::syntax::{AggKind, ColSpec, Float64, ScalarTy, TableTy, TagSet};
 use dana::ffi::{GzipReader, GzipWriter, ZstdReader, ZstdWriter};
 use dana::formats::compress::{
     AutoDecodeReader, AutoEncodeWriter, CompressionKind, compress_bytes, decompress_bytes,
@@ -23,18 +23,23 @@ use dana::formats::crypto::{hmac_sha256, hmac_sha256_pseudonym, sha256, to_hex_l
 use dana::formats::csv::{
     CSV_BATCH_SIZE, CsvBatchReader, parse_csv_records, read_csv_stream_with_schema,
 };
-use dana::formats::infer::{InferFormat, infer_schema_from_file, infer_schema_from_reader};
+use dana::formats::infer::{
+    InferFormat, InferredTy, infer_schema_from_file, infer_schema_from_reader,
+};
 use dana::formats::json::{
-    JsonValue, MAX_JSON_DEPTH, parse_json, parse_jsonl_with_schema, to_json_compact,
-    write_jsonl_table,
+    JsonValue, MAX_JSON_DEPTH, format_json_array_table, format_json_array_vm_table,
+    format_jsonl_table, format_jsonl_vm_table, parse_json, parse_jsonl_with_schema,
+    to_json_compact, write_jsonl_table,
 };
 use dana::formats::time::{
     format_iso_date, format_timestamp_in_tz, load_timezone, local_date_in_tz, parse_iso_timestamp,
 };
 use dana::lower::lower_program;
-use dana::oracle::value::{Val, val_eq, val_list_eq};
+use dana::oracle::value::{TableRow, TableVal, Val, val_eq, val_list_eq};
 use dana::runtime::{RunConfig, RunResult, run_exec_program, run_program_tests};
 use dana::syntax::{format_module, parse_module};
+use dana::vm::batch::table_to_batches;
+use dana::vm::ops::VmTable;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1095,5 +1100,103 @@ end
     ));
 
     let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn jsonl_and_json_array_preserve_dot_zero_on_integral_floats() -> Result<(), String> {
+    let cols = vec![
+        ColSpec {
+            name: "id".to_string(),
+            ty: ScalarTy::Int,
+            tags: TagSet::empty(),
+            bucketed: false,
+            agg_kind: AggKind::Raw,
+        },
+        ColSpec {
+            name: "elevation_m".to_string(),
+            ty: ScalarTy::Option(Box::new(ScalarTy::Float)),
+            tags: TagSet::empty(),
+            bucketed: false,
+            agg_kind: AggKind::Raw,
+        },
+    ];
+    let tv = TableVal {
+        cols: cols.clone(),
+        rows: vec![
+            TableRow {
+                cells: vec![
+                    Val::Int(BigInt::from(1)),
+                    Val::OptSome(Box::new(Val::Float(Float64::from_f64(170.0)))),
+                ],
+                group_meta: None,
+            },
+            TableRow {
+                cells: vec![
+                    Val::Int(BigInt::from(2)),
+                    Val::OptSome(Box::new(Val::Float(Float64::from_f64(-9999.0)))),
+                ],
+                group_meta: None,
+            },
+            TableRow {
+                cells: vec![
+                    Val::Int(BigInt::from(3)),
+                    Val::OptSome(Box::new(Val::Float(Float64::from_f64(-0.0)))),
+                ],
+                group_meta: None,
+            },
+            TableRow {
+                cells: vec![
+                    Val::Int(BigInt::from(4)),
+                    Val::OptSome(Box::new(Val::Float(Float64::from_f64(1.5)))),
+                ],
+                group_meta: None,
+            },
+        ],
+    };
+    let schema_tt = TableTy {
+        cols: cols.clone(),
+        row_tags: TagSet::empty(),
+        order_tags: TagSet::empty(),
+        grouped_by: None,
+        summarized: false,
+        distinct_by: None,
+    };
+    let vm = VmTable {
+        cols,
+        batches: table_to_batches(&tv, 64),
+    };
+
+    let jsonl_tv = format_jsonl_table(&tv);
+    let jsonl_vm = format_jsonl_vm_table(&vm);
+    assert_eq!(jsonl_tv, jsonl_vm);
+    let expected_jsonl = "\
+{\"id\":1,\"elevation_m\":170.0}
+{\"id\":2,\"elevation_m\":-9999.0}
+{\"id\":3,\"elevation_m\":0.0}
+{\"id\":4,\"elevation_m\":1.5}
+";
+    assert_eq!(jsonl_tv, expected_jsonl);
+
+    let arr_tv = format_json_array_table(&tv);
+    let arr_vm = format_json_array_vm_table(&vm);
+    assert_eq!(arr_tv, arr_vm);
+    assert_eq!(
+        arr_tv,
+        "[{\"id\":1,\"elevation_m\":170.0},{\"id\":2,\"elevation_m\":-9999.0},{\"id\":3,\"elevation_m\":0.0},{\"id\":4,\"elevation_m\":1.5}]"
+    );
+
+    let inferred = infer_schema_from_reader(
+        Cursor::new(jsonl_tv.as_bytes()),
+        "GeoPoint",
+        InferFormat::Jsonl,
+        100,
+    )?;
+    assert_eq!(inferred.cols[0].ty, InferredTy::Int);
+    assert_eq!(inferred.cols[1].ty, InferredTy::Decimal);
+    let (roundtrip_good, roundtrip_bad) =
+        parse_jsonl_with_schema(&jsonl_tv, &schema_tt, |_, _| true)?;
+    assert_eq!(roundtrip_good.rows.len(), 4);
+    assert!(roundtrip_bad.rows.is_empty());
     Ok(())
 }

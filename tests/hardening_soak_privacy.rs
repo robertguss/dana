@@ -584,6 +584,13 @@ fn soak_extended_differential_exec_and_sqlite_pushdown() -> TestResult {
                             }),
                             else_br: Box::new(ExecRowExpr::Lit(Literal::NoneLit(Ty::Int))),
                         }),
+                        spec: ColSpec {
+                            name: "opt_n".to_string(),
+                            ty: ScalarTy::Option(Box::new(ScalarTy::Int)),
+                            tags: TagSet::empty(),
+                            bucketed: false,
+                            agg_kind: AggKind::Raw,
+                        },
                     }],
                 };
                 let thresh = rng.pick_int();
@@ -614,6 +621,13 @@ fn soak_extended_differential_exec_and_sqlite_pushdown() -> TestResult {
                                             ExecRowExpr::Col("mult".to_string()),
                                         ],
                                     }),
+                                    spec: ColSpec {
+                                        name: "score".to_string(),
+                                        ty: ScalarTy::Int,
+                                        tags: TagSet::empty(),
+                                        bucketed: false,
+                                        agg_kind: AggKind::Raw,
+                                    },
                                 },
                                 ExecDeriveItem::BucketCol {
                                     name: "band".to_string(),
@@ -1018,6 +1032,13 @@ fn soak_extended_differential_exec_and_sqlite_pushdown() -> TestResult {
                                 ExecRowExpr::Col("m2".to_string()),
                             ],
                         }),
+                        spec: ColSpec {
+                            name: "sum_m".to_string(),
+                            ty: ScalarTy::Int,
+                            tags: TagSet::empty(),
+                            bucketed: false,
+                            agg_kind: AggKind::Raw,
+                        },
                     }],
                 };
                 let melted = ExecPlan::PivotLonger {
@@ -1278,6 +1299,13 @@ fn soak_extended_differential_exec_and_sqlite_pushdown() -> TestResult {
                                                 ExecRowExpr::Lit(Literal::int(2)),
                                             ],
                                         }),
+                                        spec: ColSpec {
+                                            name: "weighted".to_string(),
+                                            ty: ScalarTy::Int,
+                                            tags: TagSet::empty(),
+                                            bucketed: false,
+                                            agg_kind: AggKind::Raw,
+                                        },
                                     }],
                                 }),
                                 items: vec![WindowItem {

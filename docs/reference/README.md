@@ -123,9 +123,9 @@ Contextual words:
 - Named-argument labels (`as`, `on`, `from`, `left`, `right`, `allows`, `over`, `order`, `cuts`,
   `labels`, `columns`, `cols`, `names_from`, `values_from`, `names_to`, `values_to`, `fill`,
   `key`, `sheet`, `sheets`, `method`, `threshold`, `flag`, `bins`, `trendline`, `title`,
-  `params`, `headers`, `responses`, `every`, `rows`, `by`, `min`, `distinct_by`, `mode`, `seed`,
-  `private`, `sanitize_formulas`, `sub`, `prefix`, `suffix`, `start`, `len`, `list`, `lo`, `hi`,
-  `step`, `suffixes`) are ordinary identifiers.
+  `params`, `headers`, `fields`, `responses`, `every`, `rows`, `by`, `min`, `distinct_by`,
+  `mode`, `seed`, `private`, `sanitize_formulas`, `sub`, `prefix`, `suffix`, `start`, `len`,
+  `list`, `lo`, `hi`, `step`, `suffixes`) are ordinary identifiers.
 
 ### 2.4 Line Breaks & Continuations
 
@@ -169,10 +169,11 @@ immediately before a closing delimiter, `.`, `|>`, or any binary operator other 
      as `Decimal` from the schema boundary).
 3. **Scalar text, numeric, parsing & time helpers** (available both in normal expressions and
    inside row expressions `where`/`derive`):
-   - `Text`: `a + b` (concatenation), `#{expr}` (interpolation), `.empty?`, `.trim`,
-     `.ascii_lowercase`, `.lower`, `.upper`, `.slice(start, len)` (UTF-8 char slicing; negative
-     `start` counts from end, `len <= 0` returns `""`), `.contains?("sub")`,
-     `.starts_with?("prefix")`, `.ends_with?("suffix")`.
+   - `Text`: `a + b` (concatenation), `#{expr}` (interpolation), `.len : Int` (UTF-8 character
+     count; pushes down to SQL `LENGTH(...)`), `.empty?`, `.trim`, `.ascii_lowercase`, `.lower`,
+     `.upper`, `.slice(start, len)` (UTF-8 char slicing; negative `start` counts from end,
+     `len <= 0` returns `""`), `.contains?("sub")`, `.starts_with?("prefix")`,
+     `.ends_with?("suffix")`.
    - **Safe parsing on `Text`** (trims ASCII whitespace, returns `T?`, never traps):
      `.try_parse_date : Date?`, `.try_parse_int : Int?`, `.try_parse_decimal : Decimal?`,
      `.try_parse_float : Float?`.
@@ -366,7 +367,7 @@ end
 | `drop` | `drop(.a, .b)` — Remove columns (cannot drop all columns). |
 | `rename` | `rename(new_name: .old_name, ...)` — Rename columns in place. |
 | `derive` | `derive(x: expr, y: bucket(...), z: coarsen(...))` — Add or replace computed columns (pure row exprs, audited coarseners, & pure UDFs). |
-| `sort_by` | `sort_by(.a, .b)` — Deterministic **stable** ascending sort (`none` sorts first). Adds key tags to `order_tags`. |
+| `sort_by` | `sort_by(.a, desc(.b), asc(.c))` — Deterministic **stable** multi-key sort (`asc(.col)` or bare `.col` ascending with `none` first; `desc(.col)` descending with `none` last; trailing `:asc`/`:desc` also accepted). Adds key tags to `order_tags`. |
 | `sort_desc` | `sort_desc(.a, .b)` — Deterministic **stable** descending sort (`none` sorts last). Adds key tags to `order_tags`. |
 | `distinct` | `distinct(.a, .b)` or `distinct()` — Deduplicate rows. Adds key tags to `row_tags`. |
 | `dedupe_by` | `dedupe_by(.k1, ..., [order_by: [asc/desc(.col)], keep: :first | :last])` — Deterministic keyed deduplication keeping `:first` (default) or `:last` row per key tuple (`order_by:` defaults to input order). Adds key and `order_by` tags to `row_tags`. |
@@ -385,9 +386,11 @@ end
 | `redact` | `redact(.col)` — Replace column with `"[REDACTED]"` (`Text`), clearing `col_tags(.col)`. |
 | `pseudonymize` | `pseudonymize(.col, key: secret)` — Keyed HMAC-SHA256 `Text` token, clearing `[pii]`. |
 
-Both `sort_by` and `sort_desc` are deterministic **stable** sorts, so chaining them produces
-exact mixed-direction tie-breaks: `|> sort_by(.category) |> sort_desc(.total_amount)` sorts
-descending by `.total_amount` with ties broken ascending by `.category`.
+`sort_by` supports single-call mixed directions via `asc(.col)` / `desc(.col)` (for example,
+`|> sort_by(desc(.total_amount), asc(.category))`). Both `sort_by` and `sort_desc` are
+deterministic **stable** sorts, so chaining them produces equivalent tie-breaks:
+`|> sort_by(.category) |> sort_desc(.total_amount)` sorts descending by `.total_amount` with ties
+broken ascending by `.category`.
 
 ### 6.3 Aggregates Inside `summarize(...)`
 
@@ -820,12 +823,53 @@ fn fetch_page(
 end
 ```
 
-`JsonResponse` helpers:
+`JsonResponse` helpers and `HttpsAllow` write methods:
 
-- `resp.parse_table("items", as: Schema) : (Table(Schema), Table(BadRow(Schema)))` (direct tuple, not `Result`).
-- `resp.bool_at("field") : Bool`
-- `resp.text_at("field") : Text`
-- `resp.int_at("field") : Int`
+- `resp.parse_table("items", as: Schema, [fields: {"col": "nested.path.0"}]) : (Table(Schema), Table(BadRow(Schema)))`
+  (direct tuple, not `Result`; optional `fields:` maps schema columns to dotted object paths and
+  0-based JSON array indices — e.g. `"lon": "geometry.coordinates.0"`). Pass `""` as the
+  container key when the JSON root itself is an array (`[...]`).
+- `resp.bool_at("field") : Bool`, `resp.text_at("field") : Text`, `resp.int_at("field") : Int`.
+- `api.post_json(url, body, [headers: {...}])` and `api.put_json(url, body, [headers: {...}])`
+  return `Result(JsonResponse, Text)`. `body` may be `Text` (sent verbatim with
+  `Content-Type: application/json`) or a `Table(...)` (serialized as a compact JSON array of row
+  objects). Empty `2xx` / `204 No Content` responses succeed with a null JSON body. Sensitive bodies
+  or headers require **both** compile-time `allows: [...]` and runtime `--allow-export`. Running
+  under `dana dry-run` intercepts writes cleanly and prints `[DRY-RUN] would POST/PUT ...` with
+  headers/sensitive payloads redacted.
+
+<!-- dana-example: file -->
+```dana
+module HttpsPostAndNestedDemo
+
+schema Quake
+  id: Text
+  place: Text
+  lon: Float
+end
+
+fn sync_quakes(api: HttpsAllow("api.example.com")) : Result(Int, Text)
+  resp = try api.get_json("https://api.example.com/quakes")
+  (rows, _bad) = resp.parse_table(
+    "features",
+    as: Quake,
+    fields: {"place": "properties.place", "lon": "geometry.coordinates.0"}
+  )
+  _ack = try api.post_json("https://api.example.com/ingest", rows)
+  Ok(rows.count())
+end
+
+test "nested fields mapping and table post_json work with Https.fake"
+  payload = """{"features": [{"id": "q1", "properties": {"place": "OR"}, "geometry": {"coordinates": [-122.7, 45.5]}}]}"""
+  api = Https.fake(
+    "api.example.com",
+    responses: {"https://api.example.com/quakes": payload, "https://api.example.com/ingest": "{}"}
+  )
+  assert (try sync_quakes(api)) == 1
+  assert api.requests.size == 2
+  assert api.request_bodies.first!.contains?("\"place\":\"OR\"")
+end
+```
 
 ---
 
@@ -931,7 +975,7 @@ production code is a compile error):
 | `Files.in_memory({"a.csv": "..."}).read_only` | `ReadFiles` | Serves in-memory CSV/TSV/JSONL fixtures |
 | `DB.in_memory(DbName, {Schema1: tbl1, ...})` | `ReadDB(DbName)` | Serves typed in-memory tables |
 | `Console.fake()` | `Console` | `.printed_lines : List(Text)`, `.printed_errors : List(Text)`, `.printed_tables : List(Table)` |
-| `Https.fake("host", responses: {"https://host/...": "{...}"}, allows: [pii])` | `HttpsAllow` | Returns stubbed JSON responses (`allows:` optional) |
+| `Https.fake("host", responses: {"https://host/...": "{...}"}, allows: [pii])` | `HttpsAllow` | Stubbed JSON responses (`allows:` optional); `.requests : List(Text)` & `.request_bodies : List(Text)` |
 | `Secret.fake("test-key")` | `Secret` | Deterministic test secret for `pseudonymize` / HTTPS |
 | `Args.of(["a.csv", "b.csv"])` | `Args` | Supplies CLI args to `main(...)` in tests |
 
@@ -988,6 +1032,8 @@ dana vendor verify            # verifies every vendored file offline (rejects ta
 
 Every `use` resolved from `vendor/` is automatically hash-verified by the compiler against
 `vendor/vendor.lock`, and vendored modules are **pure by default** (cannot mint ambient I/O).
+`dana vendor pin` warns on stderr if a vendored file path does not match the kebab-case relative
+path expected by `use ModuleName`.
 
 ### 11.2 Safe Interactive REPL (`dana repl`)
 
@@ -1003,6 +1049,11 @@ interactive session:
   hard-fails with `E0202`.
 - **Flags:** `--eval EXPR` (one-liner), `--db Name=URI`, `--policy FILE`, `--schema-lock FILE`,
   `--show-sensitive TAGS`.
+- **Zero-boilerplate `--schema-lock` tables:** When `--schema-lock` is active (or a sibling
+  `schema.lock` is auto-discovered), locked tables are pre-declared as `CapCase` schemas (e.g.
+  `Db.table(GhRepos)`) and also support direct string shorthand `Db.table("gh_repos")` without
+  typing `schema ... end` first — preserving all locked `[pii]`/`[ferpa]` tags and full SQL
+  pushdown (`:explain` and `--eval`). User-defined `schema` declarations override auto-generated ones.
 - **REPL-only `untyped` data explorer** (for inspecting files before writing a `schema`):
   `untyped.read_csv("path.csv")`, `untyped.read_jsonl("path.jsonl")`,
   `untyped.read_parquet("path.parquet")`, `untyped.read_xlsx("path.xlsx", sheet: "Sheet1")`.
@@ -1012,11 +1063,13 @@ interactive session:
   - `:profile <expr>` — Print privacy-redacted dataset profile
   - `:explain <expr>` — Show optimized plan, SQL pushdown, and sensitivity provenance
   - `:infer-schema <var|path>` — Emit ready-to-paste `schema ... end` declaration
-  - `:vars` — List capabilities, session definitions, and bound variables
+  - `:vars` — List capabilities, locked `schema.lock` tables, session definitions, and bound variables
   - `:reset` — Clear all session declarations and variables
   - `:quit` (`:q`, `:exit`) — Exit the REPL
 
 ### 11.3 CLI Reference
+
+Every `dana <subcommand>` accepts `-h` or `--help` to print its usage summary.
 
 ```sh
 dana check [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--json] <FILE...>

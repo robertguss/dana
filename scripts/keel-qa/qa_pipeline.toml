@@ -1,0 +1,73 @@
+[pipeline]
+name = "dana-keel-blackbox-qa"
+
+[[steps]]
+id = "dana_format_check"
+kind = "shell"
+cmd = "\"$DANA_BIN\" format --check qa_pipeline.dana"
+
+[[steps]]
+id = "dana_check_and_test"
+kind = "shell"
+depends_on = ["dana_format_check"]
+cmd = "\"$DANA_BIN\" check --policy dana.policy qa_pipeline.dana && \"$DANA_BIN\" test --policy dana.policy qa_pipeline.dana"
+
+[[steps]]
+id = "dana_explain"
+kind = "shell"
+depends_on = ["dana_format_check"]
+cmd = "out=$(\"$DANA_BIN\" explain --dialect sqlite --policy dana.policy qa_pipeline.dana) && ! printf '%s' \"$out\" | grep -q \"unresolved table schema\" && printf '%s' \"$out\" | grep -q \"CLEAR Pseudonymize\" && printf '%s' \"$out\" | grep -q \"CLEAR SuppressSmallGroups\""
+
+[[steps]]
+id = "dana_dry_run"
+kind = "shell"
+depends_on = ["dana_check_and_test"]
+cmd = "dry=$(\"$DANA_BIN\" dry-run --policy dana.policy --db QaDb=sqlite://qa-out/qa.sqlite qa_pipeline.dana) && printf '%s' \"$dry\" | grep -q \"UPSERT inserted=30 updated=0 unchanged=0\" && test ! -e qa-out/readings_clean.parquet"
+
+[[steps]]
+id = "dana_run_pass1"
+kind = "shell"
+depends_on = ["dana_dry_run"]
+cmd = "p1=$(\"$DANA_BIN\" run --policy dana.policy --db QaDb=sqlite://qa-out/qa.sqlite qa_pipeline.dana) && printf '%s\n' \"$p1\" && printf '%s' \"$p1\" | grep -q \"UPSERT inserted=30 updated=0 unchanged=0 bad=2\""
+
+[[steps]]
+id = "dana_run_pass2_idempotent"
+kind = "shell"
+depends_on = ["dana_run_pass1"]
+cmd = "p2=$(\"$DANA_BIN\" run --policy dana.policy --db QaDb=sqlite://qa-out/qa.sqlite qa_pipeline.dana) && printf '%s\n' \"$p2\" && printf '%s' \"$p2\" | grep -q \"UPSERT inserted=0 updated=0 unchanged=30\""
+
+[[steps]]
+id = "dana_schema_sync_and_repl"
+kind = "shell"
+depends_on = ["dana_run_pass1"]
+cmd = "\"$DANA_BIN\" schema-sync --db QaDb=sqlite://qa-out/qa.sqlite --out schema.lock && repl_out=$(\"$DANA_BIN\" repl --policy dana.policy --db QaDb=sqlite://qa-out/qa.sqlite --schema-lock schema.lock --eval 'QaDb.table(\"qa_metrics\") |> group_by(.region_bucket) |> summarize(n: count()) |> sort_by(desc(.n))') && printf '%s\n' \"$repl_out\" && printf '%s' \"$repl_out\" | grep -q \"north\""
+
+[[steps]]
+id = "keel_stat_parity"
+kind = "shell"
+depends_on = ["dana_run_pass2_idempotent"]
+cmd = "statkeel compare --format agent --key id --fail-on-schema-change --fail-on-row-diff \"sqlite://$PWD/qa-out/qa.sqlite#qa_metrics\" qa-out/readings_clean.parquet && statkeel compare --format agent --key id --fail-on-schema-change --fail-on-row-diff qa-out/readings_clean.parquet qa-out/readings_clean.jsonl"
+
+[[steps]]
+id = "keel_sheet_xlsx"
+kind = "shell"
+depends_on = ["dana_run_pass2_idempotent"]
+cmd = "sheetkeel inspect --format agent qa-out/qa_workbook.xlsx && sheetkeel export --sheet RegionSummary -o qa-out/region_summary_export.jsonl qa-out/qa_workbook.xlsx && grep -q 'north' qa-out/region_summary_export.jsonl"
+
+[[steps]]
+id = "keel_mask_pii"
+kind = "shell"
+depends_on = ["dana_run_pass2_idempotent"]
+cmd = "python3 -c 'import json, subprocess, sys\nfor p in [\"qa-out/readings_clean.jsonl\", \"qa-out/readings_clean.parquet\", \"qa-out/readings_clean.csv\"]:\n    out = subprocess.check_output([\"maskkeel\", \"scan\", \"--format\", \"json\", p], text=True)\n    d = json.loads(out)\n    assert d[\"pii_columns_found\"] == 0, f\"{p}: {d}\"\nprint(\"maskkeel: 0 PII columns leaked across JSONL, Parquet, CSV\")'"
+
+[[steps]]
+id = "keel_datakeel_odcs"
+kind = "shell"
+depends_on = ["dana_run_pass2_idempotent"]
+cmd = "datakeel check --format agent --strict qa_contract.odcs.yaml qa-out/readings_clean.parquet && datakeel check --format agent --strict qa_contract.odcs.yaml qa-out/readings_clean.jsonl"
+
+[[steps]]
+id = "keel_drift_and_lite"
+kind = "shell"
+depends_on = ["dana_run_pass2_idempotent"]
+cmd = "driftkeel snapshot -o qa-out/baseline.json qa-out/readings_clean.parquet && driftkeel check --format json qa-out/baseline.json qa-out/readings_clean.jsonl && litekeel tables --format agent qa-out/qa.sqlite"

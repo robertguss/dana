@@ -23,10 +23,10 @@ use crate::base::{
     DiagCode, Diagnostic, Severity, SourceMap, render_diagnostic, render_diagnostics_json,
 };
 use crate::check::{
-    check_resolved, check_resolved_with_lock, parse_policy, pin_vendor_dir, resolve_path,
-    verify_vendor_dir,
+    check_resolved, check_resolved_with_lock, expected_vendor_module_rel_path, parse_policy,
+    pin_vendor_dir, resolve_path, verify_vendor_dir,
 };
-use crate::core::syntax::{Policy, TagSet};
+use crate::core::syntax::{Ident, Policy, TableTy, TagSet};
 use crate::core::text::print_program;
 use crate::db::schema_lock::{
     SchemaLock, SchemaLockFile, format_schema_lock, merge_schema_lock, parse_schema_lock,
@@ -39,7 +39,10 @@ use crate::formats::parquet::infer_parquet_schema_from_file;
 use crate::formats::xlsx::infer_xlsx_schema_from_file;
 use crate::lower::lower_program;
 use crate::oracle::cli::parse_comma_tags;
-use crate::plan::{bind_exec_plan_sources, exec_plan_db_names, explain_exec_plan_with_pushdown};
+use crate::plan::{
+    bind_exec_plan_sources, bind_lty_in_scope, exec_plan_db_names,
+    explain_exec_plan_with_pushdown_scoped,
+};
 use crate::repl::{ReplConfig, ReplSession, run_repl_reader, run_repl_stdio};
 use crate::runtime::{RunConfig, RunResult, run_exec_program, run_program_tests};
 use crate::syntax::{format_module, parse_module};
@@ -123,6 +126,10 @@ pub fn run_cli(args: &[String]) -> i32 {
 }
 
 fn cmd_guide(args: &[String]) -> i32 {
+    if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
+        println!("usage: dana guide [SECTION]");
+        return 0;
+    }
     if args.is_empty() {
         print!("{EMBEDDED_GUIDE}");
         return 0;
@@ -155,7 +162,10 @@ fn cmd_format(args: &[String]) -> i32 {
     let mut check_only = false;
     let mut paths = Vec::new();
     for a in args {
-        if a == "--check" {
+        if matches!(a.as_str(), "--help" | "-h") {
+            println!("usage: dana format [--check] <PATH...>");
+            return 0;
+        } else if a == "--check" {
             check_only = true;
         } else if a.starts_with('-') {
             eprintln!("dana format: unknown flag `{a}`");
@@ -454,6 +464,12 @@ fn cmd_check(args: &[String]) -> i32 {
                     }
                 }
                 "--json" => json_out = true,
+                "--help" | "-h" => {
+                    println!(
+                        "usage: dana check [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--json] <FILE...>"
+                    );
+                    return 0;
+                }
                 flag if flag.starts_with('-') => {
                     eprintln!("dana check: unknown flag `{flag}`");
                     return 2;
@@ -592,6 +608,12 @@ fn cmd_test(args: &[String]) -> i32 {
                         return 2;
                     };
                     filter = Some(f.clone());
+                }
+                "--help" | "-h" => {
+                    println!(
+                        "usage: dana test [--oracle] [--oracle-steps N] [--policy FILE] [--filter SUBSTR] [PATH...]"
+                    );
+                    return 0;
                 }
                 flag if flag.starts_with('-') => {
                     eprintln!("dana test: unknown flag `{flag}`");
@@ -832,6 +854,18 @@ fn cmd_run_impl(args: &[String], dry_run: bool) -> i32 {
                             return 2;
                         }
                     }
+                }
+                "--help" | "-h" if script_path.is_none() => {
+                    if dry_run {
+                        println!(
+                            "usage: dana dry-run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] <FILE> [-- ARGS...]"
+                        );
+                    } else {
+                        println!(
+                            "usage: dana run [--oracle] [--oracle-steps N] [--db Name=URI]... [--attach [DB:]schema=PATH]... [--schema-lock FILE] [--policy FILE] [--allow-export TAGS] [--emit-core] <FILE> [-- ARGS...]"
+                        );
+                    }
+                    return 0;
                 }
                 flag if flag.starts_with('-') => {
                     eprintln!("{cmd_name}: unknown flag `{flag}`");
@@ -1096,6 +1130,12 @@ fn cmd_schema_sync(args: &[String]) -> i32 {
                     };
                     out_path = PathBuf::from(p);
                 }
+                "--help" | "-h" => {
+                    println!(
+                        "usage: dana schema-sync --db Name=URI [--db Name2=URI2 ...] [--attach [DB:]schema=PATH]... [--schemas s1,s2,...] [--out schema.lock]"
+                    );
+                    return 0;
+                }
                 flag if flag.starts_with('-') => {
                     eprintln!("dana schema-sync: unknown flag `{flag}`");
                     return 2;
@@ -1196,56 +1236,99 @@ fn cmd_schema_sync(args: &[String]) -> i32 {
     0
 }
 
-fn collect_exec_plans<'a>(
+struct ScopedExecPlan<'a> {
+    plan: &'a crate::runtime::ExecPlan,
+    var_tags: HashMap<Ident, TagSet>,
+    table_vars: HashMap<Ident, TableTy>,
+}
+
+fn collect_exec_plans_with_scope<'a>(
     expr: &'a crate::runtime::ExecExpr,
-    out: &mut Vec<&'a crate::runtime::ExecPlan>,
+    var_tags: &HashMap<Ident, TagSet>,
+    table_vars: &HashMap<Ident, TableTy>,
+    out: &mut Vec<ScopedExecPlan<'a>>,
 ) {
     use crate::runtime::ExecExpr;
     match expr {
-        ExecExpr::Rel(plan) => out.push(plan),
-        ExecExpr::LetE { bound, body, .. }
-        | ExecExpr::Join {
-            rhs: bound, body, ..
+        ExecExpr::Rel(plan) => out.push(ScopedExecPlan {
+            plan,
+            var_tags: var_tags.clone(),
+            table_vars: table_vars.clone(),
+        }),
+        ExecExpr::LetE {
+            name,
+            lty,
+            bound,
+            body,
         } => {
-            collect_exec_plans(bound, out);
-            collect_exec_plans(body, out);
+            collect_exec_plans_with_scope(bound, var_tags, table_vars, out);
+            let mut next_var_tags = var_tags.clone();
+            let mut next_table_vars = table_vars.clone();
+            bind_lty_in_scope(name, lty, &mut next_var_tags, &mut next_table_vars);
+            collect_exec_plans_with_scope(body, &next_var_tags, &next_table_vars, out);
+        }
+        ExecExpr::Join {
+            params, rhs, body, ..
+        } => {
+            let mut rhs_var_tags = var_tags.clone();
+            let mut rhs_table_vars = table_vars.clone();
+            for (pname, plty) in params {
+                bind_lty_in_scope(pname, plty, &mut rhs_var_tags, &mut rhs_table_vars);
+            }
+            collect_exec_plans_with_scope(rhs, &rhs_var_tags, &rhs_table_vars, out);
+            collect_exec_plans_with_scope(body, var_tags, table_vars, out);
         }
         ExecExpr::IfE {
             cond,
             then_br,
             else_br,
         } => {
-            collect_exec_plans(cond, out);
-            collect_exec_plans(then_br, out);
-            collect_exec_plans(else_br, out);
+            collect_exec_plans_with_scope(cond, var_tags, table_vars, out);
+            collect_exec_plans_with_scope(then_br, var_tags, table_vars, out);
+            collect_exec_plans_with_scope(else_br, var_tags, table_vars, out);
         }
         ExecExpr::CaseE { scrut, arms } => {
-            collect_exec_plans(scrut, out);
+            collect_exec_plans_with_scope(scrut, var_tags, table_vars, out);
             for a in arms {
-                collect_exec_plans(&a.body, out);
+                collect_exec_plans_with_scope(&a.body, var_tags, table_vars, out);
             }
         }
         ExecExpr::ForLoop {
             iter_expr,
+            state_vars,
             body,
             after,
             ..
         } => {
-            collect_exec_plans(iter_expr, out);
-            collect_exec_plans(body, out);
-            collect_exec_plans(after, out);
+            collect_exec_plans_with_scope(iter_expr, var_tags, table_vars, out);
+            let mut loop_var_tags = var_tags.clone();
+            let mut loop_table_vars = table_vars.clone();
+            for (sname, slty) in state_vars {
+                bind_lty_in_scope(sname, slty, &mut loop_var_tags, &mut loop_table_vars);
+            }
+            collect_exec_plans_with_scope(body, &loop_var_tags, &loop_table_vars, out);
+            collect_exec_plans_with_scope(after, &loop_var_tags, &loop_table_vars, out);
         }
         ExecExpr::WhileLoop {
-            cond, body, after, ..
+            cond,
+            state_vars,
+            body,
+            after,
+            ..
         } => {
-            collect_exec_plans(cond, out);
-            collect_exec_plans(body, out);
-            collect_exec_plans(after, out);
+            let mut loop_var_tags = var_tags.clone();
+            let mut loop_table_vars = table_vars.clone();
+            for (sname, slty) in state_vars {
+                bind_lty_in_scope(sname, slty, &mut loop_var_tags, &mut loop_table_vars);
+            }
+            collect_exec_plans_with_scope(cond, &loop_var_tags, &loop_table_vars, out);
+            collect_exec_plans_with_scope(body, &loop_var_tags, &loop_table_vars, out);
+            collect_exec_plans_with_scope(after, &loop_var_tags, &loop_table_vars, out);
         }
         ExecExpr::App { fn_expr, args } => {
-            collect_exec_plans(fn_expr, out);
+            collect_exec_plans_with_scope(fn_expr, var_tags, table_vars, out);
             for a in args {
-                collect_exec_plans(a, out);
+                collect_exec_plans_with_scope(a, var_tags, table_vars, out);
             }
         }
         ExecExpr::Call { args, .. }
@@ -1255,16 +1338,23 @@ fn collect_exec_plans<'a>(
         | ExecExpr::Prim { args, .. }
         | ExecExpr::Host { args, .. } => {
             for a in args {
-                collect_exec_plans(a, out);
+                collect_exec_plans_with_scope(a, var_tags, table_vars, out);
             }
         }
         ExecExpr::Proj { tup: e, .. } | ExecExpr::Assert { cond: e, .. } | ExecExpr::Fail(e) => {
-            collect_exec_plans(e, out);
+            collect_exec_plans_with_scope(e, var_tags, table_vars, out);
         }
-        ExecExpr::Lam { body, .. } => collect_exec_plans(body, out),
+        ExecExpr::Lam { params, body, .. } => {
+            let mut lam_var_tags = var_tags.clone();
+            let mut lam_table_vars = table_vars.clone();
+            for (pname, plty) in params {
+                bind_lty_in_scope(pname, plty, &mut lam_var_tags, &mut lam_table_vars);
+            }
+            collect_exec_plans_with_scope(body, &lam_var_tags, &lam_table_vars, out);
+        }
         ExecExpr::Stop { detail, .. } => {
             if let Some(d) = detail {
-                collect_exec_plans(d, out);
+                collect_exec_plans_with_scope(d, var_tags, table_vars, out);
             }
         }
         ExecExpr::Lit(_)
@@ -1453,8 +1543,13 @@ pub fn render_explain_report(
             if f.kind.is_spec() != include_spec {
                 continue;
             }
+            let mut base_var_tags = HashMap::new();
+            let mut base_table_vars = HashMap::new();
+            for (pname, plty) in &f.params {
+                bind_lty_in_scope(pname, plty, &mut base_var_tags, &mut base_table_vars);
+            }
             let mut plans = Vec::new();
-            collect_exec_plans(&f.body, &mut plans);
+            collect_exec_plans_with_scope(&f.body, &base_var_tags, &base_table_vars, &mut plans);
             if plans.is_empty() {
                 continue;
             }
@@ -1462,11 +1557,11 @@ pub fn render_explain_report(
             let base_bindings = fn_bindings.get(&f.name).cloned().unwrap_or_default();
             let combined = collect_local_db_plans(&f.body, prog, &base_bindings);
             let _ = writeln!(out, "== fn {} ==", f.name);
-            for (idx, p) in plans.iter().enumerate() {
+            for (idx, scoped) in plans.iter().enumerate() {
                 let bound = if combined.is_empty() {
-                    (*p).clone()
+                    scoped.plan.clone()
                 } else {
-                    bind_exec_plan_sources(p, &combined)
+                    bind_exec_plan_sources(scoped.plan, &combined)
                 };
                 let db_names = exec_plan_db_names(&bound, prog);
                 let db_name = db_names.first().cloned().unwrap_or_default();
@@ -1485,8 +1580,15 @@ pub fn render_explain_report(
                     })
                     .unwrap_or(SqlDialect::Postgres);
                 let _ = writeln!(out, "-- plan #{idx} (dialect: {dialect}) --");
-                let explained =
-                    explain_exec_plan_with_pushdown(&bound, prog, &db_name, dialect, schema_lock);
+                let explained = explain_exec_plan_with_pushdown_scoped(
+                    &bound,
+                    prog,
+                    &db_name,
+                    dialect,
+                    schema_lock,
+                    &scoped.var_tags,
+                    &scoped.table_vars,
+                );
                 out.push_str(&explained);
             }
         }
@@ -1549,6 +1651,12 @@ fn cmd_explain(args: &[String]) -> i32 {
                             return 2;
                         }
                     }
+                }
+                "--help" | "-h" => {
+                    println!(
+                        "usage: dana explain [--dialect sqlite|postgres] [--schema-lock FILE] [--policy FILE] <FILE>"
+                    );
+                    return 0;
                 }
                 flag if flag.starts_with('-') => {
                     eprintln!("dana explain: unknown flag `{flag}`");
@@ -1656,6 +1764,15 @@ fn cmd_vendor(args: &[String]) -> i32 {
     match sub {
         "pin" => match pin_vendor_dir(&vendor_dir) {
             Ok((lock, paths)) => {
+                for entry in &lock.entries {
+                    let expected = expected_vendor_module_rel_path(&entry.module);
+                    if entry.path != expected {
+                        eprintln!(
+                            "warning: vendored module `{}` is at `{}`, but `use {}` expects `{expected}`",
+                            entry.module, entry.path, entry.module
+                        );
+                    }
+                }
                 for p in &paths {
                     println!("pinned {p}");
                 }
@@ -1929,6 +2046,12 @@ fn cmd_infer_schema(args: &[String]) -> i32 {
                     }
                 };
             }
+            "--help" | "-h" => {
+                println!(
+                    "usage: dana infer-schema <DATA_FILE> [--name Schema] [--sample-rows N] [--format csv|tsv|jsonl|parquet|xlsx]"
+                );
+                return 0;
+            }
             flag if flag.starts_with('-') => {
                 eprintln!("dana infer-schema: unknown flag `{flag}`");
                 return 2;
@@ -2059,6 +2182,12 @@ fn cmd_fake(args: &[String]) -> i32 {
                     return 2;
                 };
                 out_path = Some(PathBuf::from(p));
+            }
+            "--help" | "-h" => {
+                println!(
+                    "usage: dana fake <FILE.dana> [--schema Name] [--rows N] [--seed S] [--format csv|tsv|jsonl] [--out PATH]"
+                );
+                return 0;
             }
             flag if flag.starts_with('-') => {
                 eprintln!("dana fake: unknown flag `{flag}`");

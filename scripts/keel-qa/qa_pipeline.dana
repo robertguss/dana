@@ -1,0 +1,164 @@
+## Black-box QA pipeline exercised by `scripts/keel-qa/run.sh` (`make keel-qa`).
+module KeelQaPipeline
+use Stats
+
+schema ReadingRaw
+  id: Int where . > 0
+  record_code: Text where not .empty?
+  email: Text [pii]
+  age_years: Int where . >= 0
+  region: Text where not .empty?
+  score_f: Float
+  elevation_m: Float
+  amount: Decimal
+  active?: Bool
+  reading_date: Date
+  note: Text?
+end
+
+schema CleanReading
+  id: Int
+  record_code: Text
+  contact_hash: Text
+  region: Text
+  region_bucket: Text
+  score_f: Float
+  elevation_m: Float
+  note_len: Int
+  reading_date: Date
+end
+
+schema FerpaBandRow
+  id: Int [pii]
+  age_years: Int [ferpa]
+  region: Text
+  score_f: Float
+end
+
+fn summarize_ferpa_bands(rows: Table(FerpaBandRow))
+  promise all(.distinct_ids >= 5)
+
+  rows
+    |> derive(
+      age_band: bucket(.age_years, cuts: [20, 40, 65], labels: ["u20", "20_39", "40_64", "65p"])
+    )
+    |> group_by(.age_band)
+    |> summarize(distinct_ids: count_distinct(.id), avg_score: mean(.score_f) ?? 0.0)
+    |> suppress_small_groups(min: 5, distinct_by: .id)
+    |> sort_by(desc(.distinct_ids), .age_band)
+end
+
+fn transform_readings(raw: Table(ReadingRaw), salt: Secret("qa_salt")) : Table(CleanReading)
+  promise unique(.id)
+
+  raw
+    |> dedupe_by(.id)
+    |> derive(
+      contact_hash: .email,
+      region_bucket: coarsen(.region, allow: ["north", "south", "east"], other: "other"),
+      note_len: (.note ?? "").trim.len
+    )
+    |> pseudonymize(.contact_hash, key: salt)
+    |> select(
+      .id,
+      .record_code,
+      .contact_hash,
+      .region,
+      .region_bucket,
+      .score_f,
+      .elevation_m,
+      .note_len,
+      .reading_date
+    )
+end
+
+fn main(
+  files: ReadFiles,
+  out: WriteFiles("qa-out/"),
+  db_write: WriteTable(QaDb, "qa_metrics"),
+  salt: Secret("qa_salt"),
+  console: Console
+) : Int
+  (raw, bad) = try files.read_csv("qa-in/readings.csv", as: ReadingRaw)
+  clean = transform_readings(raw, salt)
+
+  region_summary = raw
+    |> dedupe_by(.id)
+    |> derive(region_bucket: coarsen(.region, allow: ["north", "south", "east"], other: "other"))
+    |> group_by(.region_bucket)
+    |> summarize(
+      rows_n: count(),
+      total_score: sum(.score_f),
+      total_amount: sum(.amount),
+      active_n: count_if(.active?)
+    )
+    |> sort_by(desc(.total_score), .region_bucket)
+    |> window(rank_no: row_number(), over: [], order: desc(.total_score))
+
+  flagged = Stats.outliers(clean, column: .elevation_m, method: :iqr, threshold: 1.5)
+    |> where(.outlier?)
+    |> select(.id, .record_code, .region_bucket, .elevation_m)
+
+  counts_wide = table
+    | stream     | valid_rows    | bad_rows    |
+    | "readings" | clean.count() | bad.count() |
+  end
+  counts_long = counts_wide
+    |> pivot_longer(cols: [.valid_rows, .bad_rows], names_to: "metric", values_to: "row_total")
+
+  ferpa_src = raw |> select(.id, .age_years, .region, .score_f)
+  ferpa_bands = summarize_ferpa_bands(ferpa_src)
+
+  chart_reg = region_summary
+    |> chart_bar(x: .region_bucket, y: .total_score, title: "QA Total Score by Region")
+  rep = Report.new("Dana Keel QA Verification Report")
+    |> add_summary(
+      "valid=#{clean.count()} bad=#{bad.count()} bands=#{ferpa_bands.count()} outliers=#{flagged.count()}"
+    )
+    |> add_chart(chart_reg)
+    |> add_table(region_summary)
+    |> add_table(counts_long)
+    |> add_table(ferpa_bands)
+
+  try out.write_parquet("readings_clean.parquet", clean)
+  try out.write_jsonl("readings_clean.jsonl", clean)
+  try out.write_csv("readings_clean.csv", clean, sanitize_formulas: true)
+  try out.write_xlsx(
+    "qa_workbook.xlsx",
+    sheets: {"CleanReadings": clean, "RegionSummary": region_summary, "CountsLong": counts_long}
+  )
+  try out.write_svg("region_chart.svg", chart_reg)
+  try out.write_html("qa_report.html", rep)
+  try out.write_markdown("qa_report.md", rep)
+
+  st = try db_write.upsert(clean, key: .id)
+  console.print(
+    "UPSERT inserted=#{st.inserted} updated=#{st.updated} unchanged=#{st.unchanged} bad=#{bad.count()} outliers=#{flagged.count()} bands=#{ferpa_bands.count()}"
+  )
+  0
+end
+
+test "QA transforms dedupe, quarantine, pseudonymize, coarsen, and suppress small FERPA groups"
+  csv = """
+    id,record_code,email,age_years,region,score_f,elevation_m,amount,active?,reading_date,note
+    1,REC-01,a@example.edu,24,north,82.5,100.0,10.50,true,2026-11-01,=cmd
+    1,REC-01-DUP,a@example.edu,24,north,82.5,100.0,10.50,true,2026-11-01,dup
+    2,REC-02,b@example.edu,25,north,71.0,396.0,20.00,true,2026-11-02,hello
+    3,REC-03,c@example.edu,28,north,90.0,0.0,30.00,false,2026-11-03,
+    4,REC-04,d@example.edu,31,south,64.5,250.5,40.00,true,2026-11-04,ok
+    5,REC-05,e@example.edu,35,south,88.0,150.0,50.00,true,2026-11-05,trimmed
+    6,REC-06,f@example.edu,70,west,50.0,120.0,12.00,false,2026-11-06,rare
+    bad_id,REC-BAD,x@example.edu,22,east,10.0,10.0,1.00,true,2026-11-07,bad
+  """
+  files = Files.in_memory({"in.csv": csv}).read_only
+  (raw, bad) = try files.read_csv("in.csv", as: ReadingRaw)
+  assert bad.count() == 1
+  clean = transform_readings(raw, Secret.fake("qa-salt"))
+  assert clean.count() == 6
+  assert clean.where(.contact_hash.contains?("@")).empty?
+  other = clean |> where(.region_bucket == "other")
+  assert other.count() == 1
+  bands = summarize_ferpa_bands(raw |> select(.id, .age_years, .region, .score_f))
+  assert bands.count() == 1
+  assert bands.first!.age_band == "20_39"
+end

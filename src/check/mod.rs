@@ -16,6 +16,7 @@ pub use types::{
     CheckedProgram, check_module, check_module_with_lock, check_resolved, check_resolved_with_lock,
 };
 pub use vendor::{
-    VENDOR_LOCK_FILENAME, VendorEntry, VendorLock, format_vendor_lock, parse_vendor_lock,
-    pin_vendor_dir, sha256_hex, verify_vendor_dir, verify_vendor_module,
+    VENDOR_LOCK_FILENAME, VendorEntry, VendorLock, expected_vendor_module_rel_path,
+    format_vendor_lock, parse_vendor_lock, pin_vendor_dir, sha256_hex, verify_vendor_dir,
+    verify_vendor_module,
 };

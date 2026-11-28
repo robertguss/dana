@@ -1894,18 +1894,21 @@ fn subst_exec_derive_item(
     params: &HashMap<Ident, ExecExpr>,
 ) -> ExecDeriveItem {
     match item {
-        ExecDeriveItem::ColExpr { name, expr } => ExecDeriveItem::ColExpr {
+        ExecDeriveItem::ColExpr { name, expr, spec } => ExecDeriveItem::ColExpr {
             name: name.clone(),
             expr: Box::new(subst_exec_row_expr(expr, params)),
+            spec: spec.clone(),
         },
         ExecDeriveItem::SummaryCol {
             name,
             expr,
             agg_kind,
+            spec,
         } => ExecDeriveItem::SummaryCol {
             name: name.clone(),
             expr: Box::new(subst_exec_row_expr(expr, params)),
             agg_kind: *agg_kind,
+            spec: spec.clone(),
         },
         ExecDeriveItem::BucketCol { .. } | ExecDeriveItem::CoarsenCol { .. } => item.clone(),
     }

@@ -16,16 +16,17 @@
 //!   `resolve_module_in_dir`, `check_resolved_with_lock`, `lower_program`, and
 //!   `eval_exec_entry_vm` (2,048-row vectorized columnar VM + SQL pushdown).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use crate::base::{DiagCode, Diagnostic, FileId, SourceMap, render_diagnostic};
+use crate::check::resolve::STDLIB_MODULES;
 use crate::check::{check_resolved_with_lock, resolve_module_in_dir};
-use crate::core::syntax::{Ident, LTy, Policy, ScalarTy, TableTy, TagSet, Ty};
+use crate::core::syntax::{BUILT_IN_TAGS, Ident, LTy, Policy, ScalarTy, TableTy, TagSet, Ty};
 use crate::db::SqlDialect;
-use crate::db::schema_lock::SchemaLockFile;
+use crate::db::schema_lock::{LockedTable, SchemaLockFile};
 use crate::formats::compress::strip_compression_ext;
 use crate::formats::infer::{
     InferredSchema, default_schema_name_from_path, infer_schema_from_file, read_csv_file_untyped,
@@ -36,7 +37,10 @@ use crate::formats::time::{format_iso_date, format_iso_timestamp};
 use crate::formats::xlsx::{infer_xlsx_schema_from_file, read_xlsx_file_untyped};
 use crate::lower::lower_program;
 use crate::oracle::value::{TableVal, Val, redact_tags, render_decimal, render_public_val};
-use crate::plan::{bind_exec_plan_sources, exec_plan_db_names, explain_exec_plan_with_pushdown};
+use crate::plan::{
+    bind_exec_plan_sources, bind_lty_in_scope, exec_plan_db_names,
+    explain_exec_plan_with_pushdown_scoped,
+};
 use crate::runtime::{EvalProgramResult, ExecExpr, ExecPlan, RunConfig, StructLayout};
 use crate::stats::profile::{format_scalar_ty_name, render_profile_terminal};
 use crate::syntax::{
@@ -113,6 +117,15 @@ struct UntypedBinding {
     table: TableVal,
 }
 
+#[derive(Clone, Debug)]
+struct LockedSchemaDecl {
+    db_name: String,
+    raw_table_name: String,
+    schema_name: String,
+    schema_src: String,
+    custom_tags: Vec<String>,
+}
+
 /// Persistent safe interactive Dana REPL session.
 #[derive(Debug)]
 pub struct ReplSession {
@@ -122,8 +135,10 @@ pub struct ReplSession {
     bindings: Vec<String>,
     var_types: Vec<(String, LTy)>,
     untyped_tables: Vec<UntypedBinding>,
+    locked_table_schemas: Vec<LockedSchemaDecl>,
     var_inferred_schemas: HashMap<String, InferredSchema>,
     next_untyped_id: usize,
+    next_locked_id: usize,
 }
 
 impl ReplSession {
@@ -155,8 +170,10 @@ impl ReplSession {
             bindings: Vec::new(),
             var_types: Vec::new(),
             untyped_tables: Vec::new(),
+            locked_table_schemas: Vec::new(),
             var_inferred_schemas: HashMap::new(),
             next_untyped_id: 1,
+            next_locked_id: 1,
         })
     }
 
@@ -173,8 +190,10 @@ impl ReplSession {
         self.bindings.clear();
         self.var_types.clear();
         self.untyped_tables.clear();
+        self.locked_table_schemas.clear();
         self.var_inferred_schemas.clear();
         self.next_untyped_id = 1;
+        self.next_locked_id = 1;
     }
 
     /// Determine whether `buf` is syntactically incomplete and requires additional input lines
@@ -381,6 +400,11 @@ impl ReplSession {
         out.push_str("  untyped.read_jsonl(\"path.jsonl\")\n");
         out.push_str("  untyped.read_parquet(\"path.parquet\")\n");
         out.push_str("  untyped.read_xlsx(\"path.xlsx\", sheet: \"Sheet1\")\n");
+        if self.cfg.schema_lock.is_some() {
+            out.push_str(
+                "Schema lock active: locked DB tables are pre-declared and support `Db.table(\"table_name\")`.\n",
+            );
+        }
         if self.cfg.allowed_show_tags.is_empty() {
             out.push_str("Privacy display: ALL sensitive tags redacted ([REDACTED:<tags>])\n");
         } else {
@@ -400,6 +424,17 @@ impl ReplSession {
         out.push_str("  console : Console\n");
         for (db_name, _) in &self.cfg.db_bindings {
             let _ = writeln!(out, "  {db_name} : ReadDB({db_name})");
+        }
+        let auto_locked = self.collect_auto_lock_schemas(&self.top_decls);
+        if !auto_locked.is_empty() {
+            out.push_str("Locked tables (from schema.lock):\n");
+            for decl in &auto_locked {
+                let _ = writeln!(
+                    out,
+                    "  {}.table(\"{}\")  [schema {}]",
+                    decl.db_name, decl.raw_table_name, decl.schema_name
+                );
+            }
         }
         if !self.top_decls.is_empty() {
             out.push_str("Definitions:\n");
@@ -427,6 +462,7 @@ impl ReplSession {
             &next_uses,
             &self.top_decls,
             &self.untyped_tables,
+            &self.locked_table_schemas,
             &self.bindings,
             "Unit",
         );
@@ -480,6 +516,7 @@ impl ReplSession {
             &self.uses,
             &next_decls,
             &self.untyped_tables,
+            &self.locked_table_schemas,
             &self.bindings,
             "Unit",
         );
@@ -500,7 +537,17 @@ impl ReplSession {
                 Ok(pair) => pair,
                 Err(msg) => return ReplOutput::Error(msg),
             };
-        let db_rewritten = self.rewrite_db_cap_refs(&rewritten_src);
+        let mut temp_locked = Vec::new();
+        let mut temp_next_locked_id = self.next_locked_id;
+        let locked_rewritten = match self.rewrite_locked_db_table_calls(
+            &rewritten_src,
+            &mut temp_locked,
+            &mut temp_next_locked_id,
+        ) {
+            Ok(s) => s,
+            Err(msg) => return ReplOutput::Error(msg),
+        };
+        let db_rewritten = self.rewrite_db_cap_refs(&locked_rewritten);
 
         // Parse fragment to detect variable binding(s) vs. bare expression/statement.
         let mut sm = SourceMap::new();
@@ -528,6 +575,8 @@ impl ReplSession {
 
         let mut all_untyped = self.untyped_tables.clone();
         all_untyped.extend(temp_untyped.iter().cloned());
+        let mut all_locked = self.locked_table_schemas.clone();
+        all_locked.extend(temp_locked.iter().cloned());
 
         let (tail_code, extra_bindings) = if is_persistent_binding {
             let ret_expr = if bound_names.len() == 1 {
@@ -546,6 +595,7 @@ impl ReplSession {
             &self.uses,
             &self.top_decls,
             &all_untyped,
+            &all_locked,
             &extra_bindings,
             &tail_code,
         );
@@ -575,6 +625,8 @@ impl ReplSession {
                 if is_persistent_binding {
                     self.next_untyped_id = temp_next_id;
                     self.untyped_tables.extend(temp_untyped);
+                    self.next_locked_id = temp_next_locked_id;
+                    self.locked_table_schemas.extend(temp_locked);
                     self.bindings.push(db_rewritten);
                     if bound_names.len() == 1 {
                         self.record_var_type(bound_names[0].clone(), (*ret_lty).clone());
@@ -624,22 +676,41 @@ impl ReplSession {
         }
     }
 
-    fn cmd_type(&self, expr_src: &str) -> ReplOutput {
+    fn prepare_expr_for_inspection(
+        &self,
+        expr_src: &str,
+    ) -> Result<(String, Vec<UntypedBinding>, Vec<LockedSchemaDecl>), String> {
         let mut temp_untyped = Vec::new();
         let mut temp_next_id = self.next_untyped_id;
         let (rewritten_src, _) =
-            match self.rewrite_untyped_calls(expr_src, &mut temp_untyped, &mut temp_next_id) {
-                Ok(pair) => pair,
-                Err(msg) => return ReplOutput::Error(msg),
-            };
-        let db_rewritten = self.rewrite_db_cap_refs(&rewritten_src);
+            self.rewrite_untyped_calls(expr_src, &mut temp_untyped, &mut temp_next_id)?;
+        let mut temp_locked = Vec::new();
+        let mut temp_next_locked_id = self.next_locked_id;
+        let locked_rewritten = self.rewrite_locked_db_table_calls(
+            &rewritten_src,
+            &mut temp_locked,
+            &mut temp_next_locked_id,
+        )?;
+        let db_rewritten = self.rewrite_db_cap_refs(&locked_rewritten);
         let mut all_untyped = self.untyped_tables.clone();
         all_untyped.extend(temp_untyped);
+        let mut all_locked = self.locked_table_schemas.clone();
+        all_locked.extend(temp_locked);
+        Ok((db_rewritten, all_untyped, all_locked))
+    }
+
+    fn cmd_type(&self, expr_src: &str) -> ReplOutput {
+        let (db_rewritten, all_untyped, all_locked) =
+            match self.prepare_expr_for_inspection(expr_src) {
+                Ok(parts) => parts,
+                Err(msg) => return ReplOutput::Error(msg),
+            };
 
         let module_src = self.build_module_source(
             &self.uses,
             &self.top_decls,
             &all_untyped,
+            &all_locked,
             &self.bindings,
             &db_rewritten,
         );
@@ -654,22 +725,18 @@ impl ReplSession {
     }
 
     fn cmd_profile(&mut self, expr_src: &str) -> ReplOutput {
-        let mut temp_untyped = Vec::new();
-        let mut temp_next_id = self.next_untyped_id;
-        let (rewritten_src, _) =
-            match self.rewrite_untyped_calls(expr_src, &mut temp_untyped, &mut temp_next_id) {
-                Ok(pair) => pair,
+        let (db_rewritten, all_untyped, all_locked) =
+            match self.prepare_expr_for_inspection(expr_src) {
+                Ok(parts) => parts,
                 Err(msg) => return ReplOutput::Error(msg),
             };
-        let db_rewritten = self.rewrite_db_cap_refs(&rewritten_src);
-        let mut all_untyped = self.untyped_tables.clone();
-        all_untyped.extend(temp_untyped);
 
         let prof_tail = format!("({db_rewritten}).profile()");
         let module_src = self.build_module_source(
             &self.uses,
             &self.top_decls,
             &all_untyped,
+            &all_locked,
             &self.bindings,
             &prof_tail,
         );
@@ -705,21 +772,17 @@ impl ReplSession {
     }
 
     fn cmd_explain(&self, expr_src: &str) -> ReplOutput {
-        let mut temp_untyped = Vec::new();
-        let mut temp_next_id = self.next_untyped_id;
-        let (rewritten_src, _) =
-            match self.rewrite_untyped_calls(expr_src, &mut temp_untyped, &mut temp_next_id) {
-                Ok(pair) => pair,
+        let (db_rewritten, all_untyped, all_locked) =
+            match self.prepare_expr_for_inspection(expr_src) {
+                Ok(parts) => parts,
                 Err(msg) => return ReplOutput::Error(msg),
             };
-        let db_rewritten = self.rewrite_db_cap_refs(&rewritten_src);
-        let mut all_untyped = self.untyped_tables.clone();
-        all_untyped.extend(temp_untyped);
 
         let module_src = self.build_module_source(
             &self.uses,
             &self.top_decls,
             &all_untyped,
+            &all_locked,
             &self.bindings,
             &db_rewritten,
         );
@@ -732,9 +795,20 @@ impl ReplSession {
         };
 
         // Collect all prior local `let` bindings so `:explain x` or `:explain x |> where(...)`
-        // resolves `x` into its underlying relational plan (including DB pushdown sources!).
+        // resolves `x` into its underlying relational plan (including DB pushdown sources!)
+        // and carries lexical sensitivity provenance for bound variables.
         let mut local_plans: HashMap<String, ExecPlan> = HashMap::new();
-        let tail_expr = collect_let_plans_and_tail(&entry_fn.body, &mut local_plans);
+        let mut var_tags: HashMap<Ident, TagSet> = HashMap::new();
+        let mut table_vars: HashMap<Ident, TableTy> = HashMap::new();
+        for (pname, plty) in &entry_fn.params {
+            bind_lty_in_scope(pname, plty, &mut var_tags, &mut table_vars);
+        }
+        let tail_expr = collect_let_plans_and_scope(
+            &entry_fn.body,
+            &mut local_plans,
+            &mut var_tags,
+            &mut table_vars,
+        );
 
         let mut target_plans: Vec<ExecPlan> = Vec::new();
         match tail_expr {
@@ -768,12 +842,14 @@ impl ReplSession {
             let db_name = db_names.first().cloned().unwrap_or_default();
             let dialect = self.infer_dialect_for_db(&db_name);
             let _ = writeln!(out, "-- plan #{idx} (dialect: {dialect}) --");
-            out.push_str(&explain_exec_plan_with_pushdown(
+            out.push_str(&explain_exec_plan_with_pushdown_scoped(
                 plan,
                 &lowered.exec,
                 &db_name,
                 dialect,
                 self.cfg.schema_lock.as_ref(),
+                &var_tags,
+                &table_vars,
             ));
         }
         ReplOutput::Info(out.trim_end().to_string())
@@ -888,14 +964,128 @@ impl ReplSession {
         }
     }
 
+    fn collect_auto_lock_schemas(&self, top_decls: &[TopDeclEntry]) -> Vec<LockedSchemaDecl> {
+        let Some(lock) = self.cfg.schema_lock.as_ref() else {
+            return Vec::new();
+        };
+        let mut used_names: HashSet<String> = HashSet::new();
+        for d in top_decls {
+            if matches!(d.kind, "schema" | "struct" | "enum") {
+                used_names.insert(d.name.clone());
+            }
+        }
+        for (db_name, _) in &self.cfg.db_bindings {
+            used_names.insert(db_name.clone());
+        }
+        for std_mod in STDLIB_MODULES {
+            used_names.insert((*std_mod).to_string());
+        }
+        for reserved in [
+            "Int",
+            "Decimal",
+            "Float",
+            "Bool",
+            "Text",
+            "Bytes",
+            "Date",
+            "Timestamp",
+            "Duration",
+            "Unit",
+            "Option",
+            "Result",
+            "List",
+            "Map",
+            "Table",
+            "DynamicTable",
+            "Chart",
+            "Report",
+            "Profile",
+            "LinearModel",
+            "StatTest",
+            "Args",
+            "Clock",
+            "ReadFiles",
+            "WriteFiles",
+            "ReadDB",
+            "RawReadDB",
+            "WriteTable",
+            "HttpsAllow",
+            "Declassify",
+        ] {
+            used_names.insert(reserved.to_string());
+        }
+
+        let mut ordered_dbs = Vec::new();
+        let mut seen_dbs = HashSet::new();
+        for (db_name, _) in &self.cfg.db_bindings {
+            if let Some(db) = lock.find_db(db_name)
+                && seen_dbs.insert(db.name.clone())
+            {
+                ordered_dbs.push(db);
+            }
+        }
+        for db in &lock.dbs {
+            if seen_dbs.insert(db.name.clone()) {
+                ordered_dbs.push(db);
+            }
+        }
+
+        let mut out = Vec::new();
+        for db in ordered_dbs {
+            for tbl in &db.tables {
+                if incompatible_locked_table_reason(tbl).is_some() {
+                    continue;
+                }
+                let base = locked_table_to_schema_name(&tbl.name);
+                let chosen = if used_names.insert(base.clone()) {
+                    base
+                } else {
+                    let qualified = format!("{}{}", locked_table_to_schema_name(&db.name), base);
+                    if used_names.insert(qualified.clone()) {
+                        qualified
+                    } else {
+                        continue;
+                    }
+                };
+                let (schema_src, custom_tags) = render_locked_table_schema(&chosen, tbl);
+                out.push(LockedSchemaDecl {
+                    db_name: db.name.clone(),
+                    raw_table_name: tbl.name.clone(),
+                    schema_name: chosen,
+                    schema_src,
+                    custom_tags,
+                });
+            }
+        }
+        out
+    }
+
     fn build_module_source(
         &self,
         uses: &[String],
         top_decls: &[TopDeclEntry],
         untyped_tables: &[UntypedBinding],
+        locked_schemas: &[LockedSchemaDecl],
         bindings: &[String],
         tail_code: &str,
     ) -> String {
+        let auto_locked = self.collect_auto_lock_schemas(top_decls);
+        let mut declared_tags: HashSet<String> =
+            BUILT_IN_TAGS.iter().map(|t| (*t).to_string()).collect();
+        for d in top_decls {
+            if d.kind == "tag" {
+                declared_tags.insert(d.name.clone());
+            }
+        }
+        let mut auto_custom_tags: Vec<String> = Vec::new();
+        for decl in auto_locked.iter().chain(locked_schemas.iter()) {
+            for t in &decl.custom_tags {
+                if declared_tags.insert(t.clone()) {
+                    auto_custom_tags.push(t.clone());
+                }
+            }
+        }
+
         let mut out = String::new();
         out.push_str("module ReplSession\n");
         let has_stats = uses.iter().any(|u| u.trim() == "use Stats");
@@ -908,8 +1098,19 @@ impl ReplSession {
         }
         out.push('\n');
 
+        for t in &auto_custom_tags {
+            let _ = writeln!(out, "tag {t}");
+        }
+        if !auto_custom_tags.is_empty() {
+            out.push('\n');
+        }
+
         for u in untyped_tables {
             out.push_str(&u.schema_src);
+            out.push('\n');
+        }
+        for decl in auto_locked.iter().chain(locked_schemas.iter()) {
+            out.push_str(&decl.schema_src);
             out.push('\n');
         }
 
@@ -954,6 +1155,135 @@ impl ReplSession {
         }
         out.push_str("end\n");
         out
+    }
+
+    fn resolve_db_receiver_name(&self, receiver: &Expr) -> Option<String> {
+        match &receiver.kind {
+            ExprKind::CapName(cap) => {
+                if self.top_decls.iter().any(|d| d.name == *cap) {
+                    return None;
+                }
+                self.cfg
+                    .db_bindings
+                    .iter()
+                    .find(|(db_name, _)| db_name == cap)
+                    .map(|(db_name, _)| db_name.clone())
+            }
+            ExprKind::Ident(ident) => {
+                if self.var_types.iter().any(|(v, _)| v == ident) {
+                    return None;
+                }
+                self.cfg
+                    .db_bindings
+                    .iter()
+                    .find(|(db_name, _)| db_name.to_ascii_lowercase() == *ident)
+                    .map(|(db_name, _)| db_name.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn rewrite_locked_db_table_calls(
+        &self,
+        src: &str,
+        out_schemas: &mut Vec<LockedSchemaDecl>,
+        next_id: &mut usize,
+    ) -> Result<String, String> {
+        let Some(lock) = self.cfg.schema_lock.as_ref() else {
+            return Ok(src.to_string());
+        };
+        if !src.contains(".table(") {
+            return Ok(src.to_string());
+        }
+        let mut sm = SourceMap::new();
+        let fid = sm.add_file("<repl>".to_string(), format!("{src}\n"));
+        let frag =
+            parse_fragment(fid, &format!("{src}\n")).map_err(|d| render_diagnostic(&d, &sm))?;
+
+        let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+        for item in &frag.items {
+            if let FragmentItem::Stmt(st) = item {
+                walk_stmt_exprs(st, &mut |expr| {
+                    let ExprKind::Call { callee, args } = &expr.kind else {
+                        return Ok(false);
+                    };
+                    let ExprKind::Field { receiver, member } = &callee.kind else {
+                        return Ok(false);
+                    };
+                    if member.name != "table" {
+                        return Ok(false);
+                    }
+                    let Some(db_name) = self.resolve_db_receiver_name(receiver) else {
+                        return Ok(false);
+                    };
+                    let [
+                        CallArg::Positional(Expr {
+                            kind:
+                                ExprKind::Text {
+                                    value: table_lit, ..
+                                },
+                            ..
+                        }),
+                    ] = args.as_slice()
+                    else {
+                        return Ok(false);
+                    };
+
+                    let locked_db = lock.find_db(&db_name).ok_or_else(|| {
+                        format!("database `{db_name}` was not found in schema.lock")
+                    })?;
+                    let locked_tbl = locked_db.resolve_table(table_lit).map_err(|_| {
+                        let avail: Vec<&str> =
+                            locked_db.tables.iter().map(|t| t.name.as_str()).collect();
+                        if avail.is_empty() {
+                            format!(
+                                "table `{table_lit}` not found in schema.lock for db `{db_name}`"
+                            )
+                        } else {
+                            format!(
+                                "table `{table_lit}` not found in schema.lock for db `{db_name}` (available: {})",
+                                avail.join(", ")
+                            )
+                        }
+                    })?;
+                    if let Some(reason) = incompatible_locked_table_reason(locked_tbl) {
+                        return Err(format!(
+                            "cannot auto-synthesize schema for locked table `{db_name}.{}`: {reason}",
+                            locked_tbl.name
+                        ));
+                    }
+
+                    let id = *next_id;
+                    *next_id += 1;
+                    let schema_name = format!("ReplLock_{id}");
+                    let (schema_src, custom_tags) =
+                        render_locked_table_schema(&schema_name, locked_tbl);
+                    let recv_src = src
+                        .get(receiver.span.start as usize..receiver.span.end as usize)
+                        .unwrap_or(&db_name);
+                    let escaped = escape_dana_str(&locked_tbl.name);
+                    replacements.push((
+                        expr.span.start as usize,
+                        expr.span.end as usize,
+                        format!("{recv_src}.table({schema_name}, from: \"{escaped}\")"),
+                    ));
+                    out_schemas.push(LockedSchemaDecl {
+                        db_name,
+                        raw_table_name: locked_tbl.name.clone(),
+                        schema_name,
+                        schema_src,
+                        custom_tags,
+                    });
+                    Ok(true)
+                })?;
+            }
+        }
+
+        if replacements.is_empty() {
+            Ok(src.to_string())
+        } else {
+            Ok(apply_span_replacements(src, &replacements))
+        }
     }
 
     fn compile_module(&self, src: &str) -> Result<crate::lower::LoweredProgram, String> {
@@ -1803,95 +2133,111 @@ struct UntypedCallSite {
 }
 
 fn collect_untyped_calls_stmt(st: &Stmt, out: &mut Vec<UntypedCallSite>) -> Result<(), String> {
+    walk_stmt_exprs(st, &mut |expr| {
+        if let ExprKind::Call { callee, args } = &expr.kind
+            && let ExprKind::Field { receiver, member } = &callee.kind
+            && matches!(&receiver.kind, ExprKind::Ident(name) if name == "untyped")
+        {
+            let path = match args.first() {
+                Some(CallArg::Positional(Expr {
+                    kind: ExprKind::Text { value, .. },
+                    ..
+                })) => value.clone(),
+                _ => {
+                    return Err(format!(
+                        "`untyped.{}` requires a string literal file path as its first argument",
+                        member.name
+                    ));
+                }
+            };
+            let mut sheet = None;
+            for arg in args.iter().skip(1) {
+                if let CallArg::Named { name, value, .. } = arg
+                    && name.name == "sheet"
+                {
+                    if let ExprKind::Text { value: s, .. } = &value.kind {
+                        sheet = Some(s.clone());
+                    } else {
+                        return Err(
+                            "`untyped.read_xlsx` `sheet:` argument must be a string literal"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            out.push(UntypedCallSite {
+                start: expr.span.start as usize,
+                end: expr.span.end as usize,
+                method: member.name.clone(),
+                path,
+                sheet,
+            });
+            return Ok(true);
+        }
+        Ok(false)
+    })
+}
+
+fn walk_stmt_exprs<F: FnMut(&Expr) -> Result<bool, String>>(
+    st: &Stmt,
+    visit: &mut F,
+) -> Result<(), String> {
     match &st.kind {
         StmtKind::Var { value, .. } | StmtKind::Expr(value) | StmtKind::Assert(value) => {
-            collect_untyped_calls_expr(value, out)
+            walk_expr_tree(value, visit)
         }
         StmtKind::Assign { lhs, rhs } => {
-            collect_untyped_calls_expr(lhs, out)?;
-            collect_untyped_calls_expr(rhs, out)
+            walk_expr_tree(lhs, visit)?;
+            walk_expr_tree(rhs, visit)
         }
         StmtKind::Return { value, guard } => {
             if let Some(v) = value {
-                collect_untyped_calls_expr(v, out)?;
+                walk_expr_tree(v, visit)?;
             }
             if let Some(g) = guard {
-                collect_untyped_calls_expr(g, out)?;
+                walk_expr_tree(g, visit)?;
             }
             Ok(())
         }
         StmtKind::Break { guard } | StmtKind::Continue { guard } => {
             if let Some(g) = guard {
-                collect_untyped_calls_expr(g, out)?;
+                walk_expr_tree(g, visit)?;
             }
             Ok(())
         }
-        StmtKind::Stop(Some(e)) => collect_untyped_calls_expr(e, out),
+        StmtKind::Stop(Some(e)) => walk_expr_tree(e, visit),
         StmtKind::Stop(None) => Ok(()),
         StmtKind::For { iter, body, .. } => {
-            collect_untyped_calls_expr(iter, out)?;
+            walk_expr_tree(iter, visit)?;
             for s in body {
-                collect_untyped_calls_stmt(s, out)?;
+                walk_stmt_exprs(s, visit)?;
             }
             Ok(())
         }
         StmtKind::While { cond, body } => {
-            collect_untyped_calls_expr(cond, out)?;
+            walk_expr_tree(cond, visit)?;
             for s in body {
-                collect_untyped_calls_stmt(s, out)?;
+                walk_stmt_exprs(s, visit)?;
             }
             Ok(())
         }
     }
 }
 
-fn collect_untyped_calls_expr(expr: &Expr, out: &mut Vec<UntypedCallSite>) -> Result<(), String> {
+fn walk_expr_tree<F: FnMut(&Expr) -> Result<bool, String>>(
+    expr: &Expr,
+    visit: &mut F,
+) -> Result<(), String> {
+    if visit(expr)? {
+        return Ok(());
+    }
     match &expr.kind {
         ExprKind::Call { callee, args } => {
-            if let ExprKind::Field { receiver, member } = &callee.kind
-                && matches!(&receiver.kind, ExprKind::Ident(name) if name == "untyped")
-            {
-                let path = match args.first() {
-                    Some(CallArg::Positional(Expr {
-                        kind: ExprKind::Text { value, .. },
-                        ..
-                    })) => value.clone(),
-                    _ => {
-                        return Err(format!(
-                            "`untyped.{}` requires a string literal file path as its first argument",
-                            member.name
-                        ));
-                    }
-                };
-                let mut sheet = None;
-                for arg in args.iter().skip(1) {
-                    if let CallArg::Named { name, value, .. } = arg
-                        && name.name == "sheet"
-                    {
-                        if let ExprKind::Text { value: s, .. } = &value.kind {
-                            sheet = Some(s.clone());
-                        } else {
-                            return Err(
-                                "`untyped.read_xlsx` `sheet:` argument must be a string literal"
-                                    .to_string(),
-                            );
-                        }
-                    }
-                }
-                out.push(UntypedCallSite {
-                    start: expr.span.start as usize,
-                    end: expr.span.end as usize,
-                    method: member.name.clone(),
-                    path,
-                    sheet,
-                });
-                return Ok(());
-            }
-            collect_untyped_calls_expr(callee, out)?;
+            walk_expr_tree(callee, visit)?;
             for a in args {
                 match a {
                     CallArg::Positional(e) | CallArg::Named { value: e, .. } => {
-                        collect_untyped_calls_expr(e, out)?;
+                        walk_expr_tree(e, visit)?;
                     }
                 }
             }
@@ -1899,25 +2245,25 @@ fn collect_untyped_calls_expr(expr: &Expr, out: &mut Vec<UntypedCallSite>) -> Re
         }
         ExprKind::Field { receiver, .. }
         | ExprKind::Unary { expr: receiver, .. }
-        | ExprKind::Paren(receiver) => collect_untyped_calls_expr(receiver, out),
+        | ExprKind::Paren(receiver) => walk_expr_tree(receiver, visit),
         ExprKind::Binary { lhs, rhs, .. } => {
-            collect_untyped_calls_expr(lhs, out)?;
-            collect_untyped_calls_expr(rhs, out)
+            walk_expr_tree(lhs, visit)?;
+            walk_expr_tree(rhs, visit)
         }
         ExprKind::Index { target, index } => {
-            collect_untyped_calls_expr(target, out)?;
-            collect_untyped_calls_expr(index, out)
+            walk_expr_tree(target, visit)?;
+            walk_expr_tree(index, visit)
         }
         ExprKind::Tuple(xs) | ExprKind::List(xs) => {
             for e in xs {
-                collect_untyped_calls_expr(e, out)?;
+                walk_expr_tree(e, visit)?;
             }
             Ok(())
         }
         ExprKind::Map(pairs) => {
             for (k, v) in pairs {
-                collect_untyped_calls_expr(k, out)?;
-                collect_untyped_calls_expr(v, out)?;
+                walk_expr_tree(k, visit)?;
+                walk_expr_tree(v, visit)?;
             }
             Ok(())
         }
@@ -1927,13 +2273,13 @@ fn collect_untyped_calls_expr(expr: &Expr, out: &mut Vec<UntypedCallSite>) -> Re
             else_ifs,
             else_expr,
         } => {
-            collect_untyped_calls_expr(cond, out)?;
-            collect_untyped_calls_expr(then_expr, out)?;
+            walk_expr_tree(cond, visit)?;
+            walk_expr_tree(then_expr, visit)?;
             for (c, b) in else_ifs {
-                collect_untyped_calls_expr(c, out)?;
-                collect_untyped_calls_expr(b, out)?;
+                walk_expr_tree(c, visit)?;
+                walk_expr_tree(b, visit)?;
             }
-            collect_untyped_calls_expr(else_expr, out)
+            walk_expr_tree(else_expr, visit)
         }
         ExprKind::IfBlock {
             cond,
@@ -1941,43 +2287,43 @@ fn collect_untyped_calls_expr(expr: &Expr, out: &mut Vec<UntypedCallSite>) -> Re
             else_ifs,
             else_body,
         } => {
-            collect_untyped_calls_expr(cond, out)?;
+            walk_expr_tree(cond, visit)?;
             for s in then_body {
-                collect_untyped_calls_stmt(s, out)?;
+                walk_stmt_exprs(s, visit)?;
             }
             for br in else_ifs {
-                collect_untyped_calls_expr(&br.cond, out)?;
+                walk_expr_tree(&br.cond, visit)?;
                 for s in &br.body {
-                    collect_untyped_calls_stmt(s, out)?;
+                    walk_stmt_exprs(s, visit)?;
                 }
             }
             if let Some(eb) = else_body {
                 for s in &eb.body {
-                    collect_untyped_calls_stmt(s, out)?;
+                    walk_stmt_exprs(s, visit)?;
                 }
             }
             Ok(())
         }
         ExprKind::Case { scrut, lines } => {
-            collect_untyped_calls_expr(scrut, out)?;
+            walk_expr_tree(scrut, visit)?;
             for line in lines {
                 match line {
                     crate::syntax::CaseLine::ArmHeader { .. } => {}
                     crate::syntax::CaseLine::ArmInline { expr, .. } => {
-                        collect_untyped_calls_expr(expr, out)?;
+                        walk_expr_tree(expr, visit)?;
                     }
                     crate::syntax::CaseLine::Stmt(s) => {
-                        collect_untyped_calls_stmt(s, out)?;
+                        walk_stmt_exprs(s, visit)?;
                     }
                 }
             }
             Ok(())
         }
         ExprKind::Lambda { body, .. } => match body {
-            crate::syntax::LambdaBody::Expr(e) => collect_untyped_calls_expr(e, out),
+            crate::syntax::LambdaBody::Expr(e) => walk_expr_tree(e, visit),
             crate::syntax::LambdaBody::Block(stmts) => {
                 for s in stmts {
-                    collect_untyped_calls_stmt(s, out)?;
+                    walk_stmt_exprs(s, visit)?;
                 }
                 Ok(())
             }
@@ -1985,7 +2331,7 @@ fn collect_untyped_calls_expr(expr: &Expr, out: &mut Vec<UntypedCallSite>) -> Re
         ExprKind::TableLit { rows, .. } => {
             for row in rows {
                 for cell in row {
-                    collect_untyped_calls_expr(cell, out)?;
+                    walk_expr_tree(cell, visit)?;
                 }
             }
             Ok(())
@@ -1993,7 +2339,7 @@ fn collect_untyped_calls_expr(expr: &Expr, out: &mut Vec<UntypedCallSite>) -> Re
         ExprKind::InterpText { parts, .. } => {
             for p in parts {
                 if let crate::syntax::InterpPart::Expr(e) = p {
-                    collect_untyped_calls_expr(e, out)?;
+                    walk_expr_tree(e, visit)?;
                 }
             }
             Ok(())
@@ -2012,6 +2358,136 @@ fn collect_untyped_calls_expr(expr: &Expr, out: &mut Vec<UntypedCallSite>) -> Re
         | ExprKind::CapName(_)
         | ExprKind::Underscore => Ok(()),
     }
+}
+
+fn locked_table_to_schema_name(raw: &str) -> String {
+    let is_valid_cap = !raw.is_empty()
+        && raw.as_bytes()[0].is_ascii_uppercase()
+        && raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if is_valid_cap {
+        return raw.to_string();
+    }
+    let mut out = String::new();
+    for part in raw.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            if out.is_empty() && !first.is_ascii_alphabetic() {
+                out.push_str("Locked");
+            }
+            out.push(first.to_ascii_uppercase());
+            for ch in chars {
+                out.push(ch.to_ascii_lowercase());
+            }
+        }
+    }
+    if out.is_empty() || !out.as_bytes()[0].is_ascii_uppercase() {
+        "LockedRecord".to_string()
+    } else {
+        out
+    }
+}
+
+fn is_valid_dana_schema_col_ident(name: &str) -> bool {
+    let Ok(lexed) = lex(FileId(0), name) else {
+        return false;
+    };
+    matches!(
+        lexed.tokens.as_slice(),
+        [
+            crate::syntax::Token {
+                kind: TokenKind::Name(tok_name),
+                ..
+            },
+            crate::syntax::Token {
+                kind: TokenKind::Newline,
+                ..
+            },
+            crate::syntax::Token {
+                kind: TokenKind::Eof,
+                ..
+            },
+        ] | [
+            crate::syntax::Token {
+                kind: TokenKind::Name(tok_name),
+                ..
+            },
+            crate::syntax::Token {
+                kind: TokenKind::Eof,
+                ..
+            },
+        ] if tok_name == name
+    )
+}
+
+fn scalar_ty_contains_data(ty: &ScalarTy) -> bool {
+    match ty {
+        ScalarTy::Data(_) => true,
+        ScalarTy::Option(inner) => scalar_ty_contains_data(inner),
+        _ => false,
+    }
+}
+
+fn incompatible_locked_table_reason(tbl: &LockedTable) -> Option<String> {
+    if tbl.cols.is_empty() {
+        return Some("table has zero columns".to_string());
+    }
+    for c in &tbl.cols {
+        if !is_valid_dana_schema_col_ident(&c.name) {
+            return Some(format!(
+                "column `{}` is not a valid Dana schema identifier",
+                c.name
+            ));
+        }
+        if scalar_ty_contains_data(&c.ty) {
+            return Some(format!(
+                "column `{}` uses an unsupported enum/struct Data type",
+                c.name
+            ));
+        }
+    }
+    None
+}
+
+fn render_locked_table_schema(schema_name: &str, tbl: &LockedTable) -> (String, Vec<String>) {
+    let mut out = String::new();
+    let mut custom_tags = Vec::new();
+    let _ = writeln!(out, "schema {schema_name}");
+    for c in &tbl.cols {
+        let eff_ty = c.effective_scalar_ty();
+        let ty_str = format_scalar_ty_name(&eff_ty);
+        if c.tags.is_empty() {
+            let _ = writeln!(out, "  {}: {ty_str}", c.name);
+        } else {
+            for t in c.tags.elems() {
+                if !BUILT_IN_TAGS.contains(&t.as_str()) && !custom_tags.iter().any(|x| x == t) {
+                    custom_tags.push(t.clone());
+                }
+            }
+            let _ = writeln!(
+                out,
+                "  {}: {ty_str} [{}]",
+                c.name,
+                c.tags.elems().join(", ")
+            );
+        }
+    }
+    out.push_str("end\n");
+    (out, custom_tags)
+}
+
+fn escape_dana_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn collect_lhs_bound_names(lhs: &Expr, out: &mut Vec<String>) {
@@ -2065,14 +2541,19 @@ fn render_table_ty_as_schema(schema_name: &str, tt: &TableTy) -> String {
     out
 }
 
-fn collect_let_plans_and_tail<'a>(
+fn collect_let_plans_and_scope<'a>(
     mut expr: &'a ExecExpr,
     local_plans: &mut HashMap<String, ExecPlan>,
+    var_tags: &mut HashMap<Ident, TagSet>,
+    table_vars: &mut HashMap<Ident, TableTy>,
 ) -> &'a ExecExpr {
     loop {
         match expr {
             ExecExpr::LetE {
-                name, bound, body, ..
+                name,
+                lty,
+                bound,
+                body,
             } => {
                 match bound.as_ref() {
                     ExecExpr::Rel(plan) => {
@@ -2086,6 +2567,7 @@ fn collect_let_plans_and_tail<'a>(
                     }
                     _ => {}
                 }
+                bind_lty_in_scope(name, lty, var_tags, table_vars);
                 expr = body;
             }
             ExecExpr::Join { body, .. } => {

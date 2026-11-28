@@ -13,7 +13,9 @@ use std::fmt::{self, Write as _};
 
 use crate::core::bigint::{BigInt, DEC_MAX, DEC_MIN, DEC_SCALE};
 use crate::core::syntax::{ColSpec, Float64, Ident, ScalarTy, TableTy, TagSet};
-use crate::formats::time::{parse_decimal_bigint_strict, parse_iso_timestamp};
+use crate::formats::time::{
+    format_iso_timestamp, parse_decimal_bigint_strict, parse_iso_timestamp,
+};
 use crate::oracle::value::{
     TableRow, TableVal, Val, redact_tags, render_decimal, render_public_val, val_eq,
 };
@@ -630,10 +632,20 @@ impl UpsertDiff {
     }
 }
 
+fn render_diff_public_val(val: &Val) -> String {
+    match val {
+        Val::Timestamp(us) => us
+            .to_i64()
+            .map_or_else(|| us.to_string(), format_iso_timestamp),
+        Val::OptSome(inner) => format!("some({})", render_diff_public_val(inner)),
+        other => render_public_val(other),
+    }
+}
+
 fn render_val_with_export_gate(val: &Val, tags: &TagSet, allow_export: &TagSet) -> String {
     let unauth = tags.diff(allow_export);
     if unauth.is_empty() {
-        render_public_val(val)
+        render_diff_public_val(val)
     } else {
         redact_tags(&unauth)
     }

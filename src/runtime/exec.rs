@@ -32,8 +32,8 @@ use crate::formats::csv::{
     write_csv_table_with_options, write_csv_vm_table_with_options,
 };
 use crate::formats::json::{
-    format_jsonl_table, format_jsonl_vm_table, read_jsonl_stream_with_schema, write_jsonl_table,
-    write_jsonl_vm_table,
+    format_json_array_table, format_json_array_vm_table, format_jsonl_table, format_jsonl_vm_table,
+    read_jsonl_stream_with_schema, write_jsonl_table, write_jsonl_vm_table,
 };
 use crate::formats::parquet::{
     ParquetCompression, read_parquet_bytes_to_vm_table, read_parquet_bytes_with_schema,
@@ -47,7 +47,10 @@ use crate::formats::time::{
     round_decimal_even_bigint,
 };
 use crate::formats::xlsx::{read_xlsx_bytes_with_schema, write_xlsx_sheets};
-use crate::net::{HttpsClientConfig, JsonResponse, ParsedHttpsUrl, https_get_json};
+use crate::net::{
+    HttpsClientConfig, JsonResponse, ParsedHttpsUrl, https_get_json, https_post_json,
+    https_put_json,
+};
 use crate::oracle::eval::{PrimResult, eval_literal, eval_prim_op, pseudonymize_token};
 use crate::oracle::value::{
     Bug, CapHandle, GroupMeta, TableRow, TableVal, Val, render_decimal, render_decimal_i128_into,
@@ -162,6 +165,7 @@ struct ExecWorld {
     fake_binary_files: HashMap<usize, Vec<(String, Vec<u8>)>>,
     written_binary_files: Vec<(String, Vec<u8>)>,
     json_responses: Vec<JsonResponse>,
+    fake_https_bodies: HashMap<usize, Vec<String>>,
     work_dir: Option<std::path::PathBuf>,
     live_io: bool,
     pseudonymize_mode: PseudonymizeMode,
@@ -196,6 +200,7 @@ impl ExecWorld {
             fake_binary_files: HashMap::new(),
             written_binary_files: Vec::new(),
             json_responses: Vec::new(),
+            fake_https_bodies: HashMap::new(),
             work_dir: cfg.work_dir.clone(),
             live_io: cfg.live_io,
             pseudonymize_mode: cfg.pseudonymize_mode,
@@ -1220,7 +1225,11 @@ impl<'a> Evaluator<'a> {
                         ) = (&cap_v, &path_v)
                         {
                             if !self.ew.dry_run
-                                && let Some(bug) = self.check_export_gate(*handle, allows)
+                                && let Some(bug) = self.check_export_gate(
+                                    *handle,
+                                    allows,
+                                    &format!("WriteFiles(\"{root}\")"),
+                                )
                             {
                                 return EvalOut::Stopped(bug);
                             }
@@ -1871,6 +1880,10 @@ impl<'a> Evaluator<'a> {
             ExecPrimOp::UpperText => match args {
                 [Val::Text(s)] => EvalOut::Ok(Val::Text(s.to_uppercase())),
                 _ => EvalOut::Failed("UpperText requires Text".to_string()),
+            },
+            ExecPrimOp::TextLen => match args {
+                [Val::Text(s)] => EvalOut::Ok(Val::Int(BigInt::from(s.chars().count()))),
+                _ => EvalOut::Failed("TextLen requires Text".to_string()),
             },
             ExecPrimOp::SliceText => match args {
                 [Val::Text(s), Val::Int(start), Val::Int(len)] => {
@@ -2789,7 +2802,11 @@ impl<'a> Evaluator<'a> {
                 } = cap
                 {
                     if !self.ew.dry_run
-                        && let Some(bug) = self.check_export_gate(*handle, allows)
+                        && let Some(bug) = self.check_export_gate(
+                            *handle,
+                            allows,
+                            &format!("WriteFiles(\"{root}\")"),
+                        )
                     {
                         return EvalOut::Stopped(bug);
                     }
@@ -2850,7 +2867,11 @@ impl<'a> Evaluator<'a> {
                 } = cap
                 {
                     if !self.ew.dry_run
-                        && let Some(bug) = self.check_export_gate(*handle, allows)
+                        && let Some(bug) = self.check_export_gate(
+                            *handle,
+                            allows,
+                            &format!("WriteFiles(\"{root}\")"),
+                        )
                     {
                         return EvalOut::Stopped(bug);
                     }
@@ -2902,7 +2923,11 @@ impl<'a> Evaluator<'a> {
                 } = cap
                 {
                     if !self.ew.dry_run
-                        && let Some(bug) = self.check_export_gate(*handle, allows)
+                        && let Some(bug) = self.check_export_gate(
+                            *handle,
+                            allows,
+                            &format!("WriteFiles(\"{root}\")"),
+                        )
                     {
                         return EvalOut::Stopped(bug);
                     }
@@ -2936,7 +2961,11 @@ impl<'a> Evaluator<'a> {
                 } = cap
                 {
                     if !self.ew.dry_run
-                        && let Some(bug) = self.check_export_gate(*handle, allows)
+                        && let Some(bug) = self.check_export_gate(
+                            *handle,
+                            allows,
+                            &format!("WriteFiles(\"{root}\")"),
+                        )
                     {
                         return EvalOut::Stopped(bug);
                     }
@@ -3000,7 +3029,11 @@ impl<'a> Evaluator<'a> {
                         required_tags = required_tags.union(&col.tags);
                     }
                     if !self.ew.dry_run
-                        && let Some(bug) = self.check_export_gate(*handle, &required_tags)
+                        && let Some(bug) = self.check_export_gate(
+                            *handle,
+                            &required_tags,
+                            &format!("WriteTable({db}, \"{table_name}\")"),
+                        )
                     {
                         return EvalOut::Stopped(bug);
                     }
@@ -3152,13 +3185,76 @@ impl<'a> Evaluator<'a> {
                     allows: TagSet::empty(),
                 })
             }
-            ExecHostOp::JsonParseTable(schema_name) => {
-                if let [resp_val, Val::Text(field)] = args {
-                    self.eval_json_parse_table(resp_val, field, schema_name)
+            ExecHostOp::FakeHttpsRequests => match args {
+                [
+                    Val::CapHttpsAllow {
+                        handle: CapHandle::Fake(idx),
+                        ..
+                    },
+                ] => {
+                    let reqs = self
+                        .ew
+                        .world
+                        .fake_https
+                        .get(*idx)
+                        .map(|fh| fh.requests.iter().cloned().map(Val::Text).collect())
+                        .unwrap_or_default();
+                    EvalOut::Ok(Val::List(reqs))
+                }
+                _ => EvalOut::Failed("Https.requests requires fake HttpsAllow".to_string()),
+            },
+            ExecHostOp::FakeHttpsBodies => match args {
+                [
+                    Val::CapHttpsAllow {
+                        handle: CapHandle::Fake(idx),
+                        ..
+                    },
+                ] => {
+                    let bodies = self
+                        .ew
+                        .fake_https_bodies
+                        .get(idx)
+                        .map(|bs| bs.iter().cloned().map(Val::Text).collect())
+                        .unwrap_or_default();
+                    EvalOut::Ok(Val::List(bodies))
+                }
+                _ => EvalOut::Failed("Https.request_bodies requires fake HttpsAllow".to_string()),
+            },
+            ExecHostOp::HttpsPostJson | ExecHostOp::HttpsPutJson => {
+                let method = if matches!(op, ExecHostOp::HttpsPostJson) {
+                    "POST"
                 } else {
-                    EvalOut::Failed("parse_table expects (JsonResponse, field)".to_string())
+                    "PUT"
+                };
+                match args {
+                    [
+                        Val::CapHttpsAllow {
+                            handle,
+                            host,
+                            allows,
+                        },
+                        Val::Text(url),
+                        body_val,
+                        hdr_val,
+                    ] => self.eval_https_write_json(
+                        method, *handle, host, allows, url, body_val, hdr_val,
+                    ),
+                    _ => EvalOut::Failed(format!(
+                        "HttpsAllow.{method} expects (HttpsAllow, url, body, headers)"
+                    )),
                 }
             }
+            ExecHostOp::JsonParseTable(schema_name) => match args {
+                [resp_val, Val::Text(field)] => {
+                    self.eval_json_parse_table(resp_val, field, schema_name, None)
+                }
+                [resp_val, Val::Text(field), fields_val] => {
+                    self.eval_json_parse_table(resp_val, field, schema_name, Some(fields_val))
+                }
+                _ => EvalOut::Failed(
+                    "parse_table expects (JsonResponse, field[, fields])".to_string(),
+                ),
+            },
             ExecHostOp::JsonBoolAt => {
                 if let [resp_val, Val::Text(field)] = args {
                     let Some(jresp) = self.extract_json_response(resp_val) else {
@@ -3334,18 +3430,25 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn check_export_gate(&self, handle: CapHandle, allows: &TagSet) -> Option<Bug> {
+    fn check_export_gate(
+        &self,
+        handle: CapHandle,
+        allows: &TagSet,
+        sink_desc: &str,
+    ) -> Option<Bug> {
         match handle {
             CapHandle::Fake(_) => None,
             CapHandle::Real => {
-                if allows.is_empty() || allows.is_subset(&self.ew.world.runtime_allow_export) {
+                let missing = allows.diff(&self.ew.world.runtime_allow_export);
+                if missing.is_empty() {
                     None
                 } else {
+                    let tags_str = missing.elems().join(",");
                     Some(Bug {
                         kind: BugKind::ExportGateDenied,
-                        message:
-                            "runtime --allow-export authorization required for sensitive external sink"
-                                .to_string(),
+                        message: format!(
+                            "runtime --allow-export {tags_str} authorization required for sensitive external sink {sink_desc}"
+                        ),
                     })
                 }
             }
@@ -3676,7 +3779,8 @@ impl<'a> Evaluator<'a> {
             ));
         };
         if !self.ew.dry_run
-            && let Some(bug) = self.check_export_gate(*handle, allows)
+            && let Some(bug) =
+                self.check_export_gate(*handle, allows, &format!("WriteFiles(\"{root}\")"))
         {
             return EvalOut::Stopped(bug);
         }
@@ -4189,7 +4293,9 @@ impl<'a> Evaluator<'a> {
                         message: err.message,
                     });
                 }
-                if let Some(bug) = self.check_export_gate(handle, allows) {
+                if let Some(bug) =
+                    self.check_export_gate(handle, allows, &format!("HttpsAllow(\"{host}\")"))
+                {
                     return EvalOut::Stopped(bug);
                 }
                 if !self.ew.live_io {
@@ -4217,6 +4323,151 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "HTTPS JSON write carries method, cap handle, host, tags, URL, body, and headers"
+    )]
+    fn eval_https_write_json(
+        &mut self,
+        method: &str,
+        handle: CapHandle,
+        host: &str,
+        allows: &TagSet,
+        url: &str,
+        body_val: &Val,
+        hdr_val: &Val,
+    ) -> EvalOut {
+        let req_headers: Vec<(String, String)> = match hdr_val {
+            Val::Unit => Vec::new(),
+            Val::Map(pairs) => pairs
+                .iter()
+                .map(|(k, v)| (format_display_val(k), format_display_val(v)))
+                .collect(),
+            _ => {
+                return EvalOut::Failed(format!(
+                    "HttpsAllow.{method} `headers:` must be a Map(Text, Text)"
+                ));
+            }
+        };
+
+        let body_json = match body_val {
+            Val::Text(s) => s.clone(),
+            Val::Table(tv) => format_json_array_table(tv),
+            Val::Columnar(vm) => format_json_array_vm_table(vm),
+            _ => {
+                return EvalOut::Failed(format!(
+                    "HttpsAllow.{method} body must be `Text` or `Table`"
+                ));
+            }
+        };
+
+        match handle {
+            CapHandle::Fake(idx) => {
+                let parsed = match ParsedHttpsUrl::parse_and_check_host(url, host) {
+                    Ok(p) => p,
+                    Err(e) => return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string())))),
+                };
+                let Some(fh) = self.ew.world.fake_https.get_mut(idx) else {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(
+                        "invalid fake HTTPS handle".to_string(),
+                    ))));
+                };
+                fh.requests.push(url.to_string());
+                self.ew
+                    .fake_https_bodies
+                    .entry(idx)
+                    .or_default()
+                    .push(body_json);
+                let method_url = format!("{method} {url}");
+                let method_path = format!("{method} {}", parsed.path_and_query);
+                let resp_opt = fh
+                    .responses
+                    .iter()
+                    .find(|(k, _)| k == &method_url || k == &method_path)
+                    .or_else(|| {
+                        fh.responses
+                            .iter()
+                            .find(|(k, _)| k == url || k == &parsed.path_and_query)
+                    })
+                    .map(|(_, v)| v.clone());
+                let Some(resp_raw) = resp_opt else {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                        "no fake HTTPS response registered for `{method} {url}`"
+                    )))));
+                };
+                let jresp = if resp_raw.trim().is_empty() {
+                    Ok(JsonResponse::from_value(
+                        crate::formats::json::JsonValue::Null,
+                    ))
+                } else {
+                    JsonResponse::from_json_str(&resp_raw)
+                };
+                match jresp {
+                    Ok(jr) => {
+                        let resp_idx = self.ew.json_responses.len();
+                        self.ew.json_responses.push(jr);
+                        EvalOut::Ok(Val::ResOk(Box::new(make_json_response_val(resp_idx))))
+                    }
+                    Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string())))),
+                }
+            }
+            CapHandle::Real => {
+                let cap_ty = Ty::HttpsAllow {
+                    host: host.to_string(),
+                    allows: allows.clone(),
+                };
+                if let Err(err) = check_cap_against_policy(self.prog.policy.as_ref(), &cap_ty) {
+                    return EvalOut::Stopped(Bug {
+                        kind: BugKind::ExportGateDenied,
+                        message: err.message,
+                    });
+                }
+                if self.ew.dry_run {
+                    self.ew.world.stdout.push(format!(
+                        "[DRY-RUN] would {method} {url} ({} bytes)",
+                        body_json.len()
+                    ));
+                    let resp_idx = self.ew.json_responses.len();
+                    self.ew.json_responses.push(JsonResponse::from_value(
+                        crate::formats::json::JsonValue::Null,
+                    ));
+                    return EvalOut::Ok(Val::ResOk(Box::new(make_json_response_val(resp_idx))));
+                }
+                if let Some(bug) =
+                    self.check_export_gate(handle, allows, &format!("HttpsAllow(\"{host}\")"))
+                {
+                    return EvalOut::Stopped(bug);
+                }
+                if !self.ew.live_io {
+                    return EvalOut::Ok(Val::ResErr(Box::new(Val::Text(format!(
+                        "HTTPS I/O disabled in spec mode: {url}"
+                    )))));
+                }
+                let https_cfg = HttpsClientConfig {
+                    ca_cert_path: self
+                        .ew
+                        .https_ca_cert
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    ..HttpsClientConfig::default()
+                };
+                let res = if method == "POST" {
+                    https_post_json(url, host, &body_json, &req_headers, &https_cfg)
+                } else {
+                    https_put_json(url, host, &body_json, &req_headers, &https_cfg)
+                };
+                match res {
+                    Ok(jresp) => {
+                        let resp_idx = self.ew.json_responses.len();
+                        self.ew.json_responses.push(jresp);
+                        EvalOut::Ok(Val::ResOk(Box::new(make_json_response_val(resp_idx))))
+                    }
+                    Err(e) => EvalOut::Ok(Val::ResErr(Box::new(Val::Text(e.to_string())))),
+                }
+            }
+        }
+    }
+
     fn extract_json_response(&self, val: &Val) -> Option<&JsonResponse> {
         if let Val::Ctor {
             type_name, fields, ..
@@ -4230,18 +4481,48 @@ impl<'a> Evaluator<'a> {
         None
     }
 
-    fn eval_json_parse_table(&mut self, resp_val: &Val, field: &str, schema_name: &str) -> EvalOut {
+    fn eval_json_parse_table(
+        &mut self,
+        resp_val: &Val,
+        field: &str,
+        schema_name: &str,
+        fields_val: Option<&Val>,
+    ) -> EvalOut {
         let Some(cs) = self.prog.find_schema(schema_name) else {
             return EvalOut::Failed(format!("unknown schema `{schema_name}`"));
         };
         let constraints = cs.constraints.clone();
         let schema_tt = cs.decl.schema.clone();
+        let mut field_paths = HashMap::new();
+        match fields_val {
+            None | Some(Val::Unit) => {}
+            Some(Val::Map(pairs)) => {
+                for (k, v) in pairs {
+                    let (Val::Text(col), Val::Text(jpath)) = (k, v) else {
+                        return EvalOut::Failed(
+                            "parse_table `fields:` must be Map(Text, Text)".to_string(),
+                        );
+                    };
+                    if schema_tt.find_col(col).is_none() {
+                        return EvalOut::Failed(format!(
+                            "parse_table `fields:` references unknown column `{col}` on schema `{schema_name}`"
+                        ));
+                    }
+                    field_paths.insert(col.clone(), jpath.clone());
+                }
+            }
+            Some(_) => {
+                return EvalOut::Failed(
+                    "parse_table `fields:` must be Map(Text, Text)".to_string(),
+                );
+            }
+        }
         let self_cols = build_constraint_self_cols(&schema_tt);
         let Some(jresp) = self.extract_json_response(resp_val).cloned() else {
             return EvalOut::Failed("invalid JsonResponse handle".to_string());
         };
         let empty_env = RTEnv::new();
-        match jresp.parse_table(field, &schema_tt, |ci, val| {
+        match jresp.parse_table_with_fields(field, &schema_tt, &field_paths, |ci, val| {
             self.eval_schema_constraint(&self_cols, &constraints, ci, val, &empty_env)
         }) {
             Ok((good, bad)) => EvalOut::Ok(Val::Tuple(vec![Val::Table(good), Val::Table(bad)])),
@@ -4641,7 +4922,7 @@ impl<'a> Evaluator<'a> {
                 let mut tv = tv;
                 for item in items {
                     match item {
-                        ExecDeriveItem::ColExpr { name, expr } => {
+                        ExecDeriveItem::ColExpr { name, expr, spec } => {
                             let existing_idx = tv.cols.iter().position(|c| c.name == *name);
                             let mut new_vals = Vec::with_capacity(tv.rows.len());
                             for row in &tv.rows {
@@ -4651,17 +4932,12 @@ impl<'a> Evaluator<'a> {
                                 }
                             }
                             if let Some(idx) = existing_idx {
+                                tv.cols[idx] = spec.clone();
                                 for (row, v) in tv.rows.iter_mut().zip(new_vals) {
                                     row.cells[idx] = v;
                                 }
                             } else {
-                                tv.cols.push(ColSpec {
-                                    name: name.clone(),
-                                    ty: ScalarTy::Unit,
-                                    tags: TagSet::empty(),
-                                    bucketed: false,
-                                    agg_kind: AggKind::Raw,
-                                });
+                                tv.cols.push(spec.clone());
                                 for (row, v) in tv.rows.iter_mut().zip(new_vals) {
                                     row.cells.push(v);
                                 }
@@ -4671,6 +4947,7 @@ impl<'a> Evaluator<'a> {
                             name,
                             expr,
                             agg_kind,
+                            spec,
                         } => {
                             let existing_idx = tv.cols.iter().position(|c| c.name == *name);
                             let mut new_vals = Vec::with_capacity(tv.rows.len());
@@ -4680,19 +4957,15 @@ impl<'a> Evaluator<'a> {
                                     other => return other,
                                 }
                             }
+                            let mut target_spec = spec.clone();
+                            target_spec.agg_kind = *agg_kind;
                             if let Some(idx) = existing_idx {
-                                tv.cols[idx].agg_kind = *agg_kind;
+                                tv.cols[idx] = target_spec;
                                 for (row, v) in tv.rows.iter_mut().zip(new_vals) {
                                     row.cells[idx] = v;
                                 }
                             } else {
-                                tv.cols.push(ColSpec {
-                                    name: name.clone(),
-                                    ty: ScalarTy::Unit,
-                                    tags: TagSet::empty(),
-                                    bucketed: false,
-                                    agg_kind: *agg_kind,
-                                });
+                                tv.cols.push(target_spec);
                                 for (row, v) in tv.rows.iter_mut().zip(new_vals) {
                                     row.cells.push(v);
                                 }

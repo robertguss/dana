@@ -6612,6 +6612,20 @@ fn translate_exec_row_expr(
                     tags,
                 ))
             }
+            (ExecPrimOp::TextLen, [arg]) => {
+                let (e, ty, tags) = translate_exec_row_expr(arg, schema, ctx)?;
+                if ty != ScalarTy::Text {
+                    return Err("TextLen expects Text".to_string());
+                }
+                Ok((
+                    SqlExpr::Func {
+                        name: "LENGTH",
+                        args: vec![e],
+                    },
+                    ScalarTy::Int,
+                    tags,
+                ))
+            }
             (ExecPrimOp::SliceText, [s_re, start_re, len_re]) => {
                 let (s_e, s_ty, s_tags) = translate_exec_row_expr(s_re, schema, ctx)?;
                 if s_ty != ScalarTy::Text {
@@ -7403,7 +7417,7 @@ fn split_exec_node(
                     let mut names = Vec::with_capacity(items.len());
                     for item in items {
                         match item {
-                            ExecDeriveItem::ColExpr { name, expr }
+                            ExecDeriveItem::ColExpr { name, expr, .. }
                             | ExecDeriveItem::SummaryCol { name, expr, .. } => {
                                 let ak = match item {
                                     ExecDeriveItem::SummaryCol { agg_kind, .. } => *agg_kind,

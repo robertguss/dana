@@ -9,8 +9,8 @@ use crate::core::check::{
     resolve_join_pairs,
 };
 use crate::core::syntax::{
-    AggItem, AggKind, ColSpec, DeriveItem, Expr, Ident, JoinKind, JoinOn, Plan, Program, RowExpr,
-    ScalarTy, SuppressMode, TableTy, TagSet, Ty,
+    AggItem, AggKind, ColSpec, DeriveItem, Expr, Ident, JoinKind, JoinOn, LTy, Plan, Program,
+    RowExpr, ScalarTy, SuppressMode, TableTy, TagSet, Ty,
 };
 use crate::db::SqlDialect;
 use crate::db::schema_lock::SchemaLockFile;
@@ -20,7 +20,8 @@ use crate::plan::pushdown::{
     split_core_plan_pushdown, split_exec_plan_pushdown,
 };
 use crate::runtime::ir::{
-    ExecAggItem, ExecDeriveItem, ExecExpr, ExecPlan, ExecProgram, ExecRowExpr,
+    ExecAggItem, ExecDeriveItem, ExecExpr, ExecHostOp, ExecPlan, ExecPrimOp, ExecProgram,
+    ExecRowExpr,
 };
 
 /// Render a Core IR [`Plan`] as an indented execution tree.
@@ -137,6 +138,41 @@ pub fn explain_exec_plan_with_pushdown(
     dialect: SqlDialect,
     lock: Option<&SchemaLockFile>,
 ) -> String {
+    explain_exec_plan_with_pushdown_impl(plan, prog, db_name, dialect, lock, None)
+}
+
+/// Render a full explain report for a Phase 2 [`ExecPlan`] using explicit lexical variable
+/// scopes (`var_tags`, `table_vars`) for `[SENSITIVITY PROVENANCE]`.
+#[must_use]
+pub fn explain_exec_plan_with_pushdown_scoped(
+    plan: &ExecPlan,
+    prog: &ExecProgram,
+    db_name: &str,
+    dialect: SqlDialect,
+    lock: Option<&SchemaLockFile>,
+    var_tags: &HashMap<Ident, TagSet>,
+    table_vars: &HashMap<Ident, TableTy>,
+) -> String {
+    explain_exec_plan_with_pushdown_impl(
+        plan,
+        prog,
+        db_name,
+        dialect,
+        lock,
+        Some((var_tags, table_vars)),
+    )
+}
+
+type ExplainScopeRef<'a> = (&'a HashMap<Ident, TagSet>, &'a HashMap<Ident, TableTy>);
+
+fn explain_exec_plan_with_pushdown_impl(
+    plan: &ExecPlan,
+    prog: &ExecProgram,
+    db_name: &str,
+    dialect: SqlDialect,
+    lock: Option<&SchemaLockFile>,
+    scope: Option<ExplainScopeRef<'_>>,
+) -> String {
     let (opt, stats) = optimize_exec_plan(plan, prog);
     let split = split_exec_plan_pushdown(&opt, prog, db_name, dialect, lock);
 
@@ -202,7 +238,12 @@ pub fn explain_exec_plan_with_pushdown(
     }
 
     let _ = writeln!(out, "[SENSITIVITY PROVENANCE]");
-    let prov = explain_exec_sensitivity_provenance(&opt, prog);
+    let prov = match scope {
+        Some((var_tags, table_vars)) => {
+            explain_exec_sensitivity_provenance_scoped(&opt, prog, var_tags, table_vars)
+        }
+        None => explain_exec_sensitivity_provenance(&opt, prog),
+    };
     out.push_str(&prov);
     out
 }
@@ -226,6 +267,24 @@ pub fn explain_sensitivity_provenance(plan: &Plan, prog: &Program) -> String {
     fmt_provenance_summary(&lines, out_tt.as_ref())
 }
 
+/// Bind a typed local or parameter variable into lexical explain provenance maps.
+pub fn bind_lty_in_scope(
+    name: &Ident,
+    lty: &LTy,
+    var_tags: &mut HashMap<Ident, TagSet>,
+    table_vars: &mut HashMap<Ident, TableTy>,
+) {
+    if let Ty::Table(tt) = &lty.ty {
+        let mut bound_tt = tt.clone();
+        bound_tt.row_tags = bound_tt.row_tags.union(&lty.tags);
+        var_tags.remove(name);
+        table_vars.insert(name.clone(), bound_tt);
+    } else {
+        table_vars.remove(name);
+        var_tags.insert(name.clone(), lty.effective_tags());
+    }
+}
+
 /// Trace where sensitivity tags enter, propagate, clear, or remain across a Phase 2 [`ExecPlan`].
 #[must_use]
 pub fn explain_exec_sensitivity_provenance(plan: &ExecPlan, prog: &ExecProgram) -> String {
@@ -233,16 +292,128 @@ pub fn explain_exec_sensitivity_provenance(plan: &ExecPlan, prog: &ExecProgram) 
     let mut table_vars: HashMap<Ident, TableTy> = HashMap::new();
     for f in &prog.funs {
         for (name, lty) in &f.params {
-            if let Ty::Table(tt) = &lty.ty {
-                table_vars.insert(name.clone(), tt.clone());
-            } else {
-                var_tags.insert(name.clone(), lty.effective_tags());
+            bind_lty_in_scope(name, lty, &mut var_tags, &mut table_vars);
+        }
+        collect_exec_let_ltys(&f.body, &mut var_tags, &mut table_vars);
+    }
+    explain_exec_sensitivity_provenance_scoped(plan, prog, &var_tags, &table_vars)
+}
+
+/// Trace sensitivity provenance for a Phase 2 [`ExecPlan`] using explicit lexical scopes.
+#[must_use]
+pub fn explain_exec_sensitivity_provenance_scoped(
+    plan: &ExecPlan,
+    prog: &ExecProgram,
+    var_tags: &HashMap<Ident, TagSet>,
+    table_vars: &HashMap<Ident, TableTy>,
+) -> String {
+    let mut lines = Vec::new();
+    let out_tt = trace_exec_provenance(plan, prog, var_tags, table_vars, &mut lines);
+    fmt_provenance_summary(&lines, out_tt.as_ref())
+}
+
+fn collect_exec_let_ltys(
+    expr: &ExecExpr,
+    var_tags: &mut HashMap<Ident, TagSet>,
+    table_vars: &mut HashMap<Ident, TableTy>,
+) {
+    let mut stack = vec![expr];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            ExecExpr::LetE {
+                name,
+                lty,
+                bound,
+                body,
+            } => {
+                bind_lty_in_scope(name, lty, var_tags, table_vars);
+                stack.push(body);
+                stack.push(bound);
             }
+            ExecExpr::IfE {
+                cond,
+                then_br,
+                else_br,
+            } => {
+                stack.push(else_br);
+                stack.push(then_br);
+                stack.push(cond);
+            }
+            ExecExpr::CaseE { scrut, arms } => {
+                for a in arms {
+                    stack.push(&a.body);
+                }
+                stack.push(scrut);
+            }
+            ExecExpr::Join {
+                params, rhs, body, ..
+            } => {
+                for (pname, plty) in params {
+                    bind_lty_in_scope(pname, plty, var_tags, table_vars);
+                }
+                stack.push(body);
+                stack.push(rhs);
+            }
+            ExecExpr::ForLoop {
+                iter_expr,
+                state_vars,
+                body,
+                after,
+                ..
+            } => {
+                for (sname, slty) in state_vars {
+                    bind_lty_in_scope(sname, slty, var_tags, table_vars);
+                }
+                stack.push(after);
+                stack.push(body);
+                stack.push(iter_expr);
+            }
+            ExecExpr::WhileLoop {
+                cond,
+                state_vars,
+                body,
+                after,
+                ..
+            } => {
+                for (sname, slty) in state_vars {
+                    bind_lty_in_scope(sname, slty, var_tags, table_vars);
+                }
+                stack.push(after);
+                stack.push(body);
+                stack.push(cond);
+            }
+            ExecExpr::App { fn_expr, args } => {
+                for a in args {
+                    stack.push(a);
+                }
+                stack.push(fn_expr);
+            }
+            ExecExpr::Call { args, .. }
+            | ExecExpr::Jump { args, .. }
+            | ExecExpr::Tuple(args)
+            | ExecExpr::Ctor { args, .. }
+            | ExecExpr::Prim { args, .. }
+            | ExecExpr::Host { args, .. } => {
+                for a in args {
+                    stack.push(a);
+                }
+            }
+            ExecExpr::Proj { tup: e, .. }
+            | ExecExpr::Assert { cond: e, .. }
+            | ExecExpr::Fail(e)
+            | ExecExpr::Stop {
+                detail: Some(e), ..
+            } => stack.push(e),
+            ExecExpr::Lam { body, .. } => stack.push(body),
+            ExecExpr::Lit(_)
+            | ExecExpr::Var(_)
+            | ExecExpr::ConstRef(_)
+            | ExecExpr::TableLit { .. }
+            | ExecExpr::Rel(_)
+            | ExecExpr::CheckPromise { .. }
+            | ExecExpr::Stop { detail: None, .. } => {}
         }
     }
-    let mut lines = Vec::new();
-    let out_tt = trace_exec_provenance(plan, prog, &var_tags, &table_vars, &mut lines);
-    fmt_provenance_summary(&lines, out_tt.as_ref())
 }
 
 fn fmt_pushdown_query(q: &SqlPushdownQuery, bind_var: Option<&str>, out: &mut String) {
@@ -1004,6 +1175,115 @@ fn exec_row_expr_tags(
     }
 }
 
+fn trace_source_expr_table_ty(
+    e: &ExecExpr,
+    prog: &ExecProgram,
+    var_tags: &HashMap<Ident, TagSet>,
+    table_vars: &HashMap<Ident, TableTy>,
+    lines: &mut Vec<String>,
+) -> Option<TableTy> {
+    match e {
+        ExecExpr::Rel(inner) => trace_exec_provenance(inner, prog, var_tags, table_vars, lines),
+        ExecExpr::TableLit { schema, .. } => {
+            lines.push(format!(
+                "ENTER TableLit: tags={}, cols={}",
+                fmt_tags(&schema.total_tags()),
+                fmt_tagged_cols(&schema.cols)
+            ));
+            Some(schema.clone())
+        }
+        ExecExpr::Var(v) => {
+            let tt = table_vars.get(v).cloned();
+            if let Some(ref schema) = tt {
+                if schema.row_tags.is_empty() {
+                    lines.push(format!(
+                        "ENTER SourceVar({v}): tags={}, cols={}",
+                        fmt_tags(&schema.total_tags()),
+                        fmt_tagged_cols(&schema.cols)
+                    ));
+                } else {
+                    lines.push(format!(
+                        "ENTER SourceVar({v}): tags={}, cols={}, row_tags={}",
+                        fmt_tags(&schema.total_tags()),
+                        fmt_tagged_cols(&schema.cols),
+                        fmt_tags(&schema.row_tags)
+                    ));
+                }
+            }
+            tt
+        }
+        ExecExpr::Call { fn_name, .. } => {
+            let callee = prog.find_fun(fn_name)?;
+            if let Ty::Table(tt) = &callee.ret.ty {
+                let mut out_tt = tt.clone();
+                out_tt.row_tags = out_tt.row_tags.union(&callee.ret.tags);
+                lines.push(format!(
+                    "ENTER Call({fn_name}): tags={}, cols={}",
+                    fmt_tags(&out_tt.total_tags()),
+                    fmt_tagged_cols(&out_tt.cols)
+                ));
+                Some(out_tt)
+            } else {
+                None
+            }
+        }
+        ExecExpr::Prim {
+            op: ExecPrimOp::TableCoerce(tt) | ExecPrimOp::TableBuildDynamic(tt),
+            ..
+        } => {
+            lines.push(format!(
+                "ENTER TableExpr: tags={}, cols={}",
+                fmt_tags(&tt.total_tags()),
+                fmt_tagged_cols(&tt.cols)
+            ));
+            Some(tt.clone())
+        }
+        ExecExpr::Host {
+            op: ExecHostOp::RawSqlQuery { out_schema, .. },
+            ..
+        } => {
+            lines.push(format!(
+                "ENTER RawSql: tags={}, cols={}",
+                fmt_tags(&out_schema.total_tags()),
+                fmt_tagged_cols(&out_schema.cols)
+            ));
+            Some(out_schema.clone())
+        }
+        ExecExpr::Prim {
+            op:
+                ExecPrimOp::StatsOutliers {
+                    flag_col,
+                    flag_tags,
+                    ..
+                },
+            args,
+        } => {
+            let input_expr = args.first()?;
+            let mut tt = trace_source_expr_table_ty(input_expr, prog, var_tags, table_vars, lines)?;
+            let flag_spec = ColSpec {
+                name: flag_col.clone(),
+                ty: ScalarTy::Bool,
+                tags: flag_tags.clone(),
+                bucketed: false,
+                agg_kind: AggKind::Raw,
+            };
+            if let Some(slot) = tt.cols.iter_mut().find(|c| c.name == *flag_col) {
+                *slot = flag_spec;
+            } else {
+                tt.cols.push(flag_spec);
+            }
+            if !flag_tags.is_empty() {
+                lines.push(format!(
+                    "PROPAGATE Outliers({flag_col}): tags={}",
+                    fmt_tags(flag_tags)
+                ));
+            }
+            Some(tt)
+        }
+        _ => None,
+    }
+}
+
 fn trace_exec_provenance(
     plan: &ExecPlan,
     prog: &ExecProgram,
@@ -1024,28 +1304,7 @@ fn trace_exec_provenance(
             ));
             Some(schema.clone())
         }
-        ExecPlan::SourceExpr(e) => match e.as_ref() {
-            ExecExpr::TableLit { schema, .. } => {
-                lines.push(format!(
-                    "ENTER TableLit: tags={}, cols={}",
-                    fmt_tags(&schema.total_tags()),
-                    fmt_tagged_cols(&schema.cols)
-                ));
-                Some(schema.clone())
-            }
-            ExecExpr::Var(v) => {
-                let tt = table_vars.get(v).cloned();
-                if let Some(ref schema) = tt {
-                    lines.push(format!(
-                        "ENTER SourceVar({v}): tags={}, cols={}",
-                        fmt_tags(&schema.total_tags()),
-                        fmt_tagged_cols(&schema.cols)
-                    ));
-                }
-                tt
-            }
-            _ => None,
-        },
+        ExecPlan::SourceExpr(e) => trace_source_expr_table_ty(e, prog, var_tags, table_vars, lines),
         ExecPlan::Select { input, cols } => {
             let tt = trace_exec_provenance(input, prog, var_tags, table_vars, lines)?;
             let dropped: Vec<String> = tt
@@ -1198,7 +1457,7 @@ fn trace_exec_provenance(
                 .collect();
             for item in items {
                 match item {
-                    ExecDeriveItem::ColExpr { name, expr } => {
+                    ExecDeriveItem::ColExpr { name, expr, spec } => {
                         let tags = exec_row_expr_tags(expr, &cols, prog, var_tags);
                         if !tags.is_empty() {
                             lines.push(format!(
@@ -1208,10 +1467,11 @@ fn trace_exec_provenance(
                         }
                         let new_col = ColSpec {
                             name: name.clone(),
-                            ty: ScalarTy::Text,
-                            tags,
-                            bucketed: crate::runtime::ir::is_exec_row_expr_coarsened(expr, &cols),
-                            agg_kind: AggKind::Raw,
+                            ty: spec.ty.clone(),
+                            tags: spec.tags.union(&tags),
+                            bucketed: spec.bucketed
+                                || crate::runtime::ir::is_exec_row_expr_coarsened(expr, &cols),
+                            agg_kind: spec.agg_kind,
                         };
                         if let Some(slot) = cols.iter_mut().find(|c| c.name == *name) {
                             *slot = new_col;
@@ -1223,6 +1483,7 @@ fn trace_exec_provenance(
                         name,
                         expr,
                         agg_kind,
+                        spec,
                     } => {
                         let tags = exec_row_expr_tags(expr, &cols, prog, var_tags);
                         if !tags.is_empty() {
@@ -1233,9 +1494,10 @@ fn trace_exec_provenance(
                         }
                         let new_col = ColSpec {
                             name: name.clone(),
-                            ty: ScalarTy::Text,
-                            tags,
-                            bucketed: crate::runtime::ir::is_exec_row_expr_coarsened(expr, &cols),
+                            ty: spec.ty.clone(),
+                            tags: spec.tags.union(&tags),
+                            bucketed: spec.bucketed
+                                || crate::runtime::ir::is_exec_row_expr_coarsened(expr, &cols),
                             agg_kind: *agg_kind,
                         };
                         if let Some(slot) = cols.iter_mut().find(|c| c.name == *name) {

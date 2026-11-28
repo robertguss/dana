@@ -3516,6 +3516,13 @@ fn optimizer_rewrites_stop_safety_and_explain() -> Result<(), String> {
             items: vec![ExecDeriveItem::ColExpr {
                 name: "z".into(),
                 expr: Box::new(ExecRowExpr::Col("x".into())),
+                spec: ColSpec {
+                    name: "z".into(),
+                    ty: ScalarTy::Int,
+                    tags: TagSet::empty(),
+                    bucketed: false,
+                    agg_kind: AggKind::Raw,
+                },
             }],
         }),
         n: BigInt::from(5u64),

@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Component, Path};
 
 use crate::base::FileId;
-use crate::check::resolve::join_module_path;
+use crate::check::resolve::{cap_segment_to_kebab, join_module_path};
 use crate::formats::crypto::{sha256, to_hex_lower};
 use crate::syntax::parse_module;
 
@@ -51,6 +51,23 @@ impl Default for VendorLock {
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     to_hex_lower(&sha256(bytes))
+}
+
+/// Return the expected relative POSIX path under `vendor/` for `module_name` (`TextNorm` -> `"text-norm.dana"`,
+/// `Util.TextNorm` -> `"util/text-norm.dana"`), matching `use <Module>` resolution rules.
+#[must_use]
+pub fn expected_vendor_module_rel_path(module_name: &str) -> String {
+    let segs: Vec<&str> = module_name.split('.').collect();
+    let mut parts = Vec::with_capacity(segs.len());
+    for (idx, seg) in segs.iter().enumerate() {
+        let kebab = cap_segment_to_kebab(seg);
+        if idx + 1 == segs.len() {
+            parts.push(format!("{kebab}.dana"));
+        } else {
+            parts.push(kebab);
+        }
+    }
+    parts.join("/")
 }
 
 /// Convert a relative [`Path`] into canonical POSIX slash-separated form (`a/b/c.dana`).

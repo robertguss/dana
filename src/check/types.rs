@@ -4553,10 +4553,11 @@ impl<'a> Checker<'a> {
                         bucketed: crate::runtime::ir::is_exec_row_expr_coarsened(&re, &out_tt.cols),
                         agg_kind: AggKind::Raw,
                     };
-                    upsert_col(&mut out_tt.cols, spec);
+                    upsert_col(&mut out_tt.cols, spec.clone());
                     items.push(ExecDeriveItem::ColExpr {
                         name: name.name.clone(),
                         expr: Box::new(re),
+                        spec,
                     });
                 }
                 (
@@ -4568,30 +4569,81 @@ impl<'a> Checker<'a> {
                 )
             }
             "sort_by" | "sort_desc" => {
-                let dir = if verb == "sort_desc" {
+                let default_dir = if verb == "sort_desc" {
                     SortDir::Desc
                 } else {
                     SortDir::Asc
                 };
-                let mut keys = Vec::new();
+                if args.is_empty() {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`{verb}` requires at least one sort column"),
+                        )
+                        .with_span(span),
+                    );
+                }
+                let mut keys: Vec<(Ident, SortDir)> = Vec::new();
                 let mut key_tags = TagSet::empty();
+                let mut last_was_bare_col = false;
                 for arg in args {
-                    if let CallArg::Positional(e) = arg
-                        && let ExprKind::DotField(m) = &e.kind
+                    let CallArg::Positional(e) = arg else {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("`{verb}` does not accept named arguments"),
+                            )
+                            .with_span(span),
+                        );
+                        last_was_bare_col = false;
+                        continue;
+                    };
+                    if let ExprKind::Atom(dir_atom) = &e.kind
+                        && (dir_atom == "asc" || dir_atom == "desc")
                     {
-                        if let Some(c) = in_tt.find_col(&m.name) {
-                            key_tags = key_tags.union(&c.tags);
-                            keys.push((m.name.clone(), dir));
-                        } else {
+                        if last_was_bare_col && let Some(prev) = keys.last_mut() {
+                            prev.1 = if dir_atom == "desc" {
+                                SortDir::Desc
+                            } else {
+                                SortDir::Asc
+                            };
+                            last_was_bare_col = false;
+                            continue;
+                        }
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!(
+                                    "`:{dir_atom}` in `{verb}` must follow a `.column` argument"
+                                ),
+                            )
+                            .with_span(e.span),
+                        );
+                        last_was_bare_col = false;
+                        continue;
+                    }
+                    let is_bare = matches!(&e.kind, ExprKind::DotField(_));
+                    if let Some((col_name, col_dir)) = self.check_sort_key_expr(
+                        e,
+                        &in_tt,
+                        default_dir,
+                        &format!("`{verb}`"),
+                        "sort",
+                    ) {
+                        if keys.iter().any(|(k, _)| k == &col_name) {
                             self.diags.push(
                                 Diagnostic::error(
                                     DiagCode::TypeError,
-                                    format!("unknown sort column `.{}`", m.name),
+                                    format!("duplicate sort column `.{col_name}` in `{verb}`"),
                                 )
-                                .with_span(m.span),
+                                .with_span(e.span),
                             );
+                        } else if let Some(c) = in_tt.find_col(&col_name) {
+                            key_tags = key_tags.union(&c.tags);
+                            keys.push((col_name, col_dir));
                         }
                     }
+                    last_was_bare_col = is_bare;
                 }
                 let mut out_tt = in_tt;
                 for c in &mut out_tt.cols {
@@ -5311,20 +5363,23 @@ impl<'a> Checker<'a> {
         ))
     }
 
-    fn parse_dedupe_order_spec(
+    fn check_sort_key_expr(
         &mut self,
         expr: &Expr,
         in_tt: &TableTy,
+        default_dir: SortDir,
+        ctx_name: &str,
+        entry_label: &str,
     ) -> Option<(Ident, SortDir)> {
         match &expr.kind {
             ExprKind::DotField(m) => {
                 if in_tt.find_col(&m.name).is_some() {
-                    Some((m.name.clone(), SortDir::Asc))
+                    Some((m.name.clone(), default_dir))
                 } else {
                     self.diags.push(
                         Diagnostic::error(
                             DiagCode::TypeError,
-                            format!("unknown `order_by` column `.{}` in `dedupe_by`", m.name),
+                            format!("unknown {entry_label} column `.{}` in {ctx_name}", m.name),
                         )
                         .with_span(m.span),
                     );
@@ -5345,7 +5400,7 @@ impl<'a> Checker<'a> {
                     self.diags.push(
                         Diagnostic::error(
                             DiagCode::TypeError,
-                            format!("`{fname}(.col)` in `dedupe_by(order_by: ...)` expects 1 `.column` argument"),
+                            format!("`{fname}(.col)` in {ctx_name} expects 1 `.column` argument"),
                         )
                         .with_span(expr.span),
                     );
@@ -5359,7 +5414,7 @@ impl<'a> Checker<'a> {
                     self.diags.push(
                         Diagnostic::error(
                             DiagCode::TypeError,
-                            format!("`{fname}(.col)` in `dedupe_by(order_by: ...)` expects a `.column` argument"),
+                            format!("`{fname}(.col)` in {ctx_name} expects a `.column` argument"),
                         )
                         .with_span(expr.span),
                     );
@@ -5371,7 +5426,7 @@ impl<'a> Checker<'a> {
                     self.diags.push(
                         Diagnostic::error(
                             DiagCode::TypeError,
-                            format!("unknown `order_by` column `.{}` in `dedupe_by`", m.name),
+                            format!("unknown {entry_label} column `.{}` in {ctx_name}", m.name),
                         )
                         .with_span(m.span),
                     );
@@ -5382,13 +5437,27 @@ impl<'a> Checker<'a> {
                 self.diags.push(
                     Diagnostic::error(
                         DiagCode::TypeError,
-                        "`dedupe_by` `order_by:` entries must be `.col`, `asc(.col)`, or `desc(.col)`",
+                        format!("{ctx_name} entries must be `.col`, `asc(.col)`, or `desc(.col)`"),
                     )
                     .with_span(expr.span),
                 );
                 None
             }
         }
+    }
+
+    fn parse_dedupe_order_spec(
+        &mut self,
+        expr: &Expr,
+        in_tt: &TableTy,
+    ) -> Option<(Ident, SortDir)> {
+        self.check_sort_key_expr(
+            expr,
+            in_tt,
+            SortDir::Asc,
+            "`dedupe_by(order_by: ...)`",
+            "`order_by`",
+        )
     }
 
     fn check_dedupe_by_verb(
@@ -5673,6 +5742,7 @@ impl<'a> Checker<'a> {
                 name: name.name.clone(),
                 expr: Box::new(re),
                 agg_kind: final_agg_kind,
+                spec: final_spec.clone(),
             });
             upsert_col(&mut out_cols, final_spec);
         }
@@ -6582,24 +6652,23 @@ impl<'a> Checker<'a> {
                         ScalarTy::Option(Box::new(ScalarTy::Float)),
                     ),
                 };
+                let spec = ColSpec {
+                    name: name.name.clone(),
+                    ty: res_ty,
+                    tags: ltags.union(&wtags),
+                    bucketed: false,
+                    agg_kind: AggKind::Raw,
+                };
                 post_derives.push(ExecDeriveItem::ColExpr {
                     name: name.name.clone(),
                     expr: Box::new(ExecRowExpr::Prim {
                         op: opt_op,
                         args: vec![lre, ExecRowExpr::Col(tmp.clone())],
                     }),
+                    spec: spec.clone(),
                 });
                 post_drops.push(tmp);
-                upsert_col(
-                    &mut out_tt.cols,
-                    ColSpec {
-                        name: name.name.clone(),
-                        ty: res_ty,
-                        tags: ltags.union(&wtags),
-                        bucketed: false,
-                        agg_kind: AggKind::Raw,
-                    },
-                );
+                upsert_col(&mut out_tt.cols, spec);
                 continue;
             }
 
@@ -7771,6 +7840,26 @@ impl<'a> Checker<'a> {
                     LTy::public(Ty::List(Box::new(LTy::public(Ty::Table(
                         TableTy::default(),
                     ))))),
+                );
+            }
+            (Ty::HttpsAllow { .. }, "requests") => {
+                self.require_spec_scope(scope, span, "`https.requests`");
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::FakeHttpsRequests,
+                        args: vec![rex],
+                    },
+                    LTy::public(Ty::List(Box::new(LTy::public(Ty::Text)))),
+                );
+            }
+            (Ty::HttpsAllow { .. }, "request_bodies") => {
+                self.require_spec_scope(scope, span, "`https.request_bodies`");
+                return (
+                    ExecExpr::Host {
+                        op: ExecHostOp::FakeHttpsBodies,
+                        args: vec![rex],
+                    },
+                    LTy::public(Ty::List(Box::new(LTy::public(Ty::Text)))),
                 );
             }
             (Ty::LinearModel, "slope" | "intercept" | "r_squared") => {
@@ -9994,8 +10083,15 @@ impl<'a> Checker<'a> {
                     LTy::new(res_ty, taint),
                 );
             }
-            (Ty::HttpsAllow { host, allows }, "get_json") => {
+            (Ty::HttpsAllow { host, allows }, method @ ("get_json" | "post_json" | "put_json")) => {
                 let Some(CallArg::Positional(url_e)) = args.first() else {
+                    self.diags.push(
+                        Diagnostic::error(
+                            DiagCode::TypeError,
+                            format!("`HttpsAllow.{method}` requires a URL argument"),
+                        )
+                        .with_span(span),
+                    );
                     return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
                 };
                 let (uex, ulty) = self.check_expr(url_e, env, Some(&Ty::Text), pc, scope, ret_ctx);
@@ -10013,6 +10109,75 @@ impl<'a> Checker<'a> {
                         .with_span(url_e.span),
                     );
                 }
+
+                let body_ex = if method == "get_json" {
+                    None
+                } else {
+                    let body_e = match (args.get(1), named_expr_arg(args, "body")) {
+                        (Some(CallArg::Positional(e)), None) => Some(e),
+                        (None | Some(CallArg::Named { .. }), Some(e)) => Some(e),
+                        (Some(CallArg::Positional(_)), Some(ne)) => {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!("duplicate `body:` argument in `HttpsAllow.{method}`"),
+                                )
+                                .with_span(ne.span),
+                            );
+                            None
+                        }
+                        _ => None,
+                    };
+                    let Some(be) = body_e else {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                format!("`HttpsAllow.{method}` requires a `body` (`Text` or `Table`) argument"),
+                            )
+                            .with_span(span),
+                        );
+                        return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
+                    };
+                    let (bex, blty) = self.check_expr(be, env, None, pc, scope, ret_ctx);
+                    let body_tags = match &blty.ty {
+                        Ty::Text => blty.effective_tags().union(pc),
+                        Ty::Table(tt) => {
+                            let mut combined = blty.effective_tags().union(pc);
+                            combined = combined.union(&tt.row_tags).union(&tt.order_tags);
+                            for c in &tt.cols {
+                                combined = combined.union(&c.tags);
+                            }
+                            combined
+                        }
+                        other => {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    DiagCode::TypeError,
+                                    format!(
+                                        "`HttpsAllow.{method}` body must be `Text` or `Table(...)`, found `{other:?}`"
+                                    ),
+                                )
+                                .with_span(be.span),
+                            );
+                            TagSet::empty()
+                        }
+                    };
+                    if !body_tags.is_subset(allows) {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::PrivacyError,
+                                format!(
+                                    "cannot send body tagged {:?} via `{method}` to `HttpsAllow(\"{host}\", allows: {:?})`",
+                                    body_tags.elems(),
+                                    allows.elems()
+                                ),
+                            )
+                            .with_span(be.span),
+                        );
+                    }
+                    Some(bex)
+                };
+
                 let hdr_ex = if let Some(he) = named_expr_arg(args, "headers") {
                     let (hex, hlty) = self.check_expr(he, env, None, pc, scope, ret_ctx);
                     // Secrets are permitted in Authorization headers for authenticated HTTPS calls.
@@ -10038,13 +10203,20 @@ impl<'a> Checker<'a> {
                     ok_ty: Box::new(Ty::Data(TY_JSON_RESPONSE.to_string())),
                     err_ty: Box::new(Ty::Text),
                 };
-                return (
-                    ExecExpr::Host {
-                        op: ExecHostOp::Core(HostOp::HttpsGetJson),
-                        args: vec![rex, uex, hdr_ex],
-                    },
-                    LTy::public(res_ty),
-                );
+                let (op, op_args) = match (method, body_ex) {
+                    ("get_json", _) => (
+                        ExecHostOp::Core(HostOp::HttpsGetJson),
+                        vec![rex, uex, hdr_ex],
+                    ),
+                    ("post_json", Some(bex)) => {
+                        (ExecHostOp::HttpsPostJson, vec![rex, uex, bex, hdr_ex])
+                    }
+                    ("put_json", Some(bex)) => {
+                        (ExecHostOp::HttpsPutJson, vec![rex, uex, bex, hdr_ex])
+                    }
+                    _ => return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit)),
+                };
+                return (ExecExpr::Host { op, args: op_args }, LTy::public(res_ty));
             }
             (Ty::Data(dname), "parse_table") if dname == TY_JSON_RESPONSE => {
                 let (fex, _) = match args.first() {
@@ -10069,6 +10241,50 @@ impl<'a> Checker<'a> {
                 let Some(cs) = self.schemas.get(&sname).cloned() else {
                     return (ExecExpr::Lit(Literal::Unit), LTy::public(Ty::Unit));
                 };
+                let fields_ex = if let Some(fe) = named_expr_arg(args, "fields") {
+                    let (fex_map, flty) = self.check_expr(fe, env, None, pc, scope, ret_ctx);
+                    let valid_map = matches!(
+                        &flty.ty,
+                        Ty::Map { key, val }
+                            if key.ty == Ty::Text
+                                && (val.ty == Ty::Text
+                                    || matches!(&fe.kind, ExprKind::Map(es) if es.is_empty()))
+                    );
+                    if !valid_map {
+                        self.diags.push(
+                            Diagnostic::error(
+                                DiagCode::TypeError,
+                                "`parse_table` `fields:` must be `Map(Text, Text)` mapping column names to JSON paths",
+                            )
+                            .with_span(fe.span),
+                        );
+                    }
+                    if let ExprKind::Map(entries) = &fe.kind {
+                        for (k, _) in entries {
+                            let col_name = match &k.kind {
+                                ExprKind::Text { value, .. } => Some(value.as_str()),
+                                ExprKind::Ident(s) | ExprKind::CapName(s) => Some(s.as_str()),
+                                _ => None,
+                            };
+                            if let Some(cname) = col_name
+                                && cs.decl.schema.find_col(cname).is_none()
+                            {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        DiagCode::SchemaError,
+                                        format!(
+                                            "`parse_table` `fields:` references unknown column `{cname}` on schema `{sname}`"
+                                        ),
+                                    )
+                                    .with_span(k.span),
+                                );
+                            }
+                        }
+                    }
+                    fex_map
+                } else {
+                    ExecExpr::Lit(Literal::Unit)
+                };
                 let bad_tt = quarantine_bad_row_table_ty(&cs.decl.schema);
                 let out_ty = Ty::Tuple(vec![
                     LTy::public(Ty::Table(cs.decl.schema)),
@@ -10077,7 +10293,7 @@ impl<'a> Checker<'a> {
                 return (
                     ExecExpr::Host {
                         op: ExecHostOp::JsonParseTable(sname),
-                        args: vec![rex, fex],
+                        args: vec![rex, fex, fields_ex],
                     },
                     LTy::public(out_ty),
                 );
@@ -15010,6 +15226,7 @@ fn date_prop_op(prop: &str) -> Option<(ExecPrimOp, Ty)> {
 fn text_prop_op(prop: &str) -> Option<(ExecPrimOp, Ty)> {
     match prop {
         "empty?" => Some((ExecPrimOp::Core(PrimOp::EmptyText), Ty::Bool)),
+        "len" => Some((ExecPrimOp::TextLen, Ty::Int)),
         "trim" => Some((ExecPrimOp::Core(PrimOp::TrimText), Ty::Text)),
         "ascii_lowercase" => Some((ExecPrimOp::Core(PrimOp::LowerAsciiText), Ty::Text)),
         "lower" => Some((ExecPrimOp::LowerText, Ty::Text)),

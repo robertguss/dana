@@ -51,6 +51,7 @@ make fuzz-soak             # run extended differential soak & 47-probe adversari
 make soak                  # run 10,000-case extended differential soak (DANA_SOAK_CASES=10000)
 make learnability          # run Phase 5C deterministic AI learnability grading harness
 make bench                 # build release binary and run Dana vs. Python/Pandas/Polars benchmarks
+make keel-qa               # run black-box keel-stack QA suite (requires keel-stack CLIs on PATH)
 make check-all             # run grammar, formal, and oracle checks end-to-end
 make check-v04             # run full v0.4 verification (grammar, formal, oracle, fuzz-parsers, fuzz-soak, learnability)
 make check-v05             # run full v0.5 verification (grammar, formal, oracle, fuzz-parsers, fuzz-soak, learnability)

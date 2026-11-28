@@ -63,6 +63,7 @@ pub enum ExecPrimOp {
     // Text transforms & predicates (v0.5)
     LowerText,
     UpperText,
+    TextLen,
     SliceText,
     StartsWithText,
     EndsWithText,
@@ -226,7 +227,13 @@ pub enum ExecHostOp {
     FakeHttps {
         host: String,
     },
-    /// `response.parse_table(field, as: S)` / `bool_at` / `text_at` / `int_at` (Phase 4 HTTPS JSON).
+    /// `fake_https.requests` / `fake_https.request_bodies` (spec-only offline HTTPS inspection).
+    FakeHttpsRequests,
+    FakeHttpsBodies,
+    /// `https.post_json(url, body, headers:)` / `https.put_json(...)` (Phase 4 HTTPS writes).
+    HttpsPostJson,
+    HttpsPutJson,
+    /// `response.parse_table(field, as: S[, fields: {...}])` / `bool_at` / `text_at` / `int_at`.
     JsonParseTable(Ident),
     JsonBoolAt,
     JsonTextAt,
@@ -305,11 +312,13 @@ pub enum ExecDeriveItem {
     ColExpr {
         name: Ident,
         expr: Box<ExecRowExpr>,
+        spec: ColSpec,
     },
     SummaryCol {
         name: Ident,
         expr: Box<ExecRowExpr>,
         agg_kind: AggKind,
+        spec: ColSpec,
     },
     BucketCol {
         name: Ident,
@@ -1028,20 +1037,27 @@ fn run_exec_clone(initial: ExecCloneTask<'_>) -> (Vec<ExecExpr>, Vec<ExecPlan>, 
                         let mut citems = Vec::with_capacity(items.len());
                         for item in items {
                             match item {
-                                ExecDeriveItem::ColExpr { name, .. } => {
+                                ExecDeriveItem::ColExpr { name, spec, .. } => {
                                     if let Some(re) = row_vals.next() {
                                         citems.push(ExecDeriveItem::ColExpr {
                                             name: name.clone(),
                                             expr: Box::new(re),
+                                            spec: spec.clone(),
                                         });
                                     }
                                 }
-                                ExecDeriveItem::SummaryCol { name, agg_kind, .. } => {
+                                ExecDeriveItem::SummaryCol {
+                                    name,
+                                    agg_kind,
+                                    spec,
+                                    ..
+                                } => {
                                     if let Some(re) = row_vals.next() {
                                         citems.push(ExecDeriveItem::SummaryCol {
                                             name: name.clone(),
                                             expr: Box::new(re),
                                             agg_kind: *agg_kind,
+                                            spec: spec.clone(),
                                         });
                                     }
                                 }

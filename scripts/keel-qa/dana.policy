@@ -1,0 +1,5 @@
+version 1
+min_group_size 5
+forbid repl_show_sensitive
+allow export "qa-out/" tags []
+allow write QaDb.qa_metrics tags []

@@ -1,0 +1,69 @@
+apiVersion: v3.2.0
+kind: DataContract
+id: urn:datakeel:qa_metrics
+name: qa_metrics
+version: 1.0.0
+status: active
+description:
+  purpose: ODCS v3.2.0 contract verified across Parquet and JSONL outputs by Dana black-box QA.
+schema:
+- name: qa_metrics
+  physicalName: qa_metrics
+  properties:
+  - name: id
+    logicalType: integer
+    physicalType: bigint
+    required: true
+    unique: true
+    primaryKey: true
+    logicalTypeOptions:
+      minimum: 1.0
+      maximum: 30.0
+  - name: record_code
+    logicalType: string
+    physicalType: text
+    required: true
+    unique: true
+  - name: contact_hash
+    logicalType: string
+    physicalType: text
+    required: true
+    unique: true
+  - name: region
+    logicalType: string
+    physicalType: text
+    required: true
+  - name: region_bucket
+    logicalType: string
+    physicalType: text
+    required: true
+  - name: score_f
+    logicalType: number
+    physicalType: double precision
+    required: true
+    logicalTypeOptions:
+      minimum: 60.0
+      maximum: 88.0
+  - name: elevation_m
+    logicalType: number
+    physicalType: double precision
+    required: true
+    logicalTypeOptions:
+      minimum: 0.0
+      maximum: 2400.0
+  - name: note_len
+    logicalType: integer
+    physicalType: bigint
+    required: true
+    logicalTypeOptions:
+      minimum: 0.0
+      maximum: 6.0
+  - name: reading_date
+    logicalType: date
+    physicalType: date
+    required: true
+  quality:
+  - type: library
+    metric: rowCount
+    description: Row count bounds check
+    mustBeGreaterThanOrEqualTo: 30.0

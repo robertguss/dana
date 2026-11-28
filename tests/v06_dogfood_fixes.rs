@@ -19,10 +19,14 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dana::base::{DiagCode, Severity, SourceMap};
-use dana::check::check_module;
-use dana::core::syntax::{BugKind, TagSet};
-use dana::db::{SqlDialect, SqlParam, open_connection};
+use dana::check::{check_module, expected_vendor_module_rel_path};
+use dana::core::syntax::{BugKind, ColSpec, ScalarTy, TagSet};
+use dana::db::{
+    CellChange, RowDiff, RowDiffKind, SqlDialect, SqlParam, UpsertDiff, open_connection,
+};
+use dana::oracle::value::Val;
 use dana::plan::{SplitPlan, split_exec_plan_pushdown};
+use dana::repl::{ReplConfig, ReplOutput, ReplSession};
 use dana::runtime::{RunConfig, RunResult, run_exec_program};
 use dana::syntax::parse_module;
 use dana::vm::{VmConfig, run_exec_program_vm};
@@ -1469,7 +1473,7 @@ fn check_src_with_lock(
 
 #[test]
 fn v06_sqlite_attach_and_unattached_schema_table_fallback() -> TestResult {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.8");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.9");
     let tmp = TempDir::new("sqlite_attach")?;
     let main_db = tmp.path().join("main.db");
     let populi_db = tmp.path().join("populi.db");
@@ -2777,12 +2781,12 @@ end
     let db_out = assert_oracle_vm_parity(db_src, Some(("DB", &uri)))?;
     assert_eq!(db_out, vec!["2"]);
 
-    // 5. CLI --version prints `dana v0.6.8`
+    // 5. CLI --version prints `dana v0.6.9`
     let ver = Command::new(env!("CARGO_BIN_EXE_dana"))
         .arg("--version")
         .output()?;
     assert_eq!(ver.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.8");
+    assert_eq!(String::from_utf8_lossy(&ver.stdout).trim(), "dana v0.6.9");
 
     Ok(())
 }
@@ -5839,4 +5843,749 @@ end
     });
 
     test_res
+}
+
+#[test]
+fn v06_derive_col_spec_propagation_profile_and_sqlite_upsert_idempotency() -> TestResult {
+    let tmp = TempDir::new("derive_spec_sqlite")?;
+    let db_path = tmp.path().join("derive_idem.db");
+    let uri = sqlite_uri(&db_path);
+    let mut conn = open_connection(&uri)?;
+    conn.execute(
+        r#"CREATE TABLE "repos" (
+            "id" INTEGER PRIMARY KEY NOT NULL,
+            "name" TEXT NOT NULL,
+            "language" TEXT NOT NULL,
+            "is_popular" INTEGER NOT NULL,
+            "name_len" INTEGER NOT NULL,
+            "updated_at" TEXT NOT NULL
+        )"#,
+        &[],
+    )?;
+    drop(conn);
+
+    let src = r#"
+module DeriveSpecAndUpsert
+
+fn measure_name(s: Text) : Int
+  s.len
+end
+
+fn main(db: WriteTable(Lake, "repos"), console: Console) : Int
+  raw = table
+    | id | name     | opt_lang | stars | updated_at           |
+    | 1  | "dana"   | "Rust"   | 250   | 2026-11-27T12:00:00Z |
+    | 2  | "modb"   | none     | 15    | 2026-11-27T12:30:00Z |
+  end
+  enriched = raw
+    |> derive(
+      language: .opt_lang ?? "Unknown",
+      is_popular: .stars >= 100,
+      name_len: measure_name(.name)
+    )
+    |> select(.id, .name, .language, .is_popular, .name_len, .updated_at)
+
+  console.print_profile(enriched.profile())
+  stats = try db.upsert(enriched, key: .id)
+  console.print("ins=#{stats.inserted} upd=#{stats.updated} unch=#{stats.unchanged}")
+  0
+end
+"#;
+    let checked = check_src(src)?;
+    let mut db_bindings = HashMap::new();
+    db_bindings.insert("Lake".to_string(), uri.clone());
+
+    // 1. Dry-run BEFORE Pass 1 shows ISO-8601 timestamps and leaves DB empty
+    let dry_cfg = RunConfig {
+        live_io: true,
+        dry_run: true,
+        db_bindings: db_bindings.clone(),
+        ..RunConfig::default()
+    };
+    let RunResult::Ok {
+        stdout: dry_out, ..
+    } = run_exec_program_vm(&checked.exec, &dry_cfg, &VmConfig::default())
+    else {
+        return Err("dry-run failed".into());
+    };
+    let dry_joined = dry_out.join("\n");
+    assert!(
+        dry_joined.contains("2026-11-27T12:00:00"),
+        "expected ISO-8601 timestamp in dry-run diff:\n{dry_joined}"
+    );
+    assert!(
+        !dry_joined.contains("timestamp("),
+        "unexpected raw timestamp(...) in dry-run diff:\n{dry_joined}"
+    );
+
+    // 2. Live Pass 1 (inserts 2) -> `.profile()` must report exact derived types (`Text`, `Bool`, `Int`)!
+    let live_cfg = RunConfig {
+        live_io: true,
+        db_bindings,
+        ..RunConfig::default()
+    };
+    let RunResult::Ok { stdout: p1_out, .. } =
+        run_exec_program_vm(&checked.exec, &live_cfg, &VmConfig::default())
+    else {
+        return Err("pass 1 failed".into());
+    };
+    let p1_joined = p1_out.join("\n");
+    assert!(
+        p1_joined.contains("language") && p1_joined.contains("| Text"),
+        "expected narrowed language: Text in profile:\n{p1_joined}"
+    );
+    assert!(
+        !p1_joined.contains("Option(Text)") && !p1_joined.contains("| Unit"),
+        "unexpected stale Option or Unit type in profile:\n{p1_joined}"
+    );
+    assert!(
+        p1_joined.contains("is_popular") && p1_joined.contains("| Bool"),
+        "expected derived is_popular: Bool in profile:\n{p1_joined}"
+    );
+    assert!(
+        p1_joined.contains("name_len") && p1_joined.contains("| Int"),
+        "expected derived name_len: Int in profile:\n{p1_joined}"
+    );
+    assert_eq!(
+        p1_out.last().map(String::as_str),
+        Some("ins=2 upd=0 unch=0")
+    );
+
+    // 3. Live Pass 2 in BOTH VM & Oracle against the populated SQLite DB -> 0 updated, 2 unchanged!
+    for (engine, res) in [
+        (
+            "vm",
+            run_exec_program_vm(&checked.exec, &live_cfg, &VmConfig::default()),
+        ),
+        ("oracle", run_exec_program(&checked.exec, &live_cfg)),
+    ] {
+        match res {
+            RunResult::Ok {
+                exit_code: 0,
+                stdout,
+                ..
+            } => {
+                assert_eq!(
+                    stdout.last().map(String::as_str),
+                    Some("ins=0 upd=0 unch=2"),
+                    "{engine} pass 2 was not idempotent:\n{stdout:?}"
+                );
+            }
+            other => return Err(format!("{engine} pass 2 failed: {other:?}").into()),
+        }
+    }
+
+    // 4. Unit check: `UpsertDiff::render_redacted` renders public timestamps as ISO and redacts PII timestamps
+    let ts_diff = UpsertDiff {
+        table: "events".to_string(),
+        inserted: 1,
+        updated: 0,
+        unchanged: 0,
+        sample_diffs: vec![RowDiff {
+            kind: RowDiffKind::Insert,
+            key_val: Val::Timestamp(dana::core::BigInt::from(1_764_244_800_000_000i64)),
+            key_tags: TagSet::empty(),
+            changes: vec![
+                CellChange {
+                    col: "public_ts".to_string(),
+                    tags: TagSet::empty(),
+                    old_val: None,
+                    new_val: Val::Timestamp(dana::core::BigInt::from(1_764_244_800_000_000i64)),
+                },
+                CellChange {
+                    col: "secret_ts".to_string(),
+                    tags: TagSet::singleton("pii"),
+                    old_val: None,
+                    new_val: Val::Timestamp(dana::core::BigInt::from(1_764_244_800_000_000i64)),
+                },
+            ],
+        }],
+    };
+    let rendered_diff = ts_diff.render_redacted(&TagSet::empty());
+    assert!(
+        rendered_diff.contains("2025-11-27T12:00:00"),
+        "{rendered_diff}"
+    );
+    assert!(rendered_diff.contains("[REDACTED:pii]"), "{rendered_diff}");
+    let _ = ColSpec {
+        name: "k".into(),
+        ty: ScalarTy::Int,
+        tags: TagSet::empty(),
+        bucketed: false,
+        agg_kind: dana::core::syntax::AggKind::Raw,
+    };
+    Ok(())
+}
+
+#[test]
+fn v06_sort_by_asc_desc_modifier_parity_pushdown_repl_and_negatives() -> TestResult {
+    let tmp = TempDir::new("sort_desc_pushdown")?;
+    let db_path = tmp.path().join("sort.db");
+    let uri = sqlite_uri(&db_path);
+    let mut conn = open_connection(&uri)?;
+    conn.execute(
+        r#"CREATE TABLE "scores" ("grp" TEXT NOT NULL, "n" INTEGER NOT NULL)"#,
+        &[],
+    )?;
+    conn.execute(
+        r#"INSERT INTO "scores" ("grp", "n") VALUES ('b', 10), ('a', 5), ('a', 20), ('b', 30)"#,
+        &[],
+    )?;
+    drop(conn);
+
+    let src = r#"
+module SortAscDescParity
+
+schema Score
+  grp: Text
+  n: Int
+end
+
+fn main(db: ReadDB(Lake), console: Console) : Int
+  s1 = db.table(Score, from: "scores") |> sort_by(desc(.n))
+  s2 = db.table(Score, from: "scores") |> sort_by(asc(.grp), desc(.n))
+  s3 = db.table(Score, from: "scores") |> sort_by(.n, :desc)
+  console.print_table(s1)
+  console.print("---")
+  console.print_table(s2)
+  console.print("---")
+  console.print_table(s3)
+  0
+end
+"#;
+    let stdout = assert_oracle_vm_parity(src, Some(("Lake", &uri)))?;
+    let joined = stdout.join("\n");
+    // Descending n: 30, 20, 10, 5; grouped asc(grp), desc(n): (a,20), (a,5), (b,30), (b,10)
+    assert!(joined.contains("30"), "{joined}");
+    let sections: Vec<&str> = joined.split("\n---\n").collect();
+    assert_eq!(sections.len(), 3, "{joined}");
+    assert_eq!(
+        sections[0].trim(),
+        sections[2].trim(),
+        "desc(.n) and (.n, :desc) must match"
+    );
+    let pos_a20 = sections[1].find("| a   | 20 |").ok_or("missing a,20")?;
+    let pos_a5 = sections[1].find("| a   | 5  |").ok_or("missing a,5")?;
+    let pos_b30 = sections[1].find("| b   | 30 |").ok_or("missing b,30")?;
+    let pos_b10 = sections[1].find("| b   | 10 |").ok_or("missing b,10")?;
+    assert!(
+        pos_a20 < pos_a5 && pos_a5 < pos_b30 && pos_b30 < pos_b10,
+        "bad order:\n{}",
+        sections[1]
+    );
+
+    // Verify SQLite pushdown actually emits ORDER BY ... DESC cleanly (grouped key suffix guarantees unique order)
+    let push_src = r#"
+module SortPushdownUnique
+schema Score
+  grp: Text
+  n: Int
+end
+fn main(db: ReadDB(Lake), console: Console) : Int
+  s = db.table(Score, from: "scores")
+    |> group_by(.grp)
+    |> summarize(n: count())
+    |> sort_by(desc(.n), asc(.grp))
+  console.print_table(s)
+  0
+end
+"#;
+    let push_checked = check_src(push_src)?;
+    let (opt_prog, _) = dana::plan::optimize_exec_program(&push_checked.exec);
+    let main_fn = opt_prog.find_fun("main").ok_or("missing main")?;
+    let plan = find_first_plan(&main_fn.body).ok_or("missing ExecPlan")?;
+    match split_exec_plan_pushdown(plan, &opt_prog, "Lake", SqlDialect::Sqlite, None) {
+        SplitPlan::FullyPushed(node) => {
+            assert!(
+                node.sql.contains("ORDER BY") && node.sql.contains("DESC"),
+                "expected ORDER BY ... DESC in pushed SQL:\n{}",
+                node.sql
+            );
+        }
+        other => return Err(format!("expected full SQLite pushdown, got {other:?}").into()),
+    }
+
+    // Negative typecheck tests: empty, bad literal, unknown column, duplicate column, stray :desc
+    for bad in [
+        "module M\nfn f()\n  t = table\n    | n |\n    | 1 |\n  end\n  t |> sort_by()\nend\n",
+        "module M\nfn f()\n  t = table\n    | n |\n    | 1 |\n  end\n  t |> sort_by(123)\nend\n",
+        "module M\nfn f()\n  t = table\n    | n |\n    | 1 |\n  end\n  t |> sort_by(desc(.nope))\nend\n",
+        "module M\nfn f()\n  t = table\n    | n |\n    | 1 |\n  end\n  t |> sort_by(.n, desc(.n))\nend\n",
+        "module M\nfn f()\n  t = table\n    | n |\n    | 1 |\n  end\n  t |> sort_by(:desc)\nend\n",
+    ] {
+        let diags = check_src_diags(bad)?;
+        assert!(
+            diags.iter().any(|d| d.code() == DiagCode::TypeError),
+            "expected TypeError for:\n{bad}\ngot {diags:?}"
+        );
+    }
+
+    // Verify REPL `sort_by(desc(.n))` & `:explain` succeed cleanly without `E0301`
+    let mut repl = ReplSession::new(ReplConfig {
+        db_bindings: vec![("Lake".to_string(), uri)],
+        work_dir: tmp.path().to_path_buf(),
+        vm_cfg: VmConfig::default(),
+        ..ReplConfig::default()
+    })
+    .map_err(|d| format!("repl init: {d:?}"))?;
+    let _ = repl.eval_input("schema Score\n  grp: Text\n  n: Int\nend");
+    match repl.eval_input(
+        r#"Lake.table(Score, from: "scores") |> group_by(.grp) |> summarize(tot: sum(.n)) |> sort_by(desc(.tot))"#,
+    ) {
+        ReplOutput::Value { rendered, .. } => {
+            let b_idx = rendered.find("| b").ok_or("missing b row")?;
+            let a_idx = rendered.find("| a").ok_or("missing a row")?;
+            assert!(b_idx < a_idx, "expected b (40) before a (25):\n{rendered}");
+        }
+        other => return Err(format!("expected REPL Value, got {other:?}").into()),
+    }
+    match repl.eval_input(r#":explain Lake.table(Score, from: "scores") |> sort_by(desc(.n))"#) {
+        ReplOutput::Info(text) => assert!(text.contains("DESC") || text.contains("Sort"), "{text}"),
+        other => return Err(format!("expected REPL :explain Info, got {other:?}").into()),
+    }
+    Ok(())
+}
+
+#[test]
+fn v06_p2_dx_text_len_vendor_pin_export_gate_and_subcommand_help() -> TestResult {
+    let tmp = TempDir::new("p2_dx")?;
+    let db_path = tmp.path().join("textlen.db");
+    let uri = sqlite_uri(&db_path);
+    let mut conn = open_connection(&uri)?;
+    conn.execute(r#"CREATE TABLE "words" ("w" TEXT NOT NULL)"#, &[])?;
+    conn.execute(
+        r#"INSERT INTO "words" ("w") VALUES ('dana'), ('café'), ('')"#,
+        &[],
+    )?;
+    drop(conn);
+
+    // 1. `Text.len` parity across VM, Oracle, and SQLite pushdown
+    let len_src = r#"
+module TextLenTest
+schema Word
+  w: Text
+end
+fn main(db: ReadDB(Lake), console: Console) : Int
+  s = "café"
+  console.print("scalar=#{s.len}")
+  t = db.table(Word, from: "words") |> derive(n: .w.len) |> sort_by(.w)
+  console.print_table(t)
+  0
+end
+"#;
+    let len_out = assert_oracle_vm_parity(len_src, Some(("Lake", &uri)))?;
+    let len_joined = len_out.join("\n");
+    assert!(len_joined.contains("scalar=4"), "{len_joined}");
+    assert!(len_joined.contains("café  | 4"), "{len_joined}");
+    assert!(len_joined.contains("dana  | 4"), "{len_joined}");
+    assert!(len_joined.contains("|       | 0"), "{len_joined}");
+
+    // 2. `vendor pin` warns on non-kebab-case module filename mismatch
+    assert_eq!(
+        expected_vendor_module_rel_path("TextNorm"),
+        "text-norm.dana"
+    );
+    assert_eq!(
+        expected_vendor_module_rel_path("Util.TextNorm"),
+        "util/text-norm.dana"
+    );
+    let vendor_dir = tmp.path().join("vendor");
+    fs::create_dir_all(&vendor_dir)?;
+    fs::write(
+        vendor_dir.join("text_norm.dana"),
+        "module TextNorm\nfn id_i(x: Int) : Int\n  x\nend\n",
+    )?;
+    let bin = env!("CARGO_BIN_EXE_dana");
+    let pin_out = Command::new(bin)
+        .args(["vendor", "pin", "--dir"])
+        .arg(&vendor_dir)
+        .output()?;
+    assert_eq!(pin_out.status.code(), Some(0));
+    let pin_err = String::from_utf8(pin_out.stderr)?;
+    assert!(
+        pin_err.contains("warning: vendored module `TextNorm`")
+            && pin_err.contains("text-norm.dana"),
+        "expected kebab-case warning in stderr:\n{pin_err}"
+    );
+
+    // 3. `ExportGateDenied` names missing `--allow-export` tag + sink
+    let gate_src = r#"
+module GateMsg
+fn main(api: HttpsAllow("example.org", allows: [pii])) : Int
+  _ = try api.get_json("https://example.org/data")
+  0
+end
+"#;
+    let checked_gate = check_src(gate_src)?;
+    let RunResult::Stopped { bug, .. } = run_exec_program_vm(
+        &checked_gate.exec,
+        &RunConfig::default(),
+        &VmConfig::default(),
+    ) else {
+        return Err("expected ExportGateDenied".into());
+    };
+    assert_eq!(bug.kind, BugKind::ExportGateDenied);
+    assert!(
+        bug.message.contains("pii") && bug.message.contains("HttpsAllow(\"example.org\")"),
+        "unexpected ExportGateDenied message: {}",
+        bug.message
+    );
+
+    // 4. `dana <subcmd> --help` exits 0 across every subcommand
+    for sub in [
+        "guide",
+        "format",
+        "check",
+        "test",
+        "run",
+        "dry-run",
+        "schema-sync",
+        "explain",
+        "vendor",
+        "repl",
+        "infer-schema",
+        "fake",
+    ] {
+        let out = Command::new(bin).args([sub, "--help"]).output()?;
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`dana {sub} --help` failed: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout_txt = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout_txt.contains("usage: dana"),
+            "`dana {sub} --help` missing usage header: {stdout_txt}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn v069_explain_resolves_local_var_provenance_and_avoids_fn_param_collision() -> TestResult {
+    let src = r#"
+module ExplainLocalScopeProvenance
+use Stats
+
+schema RawUser
+  id: Int
+  email: Text [pii]
+  dept: Text
+end
+
+schema CleanUser
+  id: Int
+  email_tok: Text
+  dept: Text
+end
+
+schema DeptRef
+  dept: Text
+  division: Text
+end
+
+schema PubItem
+  id: Int
+  label: Text
+end
+
+fn clean_users(raw: Table(RawUser), hmac: Secret("k")) : Table(CleanUser)
+  raw
+    |> derive(email_tok: .email)
+    |> pseudonymize(.email_tok, key: hmac)
+    |> select(.id, .email_tok, .dept)
+end
+
+fn clean_public(raw: Table(PubItem)) : Table(PubItem)
+  raw |> where(.id > 0)
+end
+
+fn main(hmac: Secret("k"), console: Console) : Int
+  raw_users = table
+    | id | email         | dept  |
+    | 1  | "a@edu"       | "eng" |
+    | 2  | "b@edu"       | "ops" |
+  end
+  refs = table
+    | dept  | division |
+    | "eng" | "R&D"    |
+    | "ops" | "Core"   |
+  end
+  cleaned = clean_users(raw_users, hmac)
+  clean_refs = refs |> dedupe_by(.dept)
+  enriched = cleaned
+    |> left_join_many_to_one(clean_refs, on: .dept)
+    |> derive(label: .division + ":" + .email_tok)
+    |> select(.id, .email_tok, .label)
+  scored = enriched |> derive(score: .id.to_float)
+  outliers = Stats.outliers(scored, column: .score, method: :iqr) |> where(.outlier?)
+  summary = enriched |> group_by(.label) |> summarize(n: count()) |> sort_by(desc(.n))
+  console.print_table(outliers)
+  console.print_table(summary)
+  0
+end
+"#;
+
+    let checked = check_src(src)?;
+    let report = dana::cli::render_explain_report(
+        &checked.exec,
+        Some(SqlDialect::Sqlite),
+        None,
+        Path::new("explain_scope.dana"),
+    );
+
+    assert!(
+        !report.contains("unresolved table schema"),
+        "expected every plan provenance in explain report to resolve:\n{report}"
+    );
+
+    let (_, after_clean_users) = report
+        .split_once("== fn clean_users ==")
+        .ok_or("missing clean_users section")?;
+    let (clean_users_sec, after_clean_pub) = after_clean_users
+        .split_once("== fn clean_public ==")
+        .ok_or("missing clean_public section")?;
+    let (clean_public_sec, main_sec) = after_clean_pub
+        .split_once("== fn main ==")
+        .ok_or("missing main section")?;
+
+    assert!(
+        clean_users_sec.contains("ENTER SourceVar(raw): tags=[pii]")
+            && clean_users_sec.contains("CLEAR Pseudonymize(email_tok)")
+            && clean_users_sec.contains("OUTPUT: PUBLIC"),
+        "unexpected clean_users provenance:\n{clean_users_sec}"
+    );
+    assert!(
+        clean_public_sec.contains("ENTER SourceVar(raw): tags=[], cols=[]")
+            && clean_public_sec.contains("OUTPUT: PUBLIC"),
+        "unexpected clean_public provenance (param collision with clean_users?):\n{clean_public_sec}"
+    );
+    assert!(
+        main_sec.contains("ENTER SourceVar(cleaned):")
+            && main_sec.contains("ENTER SourceVar(enriched):")
+            && main_sec.contains("OUTPUT: PUBLIC"),
+        "expected resolved local-variable provenance across main plans:\n{main_sec}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn v069_repl_schema_lock_auto_schemas_and_table_string_shorthand() -> TestResult {
+    let tmp = TempDir::new("repl_schema_lock")?;
+    let db_path = tmp.path().join("lake.db");
+    let uri = sqlite_uri(&db_path);
+    {
+        let mut conn = open_connection(&uri)?;
+        conn.execute(
+            r#"CREATE TABLE "gh_repos" ("id" INTEGER PRIMARY KEY NOT NULL, "name" TEXT NOT NULL, "language" TEXT NOT NULL, "stars" INTEGER NOT NULL)"#,
+            &[],
+        )?;
+        conn.execute(
+            r#"INSERT INTO "gh_repos" VALUES (1, 'dana', 'Rust', 250), (2, 'modb', 'Mo', 180), (3, 'keel', 'Rust', 90)"#,
+            &[],
+        )?;
+        conn.execute(
+            r#"CREATE TABLE "students" ("id" INTEGER PRIMARY KEY NOT NULL, "email" TEXT NOT NULL, "gpa" REAL NOT NULL)"#,
+            &[],
+        )?;
+        conn.execute(
+            r#"INSERT INTO "students" VALUES (1, 'alice@example.edu', 3.9)"#,
+            &[],
+        )?;
+    }
+
+    let lock = dana::db::schema_lock::SchemaLockFile {
+        version: dana::db::schema_lock::SCHEMA_LOCK_VERSION,
+        dbs: vec![dana::db::schema_lock::LockedDb {
+            name: "Lake".to_string(),
+            dialect: SqlDialect::Sqlite,
+            tables: vec![
+                dana::db::schema_lock::LockedTable {
+                    name: "gh_repos".to_string(),
+                    cols: vec![
+                        dana::db::schema_lock::LockedCol {
+                            name: "id".to_string(),
+                            ty: ScalarTy::Int,
+                            nullable: false,
+                            pk: true,
+                            tags: TagSet::empty(),
+                        },
+                        dana::db::schema_lock::LockedCol {
+                            name: "name".to_string(),
+                            ty: ScalarTy::Text,
+                            nullable: false,
+                            pk: false,
+                            tags: TagSet::empty(),
+                        },
+                        dana::db::schema_lock::LockedCol {
+                            name: "language".to_string(),
+                            ty: ScalarTy::Text,
+                            nullable: false,
+                            pk: false,
+                            tags: TagSet::empty(),
+                        },
+                        dana::db::schema_lock::LockedCol {
+                            name: "stars".to_string(),
+                            ty: ScalarTy::Int,
+                            nullable: false,
+                            pk: false,
+                            tags: TagSet::empty(),
+                        },
+                    ],
+                },
+                dana::db::schema_lock::LockedTable {
+                    name: "students".to_string(),
+                    cols: vec![
+                        dana::db::schema_lock::LockedCol {
+                            name: "id".to_string(),
+                            ty: ScalarTy::Int,
+                            nullable: false,
+                            pk: true,
+                            tags: TagSet::empty(),
+                        },
+                        dana::db::schema_lock::LockedCol {
+                            name: "email".to_string(),
+                            ty: ScalarTy::Text,
+                            nullable: false,
+                            pk: false,
+                            tags: TagSet::singleton("pii"),
+                        },
+                        dana::db::schema_lock::LockedCol {
+                            name: "gpa".to_string(),
+                            ty: ScalarTy::Float,
+                            nullable: false,
+                            pk: false,
+                            tags: TagSet::singleton("ferpa"),
+                        },
+                    ],
+                },
+            ],
+        }],
+    };
+
+    let mut session = ReplSession::new(ReplConfig {
+        db_bindings: vec![("Lake".to_string(), uri.clone())],
+        schema_lock: Some(lock.clone()),
+        work_dir: tmp.path().to_path_buf(),
+        vm_cfg: VmConfig::default(),
+        ..ReplConfig::default()
+    })
+    .map_err(|d| format!("repl init: {d:?}"))?;
+
+    // 1. `:vars` lists auto-bound schema.lock tables
+    match session.eval_input(":vars") {
+        ReplOutput::Info(vars_out) => {
+            assert!(
+                vars_out.contains("Lake.table(\"gh_repos\")  [schema GhRepos]")
+                    && vars_out.contains("Lake.table(\"students\")  [schema Students]"),
+                "unexpected :vars output:\n{vars_out}"
+            );
+        }
+        other => return Err(format!("expected :vars Info, got {other:?}").into()),
+    }
+
+    // 2. String-shorthand `Lake.table("gh_repos")` works with full pipeline + desc sort
+    match session.eval_input(
+        r#"Lake.table("gh_repos") |> group_by(.language) |> summarize(n: count()) |> sort_by(desc(.n))"#,
+    ) {
+        ReplOutput::Value { rendered, .. } => {
+            let rust_idx = rendered.find("| Rust").ok_or("missing Rust row")?;
+            let mo_idx = rendered.find("| Mo").ok_or("missing Mo row")?;
+            assert!(rust_idx < mo_idx && rendered.contains("| 2"), "{rendered}");
+        }
+        other => return Err(format!("expected string shorthand Value, got {other:?}").into()),
+    }
+
+    // 3. Auto-bound schema `Lake.table(GhRepos)` works without writing `schema ... end`
+    match session.eval_input("Lake.table(GhRepos) |> where(.stars > 200)") {
+        ReplOutput::Value { rendered, .. } => {
+            assert!(
+                rendered.contains("dana") && !rendered.contains("keel"),
+                "{rendered}"
+            );
+        }
+        other => return Err(format!("expected GhRepos Value, got {other:?}").into()),
+    }
+
+    // 4. `:explain` works with `Lake.table("gh_repos")` and pushes SQL down
+    match session.eval_input(r#":explain Lake.table("gh_repos") |> where(.stars > 10)"#) {
+        ReplOutput::Info(text) => {
+            assert!(
+                text.contains("[SQL PUSHDOWN -> sqlite]") && text.contains("OUTPUT: PUBLIC"),
+                "{text}"
+            );
+        }
+        other => return Err(format!("expected :explain Info, got {other:?}").into()),
+    }
+
+    // 5. Persistent binding using string shorthand works across subsequent turns
+    match session.eval_input(r#"r = Lake.table("gh_repos")"#) {
+        ReplOutput::Value { .. } => {}
+        other => return Err(format!("expected persistent binding Value, got {other:?}").into()),
+    }
+    match session.eval_input("r.count()") {
+        ReplOutput::Value { rendered, .. } => assert_eq!(rendered.trim(), "3"),
+        other => return Err(format!("expected r.count() == 3, got {other:?}").into()),
+    }
+
+    // 6. Sensitive columns locked in `schema.lock` MUST stay redacted in REPL
+    match session.eval_input(r#"Lake.table("students")"#) {
+        ReplOutput::Value { rendered, .. } => {
+            assert!(
+                !rendered.contains("alice@example.edu")
+                    && rendered.contains("[REDACTED:pii]")
+                    && rendered.contains("[REDACTED:ferpa]"),
+                "expected automatic PII/FERPA redaction:\n{rendered}"
+            );
+        }
+        other => return Err(format!("expected redacted students table, got {other:?}").into()),
+    }
+
+    // 7. Policy `forbid repl_show_sensitive` still blocks `--show-sensitive`
+    let pol_err = ReplSession::new(ReplConfig {
+        policy: Some(dana::core::syntax::Policy {
+            forbid_repl_sensitive: true,
+            ..dana::core::syntax::Policy::default()
+        }),
+        db_bindings: vec![("Lake".to_string(), uri)],
+        schema_lock: Some(lock),
+        allowed_show_tags: TagSet::singleton("pii"),
+        work_dir: tmp.path().to_path_buf(),
+        vm_cfg: VmConfig::default(),
+        ..ReplConfig::default()
+    })
+    .err()
+    .ok_or("expected forbid repl_show_sensitive error")?;
+    assert_eq!(pol_err.code(), DiagCode::PrivacyError);
+
+    // 8. User-defined `schema GhRepos` overrides the auto-generated schema cleanly
+    match session.eval_input("schema GhRepos\n  id: Int\n  name: Text\nend") {
+        ReplOutput::Info(_) => {}
+        other => return Err(format!("expected schema override Info, got {other:?}").into()),
+    }
+    match session.eval_input("Lake.table(GhRepos)") {
+        ReplOutput::Value { rendered, .. } => {
+            assert!(
+                rendered.contains("(3 rows, 2 cols)"),
+                "expected overridden 2-col GhRepos:\n{rendered}"
+            );
+        }
+        other => return Err(format!("expected overridden GhRepos Value, got {other:?}").into()),
+    }
+
+    // 9. Unknown table returns clear error listing available locked tables
+    match session.eval_input(r#"Lake.table("nonexistent")"#) {
+        ReplOutput::Error(msg) => {
+            assert!(
+                msg.contains("available:") && msg.contains("gh_repos"),
+                "{msg}"
+            );
+        }
+        other => return Err(format!("expected unknown table error, got {other:?}").into()),
+    }
+
+    Ok(())
 }

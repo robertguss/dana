@@ -656,47 +656,20 @@ fn eval_exec_plan_to_table(
                 let mut t = cur;
                 for item in items {
                     match item {
-                        ExecDeriveItem::ColExpr { name, expr } => {
+                        ExecDeriveItem::ColExpr { expr, spec, .. } => {
                             let rp = compile_exec_row_expr(expr, prog);
-                            let spec = t
-                                .cols
-                                .iter()
-                                .find(|c| c.name == *name)
-                                .cloned()
-                                .unwrap_or_else(|| ColSpec {
-                                    name: name.clone(),
-                                    ty: ScalarTy::Unit,
-                                    tags: TagSet::empty(),
-                                    bucketed: false,
-                                    agg_kind: AggKind::Raw,
-                                });
-                            t = op_derive_col_expr(t, spec, &rp, row_host, cfg)?;
+                            t = op_derive_col_expr(t, spec.clone(), &rp, row_host, cfg)?;
                         }
                         ExecDeriveItem::SummaryCol {
-                            name,
                             expr,
                             agg_kind,
+                            spec,
+                            ..
                         } => {
                             let rp = compile_exec_row_expr(expr, prog);
-                            let spec = t
-                                .cols
-                                .iter()
-                                .find(|c| c.name == *name)
-                                .cloned()
-                                .map_or_else(
-                                    || ColSpec {
-                                        name: name.clone(),
-                                        ty: ScalarTy::Unit,
-                                        tags: TagSet::empty(),
-                                        bucketed: false,
-                                        agg_kind: *agg_kind,
-                                    },
-                                    |mut existing| {
-                                        existing.agg_kind = *agg_kind;
-                                        existing
-                                    },
-                                );
-                            t = op_derive_col_expr(t, spec, &rp, row_host, cfg)?;
+                            let mut target_spec = spec.clone();
+                            target_spec.agg_kind = *agg_kind;
+                            t = op_derive_col_expr(t, target_spec, &rp, row_host, cfg)?;
                         }
                         ExecDeriveItem::BucketCol {
                             name,

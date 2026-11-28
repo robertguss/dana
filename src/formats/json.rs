@@ -6,7 +6,7 @@ use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 
 use crate::core::bigint::BigInt;
 use crate::core::check::quarantine_bad_row_table_ty;
-use crate::core::syntax::{Float64, ScalarTy, TableTy};
+use crate::core::syntax::{ColSpec, Float64, ScalarTy, TableTy};
 use crate::formats::crypto::to_hex_lower;
 use crate::formats::time::{
     format_iso_date, format_iso_timestamp, parse_decimal_bigint_strict, parse_iso_date,
@@ -901,7 +901,12 @@ pub fn push_dana_val_as_json(out: &mut String, v: &Val) {
         Val::Float(f) => {
             let fv = f.to_f64();
             if fv.is_finite() {
-                let _ = write!(out, "{fv}");
+                let norm = if fv == 0.0 { 0.0 } else { fv };
+                let start = out.len();
+                let _ = write!(out, "{norm}");
+                if !out[start..].contains(['.', 'e', 'E']) {
+                    out.push_str(".0");
+                }
             } else {
                 out.push_str("null");
             }
@@ -992,6 +997,57 @@ pub fn write_jsonl_vm_table<W: Write>(
         }
     }
     Ok(())
+}
+
+fn push_json_row_object(out: &mut String, cols: &[ColSpec], mut cell_at: impl FnMut(usize) -> Val) {
+    out.push('{');
+    for (ci, col) in cols.iter().enumerate() {
+        if ci > 0 {
+            out.push(',');
+        }
+        push_json_string(out, &col.name);
+        out.push(':');
+        let cell = cell_at(ci);
+        push_dana_val_as_json(out, &cell);
+    }
+    out.push('}');
+}
+
+/// Format a [`TableVal`] as a single RFC 8259 JSON array of row objects (`[{...}, ...]`).
+#[must_use]
+pub fn format_json_array_table(tv: &TableVal) -> String {
+    let mut out = String::from("[");
+    for (ri, row) in tv.rows.iter().enumerate() {
+        if ri > 0 {
+            out.push(',');
+        }
+        push_json_row_object(&mut out, &tv.cols, |ci| row.cells[ci].clone());
+    }
+    out.push(']');
+    out
+}
+
+/// Format a columnar [`crate::vm::ops::VmTable`] directly as an RFC 8259 JSON array (`[{...}, ...]`).
+#[must_use]
+pub fn format_json_array_vm_table(vm: &crate::vm::ops::VmTable) -> String {
+    let mut out = String::from("[");
+    let mut first = true;
+    for batch in &vm.batches {
+        if batch.is_empty() {
+            continue;
+        }
+        let active = batch.active_indices();
+        for &r_u16 in &active {
+            let r = usize::from(r_u16);
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            push_json_row_object(&mut out, &vm.cols, |ci| batch.cols[ci].get_val(r));
+        }
+    }
+    out.push(']');
+    out
 }
 
 /// Format a columnar [`crate::vm::ops::VmTable`] directly as JSONL text.

@@ -19,8 +19,10 @@ pub mod opt;
 pub mod pushdown;
 
 pub use explain::{
-    explain_core_plan_with_pushdown, explain_exec_plan, explain_exec_plan_with_pushdown,
-    explain_exec_sensitivity_provenance, explain_plan, explain_sensitivity_provenance,
+    bind_lty_in_scope, explain_core_plan_with_pushdown, explain_exec_plan,
+    explain_exec_plan_with_pushdown, explain_exec_plan_with_pushdown_scoped,
+    explain_exec_sensitivity_provenance, explain_exec_sensitivity_provenance_scoped, explain_plan,
+    explain_sensitivity_provenance,
 };
 pub use opt::{
     OptStats, optimize_exec_plan, optimize_exec_program, optimize_plan, optimize_program,

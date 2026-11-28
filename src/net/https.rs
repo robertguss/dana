@@ -9,6 +9,7 @@
 //! - Always enables peer certificate + hostname/IP verification (`verify_peer: true, verify_hostname: true`).
 //! - Enforces strict response header and body byte caps (32 MiB default), including after gzip decompression.
 
+use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::TcpStream;
@@ -224,21 +225,25 @@ pub struct HttpsResponse {
     pub body: Vec<u8>,
 }
 
-/// Perform a capability-gated HTTP/1.1 `GET` over verified TLS (`verify_peer: true`,
-/// `verify_hostname: true`), strictly enforcing `allowed_host`, rejecting redirects & non-2xx
-/// status codes, supporting chunked transfer-encoding and transparent gzip decompression.
+/// Perform a capability-gated HTTP/1.1 request (`GET`, `POST`, `PUT`, etc.) over verified TLS
+/// (`verify_peer: true`, `verify_hostname: true`), strictly enforcing `allowed_host`, rejecting
+/// redirects & non-2xx status codes, supporting chunked transfer-encoding and transparent gzip
+/// decompression.
 ///
 /// # Errors
 /// Returns [`HttpsError`] on scheme/host policy denial, invalid headers, TLS handshake or
 /// certificate failure, non-2xx status (including redirects), malformed HTTP framing, or size cap breach.
-pub fn https_get_bytes(
+pub fn https_request_bytes(
+    method: &str,
     url: &str,
     allowed_host: &str,
     headers: &[(String, String)],
+    body: Option<&[u8]>,
     cfg: &HttpsClientConfig,
 ) -> Result<HttpsResponse, HttpsError> {
     let parsed = ParsedHttpsUrl::parse_and_check_host(url, allowed_host)?;
 
+    let mut has_content_type = false;
     for (k, v) in headers {
         if k.is_empty()
             || k.bytes()
@@ -255,6 +260,14 @@ pub fn https_get_bytes(
             return Err(HttpsError::new(
                 "overriding the `Host` header is forbidden on `HttpsAllow` requests",
             ));
+        }
+        if k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(HttpsError::new(format!(
+                "overriding `{k}` header is forbidden on `HttpsAllow` requests"
+            )));
+        }
+        if k.eq_ignore_ascii_case("content-type") {
+            has_content_type = true;
         }
     }
 
@@ -275,10 +288,16 @@ pub fn https_get_bytes(
     let mut req = String::new();
     let _ = write!(
         req,
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: dana/0.2\r\nAccept: application/json\r\nAccept-Encoding: gzip\r\nConnection: close\r\n",
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: dana/0.2\r\nAccept: application/json\r\nAccept-Encoding: gzip\r\nConnection: close\r\n",
         parsed.path_and_query,
         parsed.host_header()
     );
+    if let Some(payload) = body {
+        if !has_content_type {
+            req.push_str("Content-Type: application/json\r\n");
+        }
+        let _ = write!(req, "Content-Length: {}\r\n", payload.len());
+    }
     for (k, v) in headers {
         if k.eq_ignore_ascii_case("connection") || k.eq_ignore_ascii_case("accept-encoding") {
             continue;
@@ -289,10 +308,32 @@ pub fn https_get_bytes(
 
     tls.write_all(req.as_bytes())
         .map_err(|e| HttpsError::new(format!("HTTPS request write failed: {e}")))?;
+    if let Some(payload) = body
+        && !payload.is_empty()
+    {
+        tls.write_all(payload)
+            .map_err(|e| HttpsError::new(format!("HTTPS body write failed: {e}")))?;
+    }
     tls.flush()
         .map_err(|e| HttpsError::new(format!("HTTPS request flush failed: {e}")))?;
 
     parse_http_response_from_reader(tls, cfg)
+}
+
+/// Perform a capability-gated HTTP/1.1 `GET` over verified TLS (`verify_peer: true`,
+/// `verify_hostname: true`), strictly enforcing `allowed_host`, rejecting redirects & non-2xx
+/// status codes, supporting chunked transfer-encoding and transparent gzip decompression.
+///
+/// # Errors
+/// Returns [`HttpsError`] on scheme/host policy denial, invalid headers, TLS handshake or
+/// certificate failure, non-2xx status (including redirects), malformed HTTP framing, or size cap breach.
+pub fn https_get_bytes(
+    url: &str,
+    allowed_host: &str,
+    headers: &[(String, String)],
+    cfg: &HttpsClientConfig,
+) -> Result<HttpsResponse, HttpsError> {
+    https_request_bytes("GET", url, allowed_host, headers, None, cfg)
 }
 
 /// Parse an HTTP/1.1 response from any [`Read`] stream, enforcing header budget, 2xx status
@@ -569,6 +610,81 @@ pub fn https_get_json(
     JsonResponse::from_json_str(&text)
 }
 
+fn https_write_json(
+    method: &str,
+    url: &str,
+    allowed_host: &str,
+    body_json: &str,
+    headers: &[(String, String)],
+    cfg: &HttpsClientConfig,
+) -> Result<JsonResponse, HttpsError> {
+    let resp = https_request_bytes(
+        method,
+        url,
+        allowed_host,
+        headers,
+        Some(body_json.as_bytes()),
+        cfg,
+    )?;
+    if resp.body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(JsonResponse::from_value(JsonValue::Null));
+    }
+    let text = String::from_utf8(resp.body)
+        .map_err(|e| HttpsError::new(format!("HTTPS JSON response is not valid UTF-8: {e}")))?;
+    JsonResponse::from_json_str(&text)
+}
+
+/// Perform a capability-gated HTTPS `POST` with a JSON payload and parse the response JSON (empty
+/// 2xx responses decode as `null`).
+///
+/// # Errors
+/// Returns [`HttpsError`] on transport/policy/status failure or non-empty invalid UTF-8 / JSON.
+pub fn https_post_json(
+    url: &str,
+    allowed_host: &str,
+    body_json: &str,
+    headers: &[(String, String)],
+    cfg: &HttpsClientConfig,
+) -> Result<JsonResponse, HttpsError> {
+    https_write_json("POST", url, allowed_host, body_json, headers, cfg)
+}
+
+/// Perform a capability-gated HTTPS `PUT` with a JSON payload and parse the response JSON (empty
+/// 2xx responses decode as `null`).
+///
+/// # Errors
+/// Returns [`HttpsError`] on transport/policy/status failure or non-empty invalid UTF-8 / JSON.
+pub fn https_put_json(
+    url: &str,
+    allowed_host: &str,
+    body_json: &str,
+    headers: &[(String, String)],
+    cfg: &HttpsClientConfig,
+) -> Result<JsonResponse, HttpsError> {
+    https_write_json("PUT", url, allowed_host, body_json, headers, cfg)
+}
+
+/// Resolve a field path against an arbitrary [`JsonValue`], checking exact object key first and
+/// otherwise walking dotted object keys and numeric array indices (e.g. `"geometry.coordinates.0"`).
+#[must_use]
+pub fn resolve_json_path<'a>(root: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
+    if path.is_empty() {
+        return Some(root);
+    }
+    if let Some(direct) = root.get(path) {
+        return Some(direct);
+    }
+    let mut cur = root;
+    for seg in path.split('.') {
+        cur = match cur {
+            JsonValue::Object(_) => cur.get(seg)?,
+            JsonValue::Array(arr) => arr.get(seg.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
 // ---------------------------------------------------------------------------
 // JsonResponse Runtime Helpers
 // ---------------------------------------------------------------------------
@@ -600,20 +716,11 @@ impl JsonResponse {
         &self.doc
     }
 
-    /// Resolve a field path (exact key first, otherwise dotted nested object path like `"meta.has_more"`).
+    /// Resolve a field path (exact key first, otherwise dotted nested object/array path like
+    /// `"meta.has_more"` or `"items.0.id"`).
     #[must_use]
     pub fn resolve_path(&self, field: &str) -> Option<&JsonValue> {
-        if field.is_empty() {
-            return Some(&self.doc);
-        }
-        if let Some(direct) = self.doc.get(field) {
-            return Some(direct);
-        }
-        let mut cur = &self.doc;
-        for seg in field.split('.') {
-            cur = cur.get(seg)?;
-        }
-        Some(cur)
+        resolve_json_path(&self.doc, field)
     }
 
     /// Extract a JSON array at `field` (supporting dotted keys) into quarantine-first
@@ -625,6 +732,24 @@ impl JsonResponse {
         &self,
         field: &str,
         schema: &TableTy,
+        check_constraint: F,
+    ) -> Result<(TableVal, TableVal), String>
+    where
+        F: FnMut(usize, &Val) -> bool,
+    {
+        self.parse_table_with_fields(field, schema, &HashMap::new(), check_constraint)
+    }
+
+    /// Extract a JSON array at `field` using optional per-column dotted object/array path
+    /// overrides in `field_paths` (`column_name -> "nested.path.or.0"`).
+    ///
+    /// # Errors
+    /// Returns an error string if `field` does not resolve to a JSON array.
+    pub fn parse_table_with_fields<F>(
+        &self,
+        field: &str,
+        schema: &TableTy,
+        field_paths: &HashMap<String, String>,
         mut check_constraint: F,
     ) -> Result<(TableVal, TableVal), String>
     where
@@ -644,7 +769,9 @@ impl JsonResponse {
         for (idx, item) in items.iter().enumerate() {
             let line_no = idx + 1;
             let raw_item = to_json_compact(item);
-            if item.as_object().is_none() {
+            let valid_container = item.as_object().is_some()
+                || (!field_paths.is_empty() && matches!(item, JsonValue::Array(_)));
+            if !valid_container {
                 bad_rows.push(TableRow {
                     cells: vec![
                         Val::Int(BigInt::from(line_no)),
@@ -662,7 +789,11 @@ impl JsonResponse {
             let mut bad_hit: Option<(&str, &str, String)> = None;
 
             for (ci, col) in schema.cols.iter().enumerate() {
-                let raw_jval = item.get(&col.name);
+                let raw_jval = if let Some(path) = field_paths.get(&col.name) {
+                    resolve_json_path(item, path)
+                } else {
+                    item.get(&col.name)
+                };
                 match json_value_to_dana(raw_jval, &col.ty) {
                     Ok(val) => {
                         let ok = match &val {
